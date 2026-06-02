@@ -50,7 +50,7 @@ from .particle_vbd_kernels import (
     solve_elasticity_tile,
     update_velocity,
 )
-from .reduced_projection import project_to_reduced_coordinates
+from .reduced_projection import ReducedProjector
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
     RigidContactHistory,
@@ -404,8 +404,15 @@ class SolverVBD(SolverBase):
             # eval_fk should be called on state before the first step() so that
             # body_q is consistent with joint_q.
             self._joint_q_prev = wp.clone(model.joint_q).to(self.device)
+            # GPU, CUDA-graph-capturable reduced-coordinate projector (built once).
+            self._reduced_projector = ReducedProjector(
+                model,
+                gn_iterations=reduced_gn_iterations,
+                damping=reduced_gn_damping,
+            )
         else:
             self._joint_q_prev = None
+            self._reduced_projector = None
 
         # Initialize particle system
         self._init_particle_system(
@@ -1646,14 +1653,7 @@ class SolverVBD(SolverBase):
         # Uses BDF1 on joint_q with velocity clamping to prevent explosion from
         # large manifold corrections.  FK produces consistent body_q + body_qd.
         if self.body_enable_reduced_solve and not self.integrate_with_external_rigid_solver:
-            project_to_reduced_coordinates(
-                self.model,
-                state_out,
-                joint_q_prev=self._joint_q_prev,
-                dt=dt,
-                gn_iterations=self.reduced_gn_iterations,
-                damping=self.reduced_gn_damping,
-            )
+            self._reduced_projector.project(state_out, self._joint_q_prev, dt)
             self._joint_q_prev.assign(state_out.joint_q)
             wp.copy(self.body_q_prev, state_out.body_q)
 
