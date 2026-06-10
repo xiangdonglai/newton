@@ -1637,8 +1637,23 @@ class SolverVBD(SolverBase):
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, dt)
 
+        # In-loop reduced projection mode:
+        #   "off"       -- project once after finalize (original scheme).
+        #   "overwrite" -- project state_in onto the joint manifold every iteration
+        #                  so the cloth contact grips a kinematically consistent
+        #                  finger pose (stable once the GN projection converges).
+        # _inloop_mode = getattr(self, "_rvbd_inloop_mode", "off")
+        _inloop_mode = getattr(self, "_rvbd_inloop_mode", "overwrite")
+        print(f"inloop_mode: {_inloop_mode}")
+        _do_inloop = (
+            _inloop_mode != "off"
+            and self.body_enable_reduced_solve
+            and not self.integrate_with_external_rigid_solver
+        )
         for iter_num in range(self.iterations):
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            if _do_inloop:
+                self._reduced_projector.project(state_in, self._joint_q_prev, dt, update_velocity=False)
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
         # Snapshot solved rigid contact state for next-frame warm-start.

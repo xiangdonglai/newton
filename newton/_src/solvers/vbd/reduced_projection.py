@@ -365,7 +365,9 @@ def _rvbd_residual_kernel(
     p_err = wp.transform_get_translation(X_fk) - wp.transform_get_translation(X_tg)
     q_fk = wp.transform_get_rotation(X_fk)
     q_tg = wp.transform_get_rotation(X_tg)
-    q_err = wp.quat_inverse(q_tg) * q_fk
+    # World-frame orientation error (to match the world-frame angular Jacobian
+    # from eval_jacobian): q_err = q_fk * q_tg^-1.
+    q_err = q_fk * wp.quat_inverse(q_tg)
     s = float(1.0)
     if q_err[3] < 0.0:
         s = -1.0
@@ -488,6 +490,8 @@ class ReducedProjector:
         self.damping = float(damping)
         self.max_joint_vel = float(max_joint_vel)
         self.device = model.device
+        # Diagnostic switch: skip the joint_q_prev position-correction clamp.
+        self.skip_dq_clamp = False
 
         self.res_dim = int(model.max_joints_per_articulation) * 6
         self.dof_dim = int(model.max_dofs_per_articulation)
@@ -530,13 +534,27 @@ class ReducedProjector:
         self.res = wp.zeros((n_art, self.res_dim, 1), dtype=wp.float32, device=self.device)
         self.dq = wp.zeros((n_art, self.dof_dim), dtype=wp.float32, device=self.device)
         self.body_q_target = wp.empty(model.body_count, dtype=wp.transform, device=self.device)
+        # Scratch to preserve body_qd when running a position-only projection.
+        self._body_qd_save = wp.empty(model.body_count, dtype=wp.spatial_vector, device=self.device)
 
         self._solve_kernel = _build_gn_solve_kernel(self.res_dim, self.dof_dim)
 
-    def project(self, state: State, joint_q_prev: wp.array, dt: float) -> None:
-        """Project maximal body_q onto the reduced manifold (all-GPU)."""
+    def project(self, state: State, joint_q_prev: wp.array, dt: float, update_velocity: bool = True) -> None:
+        """Project maximal body_q onto the reduced manifold (all-GPU).
+
+        Args:
+            update_velocity: If True, recover and clamp ``joint_qd`` and write the
+                manifold-consistent ``body_qd`` (the original behaviour). If False,
+                project positions only: ``body_qd`` is left exactly as on entry, so
+                velocity is owned solely by the BDF1 recovery in
+                ``_finalize_rigid_bodies``. Use ``False`` for the per-iteration
+                projection inside the VBD loop.
+        """
         if not self.any_managed or self.model.body_count == 0:
             return
+        # Position-only mode: snapshot body_qd so the FK below cannot change it.
+        if not update_velocity:
+            wp.copy(self._body_qd_save, state.body_qd)
         model = self.model
         dev = model.device
         ll = model.joint_limit_lower
@@ -555,6 +573,23 @@ class ReducedProjector:
                 outputs=[state.joint_q],
                 device=dev,
             )
+
+        _dbgres = getattr(self, "_dbg_residual", False)
+
+        def _resnorm():
+            import torch as _t
+
+            eval_fk(model, state.joint_q, state.joint_qd, state)
+            bq = wp.to_torch(state.body_q)
+            tq = wp.to_torch(self.body_q_target)
+            tr = (bq[:, :3] - tq[:, :3]).norm(dim=-1).max()
+            # rotation error angle = 2*acos(|<q_fk,q_tg>|)
+            dot = (bq[:, 3:] * tq[:, 3:]).sum(dim=-1).abs().clamp(max=1.0)
+            rot = (2.0 * _t.acos(dot)).max()
+            return float(tr), float(rot)
+
+        if _dbgres:
+            _r0, _rot0 = _resnorm()
 
         for _ in range(self.gn_iterations):
             eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -592,22 +627,37 @@ class ReducedProjector:
                     device=dev,
                 )
 
-        # Clamp the net position correction to keep the projection local.
-        wp.launch(
-            _rvbd_clamp_dq_kernel,
-            dim=state.joint_q.shape[0],
-            inputs=[self.coord_to_dof, joint_q_prev, self.max_joint_vel * dt],
-            outputs=[state.joint_q],
-            device=dev,
-        )
-        # Clamp joint velocities recovered by eval_ik.
-        wp.launch(
-            _rvbd_clamp_qd_kernel,
-            dim=state.joint_qd.shape[0],
-            inputs=[self.managed_dof, self.max_joint_vel],
-            outputs=[state.joint_qd],
-            device=dev,
-        )
+        if _dbgres:
+            _r1, _rot1 = _resnorm()
+            print(
+                f"[proj gn={self.gn_iterations}] tr: {_r0:.6f}->{_r1:.6f}  "
+                f"rot: {_rot0:.6f}->{_rot1:.6f}",
+                flush=True,
+            )
 
-        # Final FK → consistent projected body_q and body_qd.
+        # Clamp the net position correction to keep the projection local.
+        if not self.skip_dq_clamp:
+            wp.launch(
+                _rvbd_clamp_dq_kernel,
+                dim=state.joint_q.shape[0],
+                inputs=[self.coord_to_dof, joint_q_prev, self.max_joint_vel * dt],
+                outputs=[state.joint_q],
+                device=dev,
+            )
+        # Clamp joint velocities recovered by eval_ik (velocity mode only).
+        if update_velocity:
+            wp.launch(
+                _rvbd_clamp_qd_kernel,
+                dim=state.joint_qd.shape[0],
+                inputs=[self.managed_dof, self.max_joint_vel],
+                outputs=[state.joint_qd],
+                device=dev,
+            )
+
+        # Final FK → projected body_q (and body_qd).
         eval_fk(model, state.joint_q, state.joint_qd, state)
+
+        # Position-only mode: restore body_qd so the projection leaves velocity
+        # untouched; BDF1 in _finalize_rigid_bodies is the sole owner of body_qd.
+        if not update_velocity:
+            wp.copy(state.body_qd, self._body_qd_save)
