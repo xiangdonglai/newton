@@ -43,6 +43,7 @@ def _compute_body_residual(
     body_q_target: np.ndarray,
     body_indices: list[int],
     n_links: int,
+    orientation_frame: str = "world",
 ) -> np.ndarray:
     """Compute 6-DOF residual per link: [pos_err(3), rot_err(3)].
 
@@ -51,24 +52,37 @@ def _compute_body_residual(
         body_q_target: AVBD maximal transforms, shape (n_bodies, 7).
         body_indices: Global body index for each link in the articulation.
         n_links: Number of links in the articulation.
+        orientation_frame: Frame in which the orientation error is expressed.
+
+            * ``"world"`` -- ``q_err = q_fk * q_target^{-1}`` (left factor). This
+              matches the world-frame angular block of the geometric Jacobian
+              returned by :func:`~newton.eval_jacobian`, so the Gauss-Newton step
+              is consistent and converges.
+            * ``"body"`` -- ``q_err = q_target^{-1} * q_fk`` (right factor), i.e.
+              the error in the target's body frame. This is inconsistent with the
+              world-frame Jacobian (off by the conjugation ``R_target``) and makes
+              the GN iteration diverge when link orientations are far from
+              identity. Provided only for comparison/diagnostics.
 
     Returns:
         Residual vector of shape (n_links * 6,).
     """
     residual = np.zeros(n_links * 6)
     for i, body_idx in enumerate(body_indices):
-        # Position error
+        # Position error (world frame).
         pos_fk = body_q_fk[body_idx, :3]
         pos_target = body_q_target[body_idx, :3]
         residual[i * 6 : i * 6 + 3] = pos_fk - pos_target
 
-        # Orientation error in the same sign convention as position:
-        # current FK pose minus target pose. For small angles this is
-        # q_target^{-1} * q_fk, so the GN update -J^T r moves toward target.
+        # Orientation error of fk relative to target. The GN update -J^T r moves
+        # fk toward target; r must be in the same frame as the Jacobian (world).
         q_fk = body_q_fk[body_idx, 3:]  # (x, y, z, w)
         q_target = body_q_target[body_idx, 3:]
         q_target_inv = np.array([-q_target[0], -q_target[1], -q_target[2], q_target[3]])
-        q_err = _quat_multiply(q_target_inv, q_fk)
+        if orientation_frame == "world":
+            q_err = _quat_multiply(q_fk, q_target_inv)  # world frame (left factor)
+        else:
+            q_err = _quat_multiply(q_target_inv, q_fk)  # body frame (right factor)
 
         # Shortest path
         if q_err[3] < 0.0:
@@ -87,6 +101,8 @@ def project_to_reduced_coordinates(
     gn_iterations: int = 3,
     damping: float = 1e-6,
     max_joint_vel: float = 20.0,
+    orientation_frame: str = "world",
+    residual_log: list | None = None,
 ) -> None:
     """Project maximal body_q onto the reduced-coordinate manifold.
 
@@ -106,6 +122,12 @@ def project_to_reduced_coordinates(
             projection only).
         damping: Levenberg-Marquardt damping for the normal equations.
         max_joint_vel: Maximum joint velocity [rad/s or m/s] for clamping.
+        orientation_frame: Frame for the GN orientation residual, ``"world"``
+            (correct; matches the world-frame Jacobian) or ``"body"`` (divergent;
+            diagnostic only). See :func:`_compute_body_residual`.
+        residual_log: Optional list. If provided, the per-GN-iteration
+            ``(max_translation_error[m], max_rotation_error[rad])`` over all
+            managed links is appended each iteration (for convergence reports).
     """
     if model.articulation_count == 0 or model.body_count == 0:
         return
@@ -224,7 +246,19 @@ def project_to_reduced_coordinates(
                     continue
 
                 # Residual: FK vs AVBD target
-                r = _compute_body_residual(body_q_fk_np, body_q_target_np, body_indices, n_links)
+                r = _compute_body_residual(
+                    body_q_fk_np, body_q_target_np, body_indices, n_links, orientation_frame
+                )
+
+                if residual_log is not None:
+                    _tr = max(
+                        float(np.linalg.norm(body_q_fk_np[b, :3] - body_q_target_np[b, :3])) for b in body_indices
+                    )
+                    _rot = max(
+                        2.0 * np.arccos(min(1.0, abs(float(np.dot(body_q_fk_np[b, 3:], body_q_target_np[b, 3:])))))
+                        for b in body_indices
+                    )
+                    residual_log.append((float(_tr), float(_rot)))
 
                 # Extract this articulation's Jacobian block
                 J_art = J_np[art_idx, : n_links * 6, :n_dofs]
@@ -490,8 +524,6 @@ class ReducedProjector:
         self.damping = float(damping)
         self.max_joint_vel = float(max_joint_vel)
         self.device = model.device
-        # Diagnostic switch: skip the joint_q_prev position-correction clamp.
-        self.skip_dq_clamp = False
 
         self.res_dim = int(model.max_joints_per_articulation) * 6
         self.dof_dim = int(model.max_dofs_per_articulation)
@@ -574,23 +606,6 @@ class ReducedProjector:
                 device=dev,
             )
 
-        _dbgres = getattr(self, "_dbg_residual", False)
-
-        def _resnorm():
-            import torch as _t
-
-            eval_fk(model, state.joint_q, state.joint_qd, state)
-            bq = wp.to_torch(state.body_q)
-            tq = wp.to_torch(self.body_q_target)
-            tr = (bq[:, :3] - tq[:, :3]).norm(dim=-1).max()
-            # rotation error angle = 2*acos(|<q_fk,q_tg>|)
-            dot = (bq[:, 3:] * tq[:, 3:]).sum(dim=-1).abs().clamp(max=1.0)
-            rot = (2.0 * _t.acos(dot)).max()
-            return float(tr), float(rot)
-
-        if _dbgres:
-            _r0, _rot0 = _resnorm()
-
         for _ in range(self.gn_iterations):
             eval_fk(model, state.joint_q, state.joint_qd, state)
             eval_jacobian(model, state, J=self.J, joint_S_s=self.joint_S_s)
@@ -627,23 +642,14 @@ class ReducedProjector:
                     device=dev,
                 )
 
-        if _dbgres:
-            _r1, _rot1 = _resnorm()
-            print(
-                f"[proj gn={self.gn_iterations}] tr: {_r0:.6f}->{_r1:.6f}  "
-                f"rot: {_rot0:.6f}->{_rot1:.6f}",
-                flush=True,
-            )
-
         # Clamp the net position correction to keep the projection local.
-        if not self.skip_dq_clamp:
-            wp.launch(
-                _rvbd_clamp_dq_kernel,
-                dim=state.joint_q.shape[0],
-                inputs=[self.coord_to_dof, joint_q_prev, self.max_joint_vel * dt],
-                outputs=[state.joint_q],
-                device=dev,
-            )
+        wp.launch(
+            _rvbd_clamp_dq_kernel,
+            dim=state.joint_q.shape[0],
+            inputs=[self.coord_to_dof, joint_q_prev, self.max_joint_vel * dt],
+            outputs=[state.joint_q],
+            device=dev,
+        )
         # Clamp joint velocities recovered by eval_ik (velocity mode only).
         if update_velocity:
             wp.launch(

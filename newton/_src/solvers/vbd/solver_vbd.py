@@ -1642,11 +1642,10 @@ class SolverVBD(SolverBase):
         #   "overwrite" -- project state_in onto the joint manifold every iteration
         #                  so the cloth contact grips a kinematically consistent
         #                  finger pose (stable once the GN projection converges).
-        # _inloop_mode = getattr(self, "_rvbd_inloop_mode", "off")
+        #   "none"      -- no projection at all (pure AVBD dynamics; diagnostic).
         _inloop_mode = getattr(self, "_rvbd_inloop_mode", "overwrite")
-        print(f"inloop_mode: {_inloop_mode}")
         _do_inloop = (
-            _inloop_mode != "off"
+            _inloop_mode == "overwrite"
             and self.body_enable_reduced_solve
             and not self.integrate_with_external_rigid_solver
         )
