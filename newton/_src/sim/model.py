@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 from ..core.types import Devicelike
+from ..utils.mesh import MeshAdjacency
 from .contacts import Contacts
 from .control import Control
 from .state import State
@@ -310,6 +311,19 @@ class Model:
         self.shape_edge_range: wp.array[wp.vec2i] | None = None
         """Per-shape (start, count) into mesh_edge_indices, shape [shape_count]. (-1,0) if no edges."""
 
+        # Rigid-mesh feature ownership (flat-packed for the triangle-driven soft-contact path)
+        self.shape_mesh_tri_edges: wp.array2d[wp.int32] | None = None
+        """Flat-packed ``Mesh.tri_edges`` across all (MESH, CONVEX_MESH) shapes with COLLIDE_PARTICLES set,
+        shape [sum_tri_count, 3]. Each entry is an ownership-space edge id (``edge_start`` offset applied)."""
+        self.shape_mesh_vertex_owner_tri: wp.array[wp.int32] | None = None
+        """Flat-packed ``Mesh.vertex_owner_tri``, shape [sum_vertex_count]. Each entry is an ownership-space
+        tri id (``tri_start`` offset applied); -1 for unreferenced vertices."""
+        self.shape_mesh_tri_feature_owner_flag: wp.array[wp.uint8] | None = None
+        """Flat-packed ``Mesh.tri_feature_owner_flag``, shape [sum_tri_count]. Bit layout matches ``MeshAdjacency``."""
+        self.shape_mesh_ownership_range: wp.array[wp.vec3i] | None = None
+        """Per-shape (tri_start, vert_start, edge_start) offsets into the three flat arrays above,
+        shape [shape_count]. (-1, -1, -1) for non-mesh or non-COLLIDE_PARTICLES shapes."""
+
         # SDF storage (compact table + per-shape index indirection)
         self.shape_sdf_index: wp.array[wp.int32] | None = None
         """Per-shape SDF index, shape [shape_count]. -1 means shape has no SDF."""
@@ -379,6 +393,8 @@ class Model:
         Components: [0] stiffness [N·m/rad], [1] damping [N·s]."""
         self.edge_constraint_lambdas: wp.array[wp.float32] | None = None
         """Lagrange multipliers for edge constraints (internal use)."""
+        self.soft_mesh_adjacency: MeshAdjacency | None = None
+        """Soft mesh topology and solver adjacency, or ``None`` before finalization."""
 
         self.tet_indices: wp.array[wp.int32] | None = None
         """Tetrahedral element indices, shape [tet_count*4], int."""
@@ -995,6 +1011,7 @@ class Model:
         contacts: Contacts | None = None,
         *,
         collision_pipeline: CollisionPipeline | None = None,
+        enable_water_tight_rigid_soft_contact: bool = False,
     ) -> Contacts:
         """
         Generate contact points for the particles and rigid bodies in the model using the default collision
@@ -1005,6 +1022,14 @@ class Model:
             contacts: The contacts buffer to populate (will be cleared first). If None, a new
                 contacts buffer is allocated via :meth:`contacts`.
             collision_pipeline: Optional collision pipeline override.
+            enable_water_tight_rigid_soft_contact: When ``True``, run the triangle-driven kernel
+                in addition to the legacy per-particle kernel to detect the edge-edge and
+                triangle-vertex soft contacts that per-particle SDF queries cannot see. The extra
+                records land in the E/F range of ``Contacts.soft_contact_*`` (shared fields at
+                indices ``[soft_contact_count[0], soft_contact_count[0] + soft_contact_count[1])``;
+                new-only fields ``soft_contact_primitive`` / ``_kind`` / ``_barycentric`` at local
+                indices ``[0, soft_contact_count[1])``). The particle range stays bit-for-bit
+                identical to the flag-off case. Defaults to ``False``.
         """
         if collision_pipeline is not None:
             self._collision_pipeline = collision_pipeline
@@ -1014,7 +1039,11 @@ class Model:
         if contacts is None:
             contacts = self._collision_pipeline.contacts()
 
-        self._collision_pipeline.collide(state, contacts)
+        self._collision_pipeline.collide(
+            state,
+            contacts,
+            enable_water_tight_rigid_soft_contact=enable_water_tight_rigid_soft_contact,
+        )
         return contacts
 
     def request_state_attributes(self, *attributes: str) -> None:

@@ -24,6 +24,7 @@ from ..geometry.support_function import (
     SupportMapDataProvider,
     pack_mesh_ptr,
 )
+from ..geometry.triangle_driven_soft_contacts import launch_create_soft_contacts_triangle_driven
 from ..geometry.types import GeoType
 from ..sim.contacts import Contacts
 from ..sim.model import Model
@@ -812,7 +813,10 @@ class CollisionPipeline:
             )
 
         if soft_contact_max is None:
-            soft_contact_max = shape_count * particle_count
+            # Headroom over the per-particle bound (shape_count * particle_count):
+            # the same buffer also holds the edge/face contact range used by the
+            # water-tight rigid-soft contact path, packed after the particle range.
+            soft_contact_max = 2 * shape_count * particle_count
         self.soft_contact_margin = soft_contact_margin
         self._soft_contact_max = soft_contact_max
         self.requires_grad = requires_grad
@@ -905,6 +909,7 @@ class CollisionPipeline:
         contacts: Contacts,
         *,
         soft_contact_margin: float | None = None,
+        enable_water_tight_rigid_soft_contact: bool = False,
     ):
         """Run the collision pipeline using NarrowPhase.
 
@@ -929,6 +934,13 @@ class CollisionPipeline:
             contacts: The contacts buffer to populate (will be cleared first).
             soft_contact_margin: Margin for soft contact generation.
                 If ``None``, uses the value from construction.
+            enable_water_tight_rigid_soft_contact: When ``True``, run the
+                triangle-driven kernel after the legacy per-particle kernel to
+                add the edge-edge and triangle-vertex soft contacts that
+                per-particle SDF queries cannot see. Records land in the E/F
+                range of ``contacts.soft_contact_*``; the particle range stays
+                bit-for-bit identical to the flag-off case. No effect when the
+                soft side has no triangulated topology. Defaults to ``False``.
         """
 
         # Counter zeroing and generation bump are fused into compute_shape_aabbs.
@@ -1229,3 +1241,15 @@ class CollisionPipeline:
                 ],
                 device=self.device,
             )
+
+            # Water-tight path: append E x E and T x V records. Runs after the
+            # legacy launch on the same stream, so ``soft_contact_count[0]`` is
+            # final before the triangle-driven kernel packs slot [1] behind it.
+            if enable_water_tight_rigid_soft_contact and model.soft_mesh_adjacency is not None:
+                launch_create_soft_contacts_triangle_driven(
+                    model=model,
+                    state=state,
+                    contacts=contacts,
+                    margin=soft_contact_margin,
+                    device=self.device,
+                )
