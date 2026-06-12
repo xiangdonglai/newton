@@ -1637,18 +1637,17 @@ class SolverVBD(SolverBase):
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, dt)
 
-        # In-loop reduced projection mode:
-        #   "off"       -- project once after finalize (original scheme).
+        # Reduced projection mode:
+        #   "off"       -- project once after finalize (original RVBD scheme).
         #   "overwrite" -- project state_in onto the joint manifold every iteration
-        #                  so the cloth contact grips a kinematically consistent
-        #                  finger pose (stable once the GN projection converges).
-        #   "none"      -- no projection at all (pure AVBD dynamics; diagnostic).
+        #                  AND once after finalize. Cloth contact grips a
+        #                  kinematically consistent finger pose each iteration.
+        #   "none"      -- no projection at all (pure maximal AVBD dynamics). Used
+        #                  as the projection-off control for A/B comparisons.
         _inloop_mode = getattr(self, "_rvbd_inloop_mode", "overwrite")
-        _do_inloop = (
-            _inloop_mode == "overwrite"
-            and self.body_enable_reduced_solve
-            and not self.integrate_with_external_rigid_solver
-        )
+        _reduced_active = self.body_enable_reduced_solve and not self.integrate_with_external_rigid_solver
+        _do_inloop = _inloop_mode == "overwrite" and _reduced_active
+        _do_postloop = _inloop_mode != "none" and _reduced_active
         for iter_num in range(self.iterations):
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
             if _do_inloop:
@@ -1666,7 +1665,7 @@ class SolverVBD(SolverBase):
         # Project maximal body poses onto kinematic manifold after finalize.
         # Uses BDF1 on joint_q with velocity clamping to prevent explosion from
         # large manifold corrections.  FK produces consistent body_q + body_qd.
-        if self.body_enable_reduced_solve and not self.integrate_with_external_rigid_solver:
+        if _do_postloop:
             self._reduced_projector.project(state_out, self._joint_q_prev, dt)
             self._joint_q_prev.assign(state_out.joint_q)
             wp.copy(self.body_q_prev, state_out.body_q)
