@@ -6,6 +6,7 @@ from .model_view import ModelView
 from .solver_coupled import SolverCoupled
 from .solver_coupled_admm import SolverCoupledADMM
 from .solver_coupled_proxy import SolverCoupledProxy
+from .solver_coupled_soft_constraint import SolverCoupledSoftConstraint
 
 __all__ = [
     "CouplingInterface",
@@ -13,4 +14,5 @@ __all__ = [
     "SolverCoupled",
     "SolverCoupledADMM",
     "SolverCoupledProxy",
+    "SolverCoupledSoftConstraint",
 ]
