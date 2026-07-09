@@ -60,7 +60,8 @@ ROBOT_INIT_Q = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.04, 0.04]
 # resolved once from ``--solver`` in :meth:`ShirtPickScene.__init__`.
 # Historical single-value home positions, for reference:
 # (0.7302, 0.0836, 0.3713), (0.69, 0.180, 0.48).
-HOME_POS_DEFAULT = (0.2676, 0.3762, 0.40)
+# HOME_POS_DEFAULT = (0.2676, 0.3762, 0.40)
+HOME_POS_DEFAULT = (0.2616, 0.3587, 0.3781)
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,8 @@ class SolverProfile:
 
 _PENALTY_PROFILE = SolverProfile(home_pos=HOME_POS_DEFAULT)  # proxy + soft_constraint
 SOLVER_PROFILES = {
-    "avbd": SolverProfile(home_pos=(0.2863, 0.3960, 0.40)),
+    # "avbd": SolverProfile(home_pos=(0.2863, 0.3960, 0.40)),
+    "avbd": SolverProfile(home_pos=(0.2616, 0.3587, 0.3781)),
     "proxy": _PENALTY_PROFILE,
     "soft_constraint": _PENALTY_PROFILE,
 }
@@ -85,7 +87,8 @@ SOLVER_PROFILES = {
 DEFAULT_PROFILE = _PENALTY_PROFILE
 
 # HOME_QUAT = (0.7140, -0.6664, -0.0916, 0.1943)  # (qx, qy, qz, qw)
-HOME_QUAT = (0.8859, -0.4521, 0.0874, 0.0565)
+# HOME_QUAT = (0.8859, -0.4521, 0.0874, 0.0565)
+HOME_QUAT = (0.9352, -0.3386, 0.0942, 0.0431)
 # GRASP_Z = 0.0981
 GRASP_Z = 0.12
 
