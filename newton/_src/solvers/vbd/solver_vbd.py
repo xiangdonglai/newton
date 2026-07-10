@@ -245,6 +245,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-cable angular joint constraints
         # Rigid body - penetration-free DAT truncation
         rigid_enable_penetration_free: bool = False,  # Truncate rigid pose updates against rigid-soft division planes
+        rigid_collision_detection_interval: int = 0,  # Re-detect rigid-soft contacts every N iterations (0 = per-step only)
         rigid_penetration_free_query_margin: float = 0.01,  # Must match the collision pipeline's soft_contact_margin
         rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
     ):
@@ -454,6 +455,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._init_rigid_penetration_free(
             model,
             rigid_enable_penetration_free,
+            rigid_collision_detection_interval,
             rigid_penetration_free_query_margin,
             rigid_conservative_bound_relaxation,
         )
@@ -469,11 +471,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         self,
         model: Model,
         rigid_enable_penetration_free: bool,
+        rigid_collision_detection_interval: int,
         rigid_penetration_free_query_margin: float,
         rigid_conservative_bound_relaxation: float,
     ):
         """Initialize rigid DAT truncation buffers and per-body bounding radii."""
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
+        self.rigid_collision_detection_interval = int(rigid_collision_detection_interval)
+        # Set via set_collision_detection_hook(); called at the interval to refresh contacts mid-step.
+        self._collision_detection_hook = None
         self.rigid_penetration_free_query_margin = rigid_penetration_free_query_margin
         self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
         # Threshold below which a displacement is treated as parallel to a division plane.
@@ -824,6 +830,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             # Kinematic bodies: set body_q.
             # Dynamic teleportation: also set body_q_prev and body_qd.
             self.body_q_prev = wp.clone(model.body_q, device=self.device)
+            # DAT truncation reference: equals body_q_prev at step start, advanced to the
+            # current poses at every mid-step re-detection (Alg. 3 commit), while
+            # body_q_prev must stay at the step-start pose for the BDF velocity finalize.
+            self.body_q_dat_ref = wp.clone(model.body_q, device=self.device)
             self._coupling_body_q_prev_snapshot = wp.clone(model.body_q, device=self.device)
             self.body_inertia_q = wp.zeros_like(model.body_q, device=self.device)  # inertial target poses for AVBD
 
@@ -1835,10 +1845,22 @@ class SolverVBD(SolverBase, CouplingInterface):
         if control is None:
             control = self.model.control(clone_variables=False)
 
+        if self.rigid_enable_penetration_free and self.model.body_count > 0:
+            wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
+        redetect_interval = self.rigid_collision_detection_interval
         for iter_num in range(self.iterations):
+            if (
+                redetect_interval >= 1
+                and iter_num > 0
+                and iter_num % redetect_interval == 0
+                and self._collision_detection_hook is not None
+                and contacts is not None
+            ):
+                self._midstep_collision_update(state_in, contacts)
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
@@ -1848,6 +1870,39 @@ class SolverVBD(SolverBase, CouplingInterface):
             state_in, state_out, dt, apply_stick_deadzone=contacts is not None and self.rigid_contact_hard
         )
         self._finalize_particles(state_out, dt)
+
+    def set_collision_detection_hook(self, hook) -> None:
+        """Register ``hook(state)`` to refresh ``contacts`` from the current state.
+
+        Called every ``rigid_collision_detection_interval`` iterations inside
+        :meth:`step` (paper Alg. 3 lines 8-12): the accumulated deformation is
+        committed by advancing the DAT references, the hook re-runs collision
+        detection on the committed state, and the body-particle contact state is
+        rebuilt. The hook must be graph-capture-safe (a fixed kernel sequence,
+        e.g. ``CollisionPipeline.collide``).
+        """
+        self._collision_detection_hook = hook
+
+    def _midstep_collision_update(self, state_in: State, contacts: Contacts):
+        """Alg. 3 mid-step commit + re-detect: advance DAT references to the current
+        state, refresh contacts via the hook, and rebuild body-particle contact state.
+        The inertia target and rigid-rigid contact state are deliberately untouched."""
+        model = self.model
+        # Commit: DAT truncates against the last-detection state from here on.
+        if model.particle_count > 0:
+            if self.particle_enable_self_contact:
+                self._collision_detection_penetration_free(state_in)
+            else:
+                self.pos_prev_collision_detection.assign(state_in.particle_q)
+                self.particle_displacements.zero_()
+        if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        # Re-detect on the committed state and rebuild the dependent contact state.
+        self._collision_detection_hook(state_in)
+        # Seed penalties at full material stiffness (k_start=-1 -> avg_ke): the system is
+        # already mid-solve, so re-starting the AVBD penalty ramp every re-detection
+        # would leave contacts permanently under-stiff (observed as the grasp slipping).
+        self._rebuild_body_particle_contact_state(contacts, k_start=-1.0)
 
     def _snapshot_rigid_contact_history(self, contacts: Contacts | None):
         """Write solved contact state for next frame's match-index warm-start."""
@@ -1956,7 +2011,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.shape_body,
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
-                    self.body_q_prev,
+                    self.body_q_dat_ref,
                     body_q,
                     self.model.body_com,
                     self.dat_body_vertex_start,
@@ -1964,6 +2019,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.dat_body_vertex_radius,
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
+                    self.rigid_penetration_free_query_margin,
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -1993,7 +2049,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=apply_body_truncation_ts,
                 dim=self.model.body_count,
                 inputs=[
-                    self.body_q_prev,
+                    self.body_q_dat_ref,
                     self.model.body_com,
                     self.body_truncation_ts,
                     self.body_bounding_radius,
@@ -2035,7 +2091,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.rigid_contact_margin1,
                     self.model.shape_body,
                     self.model.shape_margin,
-                    self.body_q_prev,
+                    self.body_q_dat_ref,
                     body_q,
                     self.model.body_com,
                     self.dat_body_vertex_start,
@@ -2066,7 +2122,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.shape_body,
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
-                    self.body_q_prev,
+                    self.body_q_dat_ref,
                     body_q,
                     self.model.body_com,
                     self.dat_body_vertex_start,
@@ -2074,6 +2130,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.dat_body_vertex_radius,
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
+                    self.rigid_penetration_free_query_margin,
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -2086,7 +2143,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             kernel=apply_body_truncation_ts,
             dim=self.model.body_count,
             inputs=[
-                self.body_q_prev,
+                self.body_q_dat_ref,
                 self.model.body_com,
                 self.body_truncation_ts,
                 self.body_bounding_radius,
@@ -2466,65 +2523,75 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_refresh = True
 
         if model.particle_count > 0 and particle_refresh and contacts is not None:
-            # Build body-particle contact lists (only when SolverVBD integrates bodies).
-            if not self.integrate_with_external_rigid_solver and model.body_count > 0:
-                self.body_particle_contact_counts.zero_()
-                self.body_particle_contact_overflow_max.zero_()
-                wp.launch(
-                    kernel=build_body_particle_contact_lists,
-                    dim=contacts.soft_contact_max,
-                    inputs=[
-                        contacts.soft_contact_count,
-                        contacts.soft_contact_shape,
-                        model.shape_body,
-                        self.body_inv_mass_effective,
-                        self.body_particle_contact_buffer_pre_alloc,
-                    ],
-                    outputs=[
-                        self.body_particle_contact_counts,
-                        self.body_particle_contact_indices,
-                        self.body_particle_contact_overflow_max,
-                    ],
-                    device=self.device,
-                )
-                wp.launch(
-                    kernel=check_contact_overflow,
-                    dim=1,
-                    inputs=[self.body_particle_contact_overflow_max, self.body_particle_contact_buffer_pre_alloc, 1],
-                    device=self.device,
-                )
+            self._rebuild_body_particle_contact_state(contacts)
 
-            # Init body-particle material properties (needed for both internal and external rigid solver).
-            soft_contact_launch_dim = contacts.soft_contact_max
-            if self.body_particle_contact_penalty_k.shape[0] < soft_contact_launch_dim:
-                self._raise_if_capturing_resize(
-                    "body-particle contact state",
-                    self.body_particle_contact_penalty_k.shape[0],
-                    soft_contact_launch_dim,
-                )
-                self._init_body_particle_contact_state(soft_contact_launch_dim)
+    def _rebuild_body_particle_contact_state(self, contacts: Contacts, k_start: float | None = None):
+        """(Re)build per-body contact lists and AVBD body-particle contact state from
+        the current ``contacts`` buffer. Called at per-step init and after every
+        mid-step re-detection (:meth:`_midstep_collision_update`). ``k_start``
+        overrides the penalty seed (-1 seeds at full material stiffness)."""
+        model = self.model
+        if k_start is None:
+            k_start = self.rigid_contact_k_start_value
+        # Build body-particle contact lists (only when SolverVBD integrates bodies).
+        if not self.integrate_with_external_rigid_solver and model.body_count > 0:
+            self.body_particle_contact_counts.zero_()
+            self.body_particle_contact_overflow_max.zero_()
             wp.launch(
-                kernel=init_body_particle_contacts,
+                kernel=build_body_particle_contact_lists,
+                dim=contacts.soft_contact_max,
                 inputs=[
                     contacts.soft_contact_count,
                     contacts.soft_contact_shape,
-                    model.soft_contact_ke,
-                    model.soft_contact_kd,
-                    model.soft_contact_mu,
-                    model.shape_material_ke,
-                    model.shape_material_kd,
-                    model.shape_material_mu,
-                    self.rigid_contact_k_start_value,
+                    model.shape_body,
+                    self.body_inv_mass_effective,
+                    self.body_particle_contact_buffer_pre_alloc,
                 ],
                 outputs=[
-                    self.body_particle_contact_penalty_k,
-                    self.body_particle_contact_material_kd,
-                    self.body_particle_contact_material_mu,
-                    self.body_particle_contact_material_ke,
+                    self.body_particle_contact_counts,
+                    self.body_particle_contact_indices,
+                    self.body_particle_contact_overflow_max,
                 ],
-                dim=soft_contact_launch_dim,
                 device=self.device,
             )
+            wp.launch(
+                kernel=check_contact_overflow,
+                dim=1,
+                inputs=[self.body_particle_contact_overflow_max, self.body_particle_contact_buffer_pre_alloc, 1],
+                device=self.device,
+            )
+
+        # Init body-particle material properties (needed for both internal and external rigid solver).
+        soft_contact_launch_dim = contacts.soft_contact_max
+        if self.body_particle_contact_penalty_k.shape[0] < soft_contact_launch_dim:
+            self._raise_if_capturing_resize(
+                "body-particle contact state",
+                self.body_particle_contact_penalty_k.shape[0],
+                soft_contact_launch_dim,
+            )
+            self._init_body_particle_contact_state(soft_contact_launch_dim)
+        wp.launch(
+            kernel=init_body_particle_contacts,
+            inputs=[
+                contacts.soft_contact_count,
+                contacts.soft_contact_shape,
+                model.soft_contact_ke,
+                model.soft_contact_kd,
+                model.soft_contact_mu,
+                model.shape_material_ke,
+                model.shape_material_kd,
+                model.shape_material_mu,
+                k_start,
+            ],
+            outputs=[
+                self.body_particle_contact_penalty_k,
+                self.body_particle_contact_material_kd,
+                self.body_particle_contact_material_mu,
+                self.body_particle_contact_material_ke,
+            ],
+            dim=soft_contact_launch_dim,
+            device=self.device,
+        )
 
     def _solve_particle_iteration(
         self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int

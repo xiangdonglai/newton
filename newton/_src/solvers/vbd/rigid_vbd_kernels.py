@@ -4257,6 +4257,23 @@ DAT_THREADS_PER_CONTACT = 8
 # Reference points within this band of a division plane count as pinched: approach is
 # blocked outright instead of bisected, separation stays free.
 DAT_PINCH_BAND = wp.constant(1.0e-6)
+# A contact only counts as truly pinched (stall semantics) when the PAIR's reference gap
+# is this small. With a healthy gap, a body vertex found on/past the division plane is a
+# foreign-plane artifact -- the lambda-placed plane of one contact legitimately cuts
+# through other parts of the body (paper Eq. 20 associates planes per vertex, not per
+# body) -- and must not stall the body.
+DAT_PINCH_GAP_EPS = wp.constant(8.0e-3)
+# Pinched points may keep the fraction of their update whose approach component is below
+# this share of the update magnitude: dominantly-tangential motion (grasp transport,
+# sliding along the squeezing surface) is not a pass-through attempt, and zeroing it
+# deadlocks gripper+cloth in a circular wait (cloth waits for finger, finger waits for
+# cloth). Overlap risk is bounded by this fraction of one update between detections.
+DAT_PINCH_TANGENTIAL_TOL = wp.constant(0.05)
+# A pinched pair is only exempt from truncation while its per-update approach stays below
+# this bound [m]: sustained force-mediated contact (grasp squeeze ~0.4mm/substep) is the
+# penalty model's domain, but a fast impactor (e.g. 8 m/s = 13mm/substep) must still be
+# truncated or it crosses the whole exempt shell within one update and tunnels.
+DAT_PINCH_APPROACH_EPS = wp.constant(1.0e-3)
 
 
 @wp.func
@@ -4322,6 +4339,8 @@ def rigid_trajectory_truncation_t(
     offset0: wp.vec3,
     gamma_r: float,
     gamma_min: float = 1e-3,
+    soft_shift: float = 0.0,
+    pair_gap: float = 0.0,
 ):
     """Latest safe interpolation parameter before the trajectory crosses the plane (n, d).
 
@@ -4329,15 +4348,39 @@ def rigid_trajectory_truncation_t(
     first sign change; bisection refines it. Endpoint checks between samples can miss an
     arc that crosses and returns within one sub-interval; the sampling density bounds that
     risk (see module note on the omitted interval-arithmetic stage).
+
+    ``soft_shift`` is the contact's soft point's already-realized displacement along ``n``
+    this step (positive = the soft side retreated from the rigid). Penetration is a
+    property of the PAIR: a pinched contact whose soft side has moved away by ``delta``
+    may safely advance by ``delta`` without closing the pair's gap. Without this, a
+    grasped cloth deadlocks the gripper: the fabric can only be carried if the fingers
+    may follow it, but an absolute (static-plane) stall zeroes any approaching update —
+    including near-tangential lift motion against tilted wrap-around contact normals —
+    freezing the whole body via the uniform body scaling.
     """
     s0 = wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
     if s0 >= -DAT_PINCH_BAND:
-        # Pinched (at or numerically over the plane): a squeezed contact must stall
-        # rather than pass through — block any approaching update, keep separation free.
+        # On or numerically over the plane at the reference. Two very different cases:
+        if pair_gap > DAT_PINCH_GAP_EPS:
+            # The PAIR has a healthy gap, so this vertex is not the contact's local
+            # geometry -- the lambda-placed plane merely cuts through another part of
+            # the body (planes are per-pair separators, not body cages). Constraining
+            # it here over-cages the body and deadlocks grippers; the vertex's own
+            # contacts (and the isotropic motion cap) guard its actual counterparts.
+            return 1.0
+        # Truly pinched (squeezed pair, gap ~ 0): hand SLOW, sustained contact over
+        # to the contact forces. A pinch IS sustained contact -- the penalty +
+        # friction model handles it (and measurably does not tunnel there), while
+        # one-sided positional stalls deadlock grasp transport: the pair must move
+        # TOGETHER, which a static-plane constraint cannot express. FAST approach
+        # (an impactor) is still stalled: it would cross the exempt shell within
+        # one update. DAT keeps guarding every pair with a real gap.
         s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
-        if s_end > s0:
-            return 0.0
-        return 1.0
+        approach = s_end - s0
+        if approach <= DAT_PINCH_APPROACH_EPS:
+            return 1.0
+        # Fast pinched approach: allow only the slow-contact budget of the update.
+        return wp.clamp(DAT_PINCH_APPROACH_EPS / approach, 0.0, 1.0)
 
     t_lo = float(0.0)
     t_hi = float(1.0)
@@ -4362,7 +4405,23 @@ def rigid_trajectory_truncation_t(
         else:
             t_hi = t_mid
 
-    return wp.clamp(wp.min(t_lo * gamma_r, t_lo - gamma_min), 0.0, 1.0)
+    t_std = wp.clamp(wp.min(t_lo * gamma_r, t_lo - gamma_min), 0.0, 1.0)
+    if pair_gap > DAT_PINCH_GAP_EPS:
+        # Parked-vertex anti-freeze: a vertex that converged onto a mid-gap plane
+        # would otherwise return ~0 every round (the gamma_min clamp), and the
+        # UNIFORM body scaling turns one such vertex into a whole-body freeze
+        # (arm creep -> runaway PD target -> catapult). Guarantee a bounded
+        # per-round advance instead: up to 4% of the pair gap past the plane,
+        # which stays short of the contact's cloth point (the plane sits at most
+        # 95% of the gap toward it). Any transient standoff overlap is
+        # re-detected within the collision interval and becomes a pinch, which
+        # the contact forces own.
+        s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
+        approach = s_end - s0
+        if approach > 0.0:
+            t_adv = wp.min(0.04 * pair_gap / approach, 1.0)
+            return wp.max(t_std, t_adv)
+    return t_std
 
 
 @wp.func
@@ -4380,6 +4439,10 @@ def rigid_body_vertices_truncation_min(
     vertex_end: int,
     lane: int,
     gamma_r: float,
+    soft_shift: float,
+    pair_gap: float,
+    x_other_ref: wp.vec3,
+    locality_r: float,
 ):
     """Minimum trajectory-truncation parameter over a body's DAT vertices vs plane (n, d).
 
@@ -4395,11 +4458,23 @@ def rigid_body_vertices_truncation_min(
     while i < vertex_end:
         v_ref = wp.transform_point(X_wb_ref, dat_body_vertices[i])
         r_v = dat_body_vertex_radius[i]
+        # Plane authority is local to the contact pair (paper Eq. 20 associates planes
+        # per vertex): a vertex whose SURFACE (offset r_v for sphere/capsule skeleton
+        # points) is farther from the contact's opposing point than locality_r cannot
+        # reach it within the isotropically-capped update, and truncating it against
+        # this (foreign) plane over-cages the body -- observed as a gripper
+        # deadlocking against planes of contacts a full margin away.
+        reach = locality_r + r_v
+        if wp.length_sq(v_ref - x_other_ref) > reach * reach:
+            i += DAT_THREADS_PER_CONTACT
+            continue
         offset = v_ref - c0
         s_ref = wp.dot(n, v_ref - d) + r_v
         motion_bound = dx_len + wp.abs(angle) * wp.length(offset)
         if s_ref + motion_bound >= 0.0:
-            t_v = rigid_trajectory_truncation_t(n, d - r_v * n, c0, dx, axis, angle, offset, gamma_r)
+            t_v = rigid_trajectory_truncation_t(
+                n, d - r_v * n, c0, dx, axis, angle, offset, gamma_r, 1e-3, soft_shift, pair_gap
+            )
             t_min = wp.min(t_min, t_v)
         i += DAT_THREADS_PER_CONTACT
     return t_min
@@ -4426,6 +4501,7 @@ def apply_rigid_soft_truncation(
     dat_body_vertex_radius: wp.array[float],
     parallel_eps: float,
     gamma: float,
+    query_margin: float,
     # outputs
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
@@ -4505,10 +4581,11 @@ def apply_rigid_soft_truncation(
     # Adaptive plane placement: room proportional to each side's approach speed along n
     # (n points from the rigid surface toward the soft side).
     delta_soft = wp.max(-wp.dot(n, dx_soft), 0.0)
-    delta_rigid = float(0.0)
+    rigid_shift = float(0.0)  # signed anchor motion along n; negative = rigid retreating from the soft side
     if body_is_moving:
         anchor_end = rigid_point_trajectory(1.0, c0, dx_body, rot_axis, rot_angle, bx0 - c0)
-        delta_rigid = wp.max(wp.dot(n, anchor_end - bx0), 0.0)
+        rigid_shift = wp.dot(n, anchor_end - bx0)
+    delta_rigid = wp.max(rigid_shift, 0.0)
 
     if delta_soft + delta_rigid == 0.0:
         lmbd = 0.5
@@ -4536,11 +4613,17 @@ def apply_rigid_soft_truncation(
                     t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, parallel_eps, gamma)
                     if t_v < 1.0:
                         wp.atomic_min(truncation_ts, vi, t_v)
-                elif s_v > -DAT_PINCH_BAND and wp.dot(n, particle_displacements[vi]) < 0.0:
-                    wp.atomic_min(truncation_ts, vi, 0.0)
+                # Pinched vertices (s_v within the band of a gap~0 pair) are handed to
+                # the contact forces (see rigid_trajectory_truncation_t): a one-sided
+                # world-space freeze cannot express co-moving pinch transport and
+                # deadlocks grasping; sustained-contact pairs are the penalty model's
+                # domain, DAT guards the finite-gap pairs against tunneling.
 
     # Rigid side: curved-trajectory truncation over the body's DAT vertices (all lanes).
+    # The soft point's realized displacement along n opens co-moving allowance for
+    # pinched contacts (grasp transport); see rigid_trajectory_truncation_t.
     if body_is_moving:
+        soft_shift = wp.dot(n, dx_soft)
         vertex_start = dat_body_vertex_start[body_index]
         vertex_end = dat_body_vertex_start[body_index + 1]
         if vertex_end > vertex_start:
@@ -4558,10 +4641,16 @@ def apply_rigid_soft_truncation(
                 vertex_end,
                 lane,
                 gamma,
+                soft_shift,
+                gap,
+                x_ref,
+                gap + 0.5 * gamma * query_margin,
             )
         elif lane == 0:
             # No DAT vertices provisioned for this body: fall back to the contact anchor.
-            t_b = rigid_trajectory_truncation_t(n, d, c0, dx_body, rot_axis, rot_angle, bx0 - c0, gamma)
+            t_b = rigid_trajectory_truncation_t(
+                n, d, c0, dx_body, rot_axis, rot_angle, bx0 - c0, gamma, 1e-3, soft_shift, gap
+            )
         else:
             t_b = 1.0
         if t_b < 1.0:
@@ -4707,6 +4796,10 @@ def apply_rigid_rigid_truncation(
                 vertex_end,
                 lane,
                 gamma,
+                0.0,
+                gap,
+                wp.vec3(0.0, 0.0, 0.0),
+                1.0e9,
             )
         elif lane == 0:
             t_a = rigid_trajectory_truncation_t(n, d - margin0 * n, c0_a, dx_a, axis_a, angle_a, p0 - c0_a, gamma)
@@ -4734,6 +4827,10 @@ def apply_rigid_rigid_truncation(
                 vertex_end,
                 lane,
                 gamma,
+                0.0,
+                gap,
+                wp.vec3(0.0, 0.0, 0.0),
+                1.0e9,
             )
         elif lane == 0:
             t_b = rigid_trajectory_truncation_t(-n, d + margin1 * n, c0_b, dx_b, axis_b, angle_b, p1 - c0_b, gamma)

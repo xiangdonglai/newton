@@ -94,6 +94,14 @@ class Experiment:
         self.state_1 = self.model.state()
         self.collision_pipeline = self.strategy.make_collision_pipeline(self.model, water_tight=self.args.water_tight)
         self.contacts = self.collision_pipeline.contacts()
+        if int(getattr(self.args, "collision_interval", 0)) >= 1 and hasattr(
+            self.solver, "set_collision_detection_hook"
+        ):
+            # Alg. 3 mid-step re-detection: the solver commits + re-detects every
+            # --collision-interval iterations via this hook (graph-capture-safe).
+            self.solver.set_collision_detection_hook(
+                lambda state: self.collision_pipeline.collide(state, self.contacts)
+            )
         self.control = self.model.control()
 
         newton.examples.configure_coupled_view(self, args)
@@ -278,9 +286,17 @@ class Experiment:
     def simulate(self):
         # One NewtonManager._simulate_physics_only: rebuild_bvh -> collide once ->
         # num_substeps solver steps with clear_forces AFTER each step+swap.
+        # With --collide-per-substep, collide instead runs inside the substep loop
+        # (DAT paper Alg. 3 runs detection at a fixed frequency *within* the step;
+        # once per frame leaves contacts/division planes stale for up to a frame).
+        # collide() is graph-capture-safe, so both variants capture into one graph.
+        per_substep = bool(getattr(self.args, "collide_per_substep", False))
         self.strategy.pre_substeps(self.solver, self.state_0)  # VBD rebuild_bvh
-        self.collision_pipeline.collide(self.state_0, self.contacts)
+        if not per_substep:
+            self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.num_substeps):
+            if per_substep:
+                self.collision_pipeline.collide(self.state_0, self.contacts)
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.strategy.post_step(self.model, self.state_1)
@@ -378,6 +394,24 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         help="Enable rigid Divide-and-Truncate (DAT) penetration-free truncation in the VBD solver "
         "(rigid_enable_penetration_free): truncates rigid pose updates and cloth displacements against "
         "per-contact division planes so the gripper cannot penetrate the cloth within a step.",
+    )
+    parser.add_argument(
+        "--collision-interval",
+        type=int,
+        default=0,
+        dest="collision_interval",
+        help="Re-detect rigid-soft contacts every N VBD iterations inside each substep (DAT-paper Alg. 3 "
+        "lines 8-12; the paper uses 5). 0 disables mid-step re-detection. Implies fresh division planes "
+        "and contact pairs while a driven body presses through resisting cloth (grasp transport).",
+    )
+    parser.add_argument(
+        "--collide-per-substep",
+        action="store_true",
+        dest="collide_per_substep",
+        default=False,
+        help="Run rigid/cloth collision-pipeline detection every VBD substep instead of once per frame "
+        "(Stage A of the DAT-paper Alg. 3 cadence: 10x finer contact/division-plane refresh; cloth "
+        "self-contact detection already runs per substep inside the solver).",
     )
     parser.add_argument(
         "--record",

@@ -14,8 +14,8 @@ from __future__ import annotations
 import newton
 from newton.solvers import SolverVBD
 
-from .base import SolverStrategy
 from . import register
+from .base import SolverStrategy
 
 # IsaacLab FRANKA_PANDA_AVBD_CFG actuator gains (defaults; scenes may override
 # per (scene, solver) via Scene.robot_gains). Arm: stiff position drive
@@ -130,6 +130,8 @@ class MonolithicAvbdStrategy(SolverStrategy):
             # collision pipeline's contact margin (base.py uses the 0.01 default).
             vbd_kwargs["rigid_enable_penetration_free"] = True
             vbd_kwargs["rigid_penetration_free_query_margin"] = 0.01
+        if int(getattr(args, "collision_interval", 0)) >= 1:
+            vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win
         self.solver = SolverVBD(model=model, **vbd_kwargs)
         # NOTE: IsaacLab's NewtonVBDManager does NOT change joint constraint mode,
