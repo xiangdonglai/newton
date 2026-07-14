@@ -4341,6 +4341,7 @@ def rigid_trajectory_truncation_t(
     gamma_min: float = 1e-3,
     soft_shift: float = 0.0,
     pair_gap: float = 0.0,
+    pinch_exempt: float = 0.0,
 ):
     """Latest safe interpolation parameter before the trajectory crosses the plane (n, d).
 
@@ -4368,14 +4369,22 @@ def rigid_trajectory_truncation_t(
             # it here over-cages the body and deadlocks grippers; the vertex's own
             # contacts (and the isotropic motion cap) guard its actual counterparts.
             return 1.0
-        # Truly pinched (squeezed pair, gap ~ 0): hand SLOW, sustained contact over
-        # to the contact forces. A pinch IS sustained contact -- the penalty +
-        # friction model handles it (and measurably does not tunnel there), while
-        # one-sided positional stalls deadlock grasp transport: the pair must move
-        # TOGETHER, which a static-plane constraint cannot express. FAST approach
-        # (an impactor) is still stalled: it would cross the exempt shell within
-        # one update. DAT keeps guarding every pair with a real gap.
         s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
+        if pinch_exempt == 0.0:
+            # Original stall (rigid-rigid): block any approaching update. Rigid-rigid
+            # pairs have no water-tight standoff force backstop, and box-box contact
+            # generation degrades under deep overlap, so exempting slow pinched
+            # approach lets bodies creep through each other (observed: two-cube
+            # head-on test drifted to -0.5 m overlap at ~1 mm/update).
+            if s_end > s0:
+                return 0.0
+            return 1.0
+        # Rigid-soft: hand SLOW, sustained contact over to the contact forces. A
+        # pinch IS sustained contact -- the penalty + friction model handles it (and
+        # measurably does not tunnel there), while one-sided positional stalls
+        # deadlock grasp transport: the pair must move TOGETHER, which a static-plane
+        # constraint cannot express. FAST approach (an impactor) is still stalled: it
+        # would cross the exempt shell within one update.
         approach = s_end - s0
         if approach <= DAT_PINCH_APPROACH_EPS:
             return 1.0
@@ -4443,6 +4452,7 @@ def rigid_body_vertices_truncation_min(
     pair_gap: float,
     x_other_ref: wp.vec3,
     locality_r: float,
+    pinch_exempt: float,
 ):
     """Minimum trajectory-truncation parameter over a body's DAT vertices vs plane (n, d).
 
@@ -4473,7 +4483,7 @@ def rigid_body_vertices_truncation_min(
         motion_bound = dx_len + wp.abs(angle) * wp.length(offset)
         if s_ref + motion_bound >= 0.0:
             t_v = rigid_trajectory_truncation_t(
-                n, d - r_v * n, c0, dx, axis, angle, offset, gamma_r, 1e-3, soft_shift, pair_gap
+                n, d - r_v * n, c0, dx, axis, angle, offset, gamma_r, 1e-3, soft_shift, pair_gap, pinch_exempt
             )
             t_min = wp.min(t_min, t_v)
         i += DAT_THREADS_PER_CONTACT
@@ -4645,11 +4655,12 @@ def apply_rigid_soft_truncation(
                 gap,
                 x_ref,
                 gap + 0.5 * gamma * query_margin,
+                1.0,
             )
         elif lane == 0:
             # No DAT vertices provisioned for this body: fall back to the contact anchor.
             t_b = rigid_trajectory_truncation_t(
-                n, d, c0, dx_body, rot_axis, rot_angle, bx0 - c0, gamma, 1e-3, soft_shift, gap
+                n, d, c0, dx_body, rot_axis, rot_angle, bx0 - c0, gamma, 1e-3, soft_shift, gap, 1.0
             )
         else:
             t_b = 1.0
@@ -4800,6 +4811,7 @@ def apply_rigid_rigid_truncation(
                 gap,
                 wp.vec3(0.0, 0.0, 0.0),
                 1.0e9,
+                0.0,
             )
         elif lane == 0:
             t_a = rigid_trajectory_truncation_t(n, d - margin0 * n, c0_a, dx_a, axis_a, angle_a, p0 - c0_a, gamma)
@@ -4831,6 +4843,7 @@ def apply_rigid_rigid_truncation(
                 gap,
                 wp.vec3(0.0, 0.0, 0.0),
                 1.0e9,
+                0.0,
             )
         elif lane == 0:
             t_b = rigid_trajectory_truncation_t(-n, d + margin1 * n, c0_b, dx_b, axis_b, angle_b, p1 - c0_b, gamma)

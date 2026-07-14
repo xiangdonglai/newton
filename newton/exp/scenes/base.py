@@ -39,6 +39,13 @@ class Scene:
 
     key: str = "scene"
 
+    #: Whether the scene contains a robot. Robot-less (physics-only) scenes set
+    #: this False: the runner then skips IK, the controller, gripper handles and
+    #: robot configuration, and the ``robot_*`` / task hooks are never called.
+    has_robot: bool = True
+    #: Scene gravity [m/s^2] along -Z (0.0 for free-space physics tests).
+    gravity: float = -9.81
+
     #: Body-label suffix the IK objective targets.
     ik_link_label: str = "fr3_hand"
     #: TCP offset from that link [m].
@@ -116,6 +123,24 @@ class Scene:
         """
         del solver_key
         return {}
+
+    # -- state initialization ---------------------------------------------
+    def init_state(self, model, state) -> None:
+        """Set initial state beyond the builder pose (e.g. body velocities).
+
+        Called for both runner states after assembly and again on every
+        :meth:`Experiment.reset`, so scripted initial velocities survive resets.
+        """
+        del model, state
+
+    # -- diagnostics --------------------------------------------------------
+    def diagnostics(self, model, state, frame: int) -> None:
+        """Optional per-frame CLI diagnostics; called after every env step."""
+        del model, state, frame
+
+    def test_final(self, model, state) -> None:
+        """Optional end-of-run scene checks/summary (after the runner's own)."""
+        del model, state
 
     # -- presentation -----------------------------------------------------
     def camera(self):

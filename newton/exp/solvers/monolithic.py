@@ -132,6 +132,10 @@ class MonolithicAvbdStrategy(SolverStrategy):
             vbd_kwargs["rigid_penetration_free_query_margin"] = 0.01
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
+        if model.particle_count == 0:
+            # Physics-only scenes (no cloth): the particle self-contact machinery
+            # cannot build on an empty mesh.
+            vbd_kwargs["particle_enable_self_contact"] = False
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win
         self.solver = SolverVBD(model=model, **vbd_kwargs)
         # NOTE: IsaacLab's NewtonVBDManager does NOT change joint constraint mode,
@@ -142,7 +146,7 @@ class MonolithicAvbdStrategy(SolverStrategy):
 
     def pre_substeps(self, solver, state):
         # IsaacLab's VBD manager rebuilds the particle BVH once per step.
-        if hasattr(solver, "rebuild_bvh"):
+        if hasattr(solver, "rebuild_bvh") and solver.model.particle_count > 0:
             solver.rebuild_bvh(state)
 
     @classmethod
