@@ -130,8 +130,15 @@ class MonolithicAvbdStrategy(SolverStrategy):
             # collision pipeline's contact margin (base.py uses the 0.01 default).
             vbd_kwargs["rigid_enable_penetration_free"] = True
             vbd_kwargs["rigid_penetration_free_query_margin"] = 0.01
+            vbd_kwargs["rigid_dat_pinch_exemption"] = bool(getattr(args, "dat_pinch_exemption", True))
+            vbd_kwargs["rigid_dat_parked_antifreeze"] = bool(getattr(args, "dat_parked_antifreeze", True))
+            vbd_kwargs["rigid_dat_plane_locality"] = bool(getattr(args, "dat_plane_locality", True))
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
+        if getattr(args, "momentum_exchange", False):
+            # Requires --dat (the exchange acts on DAT binding records).
+            vbd_kwargs["rigid_momentum_exchange"] = True
+            vbd_kwargs["rigid_restitution"] = float(getattr(args, "restitution", 0.0))
         if model.particle_count == 0:
             # Physics-only scenes (no cloth): the particle self-contact machinery
             # cannot build on an empty mesh.

@@ -4342,6 +4342,8 @@ def rigid_trajectory_truncation_t(
     soft_shift: float = 0.0,
     pair_gap: float = 0.0,
     pinch_exempt: float = 0.0,
+    parked_advance_frac: float = 0.04,
+    foreign_plane_pass: float = 1.0,
 ):
     """Latest safe interpolation parameter before the trajectory crosses the plane (n, d).
 
@@ -4361,8 +4363,9 @@ def rigid_trajectory_truncation_t(
     """
     s0 = wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
     if s0 >= -DAT_PINCH_BAND:
-        # On or numerically over the plane at the reference. Two very different cases:
-        if pair_gap > DAT_PINCH_GAP_EPS:
+        # On or numerically over the plane at the reference. Two very different cases
+        # (``foreign_plane_pass`` = 0 restores the original strict stall for both):
+        if foreign_plane_pass != 0.0 and pair_gap > DAT_PINCH_GAP_EPS:
             # The PAIR has a healthy gap, so this vertex is not the contact's local
             # geometry -- the lambda-placed plane merely cuts through another part of
             # the body (planes are per-pair separators, not body cages). Constraining
@@ -4415,20 +4418,21 @@ def rigid_trajectory_truncation_t(
             t_hi = t_mid
 
     t_std = wp.clamp(wp.min(t_lo * gamma_r, t_lo - gamma_min), 0.0, 1.0)
-    if pair_gap > DAT_PINCH_GAP_EPS:
+    if pair_gap > DAT_PINCH_GAP_EPS and parked_advance_frac > 0.0:
         # Parked-vertex anti-freeze: a vertex that converged onto a mid-gap plane
         # would otherwise return ~0 every round (the gamma_min clamp), and the
         # UNIFORM body scaling turns one such vertex into a whole-body freeze
         # (arm creep -> runaway PD target -> catapult). Guarantee a bounded
-        # per-round advance instead: up to 4% of the pair gap past the plane,
-        # which stays short of the contact's cloth point (the plane sits at most
-        # 95% of the gap toward it). Any transient standoff overlap is
-        # re-detected within the collision interval and becomes a pinch, which
-        # the contact forces own.
+        # per-round advance instead: up to ``parked_advance_frac`` of the pair
+        # gap past the plane (default 4%), which stays short of the contact's
+        # cloth point (the plane sits at most 95% of the gap toward it). Any
+        # transient standoff overlap is re-detected within the collision
+        # interval and becomes a pinch, which the contact forces own. A zero
+        # fraction disables the floor (strict truncation).
         s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
         approach = s_end - s0
         if approach > 0.0:
-            t_adv = wp.min(0.04 * pair_gap / approach, 1.0)
+            t_adv = wp.min(parked_advance_frac * pair_gap / approach, 1.0)
             return wp.max(t_std, t_adv)
     return t_std
 
@@ -4453,6 +4457,8 @@ def rigid_body_vertices_truncation_min(
     x_other_ref: wp.vec3,
     locality_r: float,
     pinch_exempt: float,
+    parked_advance_frac: float,
+    foreign_plane_pass: float,
 ):
     """Minimum trajectory-truncation parameter over a body's DAT vertices vs plane (n, d).
 
@@ -4483,7 +4489,20 @@ def rigid_body_vertices_truncation_min(
         motion_bound = dx_len + wp.abs(angle) * wp.length(offset)
         if s_ref + motion_bound >= 0.0:
             t_v = rigid_trajectory_truncation_t(
-                n, d - r_v * n, c0, dx, axis, angle, offset, gamma_r, 1e-3, soft_shift, pair_gap, pinch_exempt
+                n,
+                d - r_v * n,
+                c0,
+                dx,
+                axis,
+                angle,
+                offset,
+                gamma_r,
+                1e-3,
+                soft_shift,
+                pair_gap,
+                pinch_exempt,
+                parked_advance_frac,
+                foreign_plane_pass,
             )
             t_min = wp.min(t_min, t_v)
         i += DAT_THREADS_PER_CONTACT
@@ -4512,9 +4531,13 @@ def apply_rigid_soft_truncation(
     parallel_eps: float,
     gamma: float,
     query_margin: float,
+    pinch_exempt: float,
+    parked_advance_frac: float,
+    plane_locality: float,
     # outputs
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
+    soft_contact_bound: wp.array[wp.int32],
 ):
     """Joint DAT truncation for one rigid-soft contact: build the division plane from the
     reference configuration and atomically min-reduce the truncation scalars of the soft
@@ -4623,17 +4646,31 @@ def apply_rigid_soft_truncation(
                     t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, parallel_eps, gamma)
                     if t_v < 1.0:
                         wp.atomic_min(truncation_ts, vi, t_v)
-                # Pinched vertices (s_v within the band of a gap~0 pair) are handed to
-                # the contact forces (see rigid_trajectory_truncation_t): a one-sided
-                # world-space freeze cannot express co-moving pinch transport and
-                # deadlocks grasping; sustained-contact pairs are the penalty model's
-                # domain, DAT guards the finite-gap pairs against tunneling.
+                        if soft_contact_bound:
+                            soft_contact_bound[contact_index] = 1  # binding contact (flag-on-proposal)
+                elif pinch_exempt == 0.0 and s_v > -DAT_PINCH_BAND and wp.dot(n, particle_displacements[vi]) < 0.0:
+                    # Strict pinch stall (pinch exemption disabled): a pinched soft
+                    # vertex approaching the plane is frozen outright.
+                    wp.atomic_min(truncation_ts, vi, 0.0)
+                    if soft_contact_bound:
+                        soft_contact_bound[contact_index] = 1  # binding contact (flag-on-proposal)
+                # With the pinch exemption on, pinched vertices (s_v within the band of
+                # a gap~0 pair) are handed to the contact forces (see
+                # rigid_trajectory_truncation_t): a one-sided world-space freeze cannot
+                # express co-moving pinch transport and deadlocks grasping;
+                # sustained-contact pairs are the penalty model's domain, DAT guards
+                # the finite-gap pairs against tunneling.
 
     # Rigid side: curved-trajectory truncation over the body's DAT vertices (all lanes).
     # The soft point's realized displacement along n opens co-moving allowance for
     # pinched contacts (grasp transport); see rigid_trajectory_truncation_t.
     if body_is_moving:
         soft_shift = wp.dot(n, dx_soft)
+        # Plane-authority locality radius; unbounded when the locality cull is disabled
+        # (original semantics: every DAT vertex is swept against every plane).
+        locality_r = gap + 0.5 * gamma * query_margin
+        if plane_locality == 0.0:
+            locality_r = 1.0e9
         vertex_start = dat_body_vertex_start[body_index]
         vertex_end = dat_body_vertex_start[body_index + 1]
         if vertex_end > vertex_start:
@@ -4654,18 +4691,35 @@ def apply_rigid_soft_truncation(
                 soft_shift,
                 gap,
                 x_ref,
-                gap + 0.5 * gamma * query_margin,
-                1.0,
+                locality_r,
+                pinch_exempt,
+                parked_advance_frac,
+                pinch_exempt,
             )
         elif lane == 0:
             # No DAT vertices provisioned for this body: fall back to the contact anchor.
             t_b = rigid_trajectory_truncation_t(
-                n, d, c0, dx_body, rot_axis, rot_angle, bx0 - c0, gamma, 1e-3, soft_shift, gap, 1.0
+                n,
+                d,
+                c0,
+                dx_body,
+                rot_axis,
+                rot_angle,
+                bx0 - c0,
+                gamma,
+                1e-3,
+                soft_shift,
+                gap,
+                pinch_exempt,
+                parked_advance_frac,
+                pinch_exempt,
             )
         else:
             t_b = 1.0
         if t_b < 1.0:
             wp.atomic_min(body_truncation_ts, body_index, t_b)
+            if soft_contact_bound:
+                soft_contact_bound[contact_index] = 1  # binding contact (flag-on-proposal)
 
 
 @wp.kernel
@@ -4688,8 +4742,11 @@ def apply_rigid_rigid_truncation(
     dat_body_vertices: wp.array[wp.vec3],
     dat_body_vertex_radius: wp.array[float],
     gamma: float,
+    parked_advance_frac: float,
+    foreign_plane_pass: float,
     # outputs
     body_truncation_ts: wp.array[float],
+    rigid_contact_bound: wp.array[wp.int32],
 ):
     """DAT truncation for one rigid-rigid contact reported by the collision pipeline.
 
@@ -4812,6 +4869,8 @@ def apply_rigid_rigid_truncation(
                 wp.vec3(0.0, 0.0, 0.0),
                 1.0e9,
                 0.0,
+                parked_advance_frac,
+                foreign_plane_pass,
             )
         elif lane == 0:
             t_a = rigid_trajectory_truncation_t(n, d - margin0 * n, c0_a, dx_a, axis_a, angle_a, p0 - c0_a, gamma)
@@ -4819,6 +4878,8 @@ def apply_rigid_rigid_truncation(
             t_a = 1.0
         if t_a < 1.0:
             wp.atomic_min(body_truncation_ts, b0, t_a)
+            if rigid_contact_bound:
+                rigid_contact_bound[contact_index] = 1
 
     # Side 1 stays on the +n side (flipped normal).
     if moving_b and b1 >= 0:
@@ -4844,6 +4905,8 @@ def apply_rigid_rigid_truncation(
                 wp.vec3(0.0, 0.0, 0.0),
                 1.0e9,
                 0.0,
+                parked_advance_frac,
+                foreign_plane_pass,
             )
         elif lane == 0:
             t_b = rigid_trajectory_truncation_t(-n, d + margin1 * n, c0_b, dx_b, axis_b, angle_b, p1 - c0_b, gamma)
@@ -4851,6 +4914,8 @@ def apply_rigid_rigid_truncation(
             t_b = 1.0
         if t_b < 1.0:
             wp.atomic_min(body_truncation_ts, b1, t_b)
+            if rigid_contact_bound:
+                rigid_contact_bound[contact_index] = 1
 
 
 @wp.kernel
@@ -4863,6 +4928,8 @@ def apply_body_truncation_ts(
     max_point_displacement: float,
     # input/output
     body_q: wp.array[wp.transform],
+    # outputs
+    body_motion_lost: wp.array[wp.spatial_vector],
 ):
     """Scale each body's accumulated pose update (reference → candidate) by its truncation
     scalar, interpolating translation and rotation about the COM.
@@ -4870,6 +4937,11 @@ def apply_body_truncation_ts(
     Also applies the conservative isotropic bound: no point of the body may move farther
     than ``max_point_displacement`` from its reference position, using
     |dx| + |angle| * bounding_radius as an upper bound of the largest point motion.
+
+    ``body_motion_lost`` (optional) records the motion this launch deleted —
+    ``((1-t)*dx, (1-t)*angle*axis)`` with the isotropic cap folded into ``t`` — in
+    (linear [m], angular [rad]) spatial layout, OVERWRITTEN each launch (last pass
+    wins). Consumed by the momentum-exchange pass, which divides by dt at finalize.
     """
     b = wp.tid()
 
@@ -4884,6 +4956,10 @@ def apply_body_truncation_ts(
     if motion_bound > max_point_displacement:
         t = wp.min(t, max_point_displacement / motion_bound)
 
+    if body_motion_lost:
+        lost = wp.max(0.0, 1.0 - t)
+        body_motion_lost[b] = wp.spatial_vector(dx * lost, axis * (angle * lost))
+
     if t < 1.0:
         c_new = c0 + t * dx
         q_rot = wp.transform_get_rotation(q_ref)
@@ -4894,3 +4970,352 @@ def apply_body_truncation_ts(
             half_w = axis * (ta * 0.5)
             q_new = wp.normalize(wp.quat(half_w[0], half_w[1], half_w[2], 1.0) * q_rot)
         body_q[b] = wp.transform(c_new - wp.quat_rotate(q_new, com), q_new)
+
+
+# =====================================================================================
+# Momentum-preserving exchange (post-finalize velocity pass).
+#
+# See ctx/2026-07-13-momentum-preserving-dat-notes.md. DAT truncation deletes motion
+# unilaterally (no impulse exchange); this pass reconstructs each body's incoming
+# velocity V_hat = V + motion_lost/dt and resolves every BINDING contact as a standard
+# contact impulse (restitution per pair type, Coulomb friction on the accumulated
+# cone), then writes the result back to both velocity states. Positions are never
+# touched, so the penetration-free guarantee is unaffected. v1 scope: impulses act at
+# the contact anchor (culprit-vertex payload deferred); jointed bodies participate
+# with w = 0 and are excluded from write-back.
+# =====================================================================================
+
+
+@wp.func
+def _exchange_point_w(inv_m: float, inv_inertia_w: wp.mat33, r: wp.vec3, d: wp.vec3) -> float:
+    """Generalized inverse mass of a body at COM offset ``r`` along direction ``d``."""
+    rxd = wp.cross(r, d)
+    return inv_m + wp.dot(rxd, inv_inertia_w * rxd)
+
+
+@wp.func
+def _exchange_body_delta_v(inv_m: float, inv_inertia_w: wp.mat33, r: wp.vec3, imp: wp.vec3) -> wp.spatial_vector:
+    """Velocity change of a body from impulse ``imp`` applied at COM offset ``r``."""
+    return wp.spatial_vector(imp * inv_m, inv_inertia_w * wp.cross(r, imp))
+
+
+@wp.func
+def _exchange_inv_inertia_world(body_q: wp.array[wp.transform], inv_inertia: wp.array[wp.mat33], b: int) -> wp.mat33:
+    rot = wp.quat_to_matrix(wp.transform_get_rotation(body_q[b]))
+    return rot * inv_inertia[b] * wp.transpose(rot)
+
+
+@wp.kernel
+def momentum_exchange_build_vhat_bodies(
+    body_qd: wp.array[wp.spatial_vector],
+    body_motion_lost_rigid: wp.array[wp.spatial_vector],
+    body_motion_lost_particle: wp.array[wp.spatial_vector],
+    body_is_jointed: wp.array[wp.int32],
+    inv_dt: float,
+    body_vhat: wp.array[wp.spatial_vector],
+):
+    b = wp.tid()
+    if body_is_jointed[b] != 0:
+        body_vhat[b] = body_qd[b]  # jointed bodies: excluded (v1 policy)
+        return
+    body_vhat[b] = body_qd[b] + (body_motion_lost_rigid[b] + body_motion_lost_particle[b]) * inv_dt
+
+
+@wp.kernel
+def momentum_exchange_build_vhat_particles(
+    particle_qd: wp.array[wp.vec3],
+    particle_motion_lost: wp.array[wp.vec3],
+    inv_dt: float,
+    particle_vhat: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    particle_vhat[i] = particle_qd[i] + particle_motion_lost[i] * inv_dt
+
+
+@wp.kernel
+def momentum_exchange_sweep_rigid_soft(
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_bound: wp.array[wp.int32],
+    soft_contact_primitive: wp.array[wp.int32],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    soft_contact_shape: wp.array[wp.int32],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_mu: wp.array[wp.float32],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[wp.float32],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_is_jointed: wp.array[wp.int32],
+    particle_inv_mass: wp.array[wp.float32],
+    # accumulators (per contact row)
+    exchange_jn: wp.array[wp.float32],
+    exchange_jt: wp.array[wp.vec3],
+    # in/out
+    body_vhat: wp.array[wp.spatial_vector],
+    particle_vhat: wp.array[wp.vec3],
+):
+    """One Jacobi-style sweep over binding rigid-soft contacts (e = 0 by policy)."""
+    i = wp.tid()
+    count_particle = soft_contact_count[0]
+    count_total = count_particle + soft_contact_count[1] + soft_contact_count[2]
+    if i >= count_total or soft_contact_bound[i] == 0:
+        return
+
+    # Soft feature: single particle or barycentric point on a triangle.
+    v0 = int(-1)
+    v1 = int(-1)
+    v2 = int(-1)
+    bary = wp.vec3(1.0, 0.0, 0.0)
+    if i < count_particle:
+        v0 = soft_contact_primitive[i]
+    else:
+        tri = soft_contact_primitive[i]
+        bary = soft_contact_barycentric[i]
+        v0 = tri_indices[tri, 0]
+        v1 = tri_indices[tri, 1]
+        v2 = tri_indices[tri, 2]
+    if v0 < 0:
+        return
+
+    w_soft = bary[0] * bary[0] * particle_inv_mass[v0]
+    v_soft = particle_vhat[v0] * bary[0]
+    if v1 >= 0:
+        w_soft += bary[1] * bary[1] * particle_inv_mass[v1]
+        v_soft += particle_vhat[v1] * bary[1]
+    if v2 >= 0:
+        w_soft += bary[2] * bary[2] * particle_inv_mass[v2]
+        v_soft += particle_vhat[v2] * bary[2]
+
+    shape = soft_contact_shape[i]
+    b = shape_body[shape]
+    n = soft_contact_normal[i]  # points rigid -> soft
+
+    w_body = float(0.0)
+    inv_I_w = wp.mat33(0.0)
+    r = wp.vec3(0.0)
+    v_body = wp.vec3(0.0)
+    if b >= 0:
+        bx = wp.transform_point(body_q[b], soft_contact_body_pos[i])
+        com_w = wp.transform_point(body_q[b], body_com[b])
+        r = bx - com_w
+        vh = body_vhat[b]
+        v_body = wp.spatial_top(vh) + wp.cross(wp.spatial_bottom(vh), r)  # kinematic boundary even when jointed
+        if body_is_jointed[b] == 0:
+            inv_I_w = _exchange_inv_inertia_world(body_q, body_inv_inertia, b)
+            w_body = _exchange_point_w(body_inv_mass[b], inv_I_w, r, n)
+
+    w_sum = w_soft + w_body
+    if w_sum <= 0.0:
+        return
+
+    # Normal impulse, e = 0 (rigid-soft policy): approach = soft moving toward rigid.
+    v_rel_n = wp.dot(n, v_soft - v_body)
+    jn = float(0.0)
+    if v_rel_n < 0.0:
+        jn = -v_rel_n / w_sum
+        wp.atomic_add(exchange_jn, i, jn)
+        imp = n * jn  # +j·n on the soft side, -j·n on the rigid side
+        if bary[0] > 0.0 and v0 >= 0:
+            wp.atomic_add(particle_vhat, v0, imp * (bary[0] * particle_inv_mass[v0]))
+        if v1 >= 0 and bary[1] > 0.0:
+            wp.atomic_add(particle_vhat, v1, imp * (bary[1] * particle_inv_mass[v1]))
+        if v2 >= 0 and bary[2] > 0.0:
+            wp.atomic_add(particle_vhat, v2, imp * (bary[2] * particle_inv_mass[v2]))
+        if w_body > 0.0:
+            wp.atomic_sub(body_vhat, b, _exchange_body_delta_v(body_inv_mass[b], inv_I_w, r, imp))
+
+    # Coulomb friction on the accumulated cone.
+    jn_acc = exchange_jn[i]
+    if jn_acc <= 0.0:
+        return
+    v_rel = v_soft - v_body
+    v_t = v_rel - n * wp.dot(n, v_rel)
+    v_t_len = wp.length(v_t)
+    if v_t_len < 1.0e-9:
+        return
+    t_hat = v_t / v_t_len
+    w_t = w_soft
+    if w_body > 0.0:
+        w_t = w_soft + _exchange_point_w(body_inv_mass[b], inv_I_w, r, t_hat)
+    if w_t <= 0.0:
+        return
+    jt_want = -v_t_len / w_t  # scalar along t_hat (negative = oppose slip)
+    jt_old = exchange_jt[i]
+    jt_new_vec = jt_old + t_hat * jt_want
+    cone = soft_contact_mu[i] * jn_acc
+    jt_len = wp.length(jt_new_vec)
+    if jt_len > cone:
+        jt_new_vec = jt_new_vec * (cone / jt_len)
+    d_jt = jt_new_vec - jt_old
+    exchange_jt[i] = jt_new_vec
+    if bary[0] > 0.0 and v0 >= 0:
+        wp.atomic_add(particle_vhat, v0, d_jt * (bary[0] * particle_inv_mass[v0]))
+    if v1 >= 0 and bary[1] > 0.0:
+        wp.atomic_add(particle_vhat, v1, d_jt * (bary[1] * particle_inv_mass[v1]))
+    if v2 >= 0 and bary[2] > 0.0:
+        wp.atomic_add(particle_vhat, v2, d_jt * (bary[2] * particle_inv_mass[v2]))
+    if w_body > 0.0:
+        wp.atomic_sub(body_vhat, b, _exchange_body_delta_v(body_inv_mass[b], inv_I_w, r, d_jt))
+
+
+@wp.kernel
+def momentum_exchange_sweep_rigid_rigid(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_bound: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    shape_body: wp.array[wp.int32],
+    shape_material_mu: wp.array[wp.float32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[wp.float32],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_is_jointed: wp.array[wp.int32],
+    restitution: float,
+    # accumulators
+    exchange_jn: wp.array[wp.float32],
+    exchange_jt: wp.array[wp.vec3],
+    # in/out
+    body_vhat: wp.array[wp.spatial_vector],
+):
+    """One Jacobi-style sweep over binding rigid-rigid contacts (restitution = e)."""
+    i = wp.tid()
+    if i >= rigid_contact_count[0] or rigid_contact_bound[i] == 0:
+        return
+
+    b0 = shape_body[rigid_contact_shape0[i]]
+    b1 = shape_body[rigid_contact_shape1[i]]
+    n = rigid_contact_normal[i]  # points from shape0 toward shape1 (pair convention)
+
+    w0 = float(0.0)
+    w1 = float(0.0)
+    inv_I0 = wp.mat33(0.0)
+    inv_I1 = wp.mat33(0.0)
+    r0 = wp.vec3(0.0)
+    r1 = wp.vec3(0.0)
+    v0 = wp.vec3(0.0)
+    v1 = wp.vec3(0.0)
+    p0w = wp.vec3(0.0)
+    p1w = wp.vec3(0.0)
+    if b0 >= 0:
+        p0w = wp.transform_point(body_q[b0], rigid_contact_point0[i])
+    else:
+        p0w = rigid_contact_point0[i]
+    if b1 >= 0:
+        p1w = wp.transform_point(body_q[b1], rigid_contact_point1[i])
+    else:
+        p1w = rigid_contact_point1[i]
+    p = (p0w + p1w) * 0.5
+
+    if b0 >= 0:
+        com0 = wp.transform_point(body_q[b0], body_com[b0])
+        r0 = p - com0
+        vh0 = body_vhat[b0]
+        v0 = wp.spatial_top(vh0) + wp.cross(wp.spatial_bottom(vh0), r0)  # kinematic boundary even when jointed
+        if body_is_jointed[b0] == 0:
+            inv_I0 = _exchange_inv_inertia_world(body_q, body_inv_inertia, b0)
+            w0 = _exchange_point_w(body_inv_mass[b0], inv_I0, r0, n)
+    if b1 >= 0:
+        com1 = wp.transform_point(body_q[b1], body_com[b1])
+        r1 = p - com1
+        vh1 = body_vhat[b1]
+        v1 = wp.spatial_top(vh1) + wp.cross(wp.spatial_bottom(vh1), r1)  # kinematic boundary even when jointed
+        if body_is_jointed[b1] == 0:
+            inv_I1 = _exchange_inv_inertia_world(body_q, body_inv_inertia, b1)
+            w1 = _exchange_point_w(body_inv_mass[b1], inv_I1, r1, n)
+
+    w_sum = w0 + w1
+    if w_sum <= 0.0:
+        return
+
+    v_rel_n = wp.dot(n, v1 - v0)  # body1 relative to body0 along n
+    jn = float(0.0)
+    if v_rel_n < 0.0:
+        jn = -(1.0 + restitution) * v_rel_n / w_sum
+        wp.atomic_add(exchange_jn, i, jn)
+        imp = n * jn  # +imp on body1, -imp on body0
+        if w1 > 0.0:
+            wp.atomic_add(body_vhat, b1, _exchange_body_delta_v(body_inv_mass[b1], inv_I1, r1, imp))
+        if w0 > 0.0:
+            wp.atomic_sub(body_vhat, b0, _exchange_body_delta_v(body_inv_mass[b0], inv_I0, r0, imp))
+
+    jn_acc = exchange_jn[i]
+    if jn_acc <= 0.0:
+        return
+    # re-read velocities post-normal for the friction row
+    if w0 > 0.0:
+        vh0 = body_vhat[b0]
+        v0 = wp.spatial_top(vh0) + wp.cross(wp.spatial_bottom(vh0), r0)
+    if w1 > 0.0:
+        vh1 = body_vhat[b1]
+        v1 = wp.spatial_top(vh1) + wp.cross(wp.spatial_bottom(vh1), r1)
+    v_rel = v1 - v0
+    v_t = v_rel - n * wp.dot(n, v_rel)
+    v_t_len = wp.length(v_t)
+    if v_t_len < 1.0e-9:
+        return
+    t_hat = v_t / v_t_len
+    w_t = float(0.0)
+    if w0 > 0.0:
+        w_t += _exchange_point_w(body_inv_mass[b0], inv_I0, r0, t_hat)
+    if w1 > 0.0:
+        w_t += _exchange_point_w(body_inv_mass[b1], inv_I1, r1, t_hat)
+    if w_t <= 0.0:
+        return
+    mu = 0.5 * (shape_material_mu[rigid_contact_shape0[i]] + shape_material_mu[rigid_contact_shape1[i]])
+    jt_want = -v_t_len / w_t
+    jt_old = exchange_jt[i]
+    jt_new_vec = jt_old + t_hat * jt_want
+    cone = mu * jn_acc
+    jt_len = wp.length(jt_new_vec)
+    if jt_len > cone:
+        jt_new_vec = jt_new_vec * (cone / jt_len)
+    d_jt = jt_new_vec - jt_old
+    exchange_jt[i] = jt_new_vec
+    if w1 > 0.0:
+        wp.atomic_add(body_vhat, b1, _exchange_body_delta_v(body_inv_mass[b1], inv_I1, r1, d_jt))
+    if w0 > 0.0:
+        wp.atomic_sub(body_vhat, b0, _exchange_body_delta_v(body_inv_mass[b0], inv_I0, r0, d_jt))
+
+
+@wp.kernel
+def momentum_exchange_writeback_bodies(
+    body_vhat: wp.array[wp.spatial_vector],
+    body_is_jointed: wp.array[wp.int32],
+    stick_translation_eps: float,
+    stick_angular_eps: float,
+    body_qd: wp.array[wp.spatial_vector],
+    body_qd_mirror: wp.array[wp.spatial_vector],
+):
+    """Masked dual-state write-back: skip jointed bodies and sub-stick-epsilon deltas
+    (the exchange must not undo the resting-contact deadzone)."""
+    b = wp.tid()
+    if body_is_jointed[b] != 0:
+        return
+    d = body_vhat[b] - body_qd[b]
+    d_lin = wp.vec3(d[0], d[1], d[2])
+    d_ang = wp.vec3(d[3], d[4], d[5])
+    if wp.length(d_lin) <= stick_translation_eps and wp.length(d_ang) <= stick_angular_eps:
+        return
+    body_qd[b] = body_vhat[b]
+    body_qd_mirror[b] = body_vhat[b]
+
+
+@wp.kernel
+def momentum_exchange_writeback_particles(
+    particle_vhat: wp.array[wp.vec3],
+    eps: float,
+    particle_qd: wp.array[wp.vec3],
+    particle_qd_mirror: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    if wp.length(particle_vhat[i] - particle_qd[i]) <= eps:
+        return
+    particle_qd[i] = particle_vhat[i]
+    particle_qd_mirror[i] = particle_vhat[i]

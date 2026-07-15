@@ -63,6 +63,12 @@ from .rigid_vbd_kernels import (
     init_body_body_contact_materials,
     init_body_body_contacts_avbd,
     init_body_particle_contacts,
+    momentum_exchange_build_vhat_bodies,
+    momentum_exchange_build_vhat_particles,
+    momentum_exchange_sweep_rigid_rigid,
+    momentum_exchange_sweep_rigid_soft,
+    momentum_exchange_writeback_bodies,
+    momentum_exchange_writeback_particles,
     snapshot_body_body_contact_history,
     solve_rigid_body,
     step_body_body_contact_C0_lambda,
@@ -246,6 +252,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Rigid body - penetration-free DAT truncation
         rigid_enable_penetration_free: bool = False,  # Truncate rigid pose updates against rigid-soft division planes
         rigid_collision_detection_interval: int = 0,  # Re-detect rigid-soft contacts every N iterations (0 = per-step only)
+        rigid_momentum_exchange: bool = False,  # Post-finalize momentum-preserving velocity exchange over binding DAT contacts
+        rigid_restitution: float = 0.0,  # Restitution e for rigid-rigid exchange rows (rigid-soft is 0 by policy)
+        rigid_exchange_sweeps: int = 2,  # Jacobi sweeps of the exchange impulse pass
+        rigid_dat_pinch_exemption: bool = True,  # Exempt slow pinched rigid-soft approach from truncation (anti-deadlock)
+        rigid_dat_parked_antifreeze: bool = True,  # Bounded per-round advance for vertices parked on a mid-gap plane
+        rigid_dat_plane_locality: bool = True,  # Limit each division plane's authority to nearby body vertices
         rigid_penetration_free_query_margin: float = 0.01,  # Must match the collision pipeline's soft_contact_margin
         rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
     ):
@@ -366,6 +378,27 @@ class SolverVBD(SolverBase, CouplingInterface):
                 penetration-free, not a global guarantee), and pairs farther apart than the collision
                 pipeline's contact margins are covered by a conservative per-step motion bound derived
                 from ``rigid_penetration_free_query_margin``.
+            rigid_dat_pinch_exemption: Whether pinched rigid-soft contacts (reference gap ~ 0, e.g. cloth
+                squeezed between a gripper finger and another surface) exempt SLOW approach from DAT
+                truncation, handing sustained contact over to the penalty + friction model. Prevents the
+                circular grasp deadlock (cloth waits for the finger, the finger waits for the cloth), at
+                the cost of a bounded per-update overlap risk — a strict penetration-free guarantee no
+                longer holds for pinched pairs. ``False`` restores the strict one-sided stall. Only used
+                when ``rigid_enable_penetration_free`` is ``True``.
+            rigid_dat_parked_antifreeze: Whether a rigid DAT vertex that has converged onto a mid-gap
+                division plane is granted a bounded per-round advance (4% of the pair gap) instead of a
+                hard stall. Prevents a single parked vertex from freezing the whole body through the
+                uniform body truncation scalar, at the cost of allowing a small transient plane crossing
+                (re-detected as a pinch within the collision interval). ``False`` restores the strict
+                stall. Only used when ``rigid_enable_penetration_free`` is ``True``.
+            rigid_dat_plane_locality: Whether each rigid-soft division plane's authority over a body's
+                DAT vertices is limited to vertices whose surface lies within
+                ``gap + 0.5 * relaxation * query_margin`` of the contact's soft point. Prevents the
+                lambda-placed plane of one contact from truncating (over-caging) distant parts of the
+                body. ``False`` restores the original unbounded sweep (every vertex against every
+                plane). Setting ``rigid_dat_pinch_exemption``, ``rigid_dat_parked_antifreeze``, and
+                ``rigid_dat_plane_locality`` all ``False`` restores the original strict DAT truncation
+                semantics exactly. Only used when ``rigid_enable_penetration_free`` is ``True``.
             rigid_penetration_free_query_margin: Contact query margin [m] assumed by the rigid DAT motion
                 bound. Must not exceed the collision pipeline's ``soft_contact_margin`` (nor the rigid
                 contact margin when rigid-rigid coverage matters); per step, no surface
@@ -456,6 +489,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             model,
             rigid_enable_penetration_free,
             rigid_collision_detection_interval,
+            rigid_momentum_exchange,
+            rigid_restitution,
+            rigid_exchange_sweeps,
+            rigid_dat_pinch_exemption,
+            rigid_dat_parked_antifreeze,
+            rigid_dat_plane_locality,
             rigid_penetration_free_query_margin,
             rigid_conservative_bound_relaxation,
         )
@@ -472,12 +511,29 @@ class SolverVBD(SolverBase, CouplingInterface):
         model: Model,
         rigid_enable_penetration_free: bool,
         rigid_collision_detection_interval: int,
+        rigid_momentum_exchange: bool,
+        rigid_restitution: float,
+        rigid_exchange_sweeps: int,
+        rigid_dat_pinch_exemption: bool,
+        rigid_dat_parked_antifreeze: bool,
+        rigid_dat_plane_locality: bool,
         rigid_penetration_free_query_margin: float,
         rigid_conservative_bound_relaxation: float,
     ):
         """Initialize rigid DAT truncation buffers and per-body bounding radii."""
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
         self.rigid_collision_detection_interval = int(rigid_collision_detection_interval)
+        self.rigid_momentum_exchange = bool(rigid_momentum_exchange)
+        self.rigid_restitution = float(rigid_restitution)
+        self.rigid_exchange_sweeps = max(1, int(rigid_exchange_sweeps))
+        self.rigid_dat_pinch_exemption = bool(rigid_dat_pinch_exemption)
+        self.rigid_dat_parked_antifreeze = bool(rigid_dat_parked_antifreeze)
+        self.rigid_dat_plane_locality = bool(rigid_dat_plane_locality)
+        # Kernel-side scalars (baked into any captured CUDA graph; set before capture).
+        # All three at their "off" values restore the original strict DAT semantics.
+        self._dat_pinch_exempt = 1.0 if self.rigid_dat_pinch_exemption else 0.0
+        self._dat_parked_advance_frac = 0.04 if self.rigid_dat_parked_antifreeze else 0.0
+        self._dat_plane_locality = 1.0 if self.rigid_dat_plane_locality else 0.0
         # Set via set_collision_detection_hook(); called at the interval to refresh contacts mid-step.
         self._collision_detection_hook = None
         self.rigid_penetration_free_query_margin = rigid_penetration_free_query_margin
@@ -728,6 +784,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
 
         self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
+        # Momentum-exchange bookkeeping (particles): motion deleted by the last
+        # apply_truncation_ts launch [m]; see body_motion_lost_* for semantics.
+        self.particle_motion_lost = (
+            wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device) if model.particle_count else None
+        )
         self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.truncation_ts = wp.zeros(self.model.particle_count, dtype=float, device=self.device)
 
@@ -834,6 +895,43 @@ class SolverVBD(SolverBase, CouplingInterface):
             # current poses at every mid-step re-detection (Alg. 3 commit), while
             # body_q_prev must stay at the step-start pose for the BDF velocity finalize.
             self.body_q_dat_ref = wp.clone(model.body_q, device=self.device)
+            # Momentum-exchange bookkeeping: motion deleted by the LAST truncation of
+            # each pass type (rigid-phase vs particle-phase), (linear [m], angular
+            # [rad]); slots SUM at finalize (disjoint tranches). Overwritten by every
+            # apply_body_truncation_ts launch; zeroed at step start and at mid-step
+            # re-detection boundaries.
+            self.particle_motion_lost = getattr(self, "particle_motion_lost", None)
+            self.body_motion_lost_rigid = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.device)
+            self.body_motion_lost_particle = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.device)
+            # Momentum exchange: jointed bodies participate with w = 0 and are excluded
+            # from write-back (v1 policy: body-local impulses on stiff PD-driven
+            # articulations inject joint-violating energy).
+            jointed = np.zeros(model.body_count, dtype=np.int32)
+            if model.joint_count:
+                from ...sim.enums import JointType  # noqa: PLC0415
+
+                jtypes = model.joint_type.numpy()
+                jp = model.joint_parent.numpy()
+                jc = model.joint_child.numpy()
+                for j in range(model.joint_count):
+                    if int(jtypes[j]) == int(JointType.FREE):
+                        continue  # a free joint is a floating base, not an articulation constraint
+                    for b in (int(jp[j]), int(jc[j])):
+                        if 0 <= b < model.body_count:
+                            jointed[b] = 1
+            self.body_is_jointed = wp.array(jointed, dtype=wp.int32, device=self.device)
+            self.body_vhat = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.device)
+            self.particle_vhat = (
+                wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device) if model.particle_count else None
+            )
+            # Contact-row accumulators/flags are contact-capacity sized; allocated
+            # lazily on the first step (capacity known only from the Contacts object).
+            self._exchange_soft_bound = None
+            self._exchange_rigid_bound = None
+            self._exchange_soft_jn = None
+            self._exchange_soft_jt = None
+            self._exchange_rigid_jn = None
+            self._exchange_rigid_jt = None
             self._coupling_body_q_prev_snapshot = wp.clone(model.body_q, device=self.device)
             self.body_inertia_q = wp.zeros_like(model.body_q, device=self.device)  # inertial target poses for AVBD
 
@@ -1847,6 +1945,8 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         if self.rigid_enable_penetration_free and self.model.body_count > 0:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self._exchange_active(contacts):
+            self._momentum_exchange_prepare(contacts)
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, contacts, dt)
@@ -1870,6 +1970,168 @@ class SolverVBD(SolverBase, CouplingInterface):
             state_in, state_out, dt, apply_stick_deadzone=contacts is not None and self.rigid_contact_hard
         )
         self._finalize_particles(state_out, dt)
+
+        if self._exchange_active(contacts):
+            self._momentum_exchange(state_in, state_out, contacts, dt)
+
+    def _exchange_active(self, contacts) -> bool:
+        return (
+            self.rigid_momentum_exchange
+            and self.rigid_enable_penetration_free
+            and contacts is not None
+            and self.model.body_count > 0
+            and not self.integrate_with_external_rigid_solver
+        )
+
+    def _momentum_exchange_prepare(self, contacts: Contacts):
+        """Lazy-allocate contact-row accumulators and zero all exchange state."""
+        n_soft = int(contacts.soft_contact_max)
+        n_rigid = int(contacts.rigid_contact_max)
+        if n_soft and (self._exchange_soft_bound is None or self._exchange_soft_bound.shape[0] < n_soft):
+            self._raise_if_capturing_resize(
+                "momentum-exchange soft rows",
+                0 if self._exchange_soft_bound is None else self._exchange_soft_bound.shape[0],
+                n_soft,
+            )
+            self._exchange_soft_bound = wp.zeros(n_soft, dtype=wp.int32, device=self.device)
+            self._exchange_soft_jn = wp.zeros(n_soft, dtype=wp.float32, device=self.device)
+            self._exchange_soft_jt = wp.zeros(n_soft, dtype=wp.vec3, device=self.device)
+        if n_rigid and (self._exchange_rigid_bound is None or self._exchange_rigid_bound.shape[0] < n_rigid):
+            self._raise_if_capturing_resize(
+                "momentum-exchange rigid rows",
+                0 if self._exchange_rigid_bound is None else self._exchange_rigid_bound.shape[0],
+                n_rigid,
+            )
+            self._exchange_rigid_bound = wp.zeros(n_rigid, dtype=wp.int32, device=self.device)
+            self._exchange_rigid_jn = wp.zeros(n_rigid, dtype=wp.float32, device=self.device)
+            self._exchange_rigid_jt = wp.zeros(n_rigid, dtype=wp.vec3, device=self.device)
+        self._momentum_exchange_zero()
+
+    def _momentum_exchange_zero(self):
+        """Zero slots, flags and accumulators (step start; mid-step re-detection)."""
+        self.body_motion_lost_rigid.zero_()
+        self.body_motion_lost_particle.zero_()
+        if self.particle_motion_lost is not None:
+            self.particle_motion_lost.zero_()
+        for arr in (
+            self._exchange_soft_bound,
+            self._exchange_soft_jn,
+            self._exchange_soft_jt,
+            self._exchange_rigid_bound,
+            self._exchange_rigid_jn,
+            self._exchange_rigid_jt,
+        ):
+            if arr is not None:
+                arr.zero_()
+
+    def _momentum_exchange(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
+        """Post-finalize momentum-preserving velocity exchange over binding contacts.
+
+        V_hat = V + motion_lost/dt reconstructs each body's incoming velocity;
+        binding contacts are resolved as standard contact impulses (rigid-soft
+        e = 0, rigid-rigid e = rigid_restitution, Coulomb friction on the
+        accumulated cone); write-back is masked (jointed bodies and
+        sub-stick-epsilon deltas skipped) and hits both velocity states.
+        Positions are untouched, so the penetration-free guarantee is unaffected.
+        See ctx/2026-07-13-momentum-preserving-dat-notes.md.
+        """
+        model = self.model
+        inv_dt = 1.0 / dt
+        wp.launch(
+            kernel=momentum_exchange_build_vhat_bodies,
+            dim=model.body_count,
+            inputs=[
+                state_out.body_qd,
+                self.body_motion_lost_rigid,
+                self.body_motion_lost_particle,
+                self.body_is_jointed,
+                inv_dt,
+            ],
+            outputs=[self.body_vhat],
+            device=self.device,
+        )
+        if model.particle_count:
+            wp.launch(
+                kernel=momentum_exchange_build_vhat_particles,
+                dim=model.particle_count,
+                inputs=[state_out.particle_qd, self.particle_motion_lost, inv_dt],
+                outputs=[self.particle_vhat],
+                device=self.device,
+            )
+        for _ in range(self.rigid_exchange_sweeps):
+            if model.particle_count and self._exchange_soft_bound is not None:
+                wp.launch(
+                    kernel=momentum_exchange_sweep_rigid_soft,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        self._exchange_soft_bound,
+                        contacts.soft_contact_primitive,
+                        contacts.soft_contact_barycentric,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_normal,
+                        self.body_particle_contact_material_mu,
+                        model.tri_indices,
+                        model.shape_body,
+                        state_in.body_q,
+                        model.body_com,
+                        model.body_inv_mass,
+                        model.body_inv_inertia,
+                        self.body_is_jointed,
+                        model.particle_inv_mass,
+                        self._exchange_soft_jn,
+                        self._exchange_soft_jt,
+                    ],
+                    outputs=[self.body_vhat, self.particle_vhat],
+                    device=self.device,
+                )
+            if self._exchange_rigid_bound is not None:
+                wp.launch(
+                    kernel=momentum_exchange_sweep_rigid_rigid,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        self._exchange_rigid_bound,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        contacts.rigid_contact_point0,
+                        contacts.rigid_contact_point1,
+                        contacts.rigid_contact_normal,
+                        model.shape_body,
+                        model.shape_material_mu,
+                        state_in.body_q,
+                        model.body_com,
+                        model.body_inv_mass,
+                        model.body_inv_inertia,
+                        self.body_is_jointed,
+                        self.rigid_restitution,
+                        self._exchange_rigid_jn,
+                        self._exchange_rigid_jt,
+                    ],
+                    outputs=[self.body_vhat],
+                    device=self.device,
+                )
+        wp.launch(
+            kernel=momentum_exchange_writeback_bodies,
+            dim=model.body_count,
+            inputs=[
+                self.body_vhat,
+                self.body_is_jointed,
+                self.rigid_contact_stick_freeze_translation_eps,
+                self.rigid_contact_stick_freeze_angular_eps,
+            ],
+            outputs=[state_out.body_qd, state_in.body_qd],
+            device=self.device,
+        )
+        if model.particle_count:
+            wp.launch(
+                kernel=momentum_exchange_writeback_particles,
+                dim=model.particle_count,
+                inputs=[self.particle_vhat, 0.0],
+                outputs=[state_out.particle_qd, state_in.particle_qd],
+                device=self.device,
+            )
 
     def set_collision_detection_hook(self, hook) -> None:
         """Register ``hook(state)`` to refresh ``contacts`` from the current state.
@@ -1897,6 +2159,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.particle_displacements.zero_()
         if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self._exchange_active(contacts):
+            # Boundary semantics v1 = "clear": bindings die with their planes and the
+            # blocked motion is re-proposed against the fresh contacts (doc Sec. 2).
+            self._momentum_exchange_zero()
         # Re-detect on the committed state and rebuild the dependent contact state.
         self._collision_detection_hook(state_in)
         # Seed penalties at full material stiffness (k_start=-1 -> avg_ke): the system is
@@ -2020,10 +2286,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_penetration_free_query_margin,
+                    self._dat_pinch_exempt,
+                    self._dat_parked_advance_frac,
+                    self._dat_plane_locality,
                 ],
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
+                    self._exchange_soft_bound,
                 ],
                 device=self.device,
             )
@@ -2040,6 +2310,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             outputs=[
                 self.particle_displacements,
                 particle_q_out,
+                self.particle_motion_lost,
             ],
             device=self.device,
         )
@@ -2057,6 +2328,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ],
                 outputs=[
                     body_q,
+                    self.body_motion_lost_particle,  # particle-phase slot
                 ],
                 device=self.device,
             )
@@ -2098,9 +2370,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.dat_body_vertices,
                     self.dat_body_vertex_radius,
                     self.rigid_conservative_bound_relaxation,
+                    self._dat_parked_advance_frac,
+                    self._dat_pinch_exempt,
                 ],
                 outputs=[
                     self.body_truncation_ts,
+                    self._exchange_rigid_bound,
                 ],
                 device=self.device,
             )
@@ -2131,10 +2406,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_penetration_free_query_margin,
+                    self._dat_pinch_exempt,
+                    self._dat_parked_advance_frac,
+                    self._dat_plane_locality,
                 ],
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
+                    self._exchange_soft_bound,
                 ],
                 device=self.device,
             )
@@ -2151,6 +2430,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             ],
             outputs=[
                 body_q,
+                self.body_motion_lost_rigid,  # rigid-phase slot
             ],
             device=self.device,
         )

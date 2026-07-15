@@ -2252,10 +2252,12 @@ def apply_truncation_ts(
     max_displacement: float,
     displacement_out: wp.array[wp.vec3],
     pos_out: wp.array[wp.vec3],
+    motion_lost_out: wp.array[wp.vec3],
 ):
     i = wp.tid()
     t = truncation_ts[i]
-    particle_displacement = displacement_in[i] * t
+    disp_in = displacement_in[i]
+    particle_displacement = disp_in * t
 
     # Nuts-saving truncation: clamp displacement magnitude to max_displacement
     len_displacement = wp.length(particle_displacement)
@@ -2265,6 +2267,10 @@ def apply_truncation_ts(
     displacement_out[i] = particle_displacement
     if pos_out:
         pos_out[i] = pos[i] + particle_displacement
+    if motion_lost_out:
+        # Motion deleted by this launch (truncation + clamp), overwritten each launch;
+        # consumed by the momentum-exchange pass (divided by dt at finalize).
+        motion_lost_out[i] = disp_in - particle_displacement
 
 
 @wp.kernel

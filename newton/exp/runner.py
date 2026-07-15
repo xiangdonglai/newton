@@ -445,6 +445,49 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         "and contact pairs while a driven body presses through resisting cloth (grasp transport).",
     )
     parser.add_argument(
+        "--momentum-exchange",
+        action="store_true",
+        dest="momentum_exchange",
+        default=False,
+        help="Enable the momentum-preserving velocity exchange over binding DAT contacts (requires --dat): "
+        "reconstructs each body's pre-truncation velocity and resolves binding contacts as contact impulses, "
+        "so DAT truncation no longer destroys momentum. See ctx/2026-07-13-momentum-preserving-dat-notes.md.",
+    )
+    parser.add_argument(
+        "--restitution",
+        type=float,
+        default=0.0,
+        help="Restitution e for rigid-rigid momentum-exchange impulses (rigid-soft is 0 by policy).",
+    )
+    parser.add_argument(
+        "--no-pinch-exemption",
+        action="store_false",
+        dest="dat_pinch_exemption",
+        default=True,
+        help="Disable the DAT pinch exemption (pinched rigid-soft contacts exempt slow approach from "
+        "truncation to avoid grasp deadlock). Off = strict one-sided stall: the penetration-free "
+        "guarantee is fully strict again, but grippers may freeze against grasped cloth.",
+    )
+    parser.add_argument(
+        "--no-parked-antifreeze",
+        action="store_false",
+        dest="dat_parked_antifreeze",
+        default=True,
+        help="Disable the DAT parked-vertex anti-freeze (bounded per-round advance for vertices parked "
+        "on a mid-gap division plane). Off = strict stall: no transient plane crossing is allowed, but "
+        "a single parked vertex can freeze the whole body via the uniform truncation scalar.",
+    )
+    parser.add_argument(
+        "--no-plane-locality",
+        action="store_false",
+        dest="dat_plane_locality",
+        default=True,
+        help="Disable the DAT plane-authority locality cull (each division plane only truncates body "
+        "vertices near its contact). Off = original unbounded sweep: every body vertex against every "
+        "plane, which over-cages the body. Passing all three --no-* DAT flags restores the original "
+        "strict DAT truncation exactly.",
+    )
+    parser.add_argument(
         "--collide-per-substep",
         action="store_true",
         dest="collide_per_substep",

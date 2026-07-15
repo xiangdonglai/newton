@@ -2886,5 +2886,288 @@ add_function_test(
 )
 
 
+# =====================================================================================
+# Momentum-preserving exchange unit tests (see ctx/2026-07-13-momentum-preserving-dat-
+# notes.md Sec. 3): buffer-level analytic tests of the exchange kernels.
+# =====================================================================================
+
+from newton._src.solvers.vbd.rigid_vbd_kernels import (  # noqa: E402
+    apply_body_truncation_ts,
+    momentum_exchange_sweep_rigid_rigid,
+    momentum_exchange_writeback_bodies,
+)
+
+
+def _exchange_two_body_setup(device, v0, v1, inv_m0, inv_m1, restitution, mu=0.0, n=(1.0, 0.0, 0.0)):
+    """Two point-mass bodies at +/-0.5 x with one contact row between them at the origin."""
+    body_q = wp.array(
+        [
+            wp.transform(wp.vec3(-0.5, 0.0, 0.0), wp.quat_identity()),
+            wp.transform(wp.vec3(0.5, 0.0, 0.0), wp.quat_identity()),
+        ],
+        dtype=wp.transform,
+        device=device,
+    )
+    big_i = 1.0e8  # effectively rotation-locked point masses unless a test wants rotation
+    data = {
+        "rigid_contact_count": wp.array([1], dtype=wp.int32, device=device),
+        "rigid_contact_bound": wp.array([1], dtype=wp.int32, device=device),
+        "rigid_contact_shape0": wp.array([0], dtype=wp.int32, device=device),
+        "rigid_contact_shape1": wp.array([1], dtype=wp.int32, device=device),
+        "rigid_contact_point0": wp.array([wp.vec3(0.5, 0.0, 0.0)], dtype=wp.vec3, device=device),  # body-frame
+        "rigid_contact_point1": wp.array([wp.vec3(-0.5, 0.0, 0.0)], dtype=wp.vec3, device=device),
+        "rigid_contact_normal": wp.array([wp.vec3(*n)], dtype=wp.vec3, device=device),
+        "shape_body": wp.array([0, 1], dtype=wp.int32, device=device),
+        "shape_material_mu": wp.array([mu, mu], dtype=wp.float32, device=device),
+        "body_q": body_q,
+        "body_com": wp.array([wp.vec3(0.0)] * 2, dtype=wp.vec3, device=device),
+        "body_inv_mass": wp.array([inv_m0, inv_m1], dtype=wp.float32, device=device),
+        "body_inv_inertia": wp.array(
+            [wp.mat33(1.0 / big_i, 0, 0, 0, 1.0 / big_i, 0, 0, 0, 1.0 / big_i)] * 2, dtype=wp.mat33, device=device
+        ),
+        "body_is_jointed": wp.array([0, 0], dtype=wp.int32, device=device),
+        "restitution": float(restitution),
+        "exchange_jn": wp.zeros(1, dtype=wp.float32, device=device),
+        "exchange_jt": wp.zeros(1, dtype=wp.vec3, device=device),
+        "body_vhat": wp.array(
+            [
+                wp.spatial_vector(v0[0], v0[1], v0[2], 0.0, 0.0, 0.0),
+                wp.spatial_vector(v1[0], v1[1], v1[2], 0.0, 0.0, 0.0),
+            ],
+            dtype=wp.spatial_vector,
+            device=device,
+        ),
+    }
+    return data
+
+
+def _run_exchange_sweeps(device, data, sweeps=2):
+    for _ in range(sweeps):
+        wp.launch(
+            kernel=momentum_exchange_sweep_rigid_rigid,
+            dim=1,
+            inputs=[
+                data["rigid_contact_count"],
+                data["rigid_contact_bound"],
+                data["rigid_contact_shape0"],
+                data["rigid_contact_shape1"],
+                data["rigid_contact_point0"],
+                data["rigid_contact_point1"],
+                data["rigid_contact_normal"],
+                data["shape_body"],
+                data["shape_material_mu"],
+                data["body_q"],
+                data["body_com"],
+                data["body_inv_mass"],
+                data["body_inv_inertia"],
+                data["body_is_jointed"],
+                data["restitution"],
+                data["exchange_jn"],
+                data["exchange_jt"],
+            ],
+            outputs=[data["body_vhat"]],
+            device=device,
+        )
+    return data["body_vhat"].numpy()
+
+
+def test_exchange_impulse_equal_masses(test, device):
+    # U6a: e=0 head-on, equal masses -> both at the mean velocity.
+    d = _exchange_two_body_setup(device, v0=(2.0, 0, 0), v1=(0.0, 0, 0), inv_m0=1.0, inv_m1=1.0, restitution=0.0)
+    v = _run_exchange_sweeps(device, d)
+    test.assertAlmostEqual(v[0][0], 1.0, places=5)
+    test.assertAlmostEqual(v[1][0], 1.0, places=5)
+    # U6b: e=1 -> velocities swap.
+    d = _exchange_two_body_setup(device, v0=(2.0, 0, 0), v1=(0.0, 0, 0), inv_m0=1.0, inv_m1=1.0, restitution=1.0)
+    v = _run_exchange_sweeps(device, d, sweeps=1)
+    test.assertAlmostEqual(v[0][0], 0.0, places=5)
+    test.assertAlmostEqual(v[1][0], 2.0, places=5)
+
+
+def test_exchange_impulse_mass_ratio(test, device):
+    # U6c: 10:1 masses, e=0 -> common velocity (10*2.5 + 1*0)/11; momentum exact; KE reduced.
+    d = _exchange_two_body_setup(device, v0=(2.5, 0, 0), v1=(0.0, 0, 0), inv_m0=0.1, inv_m1=1.0, restitution=0.0)
+    v = _run_exchange_sweeps(device, d)
+    v_common = 10.0 * 2.5 / 11.0
+    test.assertAlmostEqual(v[0][0], v_common, places=4)
+    test.assertAlmostEqual(v[1][0], v_common, places=4)
+    p = 10.0 * v[0][0] + 1.0 * v[1][0]
+    test.assertAlmostEqual(p, 25.0, places=3)
+    ke = 0.5 * 10.0 * v[0][0] ** 2 + 0.5 * 1.0 * v[1][0] ** 2
+    test.assertLess(ke, 0.5 * 10.0 * 2.5**2)
+
+
+def test_exchange_static_partner_and_noop(test, device):
+    # U7: static partner (w=0) with e=0.5 -> outgoing normal velocity = -e*v_in.
+    d = _exchange_two_body_setup(device, v0=(3.0, 0, 0), v1=(0.0, 0, 0), inv_m0=1.0, inv_m1=0.0, restitution=0.5)
+    v = _run_exchange_sweeps(device, d, sweeps=1)
+    test.assertAlmostEqual(v[0][0], -1.5, places=5)
+    test.assertAlmostEqual(v[1][0], 0.0, places=6)
+    # Separating pair -> strict no-op.
+    d = _exchange_two_body_setup(device, v0=(-1.0, 0, 0), v1=(1.0, 0, 0), inv_m0=1.0, inv_m1=1.0, restitution=0.0)
+    v = _run_exchange_sweeps(device, d)
+    test.assertAlmostEqual(v[0][0], -1.0, places=6)
+    test.assertAlmostEqual(v[1][0], 1.0, places=6)
+    test.assertAlmostEqual(float(d["exchange_jn"].numpy()[0]), 0.0, places=7)
+
+
+def test_exchange_friction_cone(test, device):
+    # U8: body sliding into a static wall (normal +x), tangential +y, e=0.
+    # inside-cone (mu large): tangential fully removed; boundary (mu small): reduced by mu*jn*w.
+    for mu, vt_expected in ((2.0, 0.0), (0.25, 2.0 - 0.25 * 3.0)):
+        d = _exchange_two_body_setup(
+            device, v0=(3.0, 2.0, 0), v1=(0.0, 0, 0), inv_m0=1.0, inv_m1=0.0, restitution=0.0, mu=mu
+        )
+        v = _run_exchange_sweeps(device, d)
+        test.assertAlmostEqual(v[0][0], 0.0, places=5)  # e=0 normal
+        test.assertAlmostEqual(v[0][1], vt_expected, places=4)
+    # mu=0 preserves tangential exactly.
+    d = _exchange_two_body_setup(
+        device, v0=(3.0, 2.0, 0), v1=(0.0, 0, 0), inv_m0=1.0, inv_m1=0.0, restitution=0.0, mu=0.0
+    )
+    v = _run_exchange_sweeps(device, d)
+    test.assertAlmostEqual(v[0][1], 2.0, places=6)
+
+
+def test_exchange_energy_nonexpansive(test, device):
+    # U12: randomized configs, e<=1, sweeps: KE never increases.
+    rng = np.random.default_rng(42)
+    for _ in range(20):
+        v0 = rng.uniform(-3, 3, 3)
+        v1 = rng.uniform(-3, 3, 3)
+        m0 = rng.uniform(0.2, 5.0)
+        m1 = rng.uniform(0.2, 5.0)
+        e = rng.uniform(0.0, 1.0)
+        mu = rng.uniform(0.0, 1.5)
+        d = _exchange_two_body_setup(device, v0=v0, v1=v1, inv_m0=1.0 / m0, inv_m1=1.0 / m1, restitution=e, mu=mu)
+        ke0 = 0.5 * m0 * v0 @ v0 + 0.5 * m1 * v1 @ v1
+        v = _run_exchange_sweeps(device, d, sweeps=3)
+        ke1 = 0.5 * m0 * (v[0][:3] @ v[0][:3]) + 0.5 * m1 * (v[1][:3] @ v[1][:3])
+        test.assertLessEqual(ke1, ke0 + 1.0e-5)
+
+
+def test_exchange_vlost_slot_recording(test, device):
+    # U1: apply_body_truncation_ts records deleted motion (incl. isotropic cap).
+    def run(t, dx, max_disp=1.0e6):
+        q_ref = wp.array([wp.transform(wp.vec3(0.0), wp.quat_identity())], dtype=wp.transform, device=device)
+        body_q = wp.array([wp.transform(wp.vec3(*dx), wp.quat_identity())], dtype=wp.transform, device=device)
+        ts = wp.array([t], dtype=wp.float32, device=device)
+        lost = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        wp.launch(
+            kernel=apply_body_truncation_ts,
+            dim=1,
+            inputs=[
+                q_ref,
+                wp.array([wp.vec3(0.0)], dtype=wp.vec3, device=device),
+                ts,
+                wp.array([0.1], dtype=wp.float32, device=device),
+                max_disp,
+            ],
+            outputs=[body_q, lost],
+            device=device,
+        )
+        return lost.numpy()[0]
+
+    lost = run(0.5, (0.03, 0.0, 0.0))
+    test.assertAlmostEqual(lost[0], 0.015, places=6)  # (1-t)*dx
+    test.assertAlmostEqual(abs(lost[3]) + abs(lost[4]) + abs(lost[5]), 0.0, places=6)
+    # cap-only: t=1 but candidate 0.03 exceeds max_point_displacement 0.01 -> t_cap=1/3.
+    lost = run(1.0, (0.03, 0.0, 0.0), max_disp=0.01)
+    test.assertAlmostEqual(lost[0], 0.02, places=6)  # (1 - 1/3)*0.03
+    # overwrite: second run with t=1, no cap -> zero.
+    lost = run(1.0, (0.03, 0.0, 0.0))
+    test.assertAlmostEqual(lost[0], 0.0, places=7)
+
+
+def test_exchange_writeback_masking(test, device):
+    # U13: jointed bodies and sub-epsilon deltas untouched; dual write for the rest.
+    vhat = wp.array(
+        [
+            wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            wp.spatial_vector(1.0e-6, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ],
+        dtype=wp.spatial_vector,
+        device=device,
+    )
+    jointed = wp.array([0, 1, 0], dtype=wp.int32, device=device)
+    qd = wp.zeros(3, dtype=wp.spatial_vector, device=device)
+    qd_mirror = wp.zeros(3, dtype=wp.spatial_vector, device=device)
+    wp.launch(
+        kernel=momentum_exchange_writeback_bodies,
+        dim=3,
+        inputs=[vhat, jointed, 1.0e-4, 1.0e-4],
+        outputs=[qd, qd_mirror],
+        device=device,
+    )
+    out = qd.numpy()
+    out_m = qd_mirror.numpy()
+    test.assertAlmostEqual(out[0][0], 1.0, places=6)  # free body: written
+    test.assertAlmostEqual(out_m[0][0], 1.0, places=6)  # dual write
+    test.assertAlmostEqual(out[1][0], 0.0, places=7)  # jointed: untouched
+    test.assertAlmostEqual(out[2][0], 0.0, places=7)  # sub-eps: untouched
+
+
+def test_exchange_disjoint_tranches(test, device):
+    # U4: two sequential truncation passes on one body clip DISJOINT tranches;
+    # the slot SUM equals the total deleted motion (1 - t1*t2)*dX.
+    dx_full = 0.04
+    q_ref = wp.array([wp.transform(wp.vec3(0.0), wp.quat_identity())], dtype=wp.transform, device=device)
+    body_q = wp.array([wp.transform(wp.vec3(dx_full, 0.0, 0.0), wp.quat_identity())], dtype=wp.transform, device=device)
+    com = wp.array([wp.vec3(0.0)], dtype=wp.vec3, device=device)
+    radius = wp.array([0.1], dtype=wp.float32, device=device)
+    slot_rigid = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    slot_particle = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    for t, slot in ((0.5, slot_rigid), (0.5, slot_particle)):
+        ts = wp.array([t], dtype=wp.float32, device=device)
+        wp.launch(
+            kernel=apply_body_truncation_ts,
+            dim=1,
+            inputs=[q_ref, com, ts, radius, 1.0e6],
+            outputs=[body_q, slot],
+            device=device,
+        )
+    lost_r = slot_rigid.numpy()[0]
+    lost_p = slot_particle.numpy()[0]
+    test.assertAlmostEqual(lost_r[0], 0.5 * dx_full, places=6)  # (1-t1)*dX
+    test.assertAlmostEqual(lost_p[0], 0.5 * 0.5 * dx_full, places=6)  # t1*(1-t2)*dX
+    total = lost_r[0] + lost_p[0]
+    test.assertAlmostEqual(total, (1.0 - 0.25) * dx_full, places=6)  # (1-t1*t2)*dX
+    # realized pose + total lost = original candidate
+    realized = body_q.numpy()[0][0]
+    test.assertAlmostEqual(realized + total, dx_full, places=6)
+
+
+class TestVBDMomentumExchange(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestVBDMomentumExchange, "test_exchange_disjoint_tranches", test_exchange_disjoint_tranches, devices=devices
+)
+add_function_test(
+    TestVBDMomentumExchange, "test_exchange_impulse_equal_masses", test_exchange_impulse_equal_masses, devices=devices
+)
+add_function_test(
+    TestVBDMomentumExchange, "test_exchange_impulse_mass_ratio", test_exchange_impulse_mass_ratio, devices=devices
+)
+add_function_test(
+    TestVBDMomentumExchange,
+    "test_exchange_static_partner_and_noop",
+    test_exchange_static_partner_and_noop,
+    devices=devices,
+)
+add_function_test(TestVBDMomentumExchange, "test_exchange_friction_cone", test_exchange_friction_cone, devices=devices)
+add_function_test(
+    TestVBDMomentumExchange, "test_exchange_energy_nonexpansive", test_exchange_energy_nonexpansive, devices=devices
+)
+add_function_test(
+    TestVBDMomentumExchange, "test_exchange_vlost_slot_recording", test_exchange_vlost_slot_recording, devices=devices
+)
+add_function_test(
+    TestVBDMomentumExchange, "test_exchange_writeback_masking", test_exchange_writeback_masking, devices=devices
+)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
