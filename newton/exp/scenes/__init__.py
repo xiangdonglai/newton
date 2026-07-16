@@ -23,6 +23,8 @@ def make_scene(key: str, args) -> Scene:
 
 # Register built-in scenes.
 from . import (
+    cloth_catch_ball,  # noqa: F401
+    cradle,  # noqa: F401
     grasp_avbd_cloth,  # noqa: F401
     pick_avbd_cube,  # noqa: F401
     shirt_pick,  # noqa: F401

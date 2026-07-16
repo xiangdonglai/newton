@@ -512,9 +512,13 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         default=True,
         help="Disable CUDA graph capture.",
     )
-    scene_cls.add_args(parser)
+    # Scene last: parser.set_defaults only rewrites the defaults of options
+    # that already exist, so a scene can only override solver/controller
+    # argument defaults (e.g. vbd_iterations) if it registers after them
+    # (scene overrides win, as elsewhere).
     solver_cls.add_args(parser)
     controller_cls.add_args(parser)
+    scene_cls.add_args(parser)
     return parser
 
 

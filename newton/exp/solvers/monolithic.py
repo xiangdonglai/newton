@@ -96,6 +96,7 @@ class MonolithicAvbdStrategy(SolverStrategy):
         # Strategy defaults are the shirt_pick values; scenes override the
         # solver-specific pieces (e.g. self-contact radii/buffers for the
         # IsaacLab AVBD tasks) via Scene.solver_overrides.
+        print("args.vbd_iterations", args.vbd_iterations)
         vbd_kwargs = dict(
             iterations=int(args.vbd_iterations),
             integrate_with_external_rigid_solver=False,
