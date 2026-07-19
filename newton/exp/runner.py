@@ -460,6 +460,92 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         help="Restitution e for rigid-rigid momentum-exchange impulses (rigid-soft is 0 by policy).",
     )
     parser.add_argument(
+        "--vlost-residual",
+        action="store_true",
+        dest="vlost_residual",
+        default=False,
+        help="Estimate the cloth particles' truncation-deleted motion from the end-of-step force "
+        "residual (variant D) instead of the per-pass geometric recording, gated to binding-plane "
+        "normals and cap-held particles. Experimental; requires --momentum-exchange.",
+    )
+    parser.add_argument(
+        "--trailing-refresh",
+        action="store_true",
+        dest="trailing_refresh",
+        default=False,
+        help="EXPERIMENTAL: per-iteration trailing plane refresh — recommit the DAT references every "
+        "VBD iteration so division planes rebuild between the current surfaces (breaks the co-moving "
+        "treadmill). Weakens the anti-tunneling cap for undetected pairs; pair with a real detection "
+        "cadence. Requires --dat.",
+    )
+    parser.add_argument(
+        "--derived-pinch",
+        type=float,
+        default=0.0,
+        dest="derived_pinch_alpha",
+        metavar="ALPHA",
+        help="EXPERIMENTAL: derived pinch gate — exempt a rigid-soft pinch from strict truncation when "
+        "the pair approach is below ALPHA*(radius+margin)*sqrt(ke/m) (the penalty shell's arrest "
+        "capacity). Replaces the ad-hoc 1mm creep budget; 0 disables.",
+    )
+    parser.add_argument(
+        "--feasible-planes",
+        action="store_true",
+        dest="feasible_planes",
+        default=False,
+        help="EXPERIMENTAL: bilateral penalty handoff — a soft vertex squeezed between two opposing "
+        "penalty-mediated planes whose feasible slab is thinner than the particle diameter is handed "
+        "to the contact forces (no plane clamps; the isotropic cap still applies). Requires "
+        "--derived-pinch > 0.",
+    )
+    parser.add_argument(
+        "--friction-epsilon",
+        type=float,
+        default=None,
+        dest="friction_epsilon",
+        metavar="EPS",
+        help="Solver friction velocity-smoothing threshold [m/s] (SolverVBD default 1e-2). The "
+        "regularized model cannot statically lock: a held object creeps out of a sustained pinch "
+        "at a rate ~ EPS. 1e-4 measured to hold a grasped fold through a long static hold where "
+        "1e-2 extrudes within ~3 s.",
+    )
+    parser.add_argument(
+        "--substep-total-cap",
+        action="store_true",
+        dest="substep_total_cap",
+        default=False,
+        help="EXPERIMENTAL: bound each particle's/body's TOTAL motion per substep by the isotropic "
+        "cap budget (the per-launch cap is measured from a per-iteration reference under "
+        "--trailing-refresh, multiplying the budget by the iteration count).",
+    )
+    parser.add_argument(
+        "--exchange-take-gate",
+        action="store_true",
+        dest="exchange_take_gate",
+        default=False,
+        help="EXPERIMENTAL: momentum-exchange rows fire only when a free (non-driven) side carries a "
+        "wall-take, preventing impulses manufactured from control-driven motion (fabric dispersal).",
+    )
+    parser.add_argument(
+        "--one-sided-planes",
+        action="store_false",
+        dest="dat_soft_side",
+        default=True,
+        help="EXPERIMENTAL: constrain only the RIGID side of rigid-soft division planes (the soft side "
+        "is wall-free; its takes are zero by construction). Intended with --trailing-refresh; in "
+        "weak-contact regimes the cloth-into-rigid direction is then guarded only by the cap.",
+    )
+    parser.add_argument(
+        "--vlost-residual-body",
+        action="store_true",
+        dest="vlost_residual_body",
+        default=False,
+        help="EXPERIMENTAL: estimate each free body's truncation-deleted motion as the unrealized "
+        "remainder toward its inertia target (no force assembly; over-reads under strong contact "
+        "forces). Measures/repairs the geometric slots' per-substep under-read. Requires "
+        "--momentum-exchange.",
+    )
+    parser.add_argument(
         "--no-pinch-exemption",
         action="store_false",
         dest="dat_pinch_exemption",

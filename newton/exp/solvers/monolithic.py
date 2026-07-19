@@ -119,6 +119,8 @@ class MonolithicAvbdStrategy(SolverStrategy):
             rigid_joint_angular_kd=0.0,
             rigid_contact_history=False,
         )
+        if getattr(args, "friction_epsilon", None) is not None:
+            vbd_kwargs["friction_epsilon"] = float(args.friction_epsilon)
         if getattr(args, "water_tight", False):
             # Water-tight adds edge/face cloth-mesh contacts on top of the per-particle
             # ones; raise the per-body soft-contact buffer so they are not dropped
@@ -134,12 +136,20 @@ class MonolithicAvbdStrategy(SolverStrategy):
             vbd_kwargs["rigid_dat_pinch_exemption"] = bool(getattr(args, "dat_pinch_exemption", True))
             vbd_kwargs["rigid_dat_parked_antifreeze"] = bool(getattr(args, "dat_parked_antifreeze", True))
             vbd_kwargs["rigid_dat_plane_locality"] = bool(getattr(args, "dat_plane_locality", True))
+            vbd_kwargs["rigid_dat_trailing_refresh"] = bool(getattr(args, "trailing_refresh", False))
+            vbd_kwargs["rigid_dat_soft_side"] = bool(getattr(args, "dat_soft_side", True))
+            vbd_kwargs["rigid_dat_derived_pinch_alpha"] = float(getattr(args, "derived_pinch_alpha", 0.0))
+            vbd_kwargs["rigid_feasible_planes"] = bool(getattr(args, "feasible_planes", False))
+            vbd_kwargs["rigid_substep_total_cap"] = bool(getattr(args, "substep_total_cap", False))
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
         if getattr(args, "momentum_exchange", False):
             # Requires --dat (the exchange acts on DAT binding records).
             vbd_kwargs["rigid_momentum_exchange"] = True
             vbd_kwargs["rigid_restitution"] = float(getattr(args, "restitution", 0.0))
+            vbd_kwargs["rigid_particle_vlost_residual"] = bool(getattr(args, "vlost_residual", False))
+            vbd_kwargs["rigid_exchange_take_gate"] = bool(getattr(args, "exchange_take_gate", False))
+            vbd_kwargs["rigid_body_vlost_residual"] = bool(getattr(args, "vlost_residual_body", False))
         if model.particle_count == 0:
             # Physics-only scenes (no cloth): the particle self-contact machinery
             # cannot build on an empty mesh.

@@ -4344,6 +4344,7 @@ def rigid_trajectory_truncation_t(
     pinch_exempt: float = 0.0,
     parked_advance_frac: float = 0.04,
     foreign_plane_pass: float = 1.0,
+    pinch_approach_budget: float = 1.0e-3,
 ):
     """Latest safe interpolation parameter before the trajectory crosses the plane (n, d).
 
@@ -4389,10 +4390,10 @@ def rigid_trajectory_truncation_t(
         # constraint cannot express. FAST approach (an impactor) is still stalled: it
         # would cross the exempt shell within one update.
         approach = s_end - s0
-        if approach <= DAT_PINCH_APPROACH_EPS:
+        if approach <= pinch_approach_budget:
             return 1.0
-        # Fast pinched approach: allow only the slow-contact budget of the update.
-        return wp.clamp(DAT_PINCH_APPROACH_EPS / approach, 0.0, 1.0)
+        # Fast pinched approach: allow only the arrest budget of the update.
+        return wp.clamp(pinch_approach_budget / approach, 0.0, 1.0)
 
     t_lo = float(0.0)
     t_hi = float(1.0)
@@ -4459,6 +4460,7 @@ def rigid_body_vertices_truncation_min(
     pinch_exempt: float,
     parked_advance_frac: float,
     foreign_plane_pass: float,
+    pinch_approach_budget: float,
 ):
     """Minimum trajectory-truncation parameter over a body's DAT vertices vs plane (n, d).
 
@@ -4503,6 +4505,7 @@ def rigid_body_vertices_truncation_min(
                 pinch_exempt,
                 parked_advance_frac,
                 foreign_plane_pass,
+                pinch_approach_budget,
             )
             t_min = wp.min(t_min, t_v)
         i += DAT_THREADS_PER_CONTACT
@@ -4528,16 +4531,27 @@ def apply_rigid_soft_truncation(
     dat_body_vertex_start: wp.array[wp.int32],
     dat_body_vertices: wp.array[wp.vec3],
     dat_body_vertex_radius: wp.array[float],
+    particle_mass: wp.array[float],
+    particle_radius: wp.array[float],
+    soft_contact_material_ke: wp.array[float],
     parallel_eps: float,
     gamma: float,
     query_margin: float,
     pinch_exempt: float,
     parked_advance_frac: float,
     plane_locality: float,
+    soft_side_enable: float,
+    derived_pinch_alpha: float,
+    pinch_dt: float,
+    feasible_planes: float,
     # outputs
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
     soft_contact_bound: wp.array[wp.int32],
+    particle_bind_normal: wp.array[wp.vec3],
+    particle_pinch_plane: wp.array2d[wp.vec4],
+    particle_pinch_count: wp.array[wp.int32],
+    particle_penalty_handed: wp.array[float],
 ):
     """Joint DAT truncation for one rigid-soft contact: build the division plane from the
     reference configuration and atomically min-reduce the truncation scalars of the soft
@@ -4626,11 +4640,32 @@ def apply_rigid_soft_truncation(
         lmbd = wp.clamp(delta_rigid / (delta_rigid + delta_soft), 0.05, 0.95)
     d = bx0 + (lmbd * gap) * n
 
+    # Derived pinch gate (candidate 4): the penalty shell can arrest an
+    # approach up to v_safe = alpha * (radius + margin) * sqrt(ke/m); below
+    # that the pinch is the force model's domain (exempt from the strict
+    # stall, with the SAME derived budget as the creep throttle); above it
+    # the contact is impulsive and stays strictly truncated. alpha = 0
+    # disables the gate (legacy binary pinch_exempt + 1 mm budget).
+    row_pinch_exempt = pinch_exempt
+    pinch_budget = 1.0e-3
+    if derived_pinch_alpha > 0.0:
+        m_soft = particle_mass[v0]
+        if m_soft > 0.0:
+            shell = particle_radius[v0] + query_margin
+            v_safe = derived_pinch_alpha * shell * wp.sqrt(soft_contact_material_ke[contact_index] / m_soft)
+            pinch_budget = v_safe * pinch_dt
+            if delta_soft + delta_rigid <= pinch_budget:
+                row_pinch_exempt = 1.0
+            else:
+                row_pinch_exempt = 0.0
+        else:
+            row_pinch_exempt = 1.0  # kinematic/pinned soft vertex: penalty's domain
+
     # Soft side (lane 0): straight-ray truncation per involved vertex. Vertices within the
     # pinch band that keep approaching are frozen; vertices clearly on the rigid side of
     # the plane are not part of the local contact geometry (e.g. a triangle draped past
     # the shape) and are skipped.
-    if lane == 0:
+    if lane == 0 and soft_side_enable != 0.0:
         for i in range(3):
             vi = int(-1)
             if i == 0:
@@ -4642,18 +4677,74 @@ def apply_rigid_soft_truncation(
             if vi >= 0 and (contact_index < count_particle or bary[i] > 0.0):
                 x_v = pos_prev_collision_detection[vi]
                 s_v = wp.dot(n, x_v - d)
-                if s_v > DAT_PINCH_BAND:
+                # Feasible-planes per-PAIR release (candidate b, review 2026-07-16,
+                # corrected after the per-vertex falsification): a vertex squeezed
+                # between two OPPOSING penalty-mediated planes whose feasible slab is
+                # thinner than the particle diameter is in bilateral sustained contact
+                # along that axis — the force model's domain. Truncation must not clamp
+                # against a (near-)empty pairwise feasible set: with trailing replaning
+                # the opposing lambda-placed planes cross and the joint clamps eject
+                # the vertex violently. THIS row skips its own clamp iff IT forms such
+                # a pair with a stored plane — the minimal relaxation restoring
+                # pairwise feasibility; every other plane keeps full authority (a
+                # per-vertex release also dropped the LATERAL pad clamps of vertices
+                # squeezed pad-vs-ground and let the closing pads sweep through the
+                # fabric — measured 5.27 mm penetration). Both rows of a pair must
+                # pass the derived v_safe gate, so a fast slam keeps its strict clamp;
+                # the isotropic anti-tunneling cap is unaffected. Ring of 3 slots per
+                # vertex (ground + pad bottom + pad side is the common >=3-plane
+                # case; a single last-writer slot thrashes); all writes are racy but
+                # detection retries every iteration and in both launch phases, so a
+                # miss costs one bounded clamp iteration.
+                handed_v = float(0.0)
+                if (
+                    feasible_planes != 0.0
+                    and derived_pinch_alpha > 0.0
+                    and row_pinch_exempt == 1.0
+                    and particle_pinch_plane
+                ):
+                    off_cur = wp.dot(n, d)
+                    two_r = 2.0 * particle_radius[vi]
+                    for slot in range(3):
+                        prev = particle_pinch_plane[vi, slot]
+                        n_prev = wp.vec3(prev[0], prev[1], prev[2])
+                        if wp.length_sq(n_prev) > 0.5 and wp.dot(n_prev, n) < 0.0:
+                            # Opposing half-spaces n_k·x >= off_k: slab width along
+                            # the shared axis is -(off_prev + off_cur); negative =
+                            # crossed planes.
+                            if -(prev[3] + off_cur) < two_r:
+                                handed_v = 1.0
+                    if particle_penalty_handed and handed_v != 0.0:
+                        # Scalar flag consumed ONLY by the residual estimator gate
+                        # (bilateral penalty equilibrium error is not wall force)
+                        # and diagnostics — it releases no clamps by itself.
+                        particle_penalty_handed[vi] = 1.0
+                    slot_w = wp.atomic_add(particle_pinch_count, vi, 1) % 3
+                    particle_pinch_plane[vi, slot_w] = wp.vec4(n[0], n[1], n[2], off_cur)
+                if handed_v == 0.0 and s_v > DAT_PINCH_BAND:
                     t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, parallel_eps, gamma)
                     if t_v < 1.0:
                         wp.atomic_min(truncation_ts, vi, t_v)
                         if soft_contact_bound:
                             soft_contact_bound[contact_index] = 1  # binding contact (flag-on-proposal)
-                elif pinch_exempt == 0.0 and s_v > -DAT_PINCH_BAND and wp.dot(n, particle_displacements[vi]) < 0.0:
+                        if particle_bind_normal:
+                            # Residual-estimator gate: this vertex is plane-held
+                            # along n this substep (last-writer-wins; co-binding
+                            # normals are near-parallel in practice).
+                            particle_bind_normal[vi] = n
+                elif (
+                    handed_v == 0.0
+                    and row_pinch_exempt == 0.0
+                    and s_v > -DAT_PINCH_BAND
+                    and wp.dot(n, particle_displacements[vi]) < 0.0
+                ):
                     # Strict pinch stall (pinch exemption disabled): a pinched soft
                     # vertex approaching the plane is frozen outright.
                     wp.atomic_min(truncation_ts, vi, 0.0)
                     if soft_contact_bound:
                         soft_contact_bound[contact_index] = 1  # binding contact (flag-on-proposal)
+                    if particle_bind_normal:
+                        particle_bind_normal[vi] = n
                 # With the pinch exemption on, pinched vertices (s_v within the band of
                 # a gap~0 pair) are handed to the contact forces (see
                 # rigid_trajectory_truncation_t): a one-sided world-space freeze cannot
@@ -4692,9 +4783,10 @@ def apply_rigid_soft_truncation(
                 gap,
                 x_ref,
                 locality_r,
-                pinch_exempt,
+                row_pinch_exempt,
                 parked_advance_frac,
-                pinch_exempt,
+                row_pinch_exempt,
+                pinch_budget,
             )
         elif lane == 0:
             # No DAT vertices provisioned for this body: fall back to the contact anchor.
@@ -4710,9 +4802,10 @@ def apply_rigid_soft_truncation(
                 1e-3,
                 soft_shift,
                 gap,
-                pinch_exempt,
+                row_pinch_exempt,
                 parked_advance_frac,
-                pinch_exempt,
+                row_pinch_exempt,
+                pinch_budget,
             )
         else:
             t_b = 1.0
@@ -4871,6 +4964,7 @@ def apply_rigid_rigid_truncation(
                 0.0,
                 parked_advance_frac,
                 foreign_plane_pass,
+                1.0e-3,
             )
         elif lane == 0:
             t_a = rigid_trajectory_truncation_t(n, d - margin0 * n, c0_a, dx_a, axis_a, angle_a, p0 - c0_a, gamma)
@@ -4907,6 +5001,7 @@ def apply_rigid_rigid_truncation(
                 0.0,
                 parked_advance_frac,
                 foreign_plane_pass,
+                1.0e-3,
             )
         elif lane == 0:
             t_b = rigid_trajectory_truncation_t(-n, d + margin1 * n, c0_b, dx_b, axis_b, angle_b, p1 - c0_b, gamma)
@@ -4926,10 +5021,13 @@ def apply_body_truncation_ts(
     body_truncation_ts: wp.array[float],
     body_bounding_radius: wp.array[float],
     max_point_displacement: float,
+    max_total_point_displacement: float,
+    body_q_substep_start: wp.array[wp.transform],
     # input/output
     body_q: wp.array[wp.transform],
     # outputs
     body_motion_lost: wp.array[wp.spatial_vector],
+    body_wall_bound: wp.array[wp.int32],
 ):
     """Scale each body's accumulated pose update (reference → candidate) by its truncation
     scalar, interpolating translation and rotation about the COM.
@@ -4959,6 +5057,11 @@ def apply_body_truncation_ts(
     if body_motion_lost:
         lost = wp.max(0.0, 1.0 - t)
         body_motion_lost[b] = wp.spatial_vector(dx * lost, axis * (angle * lost))
+    if body_wall_bound:
+        if t < 1.0:
+            # Truncation (plane or cap) actually held this body this pass:
+            # the residual estimator may read it (body-side bound gate).
+            body_wall_bound[b] = 1
 
     if t < 1.0:
         c_new = c0 + t * dx
@@ -4970,6 +5073,32 @@ def apply_body_truncation_ts(
             half_w = axis * (ta * 0.5)
             q_new = wp.normalize(wp.quat(half_w[0], half_w[1], half_w[2], 1.0) * q_rot)
         body_q[b] = wp.transform(c_new - wp.quat_rotate(q_new, com), q_new)
+
+    if body_q_substep_start:
+        # Substep-total cap (see apply_truncation_ts): with trailing refresh the
+        # per-launch bound above is measured from a per-iteration reference; also
+        # bound the TOTAL pose update since the substep start by the same budget,
+        # pulling the pose back along the geodesic toward the start pose.
+        q_start = body_q_substep_start[b]
+        c0s, dxs, axis_s, angle_s = rigid_pose_delta(q_start, body_q[b], com)
+        bound_s = wp.length(dxs) + wp.abs(angle_s) * body_bounding_radius[b]
+        if bound_s > max_total_point_displacement:
+            s = max_total_point_displacement / bound_s
+            c_new_s = c0s + s * dxs
+            q_rot_s = wp.transform_get_rotation(q_start)
+            sa = s * angle_s
+            if wp.abs(sa) > _SMALL_ANGLE_EPS:
+                q_new_s = wp.normalize(wp.quat_from_axis_angle(axis_s, sa) * q_rot_s)
+            else:
+                half_ws = axis_s * (sa * 0.5)
+                q_new_s = wp.normalize(wp.quat(half_ws[0], half_ws[1], half_ws[2], 1.0) * q_rot_s)
+            body_q[b] = wp.transform(c_new_s - wp.quat_rotate(q_new_s, com), q_new_s)
+            if body_motion_lost:
+                # Fold the extra clip into this launch's deleted-motion record.
+                lost_s = 1.0 - s
+                body_motion_lost[b] = body_motion_lost[b] + wp.spatial_vector(dxs * lost_s, axis_s * (angle_s * lost_s))
+            if body_wall_bound:
+                body_wall_bound[b] = 1
 
 
 # =====================================================================================
@@ -5022,6 +5151,62 @@ def momentum_exchange_build_vhat_bodies(
 
 
 @wp.kernel
+def momentum_exchange_body_vlost_residual(
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_inertia_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[float],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_is_jointed: wp.array[wp.int32],
+    body_wall_bound: wp.array[wp.int32],
+    body_forces: wp.array[wp.vec3],
+    body_torques: wp.array[wp.vec3],
+    # outputs
+    body_motion_lost_rigid: wp.array[wp.spatial_vector],
+    body_motion_lost_particle: wp.array[wp.spatial_vector],
+):
+    """EXPERIMENTAL body-side residual estimator (variant D on bodies): the
+    deleted motion is the unrealized remainder toward the inertia target pose
+    MINUS the share the modeled contact forces account for,
+
+        motion_lost = (pose(Y) - pose(X)) + dt^2 * M^-1 * (F, tau)(x_final).
+
+    F points opposite the blocked approach during contact, so the force term
+    removes the legitimately force-decelerated share (whose momentum the
+    partner already received through the force) — without it the reading
+    over-delivers under sustained contact (measured +11 % gain on
+    cloth_catch_ball). Pass zero force arrays for the inertia-only probe
+    variant. Overwrites BOTH slots (rigid = full reading, particle = 0);
+    jointed bodies are skipped (excluded from the exchange, v1 policy) and
+    their slots left to the geometric path."""
+    b = wp.tid()
+    if body_is_jointed[b] != 0:
+        return
+    if body_wall_bound:
+        if body_wall_bound[b] == 0:
+            # Body-side bound gate: this body was not truncation-held this
+            # substep — a raw residual here is drive/deadzone/convergence
+            # state, not wall force. Leave the CMR slots untouched.
+            return
+    com_x = wp.transform_point(body_q[b], body_com[b])
+    com_y = wp.transform_point(body_inertia_q[b], body_com[b])
+    q_rel = wp.transform_get_rotation(body_inertia_q[b]) * wp.quat_inverse(wp.transform_get_rotation(body_q[b]))
+    q_rel = wp.normalize(q_rel)
+    if q_rel[3] < 0.0:
+        q_rel = wp.quat(-q_rel[0], -q_rel[1], -q_rel[2], -q_rel[3])
+    axis, angle = wp.quat_to_axis_angle(q_rel)
+    lost_lin = com_y - com_x
+    lost_ang = axis * angle
+    if body_forces:
+        inv_i_w = _exchange_inv_inertia_world(body_q, body_inv_inertia, b)
+        lost_lin += dt * dt * body_inv_mass[b] * body_forces[b]
+        lost_ang += dt * dt * (inv_i_w * body_torques[b])
+    body_motion_lost_rigid[b] = wp.spatial_vector(lost_lin, lost_ang)
+    body_motion_lost_particle[b] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+
+
+@wp.kernel
 def momentum_exchange_build_vhat_particles(
     particle_qd: wp.array[wp.vec3],
     particle_motion_lost: wp.array[wp.vec3],
@@ -5036,6 +5221,10 @@ def momentum_exchange_build_vhat_particles(
 def momentum_exchange_sweep_rigid_soft(
     soft_contact_count: wp.array[wp.int32],
     soft_contact_bound: wp.array[wp.int32],
+    exchange_take_gate: float,
+    body_motion_lost_rigid: wp.array[wp.spatial_vector],
+    body_motion_lost_particle_slot: wp.array[wp.spatial_vector],
+    particle_motion_lost: wp.array[wp.vec3],
     soft_contact_primitive: wp.array[wp.int32],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_shape: wp.array[wp.int32],
@@ -5092,6 +5281,26 @@ def momentum_exchange_sweep_rigid_soft(
     shape = soft_contact_shape[i]
     b = shape_body[shape]
     n = soft_contact_normal[i]  # points rigid -> soft
+
+    if exchange_take_gate != 0.0:
+        # Take gate (candidate 4): fire only when a FREE side actually lost
+        # motion to a wall this substep. A jointed (driven) partner has no
+        # take by policy; if the free sides carry none either, this row
+        # would manufacture an impulse from control-driven motion (measured:
+        # the finger-descent fabric dispersal) — skip it and leave the
+        # sustained contact to the penalty/friction model.
+        take = float(0.0)
+        if b >= 0 and body_is_jointed[b] == 0:
+            ml = body_motion_lost_rigid[b] + body_motion_lost_particle_slot[b]
+            take += wp.length(wp.spatial_top(ml)) + wp.length(wp.spatial_bottom(ml))
+        if particle_motion_lost:
+            take += wp.length(particle_motion_lost[v0]) * bary[0]
+            if v1 >= 0:
+                take += wp.length(particle_motion_lost[v1]) * bary[1]
+            if v2 >= 0:
+                take += wp.length(particle_motion_lost[v2]) * bary[2]
+        if take < 1.0e-9:
+            return
 
     w_body = float(0.0)
     inv_I_w = wp.mat33(0.0)

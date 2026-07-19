@@ -21,8 +21,8 @@ import warp as wp
 import newton
 
 from ..robots import HAND_BODY_SUFFIX, add_franka
-from .base import Scene
 from . import register
+from .base import Scene
 
 # Shirt cloth material (IsaacLab NewtonSurfaceDeformableBodyMaterialCfg).
 CLOTH_DENSITY = 0.02
@@ -169,18 +169,34 @@ class ShirtPickScene(Scene):
         qv = np.array([qx, qy, qz])
         vc = vc + 2.0 * qw * np.cross(qv, vc) + 2.0 * np.cross(qv, np.cross(qv, vc))
         cloth_c = np.asarray(CLOTH_POS, dtype=np.float64) + vc
-        above = np.array([cloth_c[0], cloth_c[1], 0.40])   # hover centered above the cloth
+        above = np.array([cloth_c[0], cloth_c[1], 0.40])  # hover centered above the cloth
         press = np.array([cloth_c[0], cloth_c[1], 0.08])  # 1 cm below the ground plane
 
         return {
             # Scripted pick: hover -> descend -> grasp -> lift -> hold.
             "pick": KeyframeSequence(
                 [
-                    Keyframe(0.8, home, q, GRIP_OPEN),    # hover at home, gripper open
-                    Keyframe(1.2, grasp, q, GRIP_OPEN),   # descend to grasp height
+                    Keyframe(0.8, home, q, GRIP_OPEN),  # hover at home, gripper open
+                    Keyframe(1.2, grasp, q, GRIP_OPEN),  # descend to grasp height
                     Keyframe(0.8, grasp, q, GRIP_CLOSE),  # close the gripper
-                    Keyframe(1.2, home, q, GRIP_CLOSE),   # lift back to home
-                    Keyframe(2.0, home, q, GRIP_CLOSE),   # hold
+                    Keyframe(1.2, home, q, GRIP_CLOSE),  # lift back to home
+                    Keyframe(2.0, home, q, GRIP_CLOSE),  # hold
+                ]
+            ),
+            # Gentle pick: same waypoints as "pick" with a 3.0 s close dwell (the
+            # pads reach grip equilibrium before the lift; the stock 0.8 s close
+            # ends with the contact shells barely engaged) and a 3.6 s lift (1/3
+            # the acceleration; the stock 1.2 s yank strips loose grips and
+            # causes 5-6.5 mm transient penetration spikes vs <= 0.72 mm gentle).
+            # Measured 2026-07-17: with the strict DAT stack + friction_epsilon
+            # 1e-4 at stock effort this passes the pick gate end-to-end.
+            "pick_gentle": KeyframeSequence(
+                [
+                    Keyframe(0.8, home, q, GRIP_OPEN),  # hover at home, gripper open
+                    Keyframe(1.2, grasp, q, GRIP_OPEN),  # descend to grasp height
+                    Keyframe(3.0, grasp, q, GRIP_CLOSE),  # close the gripper (dwell)
+                    Keyframe(3.6, home, q, GRIP_CLOSE),  # lift back to home (gentle)
+                    Keyframe(2.0, home, q, GRIP_CLOSE),  # hold
                 ]
             ),
             # Press: center above the cloth, close the gripper, then press the
@@ -188,8 +204,8 @@ class ShirtPickScene(Scene):
             # ground penetration stress test.
             "press": KeyframeSequence(
                 [
-                    Keyframe(0.5, home, q, GRIP_OPEN),    # start at home
-                    Keyframe(1.5, above, q, GRIP_CLOSE),   # move to center above the cloth
+                    Keyframe(0.5, home, q, GRIP_OPEN),  # start at home
+                    Keyframe(1.5, above, q, GRIP_CLOSE),  # move to center above the cloth
                     Keyframe(2.5, press, q, GRIP_CLOSE),  # press down to -0.01 m
                 ]
             ),

@@ -2250,9 +2250,12 @@ def apply_truncation_ts(
     displacement_in: wp.array[wp.vec3],
     truncation_ts: wp.array[float],
     max_displacement: float,
+    max_total_displacement: float,
+    pos_substep_start: wp.array[wp.vec3],
     displacement_out: wp.array[wp.vec3],
     pos_out: wp.array[wp.vec3],
     motion_lost_out: wp.array[wp.vec3],
+    cap_bound_out: wp.array[wp.int32],
 ):
     i = wp.tid()
     t = truncation_ts[i]
@@ -2263,6 +2266,22 @@ def apply_truncation_ts(
     len_displacement = wp.length(particle_displacement)
     if len_displacement > max_displacement:
         particle_displacement = particle_displacement * max_displacement / len_displacement
+        if cap_bound_out:
+            # Isotropic cap engaged: the residual estimator keeps this
+            # particle's FULL residual (the cap has no plane normal).
+            cap_bound_out[i] = 1
+
+    if pos_substep_start:
+        # Substep-total cap: with trailing refresh the per-launch cap above is
+        # measured from a per-iteration reference, so the per-substep budget
+        # multiplies by the iteration count. Bound the TOTAL motion since the
+        # substep start by the same budget (anti-tunneling guarantee restored).
+        total = pos[i] + particle_displacement - pos_substep_start[i]
+        len_total = wp.length(total)
+        if len_total > max_total_displacement:
+            particle_displacement = pos_substep_start[i] + total * (max_total_displacement / len_total) - pos[i]
+            if cap_bound_out:
+                cap_bound_out[i] = 1
 
     displacement_out[i] = particle_displacement
     if pos_out:
@@ -2891,3 +2910,213 @@ def accumulate_contact_force_and_hessian(
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+
+
+# =============================================================================
+# Momentum-exchange residual estimator (variant D, particle side)
+# =============================================================================
+# One force-assembly pass at the substep's FINAL configuration; the
+# stationarity residual r_i = m_i (x_i - y_i)/dt^2 - F_i(x_final) of a DOF the
+# solver settled is ~0, while a DOF held by a division plane or the isotropic
+# cap reads exactly the constraint force of that (unmodeled) "invisible wall".
+# The gated conversion below replaces the per-pass geometric motion_lost
+# recording, whose overwrite semantics lose mid-iteration cuts on
+# spring-dominated DOFs (see ctx/2026-07-13-momentum-preserving-dat-notes.md
+# Sec. 9 and ctx/2026-07-16-variant-d-review.md).
+
+
+@wp.kernel
+def residual_assemble_membrane_forces(
+    dt: float,
+    pos_anchor: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    tri_poses: wp.array[wp.mat22],
+    tri_materials: wp.array2d[float],
+    tri_areas: wp.array[float],
+    # outputs
+    forces: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    face = tid // 3
+    order = tid % 3
+    if tri_materials[face, 0] > 0.0 or tri_materials[face, 1] > 0.0:
+        f, _h = evaluate_neo_hookean_membrane_force_hessian(
+            face,
+            order,
+            pos,
+            pos_anchor,
+            tri_indices,
+            tri_poses[face],
+            tri_areas[face],
+            tri_materials[face, 0],
+            tri_materials[face, 1],
+            tri_materials[face, 2],
+            dt,
+        )
+        wp.atomic_add(forces, tri_indices[face, order], f)
+
+
+@wp.kernel
+def residual_assemble_bending_forces(
+    dt: float,
+    pos_anchor: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    edge_indices: wp.array2d[wp.int32],
+    edge_rest_angles: wp.array[float],
+    edge_rest_length: wp.array[float],
+    edge_bending_properties: wp.array2d[float],
+    # outputs
+    forces: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    edge = tid // 4
+    order = tid % 4
+    v = edge_indices[edge, order]
+    if v < 0:
+        return
+    if edge_bending_properties[edge, 0] > 0.0:
+        f, _h = evaluate_dihedral_angle_based_bending_force_hessian(
+            edge,
+            order,
+            pos,
+            pos_anchor,
+            edge_indices,
+            edge_rest_angles,
+            edge_rest_length,
+            edge_bending_properties[edge, 0],
+            edge_bending_properties[edge, 1],
+            dt,
+        )
+        wp.atomic_add(forces, v, f)
+
+
+@wp.kernel
+def residual_assemble_spring_forces(
+    dt: float,
+    num_springs: int,
+    pos_anchor: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    spring_indices: wp.array[int],
+    spring_rest_length: wp.array[float],
+    spring_stiffness: wp.array[float],
+    spring_damping: wp.array[float],
+    # outputs
+    forces: wp.array[wp.vec3],
+):
+    spring_idx = wp.tid()
+    if spring_idx < num_springs:
+        v0 = spring_indices[spring_idx * 2]
+        v1 = spring_indices[spring_idx * 2 + 1]
+        _, _, force_v0, force_v1, _h = evaluate_spring_force_and_hessian_both_vertices(
+            spring_idx, dt, pos, pos_anchor, spring_indices, spring_rest_length, spring_stiffness, spring_damping
+        )
+        wp.atomic_add(forces, v0, force_v0)
+        wp.atomic_add(forces, v1, force_v1)
+
+
+@wp.kernel
+def residual_assemble_body_contact_forces(
+    dt: float,
+    friction_epsilon: float,
+    pos_anchor: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    contact_count: wp.array[wp.int32],
+    contact_particle: wp.array[wp.int32],
+    penalty_k: wp.array[float],
+    material_kd: wp.array[float],
+    material_mu: wp.array[float],
+    shape_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    contact_shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_body_vel: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    shape_margin: wp.array[float],
+    # outputs
+    forces: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    if tid >= contact_count[0]:
+        return
+    pi = contact_particle[tid]
+    if pi < 0:
+        return
+    f, _h = _eval_body_particle_contact(
+        pi,
+        pos[pi],
+        pos_anchor[pi],
+        tid,
+        penalty_k[tid],
+        material_kd[tid],
+        material_mu[tid],
+        friction_epsilon,
+        particle_radius,
+        shape_body,
+        body_q,
+        body_q_prev,
+        body_qd,
+        body_com,
+        contact_shape,
+        contact_body_pos,
+        contact_body_vel,
+        contact_normal,
+        shape_margin,
+        dt,
+    )
+    wp.atomic_add(forces, pi, f)
+
+
+@wp.kernel
+def residual_gated_vlost(
+    dt: float,
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    pos_final: wp.array[wp.vec3],
+    inertia_target: wp.array[wp.vec3],
+    forces: wp.array[wp.vec3],
+    bind_normal: wp.array[wp.vec3],
+    cap_bound: wp.array[wp.int32],
+    penalty_handed: wp.array[float],
+    # outputs (MOTION units, consumed by momentum_exchange_build_vhat_particles)
+    motion_lost: wp.array[wp.vec3],
+):
+    """Gated conversion of the stationarity residual into deleted motion.
+
+    Mitigation (a)-extended (review 2026-07-16): a raw residual read injects
+    the Gauss-Seidel convergence error as phantom velocity (measured 0.1-0.5
+    m/s on non-contact cloth), and is stiffness-amplified. Therefore:
+    plane-bound particles keep only the residual component along the binding
+    plane normal, one-sided (a wall pushes, never pulls); cap-bound particles
+    keep the full residual (the cap is isotropic, it has no normal);
+    everything else is gated to zero.
+    """
+    i = wp.tid()
+    m = particle_mass[i]
+    if m == 0.0 or not particle_flags[i] & ParticleFlags.ACTIVE:
+        motion_lost[i] = wp.vec3(0.0)
+        return
+    if penalty_handed:
+        if penalty_handed[i] != 0.0:
+            # Feasible-planes handoff: no wall acted on this vertex (its clamps were
+            # released); the residual is contact-force equilibrium error, not wall
+            # force, and must not enter the exchange.
+            motion_lost[i] = wp.vec3(0.0)
+            return
+    r = m * (pos_final[i] - inertia_target[i]) / (dt * dt) - forces[i]
+    lost = wp.vec3(0.0)
+    if cap_bound[i] != 0:
+        lost = -dt * dt * r / m
+    else:
+        n = bind_normal[i]
+        if wp.length_sq(n) > 0.5:  # unit normal was recorded this substep
+            # The wall force on the soft side acts along +n (n points from the
+            # rigid surface toward the soft side); lambda >= 0.
+            rn = wp.dot(r, n)
+            if rn > 0.0:
+                lost = -dt * dt * rn * n / m
+    motion_lost[i] = lost

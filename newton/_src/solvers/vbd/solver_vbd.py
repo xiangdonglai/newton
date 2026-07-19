@@ -38,6 +38,12 @@ from .particle_vbd_kernels import (
     apply_truncation_ts,
     # Solver kernels (particle VBD)
     forward_step,
+    # Momentum-exchange residual estimator (variant D, particle side)
+    residual_assemble_bending_forces,
+    residual_assemble_body_contact_forces,
+    residual_assemble_membrane_forces,
+    residual_assemble_spring_forces,
+    residual_gated_vlost,
     solve_elasticity,
     solve_elasticity_tile,
     update_velocity,
@@ -63,6 +69,7 @@ from .rigid_vbd_kernels import (
     init_body_body_contact_materials,
     init_body_body_contacts_avbd,
     init_body_particle_contacts,
+    momentum_exchange_body_vlost_residual,
     momentum_exchange_build_vhat_bodies,
     momentum_exchange_build_vhat_particles,
     momentum_exchange_sweep_rigid_rigid,
@@ -255,6 +262,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_momentum_exchange: bool = False,  # Post-finalize momentum-preserving velocity exchange over binding DAT contacts
         rigid_restitution: float = 0.0,  # Restitution e for rigid-rigid exchange rows (rigid-soft is 0 by policy)
         rigid_exchange_sweeps: int = 2,  # Jacobi sweeps of the exchange impulse pass
+        rigid_particle_vlost_residual: bool = False,  # Particle V_lost via end-of-step force residual (variant D)
+        rigid_body_vlost_residual: bool = False,  # EXPERIMENTAL: body V_lost = unrealized inertia-target motion (no force assembly)
+        rigid_dat_trailing_refresh: bool = False,  # EXPERIMENTAL: per-iteration pair-plane recommit (trailing planes)
+        rigid_dat_soft_side: bool = True,  # EXPERIMENTAL when False: one-sided planes (constrain the rigid side only)
+        rigid_dat_derived_pinch_alpha: float = 0.0,  # >0: derived pinch gate v_safe = alpha*(r+margin)*sqrt(ke/m) (candidate 4)
+        rigid_exchange_take_gate: bool = False,  # exchange rows fire only when a free side carries a wall-take
+        rigid_feasible_planes: bool = False,  # hand a bilaterally squeezed vertex to the penalty (candidate b; needs derived_pinch_alpha > 0)
+        rigid_substep_total_cap: bool = False,  # bound TOTAL motion per substep by the isotropic cap (restores the anti-tunneling budget under trailing refresh)
         rigid_dat_pinch_exemption: bool = True,  # Exempt slow pinched rigid-soft approach from truncation (anti-deadlock)
         rigid_dat_parked_antifreeze: bool = True,  # Bounded per-round advance for vertices parked on a mid-gap plane
         rigid_dat_plane_locality: bool = True,  # Limit each division plane's authority to nearby body vertices
@@ -459,6 +474,25 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_external_edge_contact_filtering_map,
         )
 
+        # Set before _init_rigid_system: its exchange-buffer block reads this
+        # option (variant-D estimator state is allocated alongside body_vhat).
+        self.rigid_particle_vlost_residual = bool(rigid_particle_vlost_residual)
+        self.rigid_body_vlost_residual = bool(rigid_body_vlost_residual)
+        self.rigid_dat_trailing_refresh = bool(rigid_dat_trailing_refresh)
+        self.rigid_dat_soft_side = bool(rigid_dat_soft_side)
+        self._dat_soft_side = 1.0 if self.rigid_dat_soft_side else 0.0
+        self.rigid_dat_derived_pinch_alpha = float(rigid_dat_derived_pinch_alpha)
+        self.rigid_exchange_take_gate = bool(rigid_exchange_take_gate)
+        self.rigid_feasible_planes = bool(rigid_feasible_planes)
+        self._dat_feasible_planes = 1.0 if self.rigid_feasible_planes else 0.0
+        self.rigid_substep_total_cap = bool(rigid_substep_total_cap)
+        # Substep-total budget = per-launch cap x (iterations / detection interval):
+        # the effective allowance the accepted NON-trailing configuration already
+        # had; trailing then no longer multiplies it by the iteration count.
+        interval = max(1, int(rigid_collision_detection_interval))
+        self._substep_cap_windows = max(1.0, float(-(-int(iterations) // interval)))
+        self._substep_dt = 0.0
+
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
             model,
@@ -492,6 +526,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_momentum_exchange,
             rigid_restitution,
             rigid_exchange_sweeps,
+            rigid_particle_vlost_residual,
             rigid_dat_pinch_exemption,
             rigid_dat_parked_antifreeze,
             rigid_dat_plane_locality,
@@ -514,6 +549,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_momentum_exchange: bool,
         rigid_restitution: float,
         rigid_exchange_sweeps: int,
+        rigid_particle_vlost_residual: bool,
         rigid_dat_pinch_exemption: bool,
         rigid_dat_parked_antifreeze: bool,
         rigid_dat_plane_locality: bool,
@@ -526,6 +562,18 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_momentum_exchange = bool(rigid_momentum_exchange)
         self.rigid_restitution = float(rigid_restitution)
         self.rigid_exchange_sweeps = max(1, int(rigid_exchange_sweeps))
+        self.rigid_particle_vlost_residual = bool(rigid_particle_vlost_residual)
+        # Residual-estimator state: allocated by _init_rigid_system (which runs
+        # BEFORE this method); default to None only if that path did not run.
+        self.particle_bind_normal = getattr(self, "particle_bind_normal", None)
+        self.particle_cap_bound = getattr(self, "particle_cap_bound", None)
+        self._residual_forces = getattr(self, "_residual_forces", None)
+        self.body_wall_bound = getattr(self, "body_wall_bound", None)
+        self.particle_pinch_plane = getattr(self, "particle_pinch_plane", None)
+        self._body_q_substep_start = getattr(self, "_body_q_substep_start", None)
+        self._particle_q_substep_start = getattr(self, "_particle_q_substep_start", None)
+        self.particle_pinch_count = getattr(self, "particle_pinch_count", None)
+        self.particle_penalty_handed = getattr(self, "particle_penalty_handed", None)
         self.rigid_dat_pinch_exemption = bool(rigid_dat_pinch_exemption)
         self.rigid_dat_parked_antifreeze = bool(rigid_dat_parked_antifreeze)
         self.rigid_dat_plane_locality = bool(rigid_dat_plane_locality)
@@ -924,6 +972,27 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.particle_vhat = (
                 wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device) if model.particle_count else None
             )
+            if self.rigid_particle_vlost_residual and model.particle_count:
+                # Variant-D particle estimator state (design doc Sec. 9 + review):
+                # per-particle binding plane normal, isotropic-cap flag, and the
+                # force-assembly buffer for the end-of-step residual read.
+                self.particle_bind_normal = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+                self.particle_cap_bound = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
+                self._residual_forces = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+            if self.rigid_body_vlost_residual:
+                self.body_wall_bound = wp.zeros(model.body_count, dtype=wp.int32, device=self.device)
+            if self.rigid_substep_total_cap:
+                # Substep-start snapshots for the substep-total motion cap.
+                self._body_q_substep_start = wp.zeros_like(model.body_q, device=self.device)
+                if model.particle_count:
+                    self._particle_q_substep_start = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+            if self.rigid_feasible_planes and model.particle_count:
+                # Feasible-planes handoff state (candidate b): per-vertex last-written
+                # penalty-mediated plane (xyz = normal, w = offset n·d) and the handed
+                # flag; cleared at detection boundaries, kept across trailing recommits.
+                self.particle_pinch_plane = wp.zeros((model.particle_count, 3), dtype=wp.vec4, device=self.device)
+                self.particle_pinch_count = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
+                self.particle_penalty_handed = wp.zeros(model.particle_count, dtype=wp.float32, device=self.device)
             # Contact-row accumulators/flags are contact-capacity sized; allocated
             # lazily on the first step (capacity known only from the Contacts object).
             self._exchange_soft_bound = None
@@ -1943,8 +2012,20 @@ class SolverVBD(SolverBase, CouplingInterface):
         if control is None:
             control = self.model.control(clone_variables=False)
 
+        self._substep_dt = dt
+        if self.particle_penalty_handed is not None:
+            # Feasible-planes handoff lifecycle: cleared at detection boundaries
+            # only, kept across trailing recommits (late-set flags must survive
+            # to the next iteration's truncation; see apply_rigid_soft_truncation).
+            self.particle_penalty_handed.zero_()
+            self.particle_pinch_plane.zero_()
+            self.particle_pinch_count.zero_()
         if self.rigid_enable_penetration_free and self.model.body_count > 0:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self._body_q_substep_start is not None:
+            wp.copy(dest=self._body_q_substep_start, src=state_in.body_q)
+            if self._particle_q_substep_start is not None:
+                self._particle_q_substep_start.assign(state_in.particle_q)
         if self._exchange_active(contacts):
             self._momentum_exchange_prepare(contacts)
 
@@ -1961,7 +2042,29 @@ class SolverVBD(SolverBase, CouplingInterface):
                 and contacts is not None
             ):
                 self._midstep_collision_update(state_in, contacts)
-            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            elif (
+                self.rigid_dat_trailing_refresh
+                and iter_num > 0
+                and self.rigid_enable_penetration_free
+                and contacts is not None
+            ):
+                # Trailing plane refresh: recommit the DAT references to the
+                # current state so this iteration's division planes rebuild
+                # between the CURRENT surfaces (no re-detection; see
+                # ctx/2026-07-16-methods-momentum-estimators.md Sec. 8).
+                self._trailing_plane_recommit(state_in, contacts)
+            self._solve_rigid_body_iteration(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                assemble_residual=(
+                    self.rigid_body_vlost_residual
+                    and iter_num == self.iterations - 1
+                    and self._exchange_active(contacts)
+                ),
+            )
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
@@ -2013,6 +2116,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_motion_lost_particle.zero_()
         if self.particle_motion_lost is not None:
             self.particle_motion_lost.zero_()
+        if self.particle_bind_normal is not None:
+            self.particle_bind_normal.zero_()
+        if self.particle_cap_bound is not None:
+            self.particle_cap_bound.zero_()
+        if self.body_wall_bound is not None:
+            self.body_wall_bound.zero_()
         for arr in (
             self._exchange_soft_bound,
             self._exchange_soft_jn,
@@ -2023,6 +2132,198 @@ class SolverVBD(SolverBase, CouplingInterface):
         ):
             if arr is not None:
                 arr.zero_()
+
+    def _residual_assemble_particle_forces(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
+        """Assemble the full particle force vector at the substep's FINAL
+        configuration (variant D): membrane + bending + springs + body-particle
+        contacts. Fixed launch count, graph-safe. Cloth self-contact forces are
+        NOT yet assembled (self-contact-heavy scenes should keep the geometric
+        estimator); water-tight edge/face rows are likewise not yet included —
+        only single-particle contact rows are assembled."""
+        model = self.model
+        self._residual_forces.zero_()
+        pos = state_out.particle_q
+        if model.tri_indices.shape[0]:
+            wp.launch(
+                kernel=residual_assemble_membrane_forces,
+                dim=model.tri_indices.shape[0] * 3,
+                inputs=[
+                    dt,
+                    self.particle_q_prev,
+                    pos,
+                    model.tri_indices,
+                    model.tri_poses,
+                    model.tri_materials,
+                    model.tri_areas,
+                ],
+                outputs=[self._residual_forces],
+                device=self.device,
+            )
+        if model.edge_indices.shape[0]:
+            wp.launch(
+                kernel=residual_assemble_bending_forces,
+                dim=model.edge_indices.shape[0] * 4,
+                inputs=[
+                    dt,
+                    self.particle_q_prev,
+                    pos,
+                    model.edge_indices,
+                    model.edge_rest_angle,
+                    model.edge_rest_length,
+                    model.edge_bending_properties,
+                ],
+                outputs=[self._residual_forces],
+                device=self.device,
+            )
+        if model.spring_count:
+            wp.launch(
+                kernel=residual_assemble_spring_forces,
+                dim=model.spring_count,
+                inputs=[
+                    dt,
+                    model.spring_count,
+                    self.particle_q_prev,
+                    pos,
+                    model.spring_indices,
+                    model.spring_rest_length,
+                    model.spring_stiffness,
+                    model.spring_damping,
+                ],
+                outputs=[self._residual_forces],
+                device=self.device,
+            )
+        if contacts is not None and contacts.soft_contact_max and model.body_count:
+            wp.launch(
+                kernel=residual_assemble_body_contact_forces,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    dt,
+                    self.friction_epsilon,
+                    self.particle_q_prev,
+                    pos,
+                    model.particle_radius,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_primitive,
+                    self.body_particle_contact_penalty_k,
+                    self.body_particle_contact_material_kd,
+                    self.body_particle_contact_material_mu,
+                    model.shape_body,
+                    state_in.body_q,
+                    self.body_q_prev,
+                    state_in.body_qd,
+                    model.body_com,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
+                    model.shape_margin,
+                ],
+                outputs=[self._residual_forces],
+                device=self.device,
+            )
+
+    def _residual_assemble_body_forces(self, state_in: State, contacts: Contacts, dt: float):
+        """Accumulate all modeled body contact forces at the FINAL poses into
+        body_forces/body_torques (variant D body assembly): the accumulation-only
+        launches of the rigid iteration, all colors, no solve. Uses state_in
+        buffers — the in-place-evolved poses the last iteration's stored duals
+        are consistent with. Hessian buffers are written as side effects and
+        re-zeroed by the next step's rigid iteration."""
+        model = self.model
+        self.body_forces.zero_()
+        self.body_torques.zero_()
+        self.body_hessian_ll.zero_()
+        self.body_hessian_al.zero_()
+        self.body_hessian_aa.zero_()
+        if contacts is None:
+            return
+        for color_group in model.body_color_groups:
+            if model.particle_count > 0:
+                wp.launch(
+                    kernel=accumulate_body_particle_contacts_per_body,
+                    dim=color_group.size * _NUM_CONTACT_THREADS_PER_BODY,
+                    inputs=[
+                        dt,
+                        color_group,
+                        state_in.particle_q,
+                        self.particle_q_prev,
+                        model.particle_radius,
+                        model.tri_indices,
+                        self.body_q_prev,
+                        state_in.body_q,
+                        state_in.body_qd,
+                        model.body_com,
+                        self.body_inv_mass_effective,
+                        model.shape_body,
+                        self.friction_epsilon,
+                        self.body_particle_contact_penalty_k,
+                        self.body_particle_contact_material_ke,
+                        self.body_particle_contact_material_kd,
+                        self.body_particle_contact_material_mu,
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_primitive,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_body_vel,
+                        contacts.soft_contact_normal,
+                        contacts.soft_contact_barycentric,
+                        model.shape_margin,
+                        self.body_particle_contact_buffer_pre_alloc,
+                        self.body_particle_contact_counts,
+                        self.body_particle_contact_indices,
+                    ],
+                    outputs=[
+                        self.body_forces,
+                        self.body_torques,
+                        self.body_hessian_ll,
+                        self.body_hessian_al,
+                        self.body_hessian_aa,
+                    ],
+                    device=self.device,
+                )
+            wp.launch(
+                kernel=accumulate_body_body_contacts_per_body,
+                dim=color_group.size * _NUM_CONTACT_THREADS_PER_BODY,
+                inputs=[
+                    dt,
+                    color_group,
+                    self.body_q_prev,
+                    state_in.body_q,
+                    model.body_com,
+                    self.body_inv_mass_effective,
+                    self.friction_epsilon,
+                    self.body_body_contact_penalty_k,
+                    self.body_body_contact_material_ke,
+                    self.body_body_contact_material_kd,
+                    self.body_body_contact_material_mu,
+                    self.body_body_contact_lambda,
+                    self.body_body_contact_C0,
+                    self.rigid_contact_alpha,
+                    self.rigid_contact_hard,
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_offset0,
+                    contacts.rigid_contact_offset1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_margin0,
+                    contacts.rigid_contact_margin1,
+                    model.shape_body,
+                    self.body_body_contact_buffer_pre_alloc,
+                    self.body_body_contact_counts,
+                    self.body_body_contact_indices,
+                ],
+                outputs=[
+                    self.body_forces,
+                    self.body_torques,
+                    self.body_hessian_ll,
+                    self.body_hessian_al,
+                    self.body_hessian_aa,
+                ],
+                device=self.device,
+            )
 
     def _momentum_exchange(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
         """Post-finalize momentum-preserving velocity exchange over binding contacts.
@@ -2037,6 +2338,31 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         model = self.model
         inv_dt = 1.0 / dt
+        if self.rigid_body_vlost_residual:
+            # EXPERIMENTAL (see kernel doc): overwrite the geometric slots with
+            # the force-assembled residual reading — the unrealized
+            # inertia-target motion minus the modeled contact forces' share.
+            # body_forces/body_torques were assembled at the END OF THE LAST
+            # ITERATION, before that iteration's dual update (dual consistency;
+            # see _solve_rigid_body_iteration).
+            wp.launch(
+                kernel=momentum_exchange_body_vlost_residual,
+                dim=model.body_count,
+                inputs=[
+                    dt,
+                    state_out.body_q,
+                    self.body_inertia_q,
+                    model.body_com,
+                    model.body_inv_mass,
+                    model.body_inv_inertia,
+                    self.body_is_jointed,
+                    self.body_wall_bound,
+                    self.body_forces,
+                    self.body_torques,
+                ],
+                outputs=[self.body_motion_lost_rigid, self.body_motion_lost_particle],
+                device=self.device,
+            )
         wp.launch(
             kernel=momentum_exchange_build_vhat_bodies,
             dim=model.body_count,
@@ -2051,6 +2377,30 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
         if model.particle_count:
+            if self.rigid_particle_vlost_residual and self._residual_forces is not None:
+                # Variant D (particle side): replace the per-pass geometric
+                # motion_lost with the end-of-step force-residual read, gated to
+                # binding-plane normals / cap-held particles (doc Sec. 9; the
+                # per-pass recording loses mid-iteration cuts on spring-dominated
+                # DOFs — measured as the iteration-growing cloth-side leak).
+                self._residual_assemble_particle_forces(state_in, state_out, contacts, dt)
+                wp.launch(
+                    kernel=residual_gated_vlost,
+                    dim=model.particle_count,
+                    inputs=[
+                        dt,
+                        model.particle_mass,
+                        model.particle_flags,
+                        state_out.particle_q,
+                        self.inertia,
+                        self._residual_forces,
+                        self.particle_bind_normal,
+                        self.particle_cap_bound,
+                        self.particle_penalty_handed,
+                    ],
+                    outputs=[self.particle_motion_lost],
+                    device=self.device,
+                )
             wp.launch(
                 kernel=momentum_exchange_build_vhat_particles,
                 dim=model.particle_count,
@@ -2066,6 +2416,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                     inputs=[
                         contacts.soft_contact_count,
                         self._exchange_soft_bound,
+                        1.0 if self.rigid_exchange_take_gate else 0.0,
+                        self.body_motion_lost_rigid,
+                        self.body_motion_lost_particle,
+                        self.particle_motion_lost,
                         contacts.soft_contact_primitive,
                         contacts.soft_contact_barycentric,
                         contacts.soft_contact_shape,
@@ -2145,6 +2499,35 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         self._collision_detection_hook = hook
 
+    def _trailing_plane_recommit(self, state_in: State, contacts: Contacts):
+        """Trailing plane refresh: advance the DAT references to the current
+        state WITHOUT re-running detection or rebuilding contact/penalty state.
+
+        The division planes are derived from the reference states at every
+        truncation launch, so committing the references per iteration makes
+        the planes trail the realized surfaces: each iteration's plane sits
+        between the CURRENT surfaces with lambda-placed room proportional to
+        the remaining true gap — legitimate co-motion is no longer blocked
+        (the "treadmill"), while approach still decays geometrically and
+        cannot cross the partner (same argument as the mid-step commit).
+        V_lost slots and binding flags clear with the boundary (established
+        clear-at-boundary semantics). EXPERIMENTAL caveat: per-iteration
+        commits also reset the isotropic anti-tunneling cap's reference, so
+        undetected pairs get a larger per-substep motion budget — use with a
+        real detection cadence (e.g. per-substep) until a substep-total cap
+        is added."""
+        model = self.model
+        if model.particle_count > 0:
+            if self.particle_enable_self_contact:
+                self._collision_detection_penetration_free(state_in)
+            else:
+                self.pos_prev_collision_detection.assign(state_in.particle_q)
+                self.particle_displacements.zero_()
+        if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self._exchange_active(contacts):
+            self._momentum_exchange_zero()
+
     def _midstep_collision_update(self, state_in: State, contacts: Contacts):
         """Alg. 3 mid-step commit + re-detect: advance DAT references to the current
         state, refresh contacts via the hook, and rebuild body-particle contact state.
@@ -2163,6 +2546,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             # Boundary semantics v1 = "clear": bindings die with their planes and the
             # blocked motion is re-proposed against the fresh contacts (doc Sec. 2).
             self._momentum_exchange_zero()
+        if self.particle_penalty_handed is not None:
+            # Detection boundary: the handoff is re-derived against the fresh contacts.
+            self.particle_penalty_handed.zero_()
+            self.particle_pinch_plane.zero_()
+            self.particle_pinch_count.zero_()
         # Re-detect on the committed state and rebuild the dependent contact state.
         self._collision_detection_hook(state_in)
         # Seed penalties at full material stiffness (k_start=-1 -> avg_ke): the system is
@@ -2283,17 +2671,28 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.dat_body_vertex_start,
                     self.dat_body_vertices,
                     self.dat_body_vertex_radius,
+                    self.model.particle_mass,
+                    self.model.particle_radius,
+                    self.body_particle_contact_material_ke,
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_penetration_free_query_margin,
                     self._dat_pinch_exempt,
                     self._dat_parked_advance_frac,
                     self._dat_plane_locality,
+                    self._dat_soft_side,
+                    self.rigid_dat_derived_pinch_alpha,
+                    self._substep_dt,
+                    self._dat_feasible_planes,
                 ],
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
                     self._exchange_soft_bound,
+                    self.particle_bind_normal,
+                    self.particle_pinch_plane,
+                    self.particle_pinch_count,
+                    self.particle_penalty_handed,
                 ],
                 device=self.device,
             )
@@ -2306,11 +2705,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.particle_displacements,
                 self.truncation_ts,
                 max_displacement,
+                max_displacement * self._substep_cap_windows,
+                self._particle_q_substep_start,
             ],
             outputs=[
                 self.particle_displacements,
                 particle_q_out,
                 self.particle_motion_lost,
+                self.particle_cap_bound,
             ],
             device=self.device,
         )
@@ -2325,10 +2727,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_truncation_ts,
                     self.body_bounding_radius,
                     self.rigid_penetration_free_query_margin * self.rigid_conservative_bound_relaxation * 0.5,
+                    self.rigid_penetration_free_query_margin
+                    * self.rigid_conservative_bound_relaxation
+                    * 0.5
+                    * self._substep_cap_windows,
+                    self._body_q_substep_start,
                 ],
                 outputs=[
                     body_q,
                     self.body_motion_lost_particle,  # particle-phase slot
+                    self.body_wall_bound,
                 ],
                 device=self.device,
             )
@@ -2403,17 +2811,28 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.dat_body_vertex_start,
                     self.dat_body_vertices,
                     self.dat_body_vertex_radius,
+                    self.model.particle_mass,
+                    self.model.particle_radius,
+                    self.body_particle_contact_material_ke,
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_penetration_free_query_margin,
                     self._dat_pinch_exempt,
                     self._dat_parked_advance_frac,
                     self._dat_plane_locality,
+                    self._dat_soft_side,
+                    self.rigid_dat_derived_pinch_alpha,
+                    self._substep_dt,
+                    self._dat_feasible_planes,
                 ],
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
                     self._exchange_soft_bound,
+                    self.particle_bind_normal,
+                    self.particle_pinch_plane,
+                    self.particle_pinch_count,
+                    self.particle_penalty_handed,
                 ],
                 device=self.device,
             )
@@ -2427,10 +2846,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.body_truncation_ts,
                 self.body_bounding_radius,
                 self.rigid_penetration_free_query_margin * self.rigid_conservative_bound_relaxation * 0.5,
+                self.rigid_penetration_free_query_margin
+                * self.rigid_conservative_bound_relaxation
+                * 0.5
+                * self._substep_cap_windows,
+                self._body_q_substep_start,
             ],
             outputs=[
                 body_q,
                 self.body_motion_lost_rigid,  # rigid-phase slot
+                self.body_wall_bound,
             ],
             device=self.device,
         )
@@ -3068,7 +3493,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         wp.copy(state_out.particle_q, state_in.particle_q)
 
     def _solve_rigid_body_iteration(
-        self, state_in: State, state_out: State, control: Control, contacts: Contacts | None, dt: float
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts | None,
+        dt: float,
+        assemble_residual: bool = False,
     ):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).
 
@@ -3273,6 +3704,15 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         # Truncate the accumulated pose updates before the dual updates read them.
         self._rigid_penetration_free_truncation(contacts, state_in.body_q)
+
+        if assemble_residual:
+            # WFR dual-consistency (measured: assembling at exchange time, after
+            # the dual update below, reproduced only ~35 % of the true holding
+            # force on a resting body — the stored lambda is one update AHEAD of
+            # the one that produced these positions). Assemble the body forces
+            # NOW, at the final poses with the duals that actually acted; the
+            # exchange consumes the buffers unchanged after the finalize.
+            self._residual_assemble_body_forces(state_in, contacts, dt)
 
         if contacts is not None:
             contact_launch_dim = contacts.rigid_contact_max
