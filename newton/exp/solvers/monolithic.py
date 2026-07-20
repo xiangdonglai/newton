@@ -11,6 +11,8 @@ targets through the AVBD augmented-Lagrangian coupling.
 
 from __future__ import annotations
 
+import os as _os
+
 import newton
 from newton.solvers import SolverVBD
 
@@ -141,6 +143,12 @@ class MonolithicAvbdStrategy(SolverStrategy):
             vbd_kwargs["rigid_dat_derived_pinch_alpha"] = float(getattr(args, "derived_pinch_alpha", 0.0))
             vbd_kwargs["rigid_feasible_planes"] = bool(getattr(args, "feasible_planes", False))
             vbd_kwargs["rigid_substep_total_cap"] = bool(getattr(args, "substep_total_cap", False))
+            vbd_kwargs["rigid_dat_final_only"] = bool(getattr(args, "dat_final_only", False))
+            vbd_kwargs["rigid_particle_contact_hard"] = bool(getattr(args, "pairwise_contact", False))
+            vbd_kwargs["rigid_particle_hard_embed"] = float(
+                _os.environ.get("PW_EMBED", str(getattr(args, "pairwise_embed", 0.0)))
+            )
+            vbd_kwargs["rigid_particle_hard_compliance"] = float(_os.environ.get("PW_COMPLIANCE", "0.0"))
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
         if getattr(args, "momentum_exchange", False):

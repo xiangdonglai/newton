@@ -76,6 +76,7 @@ from .rigid_vbd_kernels import (
     momentum_exchange_sweep_rigid_soft,
     momentum_exchange_writeback_bodies,
     momentum_exchange_writeback_particles,
+    seed_body_particle_multipliers_from_store,
     snapshot_body_body_contact_history,
     solve_rigid_body,
     step_body_body_contact_C0_lambda,
@@ -270,6 +271,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_exchange_take_gate: bool = False,  # exchange rows fire only when a free side carries a wall-take
         rigid_feasible_planes: bool = False,  # hand a bilaterally squeezed vertex to the penalty (candidate b; needs derived_pinch_alpha > 0)
         rigid_substep_total_cap: bool = False,  # bound TOTAL motion per substep by the isotropic cap (restores the anti-tunneling budget under trailing refresh)
+        rigid_particle_contact_hard: bool = False,  # EXPERIMENTAL pairwise-contact port: AL normal multiplier on body-particle contacts
+        rigid_dat_final_only: bool = False,  # EXPERIMENTAL: run DAT truncation only on the LAST iteration (projection/safety-net mode for hard contacts)
+        rigid_particle_hard_k: float = 1.0e7,  # enforcement rate for the body-particle contact multiplier (decoupled from material ke)
+        rigid_particle_hard_compliance: float = 0.0,  # XPBD-style contact compliance [m/N]: equilibrium embedding = compliance*lambda (0 = rigid)
+        rigid_particle_hard_embed: float = 0.0,  # embedding allowance [m]: lambda enforces C >= -embed (material spring owns the band)
         rigid_dat_pinch_exemption: bool = True,  # Exempt slow pinched rigid-soft approach from truncation (anti-deadlock)
         rigid_dat_parked_antifreeze: bool = True,  # Bounded per-round advance for vertices parked on a mid-gap plane
         rigid_dat_plane_locality: bool = True,  # Limit each division plane's authority to nearby body vertices
@@ -486,6 +492,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_feasible_planes = bool(rigid_feasible_planes)
         self._dat_feasible_planes = 1.0 if self.rigid_feasible_planes else 0.0
         self.rigid_substep_total_cap = bool(rigid_substep_total_cap)
+        self.rigid_particle_contact_hard = bool(rigid_particle_contact_hard)
+        self.rigid_dat_final_only = bool(rigid_dat_final_only)
+        self.body_q_prev = getattr(self, "body_q_prev", None)
+        self._dat_skip_this_iteration = False
+        self.rigid_particle_hard_k = float(rigid_particle_hard_k)
+        self.rigid_particle_hard_compliance = float(rigid_particle_hard_compliance)
+        self.rigid_particle_hard_embed = float(rigid_particle_hard_embed)
+        self._particle_hard_k_enforce = self.rigid_particle_hard_k if self.rigid_particle_contact_hard else 0.0
         # Substep-total budget = per-launch cap x (iterations / detection interval):
         # the effective allowance the accepted NON-trailing configuration already
         # had; trailing then no longer multiplies it by the iteration count.
@@ -571,6 +585,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_wall_bound = getattr(self, "body_wall_bound", None)
         self.particle_pinch_plane = getattr(self, "particle_pinch_plane", None)
         self._body_q_substep_start = getattr(self, "_body_q_substep_start", None)
+        self.body_particle_contact_lambda = getattr(self, "body_particle_contact_lambda", None)
+        self.body_particle_contact_lambda_t = getattr(self, "body_particle_contact_lambda_t", None)
+        self.body_particle_contact_C0 = getattr(self, "body_particle_contact_C0", None)
+        self.body_particle_contact_force_applied = getattr(self, "body_particle_contact_force_applied", None)
         self._particle_q_substep_start = getattr(self, "_particle_q_substep_start", None)
         self.particle_pinch_count = getattr(self, "particle_pinch_count", None)
         self.particle_penalty_handed = getattr(self, "particle_penalty_handed", None)
@@ -1425,6 +1443,14 @@ class SolverVBD(SolverBase, CouplingInterface):
     def _init_body_particle_contact_state(self, soft_contact_max: int) -> None:
         """Allocate body-particle material arrays sized to the given soft contact capacity."""
         self.body_particle_contact_penalty_k = wp.zeros(soft_contact_max, dtype=float, device=self.device)
+        self.body_particle_contact_lambda = wp.zeros(soft_contact_max, dtype=float, device=self.device)
+        self.body_particle_contact_C0 = wp.zeros(soft_contact_max, dtype=float, device=self.device)
+        self.body_particle_contact_force_applied = wp.zeros(soft_contact_max, dtype=wp.vec3, device=self.device)
+        self.body_particle_contact_lambda_t = wp.zeros(soft_contact_max, dtype=wp.vec3, device=self.device)
+        n_p = max(1, self.model.particle_count)
+        self._bp_store_shape = wp.full((n_p, 4), -1, dtype=wp.int32, device=self.device)
+        self._bp_store_lam = wp.zeros((n_p, 4), dtype=float, device=self.device)
+        self._bp_store_lamt = wp.zeros((n_p, 4), dtype=wp.vec3, device=self.device)
         self.body_particle_contact_material_ke = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_kd = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(soft_contact_max, dtype=float, device=self.device)
@@ -2034,6 +2060,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         redetect_interval = self.rigid_collision_detection_interval
         for iter_num in range(self.iterations):
+            self._dat_skip_this_iteration = self.rigid_dat_final_only and iter_num < self.iterations - 1
             if (
                 redetect_interval >= 1
                 and iter_num > 0
@@ -2256,7 +2283,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_inv_mass_effective,
                         model.shape_body,
                         self.friction_epsilon,
+                        1.0 if self.rigid_particle_contact_hard else 0.0,
                         self.body_particle_contact_penalty_k,
+                        self.body_particle_contact_lambda,
+                        self.body_particle_contact_lambda_t,
+                        self.body_particle_contact_force_applied,
                         self.body_particle_contact_material_ke,
                         self.body_particle_contact_material_kd,
                         self.body_particle_contact_material_mu,
@@ -2613,6 +2644,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         that truncates the soft side.
         """
         rigid_dat_active = self.rigid_enable_penetration_free and contacts is not None and body_q is not None
+        if self._dat_skip_this_iteration:
+            # Projection mode: skip the PLANE CLAMPS on non-final iterations; the
+            # apply pass below still runs (it commits displacements into positions
+            # and enforces the isotropic cap — the distance-bound guard stays
+            # active every iteration).
+            rigid_dat_active = False
 
         # Max displacement between collision detections (0.5 * margin * relaxation per side);
         # displacements beyond it degenerate to isotropic truncation.
@@ -2742,6 +2779,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
 
     def _rigid_penetration_free_truncation(self, contacts: Contacts | None, body_q):
+        if self._dat_skip_this_iteration:
+            return
         """Truncate accumulated rigid pose updates against rigid-rigid and rigid-soft
         division planes (rigid-phase DAT pass).
 
@@ -3229,6 +3268,44 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         if model.particle_count > 0 and particle_refresh and contacts is not None:
             self._rebuild_body_particle_contact_state(contacts)
+            if self.rigid_particle_contact_hard and contacts is not None and model.particle_count > 0:
+                # C0 snapshot for hard body-particle contacts (restitution control).
+                wp.launch(
+                    kernel=update_duals_body_particle_contacts,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_primitive,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_normal,
+                        model.tri_indices,
+                        contacts.soft_contact_barycentric,
+                        state_in.particle_q,
+                        model.particle_radius,
+                        model.shape_body,
+                        model.shape_margin,
+                        state_in.body_q,
+                        self.body_particle_contact_material_ke,
+                        self.rigid_linear_beta,
+                        self._particle_hard_k_enforce,
+                        1.0,  # mode: snapshot C0
+                        self.rigid_contact_alpha,
+                        self.rigid_particle_hard_compliance,
+                        self.rigid_particle_hard_embed,
+                        self.body_q_prev if self.body_q_prev is not None else state_in.body_q,
+                        self.particle_q_prev,
+                        self.body_particle_contact_material_mu,
+                        self.body_particle_contact_penalty_k,
+                        self.body_particle_contact_lambda,
+                        self.body_particle_contact_lambda_t,
+                        self.body_particle_contact_C0,
+                        self._bp_store_shape,
+                        self._bp_store_lam,
+                        self._bp_store_lamt,
+                    ],
+                    device=self.device,
+                )
 
     def _rebuild_body_particle_contact_state(self, contacts: Contacts, k_start: float | None = None):
         """(Re)build per-body contact lists and AVBD body-particle contact state from
@@ -3275,6 +3352,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 soft_contact_launch_dim,
             )
             self._init_body_particle_contact_state(soft_contact_launch_dim)
+        if not self.rigid_particle_contact_hard:
+            self.body_particle_contact_lambda.zero_()
+        # Hard mode keeps lambda across contact-list rebuilds (v1 slot-persistence
+        # warm start; correct when slots are stable, e.g. persistent single pairs.
+        # Keyed warm-start matching, as body-body history does, is the general fix).
         wp.launch(
             kernel=init_body_particle_contacts,
             inputs=[
@@ -3287,9 +3369,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 model.shape_material_kd,
                 model.shape_material_mu,
                 k_start,
+                1.0 if self.rigid_particle_contact_hard else 0.0,
             ],
             outputs=[
                 self.body_particle_contact_penalty_k,
+                self.body_particle_contact_lambda,
                 self.body_particle_contact_material_kd,
                 self.body_particle_contact_material_mu,
                 self.body_particle_contact_material_ke,
@@ -3297,6 +3381,27 @@ class SolverVBD(SolverBase, CouplingInterface):
             dim=soft_contact_launch_dim,
             device=self.device,
         )
+        if self.rigid_particle_contact_hard and self.model.particle_count > 0:
+            wp.launch(
+                kernel=seed_body_particle_multipliers_from_store,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_primitive,
+                    contacts.soft_contact_shape,
+                    self.model.tri_indices,
+                    contacts.soft_contact_barycentric,
+                    0.95,  # per-rebuild decay
+                ],
+                outputs=[
+                    self.body_particle_contact_lambda,
+                    self.body_particle_contact_lambda_t,
+                    self._bp_store_shape,
+                    self._bp_store_lam,
+                    self._bp_store_lamt,
+                ],
+                device=self.device,
+            )
 
     def _solve_particle_iteration(
         self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
@@ -3352,6 +3457,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_count,
                         contacts.soft_contact_max,
                         self.body_particle_contact_penalty_k,
+                        self.body_particle_contact_lambda,
+                        self.body_particle_contact_lambda_t,
                         self.body_particle_contact_material_ke,
                         self.body_particle_contact_material_kd,
                         self.body_particle_contact_material_mu,
@@ -3372,6 +3479,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     outputs=[
                         self.particle_forces,
                         self.particle_hessians,
+                        self.body_particle_contact_force_applied,
                     ],
                     device=self.device,
                 )
@@ -3535,7 +3643,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                         body_q,
                         self.body_particle_contact_material_ke,
                         self.rigid_linear_beta,
+                        self._particle_hard_k_enforce,
+                        0.0,  # mode: normal dual update
+                        self.rigid_contact_alpha,
+                        self.rigid_particle_hard_compliance,
+                        self.rigid_particle_hard_embed,
+                        self.body_q_prev if self.body_q_prev is not None else body_q,
+                        self.particle_q_prev,
+                        self.body_particle_contact_material_mu,
                         self.body_particle_contact_penalty_k,  # input/output
+                        self.body_particle_contact_lambda,  # input/output
+                        self.body_particle_contact_lambda_t,  # input/output
+                        self.body_particle_contact_C0,
+                        self._bp_store_shape,
+                        self._bp_store_lam,
+                        self._bp_store_lamt,
                     ],
                     device=self.device,
                 )
@@ -3573,7 +3695,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_inv_mass_effective,
                         model.shape_body,
                         self.friction_epsilon,
+                        1.0 if self.rigid_particle_contact_hard else 0.0,
                         self.body_particle_contact_penalty_k,
+                        self.body_particle_contact_lambda,
+                        self.body_particle_contact_lambda_t,
+                        self.body_particle_contact_force_applied,
                         self.body_particle_contact_material_ke,
                         self.body_particle_contact_material_kd,
                         self.body_particle_contact_material_mu,
@@ -3770,7 +3896,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                         state_in.body_q,
                         self.body_particle_contact_material_ke,
                         self.rigid_linear_beta,
+                        self._particle_hard_k_enforce,
+                        0.0,  # mode: normal dual update
+                        self.rigid_contact_alpha,
+                        self.rigid_particle_hard_compliance,
+                        self.rigid_particle_hard_embed,
+                        self.body_q_prev if self.body_q_prev is not None else state_in.body_q,
+                        self.particle_q_prev,
+                        self.body_particle_contact_material_mu,
                         self.body_particle_contact_penalty_k,  # input/output
+                        self.body_particle_contact_lambda,  # input/output
+                        self.body_particle_contact_lambda_t,  # input/output
+                        self.body_particle_contact_C0,
+                        self._bp_store_shape,
+                        self._bp_store_lam,
+                        self._bp_store_lamt,
                     ],
                     device=self.device,
                 )

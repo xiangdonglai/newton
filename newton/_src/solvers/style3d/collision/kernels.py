@@ -99,6 +99,7 @@ def eval_body_contact_kernel(
             contact_normal,
             shape_margin,
             dt,
+            0.0,  # lam_n: style3d has no hard body-particle contacts
         )
         wp.atomic_add(forces, particle_idx, body_contact_force)
         wp.atomic_add(hessians, particle_idx, body_contact_hessian)

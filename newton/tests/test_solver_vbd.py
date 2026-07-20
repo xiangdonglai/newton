@@ -349,6 +349,8 @@ def _eval_body_particle_contact_damping_kernel(
         contact_normal,
         shape_margin,
         0.1,
+        0.0,
+        wp.vec3(0.0),
     )
     forces[i] = force
 
@@ -571,6 +573,8 @@ def _eval_body_particle_contact_rigid_motion_kernel(
         contact_normal,
         shape_margin,
         dt,
+        0.0,
+        wp.vec3(0.0),
     )
     body_particle_force_undamped, _body_particle_hessian_undamped = evaluate_body_particle_contact(
         sample,
@@ -594,6 +598,8 @@ def _eval_body_particle_contact_rigid_motion_kernel(
         contact_normal,
         shape_margin,
         dt,
+        0.0,
+        wp.vec3(0.0),
     )
     damping_delta_norms[sample] = wp.length(body_particle_force_damped - body_particle_force_undamped)
 
@@ -1181,6 +1187,8 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 contact_count,
                 4,
                 contact_penalty_k,
+                wp.zeros(4, dtype=float, device=device),  # lambda (hard off)
+                wp.zeros(4, dtype=wp.vec3, device=device),  # lambda_t
                 contact_material_ke,
                 contact_material_kd,
                 contact_material_mu,
@@ -1198,7 +1206,7 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 wp.zeros((1, 3), dtype=wp.int32, device=device),
                 wp.zeros(4, dtype=wp.vec3, device=device),
             ],
-            outputs=[forces, hessians],
+            outputs=[forces, hessians, wp.zeros(4, dtype=wp.vec3, device=device)],
             device=device,
         )
 
@@ -2438,6 +2446,9 @@ def _run_face_section2(device, shape_margin):
     material_ke = wp.zeros(smax, dtype=float, device=device)
     material_kd = wp.zeros(smax, dtype=float, device=device)
     material_mu = wp.zeros(smax, dtype=float, device=device)
+    contact_lambda_test = wp.zeros(smax, dtype=float, device=device)
+    contact_lambda_t_test = wp.zeros(smax, dtype=wp.vec3, device=device)
+    contact_force_applied_test = wp.zeros(smax, dtype=wp.vec3, device=device)
     wp.launch(
         init_body_particle_contacts,
         dim=smax,
@@ -2451,8 +2462,9 @@ def _run_face_section2(device, shape_margin):
             model.shape_material_kd,
             model.shape_material_mu,
             -1.0,  # k_start < 0 -> fixed-k: penalty seeded at the mixed ke (no ramp)
+            0.0,  # hard_mode off
         ],
-        outputs=[penalty_k, material_kd, material_mu, material_ke],
+        outputs=[penalty_k, contact_lambda_test, material_kd, material_mu, material_ke],
         device=device,
     )
 
@@ -2471,6 +2483,8 @@ def _run_face_section2(device, shape_margin):
             contacts.soft_contact_count,
             smax,
             penalty_k,
+            contact_lambda_test,
+            contact_lambda_t_test,
             material_ke,
             material_kd,
             material_mu,
@@ -2487,7 +2501,7 @@ def _run_face_section2(device, shape_margin):
             model.tri_indices,
             contacts.soft_contact_barycentric,
         ],
-        outputs=[forces, hessians],
+        outputs=[forces, hessians, contact_force_applied_test],
         device=device,
     )
     # Section 2 reads the same per-contact AVBD stiffness the particle path uses; with fixed-k init

@@ -1852,6 +1852,8 @@ def accumulate_contact_force_and_hessian_no_self_contact(
                 contact_normal,
                 shape_margin,
                 dt,
+                0.0,
+                wp.vec3(0.0),
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -2308,6 +2310,8 @@ def accumulate_particle_body_contact_force_and_hessian(
     body_particle_contact_max: int,
     # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
     body_particle_contact_penalty_k: wp.array[float],
+    body_particle_contact_lambda: wp.array[float],
+    body_particle_contact_lambda_t: wp.array[wp.vec3],
     body_particle_contact_material_ke: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
     body_particle_contact_material_mu: wp.array[float],
@@ -2327,6 +2331,7 @@ def accumulate_particle_body_contact_force_and_hessian(
     # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
+    body_particle_contact_force_applied: wp.array[wp.vec3],
 ):
     t_id = wp.tid()
 
@@ -2362,7 +2367,10 @@ def accumulate_particle_body_contact_force_and_hessian(
                 contact_normal,
                 shape_margin,
                 dt,
+                body_particle_contact_lambda[t_id],
+                body_particle_contact_lambda_t[t_id],
             )
+            body_particle_contact_force_applied[t_id] = body_contact_force  # apply-once slot
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
 
@@ -2402,7 +2410,10 @@ def accumulate_particle_body_contact_force_and_hessian(
             contact_normal,
             shape_margin,
             dt,
+            body_particle_contact_lambda[t_id],
+            body_particle_contact_lambda_t[t_id],
         )
+        body_particle_contact_force_applied[t_id] = ef_force  # apply-once slot
 
         for i in range(3):
             w = bary[i]
@@ -2907,6 +2918,8 @@ def accumulate_contact_force_and_hessian(
                 contact_normal,
                 shape_margin,
                 dt,
+                0.0,  # lambda_n: kernel is dead code (no launch site)
+                wp.vec3(0.0),
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -3067,6 +3080,8 @@ def residual_assemble_body_contact_forces(
         contact_normal,
         shape_margin,
         dt,
+        0.0,
+        wp.vec3(0.0),
     )
     wp.atomic_add(forces, pi, f)
 

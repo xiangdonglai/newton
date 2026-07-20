@@ -510,6 +510,35 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         "1e-2 extrudes within ~3 s.",
     )
     parser.add_argument(
+        "--pairwise-contact",
+        action="store_true",
+        dest="pairwise_contact",
+        default=False,
+        help="EXPERIMENTAL: augmented-Lagrangian hard body-particle contacts (per-contact normal "
+        "multiplier; enforcement decoupled from material stiffness). Physics by pairwise forces; "
+        "pair with --dat-final-only for the guarantee projection.",
+    )
+    parser.add_argument(
+        "--pairwise-embed",
+        type=float,
+        default=0.0,
+        dest="pairwise_embed",
+        metavar="M",
+        help="EXPERIMENTAL: embedding allowance [m] for hard body-particle contacts — the multiplier "
+        "enforces C >= -M, so the constraint sits M inside the detection surface and the contact "
+        "springs own that band. Recommended M = the query margin (0.01): the constraint then guards "
+        "the PHYSICAL surface, which is what makes firm fabric pinches geometrically possible "
+        "(measured: sustained shirt carry). 0 = constraint at radius+margin (legacy hard).",
+    )
+    parser.add_argument(
+        "--dat-final-only",
+        action="store_true",
+        dest="dat_final_only",
+        default=False,
+        help="EXPERIMENTAL: DAT plane clamps run only on the last solver iteration (projection of "
+        "the residual violation); the isotropic cap still runs every iteration. Requires --dat.",
+    )
+    parser.add_argument(
         "--substep-total-cap",
         action="store_true",
         dest="substep_total_cap",

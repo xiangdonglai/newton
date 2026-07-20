@@ -749,6 +749,8 @@ def _compute_body_particle_contact_force(
     mu: float,
     friction_epsilon: float,
     dt: float,
+    lam_n: float,
+    lam_t: wp.vec3,
 ):
     """Pure force law for body-particle contacts: normal penalty + damping + friction.
 
@@ -756,7 +758,11 @@ def _compute_body_particle_contact_force(
     resolved by the caller.  This function only computes the contact force and
     Hessian from those scalar/vector inputs.
     """
-    f_n = penetration_depth * ke
+    # lam_n: augmented-Lagrangian normal multiplier (0 when hard contacts off).
+    # penetration_depth may be SIGNED (negative = separated within the margin
+    # band): the multiplier's push then decays by ke*|separation| instead of
+    # acting at full strength through the whole band (body-body C_eff semantics).
+    f_n = wp.max(penetration_depth * ke + lam_n, 0.0)
     force = n * f_n
     hessian = ke * wp.outer(n, n)
 
@@ -765,10 +771,18 @@ def _compute_body_particle_contact_force(
         hessian = hessian + damping_hessian
         force = force - damping_hessian * relative_translation
 
-    eps_u = friction_epsilon * dt
-    friction_force, friction_hessian = compute_projected_isotropic_friction(mu, f_n, n, relative_translation, eps_u)
-    force = force + friction_force
-    hessian = hessian + friction_hessian
+    if wp.length_sq(lam_t) > 0.0:
+        # Hard rows: the accumulated tangential multiplier (cone-clamped in the
+        # duals) replaces the velocity-regularized friction — a static anchor
+        # that can truly stick (the regularized model creeps under sustained
+        # load; measured as the grasp hold-creep).
+        force = force - lam_t
+        hessian = hessian + ke * (wp.identity(3, float) - wp.outer(n, n))
+    else:
+        eps_u = friction_epsilon * dt
+        friction_force, friction_hessian = compute_projected_isotropic_friction(mu, f_n, n, relative_translation, eps_u)
+        force = force + friction_force
+        hessian = hessian + friction_hessian
 
     return force, hessian
 
@@ -795,6 +809,8 @@ def _eval_body_particle_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    lam_n: float,
+    lam_t: wp.vec3,
 ):
     """Particle-rigid contact force/Hessian - resolves geometry from arrays then
     delegates to ``_compute_body_particle_contact_force``.
@@ -816,7 +832,7 @@ def _eval_body_particle_contact(
 
     margin = shape_margin[shape_index] if shape_margin.shape[0] > 0 else 0.0
     penetration_depth = -(wp.dot(n, particle_pos - bx) - particle_radius[particle_index] - margin)
-    if penetration_depth > 0.0:
+    if penetration_depth > 0.0 or lam_n > 0.0:
         dx = particle_pos - particle_prev_pos
 
         if body_q_prev:
@@ -845,6 +861,8 @@ def _eval_body_particle_contact(
             friction_mu,
             friction_epsilon,
             dt,
+            lam_n,
+            lam_t,
         )
     else:
         return wp.vec3(0.0), wp.mat33(0.0)
@@ -874,6 +892,8 @@ def _eval_soft_ef_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    lam_n: float,
+    lam_t: wp.vec3,
 ):
     """Edge/face soft-contact force/Hessian at a barycentric contact point on a soft triangle.
 
@@ -912,7 +932,7 @@ def _eval_soft_ef_contact(
     hessian = wp.mat33(0.0)
 
     penetration_depth = -(wp.dot(n, x - bx) - radius - margin)
-    if penetration_depth > 0.0:
+    if penetration_depth > 0.0 or lam_n > 0.0:
         dx = x - x_prev
 
         if body_q_prev:
@@ -943,6 +963,8 @@ def _eval_soft_ef_contact(
             contact_mu,
             friction_epsilon,
             dt,
+            lam_n,
+            lam_t,
         )
 
     return force, hessian, bx
@@ -971,6 +993,8 @@ def evaluate_body_particle_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    lam_n: float,
+    lam_t: wp.vec3,
 ):
     """Particle-rigid contact force/Hessian with per-shape mu mixing.
 
@@ -1001,6 +1025,8 @@ def evaluate_body_particle_contact(
         contact_normal,
         shape_margin,
         dt,
+        lam_n,
+        lam_t,
     )
 
 
@@ -2451,7 +2477,9 @@ def init_body_particle_contacts(
     shape_material_mu: wp.array[float],
     k_start: float,
     # Outputs
+    hard_mode: float,
     body_particle_contact_penalty_k: wp.array[float],
+    body_particle_contact_lambda: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
     body_particle_contact_material_mu: wp.array[float],
     body_particle_contact_material_ke: wp.array[float],
@@ -2484,6 +2512,10 @@ def init_body_particle_contacts(
     body_particle_contact_material_mu[i] = avg_mu
 
     k_floor = avg_ke if k_start < 0.0 else wp.min(k_start, avg_ke)
+    # Multiplier persistence lives in the keyed per-particle store (see
+    # seed_body_particle_multipliers_from_store); rows reset per rebuild and k
+    # re-ramps from the floor (gentle within-frame growth — persistent k slammed
+    # first-contact iterations: restitution ~2 measured).
     body_particle_contact_penalty_k[i] = k_floor
 
 
@@ -2961,7 +2993,11 @@ def accumulate_body_particle_contacts_per_body(
     shape_body: wp.array[int],
     # AVBD body-particle soft contact penalties and material properties
     friction_epsilon: float,
+    hard_mode: float,
     body_particle_contact_penalty_k: wp.array[float],
+    body_particle_contact_lambda: wp.array[float],
+    body_particle_contact_lambda_t: wp.array[wp.vec3],
+    body_particle_contact_force_applied: wp.array[wp.vec3],
     body_particle_contact_material_ke: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
     body_particle_contact_material_mu: wp.array[float],
@@ -3054,7 +3090,8 @@ def accumulate_body_particle_contacts_per_body(
             s_idx = body_particle_contact_shape[contact_idx]
             margin = shape_margin[s_idx] if s_idx >= 0 and shape_margin.shape[0] > 0 else 0.0
             penetration_depth = -(wp.dot(n, particle_pos - cp_world) - radius - margin)
-            if penetration_depth <= 0.0:
+            slot_active = hard_mode > 0.0 and wp.length_sq(body_particle_contact_force_applied[contact_idx]) > 0.0
+            if penetration_depth <= 0.0 and body_particle_contact_lambda[contact_idx] <= 0.0 and not slot_active:
                 continue
 
             bx_prev = wp.transform_point(X_wb_prev, cp_local)
@@ -3071,6 +3108,8 @@ def accumulate_body_particle_contacts_per_body(
                 body_particle_contact_material_mu[contact_idx],
                 friction_epsilon,
                 dt,
+                body_particle_contact_lambda[contact_idx],
+                body_particle_contact_lambda_t[contact_idx],
             )
         else:
             # Water-tight edge/face: barycentric contact point on a soft triangle. Uses the shared
@@ -3100,8 +3139,15 @@ def accumulate_body_particle_contacts_per_body(
                 body_particle_contact_normal,
                 shape_margin,
                 dt,
+                body_particle_contact_lambda[contact_idx],
+                body_particle_contact_lambda_t[contact_idx],
             )
 
+        if hard_mode > 0.0:
+            # Apply-once: consume the force the particle phase ACTUALLY applied this
+            # iteration (Newton's third law by construction). Recomputing here reads
+            # post-flee positions and under-delivers ~20x (measured, free micro).
+            f_soft = body_particle_contact_force_applied[contact_idx]
         # Equal-and-opposite reaction on the body at the rigid contact point (shared by both kinds).
         f_body = -f_soft
         r = cp_world - com_world
@@ -3924,6 +3970,53 @@ def update_duals_body_body_contacts(
 
 
 @wp.kernel
+def seed_body_particle_multipliers_from_store(
+    body_particle_contact_count: wp.array[int],
+    body_particle_contact_particle: wp.array[int],
+    body_particle_contact_shape: wp.array[int],
+    tri_indices: wp.array2d[wp.int32],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    decay: float,
+    # outputs
+    body_particle_contact_lambda: wp.array[float],
+    body_particle_contact_lambda_t: wp.array[wp.vec3],
+    store_shape: wp.array2d[wp.int32],
+    store_lam: wp.array2d[float],
+    store_lamt: wp.array2d[wp.vec3],
+):
+    """Seed each rebuilt contact row's multipliers from the per-particle keyed
+    store (persistence across contact-list rebuilds), decaying stored values
+    and evicting near-zero entries. Rows with no stored key start at zero."""
+    idx = wp.tid()
+    c0 = body_particle_contact_count[0]
+    if idx >= c0 + body_particle_contact_count[1] + body_particle_contact_count[2]:
+        return
+    prim = body_particle_contact_particle[idx]
+    shape_idx = body_particle_contact_shape[idx]
+    key = prim
+    if idx >= c0:
+        bar = soft_contact_barycentric[idx]
+        key = tri_indices[prim, 0]
+        if bar[1] > bar[0] and bar[1] >= bar[2]:
+            key = tri_indices[prim, 1]
+        if bar[2] > bar[0] and bar[2] > bar[1]:
+            key = tri_indices[prim, 2]
+    prim = key  # lookup below uses the store key
+    lam = float(0.0)
+    lamt = wp.vec3(0.0)
+    for kk in range(4):
+        if store_shape[prim, kk] == shape_idx:
+            lam = store_lam[prim, kk] * decay
+            lamt = store_lamt[prim, kk] * decay
+            store_lam[prim, kk] = lam
+            store_lamt[prim, kk] = lamt
+            if lam < 1.0e-8 and wp.length_sq(lamt) < 1.0e-16:
+                store_shape[prim, kk] = -1  # evict
+    body_particle_contact_lambda[idx] = lam
+    body_particle_contact_lambda_t[idx] = lamt
+
+
+@wp.kernel
 def update_duals_body_particle_contacts(
     body_particle_contact_count: wp.array[int],
     body_particle_contact_particle: wp.array[int],
@@ -3939,7 +4032,21 @@ def update_duals_body_particle_contacts(
     body_q: wp.array[wp.transform],
     body_particle_contact_material_ke: wp.array[float],
     beta: float,
+    k_enforce: float,
+    mode: float,
+    alpha_c0: float,
+    compliance: float,
+    embed_offset: float,
+    body_q_prev: wp.array[wp.transform],
+    particle_q_prev: wp.array[wp.vec3],
+    body_particle_contact_material_mu: wp.array[float],
     body_particle_contact_penalty_k: wp.array[float],
+    body_particle_contact_lambda: wp.array[float],
+    body_particle_contact_lambda_t: wp.array[wp.vec3],
+    body_particle_contact_C0: wp.array[float],
+    store_shape: wp.array2d[wp.int32],
+    store_lam: wp.array2d[float],
+    store_lamt: wp.array2d[wp.vec3],
 ):
     """
     Update AVBD penalty parameters for body-particle soft contacts (per-iteration).
@@ -3981,10 +4088,127 @@ def update_duals_body_particle_contacts(
         radius = wp.max(particle_radius[v0], wp.max(particle_radius[v1], particle_radius[v2]))
 
     penetration = -(wp.dot(n, contact_pos - cp_world) - radius - margin)
+    pen_signed = penetration  # signed: negative when separated (lambda release)
+    if mode == 1.0:
+        # Snapshot pass (step start, hard mode): record the step-start violation.
+        # The lambda update then targets C - alpha*C0, so during a recovery frame
+        # (exiting a deep transient) the stabilized constraint goes negative and
+        # lambda RELEASES on the way out — this is the restitution control
+        # (without it: measured e ~ 2, ball in at -4 out at +8).
+        body_particle_contact_C0[idx] = pen_signed
+        return
     penetration = wp.max(0.0, penetration)
 
     k = body_particle_contact_penalty_k[idx]
-    body_particle_contact_penalty_k[idx] = wp.min(k + beta * penetration, stiffness)
+    if k_enforce > 0.0:
+        # Hard mode (pairwise-contact port, AVBD pattern): the penalty ramps toward
+        # the ENFORCEMENT cap k_enforce instead of stopping at the material
+        # stiffness, and the multiplier accumulates at the CURRENT penalty's rate
+        # (lambda += k*C). The same k flows to the force law as the contact
+        # stiffness/Hessian, so the local displacement stays ~ C + lambda/k —
+        # bounded. (A rate decoupled from the Hessian explodes light particles:
+        # measured NaN on 2e-6 kg cloth at rate 1e7.)
+        k_new = wp.min(k + beta * penetration, wp.max(stiffness, k_enforce))
+        body_particle_contact_penalty_k[idx] = k_new
+        lam = body_particle_contact_lambda[idx]
+        # SIGNED update; on separation (pen_signed < 0) release at a rate at
+        # least a fraction of the enforcement cap — with k re-ramping from a
+        # (possibly weak-material) floor each rebuild, releasing at k_new alone
+        # left stale lambda pushing for many frames (measured v1.4: lambda 81
+        # vs k 1 pushed full-strength 30 mm past separation).
+        c_stab = pen_signed - alpha_c0 * wp.max(body_particle_contact_C0[idx], 0.0)
+        if pen_signed < 0.0:
+            c_stab = pen_signed  # full-rate release on true separation
+        # Two-tier contact: the multiplier enforces C >= -embed_offset — the
+        # material spring owns the embedding band (the baseline's grip physics),
+        # lambda guards only deeper penetration. embed_offset = 0 -> pure hard.
+        c_stab = c_stab - embed_offset
+        if pen_signed - embed_offset < 0.0 and pen_signed >= 0.0:
+            c_stab = wp.min(c_stab, pen_signed - embed_offset)  # release toward the band
+        # Constraint compliance (XPBD-style): enforce C >= -compliance*lambda.
+        # At equilibrium lambda = C/compliance — a pairwise spring of stiffness
+        # 1/compliance: the soft-shell EMBEDDING the tuned baseline's grip
+        # relied on returns as a modeled material property (grasp retention
+        # lever). compliance = 0 -> rigid (unchanged).
+        c_stab = c_stab - compliance * body_particle_contact_lambda[idx]
+        k_rate = k_new
+        if c_stab < 0.0:
+            k_rate = wp.max(k_new, 0.05 * k_enforce)
+        lam_n_new = wp.max(0.0, lam + k_rate * c_stab)
+        body_particle_contact_lambda[idx] = lam_n_new
+
+        # Tangential multiplier (stick friction): accumulate against the per-step
+        # relative tangential displacement of the contact pair; Coulomb cone clamp.
+        key = prim  # store key: particle id (particle rows)
+        if idx >= c0:
+            # EF rows: tangential anchors at the barycentric point (the fold's
+            # pad contact is EF-dominated — measured: only ~6 particle-row
+            # anchors carried the whole fold). Store keyed by max-weight vertex.
+            bar = soft_contact_barycentric[idx]
+            v0 = tri_indices[prim, 0]
+            v1 = tri_indices[prim, 1]
+            v2 = tri_indices[prim, 2]
+            key = v0
+            if bar[1] > bar[0] and bar[1] >= bar[2]:
+                key = v1
+            if bar[2] > bar[0] and bar[2] > bar[1]:
+                key = v2
+        if body_idx >= 0:
+            # Dynamic partners only (statics keep regularized friction).
+            if idx < c0:
+                q_prev = particle_q_prev[prim]
+            else:
+                bar = soft_contact_barycentric[idx]
+                q_prev = (
+                    bar[0] * particle_q_prev[tri_indices[prim, 0]]
+                    + bar[1] * particle_q_prev[tri_indices[prim, 1]]
+                    + bar[2] * particle_q_prev[tri_indices[prim, 2]]
+                )
+            q_cur = contact_pos
+            X_wb_prev = wp.transform_identity()
+            if body_idx >= 0:
+                X_wb_prev = body_q_prev[body_idx]
+            cpw_prev = wp.transform_point(X_wb_prev, body_particle_contact_body_pos[idx])
+            u = (q_cur - q_prev) - (cp_world - cpw_prev)
+            u_t = u - n * wp.dot(n, u)
+            lam_t = body_particle_contact_lambda_t[idx] + k_new * u_t
+            # Cone from the TOTAL normal force (spring + multiplier): with the
+            # cone on lambda_n alone, rows whose load is spring-carried had
+            # cone = 0 -> NO friction at all (the 8-particle pinch instrument
+            # caught it: strip rides the lift, then creeps out with lam_t = 0).
+            f_n_total = wp.max(k_new * penetration + lam_n_new, 0.0)
+            cone = body_particle_contact_material_mu[idx] * f_n_total
+            lt = wp.length(lam_t)
+            if lt > cone:
+                if lt > 0.0:
+                    lam_t = lam_t * (cone / lt)
+            body_particle_contact_lambda_t[idx] = lam_t
+        else:
+            # Static partner: clear any stale anchor from a reused slot.
+            body_particle_contact_lambda_t[idx] = wp.vec3(0.0)
+
+        # Keyed persistence: write the row's multipliers to the per-particle
+        # store under the shape id, so per-frame contact-list rebuilds cannot
+        # scramble which multiplier belongs to which pair (the measured grasp
+        # blocker). Linear probe over K entries; claim-on-miss (benign race:
+        # duplicate keys converge to one entry over iterations).
+        if store_shape:
+            hit = int(-1)
+            free = int(-1)
+            for kk in range(4):
+                sid = store_shape[key, kk]
+                if sid == shape_idx:
+                    hit = kk
+                if sid < 0 and free < 0:
+                    free = kk
+            if hit < 0 and free >= 0:
+                store_shape[key, free] = shape_idx
+                hit = free
+            if hit >= 0:
+                store_lam[key, hit] = lam_n_new
+                store_lamt[key, hit] = body_particle_contact_lambda_t[idx]
+    else:
+        body_particle_contact_penalty_k[idx] = wp.min(k + beta * penetration, stiffness)
 
 
 # -----------------------------
