@@ -590,6 +590,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_particle_vlost_residual: bool = False,  # Particle V_lost via end-of-step force residual (variant D)
         rigid_body_vlost_residual: bool = False,  # EXPERIMENTAL: body V_lost = unrealized inertia-target motion (no force assembly)
         rigid_dat_trailing_refresh: bool = False,  # EXPERIMENTAL: per-iteration pair-plane recommit (trailing planes)
+        rigid_dat_adaptive: bool = False,  # EXPERIMENTAL: adaptive truncation — mid-loop plane clamps fire per row only when forces are provably losing (extrapolated approach crosses the normal-flip budget before the final projection); final iteration always clamps. Requires per-iteration references (trailing refresh).
+        rigid_dat_adaptive_budget: float = 0.05,  # trigger deadband as a fraction of the particle radius: must exceed controller-motion pending (~0.2 mm at robot speeds) and stay far under impact pending (~13 mm at 8 m/s)
         rigid_dat_soft_side: bool = True,  # EXPERIMENTAL when False: one-sided planes (constrain the rigid side only)
         rigid_dat_derived_pinch_alpha: float = 0.0,  # >0: derived pinch gate v_safe = alpha*(r+margin)*sqrt(ke/m) (candidate 4)
         rigid_exchange_take_gate: bool = False,  # exchange rows fire only when a free side carries a wall-take
@@ -809,6 +811,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_particle_vlost_residual = bool(rigid_particle_vlost_residual)
         self.rigid_body_vlost_residual = bool(rigid_body_vlost_residual)
         self.rigid_dat_trailing_refresh = bool(rigid_dat_trailing_refresh)
+        self.rigid_dat_adaptive = bool(rigid_dat_adaptive)
+        self.rigid_dat_adaptive_budget = float(rigid_dat_adaptive_budget)
+        self._dat_adaptive_remaining = 0.0
+        self._dat_adaptive_time_left = 0.0
+        self._dat_adaptive_particle_qd = None
+        self._dat_adaptive_body_qd = None
+        self._dat_adaptive_fire_count = None
         # NEWTON_EXCH_ACCUM: accumulate clamp-deleted motion across launches within
         # a substep (instead of overwrite). Read once at init (graph-safe).
         self._motion_lost_accumulate = 1.0 if _os.environ.get("NEWTON_EXCH_ACCUM") else 0.0
@@ -2375,6 +2384,23 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.particle_pinch_count.zero_()
         if self.rigid_enable_penetration_free and self.model.body_count > 0:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self.rigid_dat_adaptive:
+            # SNAPSHOT substep-start velocities for the adaptive trigger:
+            # state_in velocities are overwritten during the solve (measured
+            # in the momentum-projection investigation), so refs are tainted.
+            if self._dat_adaptive_particle_qd is None and self.model.particle_count:
+                self._dat_adaptive_particle_qd = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
+            if self._dat_adaptive_body_qd is None and self.model.body_count:
+                self._dat_adaptive_body_qd = wp.zeros(
+                    self.model.body_count, dtype=wp.spatial_vector, device=self.device
+                )
+            if self._dat_adaptive_particle_qd is not None:
+                wp.copy(dest=self._dat_adaptive_particle_qd, src=state_in.particle_qd)
+            if self._dat_adaptive_body_qd is not None:
+                wp.copy(dest=self._dat_adaptive_body_qd, src=state_in.body_qd)
+            if getattr(self, "_dat_adaptive_fire_count", None) is None:
+                self._dat_adaptive_fire_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._dat_adaptive_fire_count.zero_()
         if self._body_q_substep_start is not None:
             wp.copy(dest=self._body_q_substep_start, src=state_in.body_q)
             if self._particle_q_substep_start is not None:
@@ -2466,6 +2492,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         redetect_interval = self.rigid_collision_detection_interval
         for iter_num in range(self.iterations):
             self._dat_skip_this_iteration = self.rigid_dat_final_only and iter_num < self.iterations - 1
+            if self.rigid_dat_adaptive:
+                # adaptive mode launches the clamps every iteration; the kernel
+                # skips rows whose forces are not provably losing.
+                self._dat_skip_this_iteration = False
+                self._dat_adaptive_remaining = float(self.iterations - 1 - iter_num)
+                self._dat_adaptive_time_left = self._substep_dt  # full-horizon (v4): no shrinking escape window
             if (
                 redetect_interval >= 1
                 and iter_num > 0
@@ -3264,6 +3296,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
+    def _dat_adaptive_fire_fallback(self):
+        if getattr(self, "_dat_adaptive_fire_count", None) is None:
+            self._dat_adaptive_fire_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        return self._dat_adaptive_fire_count
+
     def _penetration_free_truncation(self, particle_q_out=None, contacts: Contacts | None = None, body_q=None):
         """
         Modify displacements_in in-place, also modify particle_q if its not None.
@@ -3351,6 +3388,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_dat_derived_pinch_alpha,
                     self._substep_dt,
                     self._dat_feasible_planes,
+                    1.0 if self.rigid_dat_adaptive else 0.0,
+                    self._dat_adaptive_remaining,
+                    self.rigid_dat_adaptive_budget,
+                    self._dat_adaptive_time_left,
+                    self._dat_adaptive_particle_qd,
+                    self._dat_adaptive_body_qd,
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -3360,6 +3403,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.particle_pinch_plane,
                     self.particle_pinch_count,
                     self.particle_penalty_handed,
+                    self._dat_adaptive_fire_count
+                    if self._dat_adaptive_fire_count is not None
+                    else self._dat_adaptive_fire_fallback(),
                 ],
                 device=self.device,
             )
@@ -3495,6 +3541,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_dat_derived_pinch_alpha,
                     self._substep_dt,
                     self._dat_feasible_planes,
+                    1.0 if self.rigid_dat_adaptive else 0.0,
+                    self._dat_adaptive_remaining,
+                    self.rigid_dat_adaptive_budget,
+                    self._dat_adaptive_time_left,
+                    self._dat_adaptive_particle_qd,
+                    self._dat_adaptive_body_qd,
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -3504,6 +3556,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.particle_pinch_plane,
                     self.particle_pinch_count,
                     self.particle_penalty_handed,
+                    self._dat_adaptive_fire_count
+                    if self._dat_adaptive_fire_count is not None
+                    else self._dat_adaptive_fire_fallback(),
                 ],
                 device=self.device,
             )

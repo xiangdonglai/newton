@@ -469,6 +469,16 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         "normals and cap-held particles. Experimental; requires --momentum-exchange.",
     )
     parser.add_argument(
+        "--dat-adaptive",
+        action="store_true",
+        dest="dat_adaptive",
+        default=False,
+        help="EXPERIMENTAL: adaptive truncation — mid-loop DAT clamps fire per contact only when the "
+        "forces are provably losing (extrapolated approach crosses the normal-flip budget before the "
+        "final projection); the final iteration always clamps. One schedule for impacts AND pinches. "
+        "Requires --dat and --trailing-refresh.",
+    )
+    parser.add_argument(
         "--trailing-refresh",
         action="store_true",
         dest="trailing_refresh",

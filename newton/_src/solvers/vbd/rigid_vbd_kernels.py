@@ -4768,6 +4768,12 @@ def apply_rigid_soft_truncation(
     derived_pinch_alpha: float,
     pinch_dt: float,
     feasible_planes: float,
+    adaptive_mode: float,
+    adaptive_remaining: float,
+    adaptive_budget_frac: float,
+    adaptive_time_left: float,
+    particle_qd: wp.array[wp.vec3],
+    body_qd: wp.array[wp.spatial_vector],
     # outputs
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
@@ -4776,6 +4782,7 @@ def apply_rigid_soft_truncation(
     particle_pinch_plane: wp.array2d[wp.vec4],
     particle_pinch_count: wp.array[wp.int32],
     particle_penalty_handed: wp.array[float],
+    adaptive_fire_count: wp.array[wp.int32],
 ):
     """Joint DAT truncation for one rigid-soft contact: build the division plane from the
     reference configuration and atomically min-reduce the truncation scalars of the soft
@@ -4857,6 +4864,31 @@ def apply_rigid_soft_truncation(
         anchor_end = rigid_point_trajectory(1.0, c0, dx_body, rot_axis, rot_angle, bx0 - c0)
         rigid_shift = wp.dot(n, anchor_end - bx0)
     delta_rigid = wp.max(rigid_shift, 0.0)
+
+    if adaptive_mode != 0.0 and adaptive_remaining > 0.0:
+        # ADAPTIVE TRUNCATION v4 — "forces provably losing" on the RIGID side's
+        # pending approach over the FULL substep horizon: fire iff the rigid
+        # anchor's closing velocity times the substep dt exceeds the current
+        # gap plus the normal-flip budget (a fraction of the particle radius).
+        # Rigid-side-only excludes cloth membrane-wave transients (measured
+        # misfires -> pinch ejection with the v2 relative-velocity form); the
+        # full-horizon dt removes the shrinking escape window (measured
+        # tunneling with the v2 time-left form). Statics never fire (anchor
+        # velocity zero); pinch pads close at mm/s (<< budget) and never fire,
+        # so the frozen-pinch deadlock cannot form; a fast body fires from
+        # first detection and gets per-iteration clamping. Final iteration
+        # always clamps (adaptive_remaining == 0 skips this block).
+        v_anchor = wp.vec3(0.0)
+        if body_index >= 0:
+            qd_b = body_qd[body_index]
+            r_a = bx0 - wp.transform_point(X_wb_ref, body_com[body_index])
+            v_anchor = wp.vec3(qd_b[0], qd_b[1], qd_b[2]) + wp.cross(wp.vec3(qd_b[3], qd_b[4], qd_b[5]), r_a)
+        v_close = wp.max(wp.dot(n, v_anchor), 0.0)  # n points rigid -> soft
+        budget = adaptive_budget_frac * particle_radius[v0]
+        if v_close * adaptive_time_left <= gap + budget:
+            return
+        if lane == 0:
+            wp.atomic_add(adaptive_fire_count, 0, 1)
 
     if delta_soft + delta_rigid == 0.0:
         lmbd = 0.5

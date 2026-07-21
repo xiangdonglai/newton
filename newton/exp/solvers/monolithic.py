@@ -128,6 +128,8 @@ class MonolithicAvbdStrategy(SolverStrategy):
             # ones; raise the per-body soft-contact buffer so they are not dropped
             # (the default 256 overflows to ~400 on the shirt-pick grasp).
             vbd_kwargs["rigid_body_particle_contact_buffer_size"] = 2048
+        if getattr(args, "dat_adaptive", False):
+            vbd_kwargs["rigid_dat_adaptive"] = True
         if getattr(args, "dat", False):
             # Rigid DAT penetration-free truncation: cap rigid pose updates and cloth
             # displacements against per-contact division planes so the gripper cannot
