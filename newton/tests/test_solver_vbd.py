@@ -3078,6 +3078,7 @@ def test_exchange_vlost_slot_recording(test, device):
                 max_disp,
                 max_disp,
                 None,
+                0.0,
             ],
             outputs=[body_q, lost, None],
             device=device,
@@ -3139,7 +3140,7 @@ def test_exchange_disjoint_tranches(test, device):
         wp.launch(
             kernel=apply_body_truncation_ts,
             dim=1,
-            inputs=[q_ref, com, ts, radius, 1.0e6, 1.0e6, None],
+            inputs=[q_ref, com, ts, radius, 1.0e6, 1.0e6, None, 0.0],
             outputs=[body_q, slot, None],
             device=device,
         )

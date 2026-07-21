@@ -2254,6 +2254,7 @@ def apply_truncation_ts(
     max_displacement: float,
     max_total_displacement: float,
     pos_substep_start: wp.array[wp.vec3],
+    accumulate_motion_lost: float,
     displacement_out: wp.array[wp.vec3],
     pos_out: wp.array[wp.vec3],
     motion_lost_out: wp.array[wp.vec3],
@@ -2289,9 +2290,14 @@ def apply_truncation_ts(
     if pos_out:
         pos_out[i] = pos[i] + particle_displacement
     if motion_lost_out:
-        # Motion deleted by this launch (truncation + clamp), overwritten each launch;
-        # consumed by the momentum-exchange pass (divided by dt at finalize).
-        motion_lost_out[i] = disp_in - particle_displacement
+        # Motion deleted by this launch (truncation + clamp); overwritten each launch
+        # by default, or ACCUMULATED across launches within the substep (fixes the
+        # momentum exchange's core defect: earlier iterations' cuts were lost).
+        lost = disp_in - particle_displacement
+        if accumulate_motion_lost != 0.0:
+            motion_lost_out[i] = motion_lost_out[i] + lost
+        else:
+            motion_lost_out[i] = lost
 
 
 @wp.kernel

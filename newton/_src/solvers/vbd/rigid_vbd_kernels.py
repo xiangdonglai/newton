@@ -5247,6 +5247,7 @@ def apply_body_truncation_ts(
     max_point_displacement: float,
     max_total_point_displacement: float,
     body_q_substep_start: wp.array[wp.transform],
+    accumulate_motion_lost: float,
     # input/output
     body_q: wp.array[wp.transform],
     # outputs
@@ -5280,7 +5281,11 @@ def apply_body_truncation_ts(
 
     if body_motion_lost:
         lost = wp.max(0.0, 1.0 - t)
-        body_motion_lost[b] = wp.spatial_vector(dx * lost, axis * (angle * lost))
+        lost_v = wp.spatial_vector(dx * lost, axis * (angle * lost))
+        if accumulate_motion_lost != 0.0:
+            body_motion_lost[b] = body_motion_lost[b] + lost_v
+        else:
+            body_motion_lost[b] = lost_v
     if body_wall_bound:
         if t < 1.0:
             # Truncation (plane or cap) actually held this body this pass:

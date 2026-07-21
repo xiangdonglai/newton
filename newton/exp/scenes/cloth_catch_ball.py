@@ -87,6 +87,7 @@ class ClothCatchBallScene(Scene):
         super().__init__(args)
         self.impact_speed = float(getattr(args, "impact_speed", 2.0))
         self.contact_ke = float(getattr(args, "contact_ke", 1.0e4))
+        self.contact_kd = float(getattr(args, "contact_kd", 1.0))
         self.cloth_mass = CLOTH_DENSITY * CLOTH_SIZE * CLOTH_SIZE
         self.ball_mass = self.cloth_mass  # equal masses: analytic capture at v0/2
         self._ball = -1
@@ -209,6 +210,12 @@ class ClothCatchBallScene(Scene):
         # has something to repair (and without --dat the ball tunnels).
         mats["soft_contact_ke"] = self.contact_ke
         mats["shape_material_ke"] = self.contact_ke
+        # At the default weak ke the damping term (kd/dt) IS the dominant
+        # contact force; measured 2026-07-20: with --contact-kd 0 the ball
+        # tunnels straight through the near-motionless sheet, and the
+        # low-iteration momentum leak scales with kd (see unification log).
+        mats["soft_contact_kd"] = self.contact_kd
+        mats["shape_material_kd"] = self.contact_kd
         return mats
 
     def solver_overrides(self, solver_key):
@@ -245,6 +252,15 @@ class ClothCatchBallScene(Scene):
             default=8.0,
             dest="impact_speed",
             help="Ball speed along +x [m/s] (keep below the DAT motion cap, ~10 m/s at 40 substeps).",
+        )
+        parser.add_argument(
+            "--contact-kd",
+            type=float,
+            default=1.0,
+            dest="contact_kd",
+            help="Ball-cloth contact damping. At the default weak ke this is the dominant contact "
+            "force: 0 makes the ball tunnel through the sheet; the momentum leak at low iteration "
+            "counts scales with it (damping momentum is only realized at solver convergence).",
         )
         parser.add_argument(
             "--contact-ke",

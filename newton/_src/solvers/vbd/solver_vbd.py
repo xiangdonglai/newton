@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os as _os
 import warnings
 from typing import Any
 
@@ -100,6 +101,329 @@ from .vbd_coupling_kernels import (
 )
 
 __all__ = ["SolverVBD"]
+
+
+@wp.kernel
+def _zero_ef_row_kd(soft_contact_count: wp.array[wp.int32], material_kd: wp.array[wp.float32]):
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 and i < c0 + soft_contact_count[1] + soft_contact_count[2]:
+        material_kd[i] = 0.0
+
+
+@wp.kernel
+def _pcorr_sum_particles(
+    qd: wp.array[wp.vec3],
+    mass: wp.array[float],
+    p_out: wp.array[wp.vec3],
+    m_out: wp.array[float],
+):
+    i = wp.tid()
+    m = mass[i]
+    if m > 0.0:
+        wp.atomic_add(p_out, 0, qd[i] * m)
+        wp.atomic_add(m_out, 0, m)
+
+
+@wp.kernel
+def _pcorr_sum_bodies(
+    qd: wp.array[wp.spatial_vector],
+    inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    p_out: wp.array[wp.vec3],
+    m_out: wp.array[float],
+):
+    b = wp.tid()
+    if jointed[b] != 0:
+        return
+    im = inv_mass[b]
+    if im <= 0.0:
+        return
+    m = 1.0 / im
+    v = wp.vec3(qd[b][0], qd[b][1], qd[b][2])
+    wp.atomic_add(p_out, 0, v * m)
+    wp.atomic_add(m_out, 0, m)
+
+
+@wp.kernel
+def _pcorr_dv(
+    p_start: wp.array[wp.vec3],
+    p_end: wp.array[wp.vec3],
+    m_tot: wp.array[float],
+    gravity: wp.array[wp.vec3],
+    jext: wp.array[wp.vec3],
+    anchored: wp.array[wp.int32],
+    dt: float,
+    dv: wp.array[wp.vec3],
+):
+    scale = 1.0 - float(wp.min(anchored[0], 1))
+    dv[0] = (p_start[0] + gravity[0] * (m_tot[0] * dt) + jext[0] - p_end[0]) * (scale / wp.max(m_tot[0], 1.0e-12))
+
+
+@wp.kernel
+def _pcorr_apply_particles(dv: wp.array[wp.vec3], mass: wp.array[float], qd: wp.array[wp.vec3]):
+    i = wp.tid()
+    if mass[i] > 0.0:
+        qd[i] = qd[i] + dv[0]
+
+
+@wp.kernel
+def _pcorr_apply_bodies(
+    dv: wp.array[wp.vec3],
+    inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    qd: wp.array[wp.spatial_vector],
+):
+    b = wp.tid()
+    if jointed[b] != 0 or inv_mass[b] <= 0.0:
+        return
+    d = dv[0]
+    qd[b] = qd[b] + wp.spatial_vector(d[0], d[1], d[2], 0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _pcorr_sum_jext(
+    soft_contact_count: wp.array[wp.int32],
+    force_applied: wp.array[wp.vec3],
+    contact_shape: wp.array[wp.int32],
+    contact_primitive: wp.array[wp.int32],
+    contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_q: wp.array[wp.vec3],
+    shape_body: wp.array[wp.int32],
+    body_is_jointed: wp.array[wp.int32],
+    dt: float,
+    jext: wp.array[wp.vec3],
+    tau_ext: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b >= 0 and body_is_jointed[b] == 0:
+        return  # free-body partner: internal to the free system
+    prim = contact_primitive[i]
+    if prim < 0:
+        return
+    if i < c0:
+        x = particle_q[prim]
+    else:
+        bary = contact_barycentric[i]
+        x = bary[0] * particle_q[tri_indices[prim, 0]]
+        x += bary[1] * particle_q[tri_indices[prim, 1]]
+        x += bary[2] * particle_q[tri_indices[prim, 2]]
+    imp = force_applied[i] * dt
+    wp.atomic_add(jext, 0, imp)
+    wp.atomic_add(tau_ext, 0, wp.cross(x, imp))
+
+
+@wp.kernel
+def _pcorr_ang_particles(
+    q: wp.array[wp.vec3],
+    qd: wp.array[wp.vec3],
+    mass: wp.array[float],
+    L_out: wp.array[wp.vec3],
+    mx_out: wp.array[wp.vec3],
+    I0: wp.array[wp.vec3],
+    I1: wp.array[wp.vec3],
+    I2: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    m = mass[i]
+    if m <= 0.0:
+        return
+    x = q[i]
+    wp.atomic_add(L_out, 0, wp.cross(x, qd[i] * m))
+    wp.atomic_add(mx_out, 0, x * m)
+    r2 = wp.dot(x, x)
+    wp.atomic_add(I0, 0, wp.vec3(m * (r2 - x[0] * x[0]), -m * x[0] * x[1], -m * x[0] * x[2]))
+    wp.atomic_add(I1, 0, wp.vec3(-m * x[1] * x[0], m * (r2 - x[1] * x[1]), -m * x[1] * x[2]))
+    wp.atomic_add(I2, 0, wp.vec3(-m * x[2] * x[0], -m * x[2] * x[1], m * (r2 - x[2] * x[2])))
+
+
+@wp.kernel
+def _pcorr_ang_bodies(
+    body_q: wp.array[wp.transform],
+    qd: wp.array[wp.spatial_vector],
+    inv_mass: wp.array[float],
+    inv_inertia: wp.array[wp.mat33],
+    body_com: wp.array[wp.vec3],
+    jointed: wp.array[wp.int32],
+    L_out: wp.array[wp.vec3],
+    mx_out: wp.array[wp.vec3],
+    I0: wp.array[wp.vec3],
+    I1: wp.array[wp.vec3],
+    I2: wp.array[wp.vec3],
+):
+    b = wp.tid()
+    if jointed[b] != 0:
+        return
+    im = inv_mass[b]
+    if im <= 0.0:
+        return
+    m = 1.0 / im
+    x = wp.transform_point(body_q[b], body_com[b])
+    v = wp.vec3(qd[b][0], qd[b][1], qd[b][2])
+    w = wp.vec3(qd[b][3], qd[b][4], qd[b][5])
+    R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[b]))
+    I_w = R @ wp.inverse(inv_inertia[b]) @ wp.transpose(R)
+    wp.atomic_add(L_out, 0, wp.cross(x, v * m) + I_w @ w)
+    wp.atomic_add(mx_out, 0, x * m)
+    r2 = wp.dot(x, x)
+    wp.atomic_add(
+        I0,
+        0,
+        wp.vec3(m * (r2 - x[0] * x[0]), -m * x[0] * x[1], -m * x[0] * x[2]) + wp.vec3(I_w[0, 0], I_w[0, 1], I_w[0, 2]),
+    )
+    wp.atomic_add(
+        I1,
+        0,
+        wp.vec3(-m * x[1] * x[0], m * (r2 - x[1] * x[1]), -m * x[1] * x[2]) + wp.vec3(I_w[1, 0], I_w[1, 1], I_w[1, 2]),
+    )
+    wp.atomic_add(
+        I2,
+        0,
+        wp.vec3(-m * x[2] * x[0], -m * x[2] * x[1], m * (r2 - x[2] * x[2])) + wp.vec3(I_w[2, 0], I_w[2, 1], I_w[2, 2]),
+    )
+
+
+@wp.kernel
+def _pcorr_ang_dv(
+    L_start: wp.array[wp.vec3],
+    L_end: wp.array[wp.vec3],
+    mx: wp.array[wp.vec3],
+    m_tot: wp.array[float],
+    I0: wp.array[wp.vec3],
+    I1: wp.array[wp.vec3],
+    I2: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    tau_ext: wp.array[wp.vec3],
+    anchored: wp.array[wp.int32],
+    dt: float,
+    com_out: wp.array[wp.vec3],
+    domega: wp.array[wp.vec3],
+):
+    m = wp.max(m_tot[0], 1.0e-12)
+    com = mx[0] / m
+    com_out[0] = com
+    # expected dL about origin: gravity torque (com x Mg) + external contact torque
+    dL = L_start[0] + wp.cross(com, gravity[0] * m) * dt + tau_ext[0] - L_end[0]
+    # shift the residual to the COM frame is unnecessary for the SOLVE if we
+    # build I about the COM: I_com = I_origin - m*(|com|^2 I - com com^T)
+    r2 = wp.dot(com, com)
+    Ic = wp.mat33(
+        I0[0][0] - m * (r2 - com[0] * com[0]),
+        I0[0][1] + m * com[0] * com[1],
+        I0[0][2] + m * com[0] * com[2],
+        I1[0][0] + m * com[1] * com[0],
+        I1[0][1] - m * (r2 - com[1] * com[1]),
+        I1[0][2] + m * com[1] * com[2],
+        I2[0][0] + m * com[2] * com[0],
+        I2[0][1] + m * com[2] * com[1],
+        I2[0][2] - m * (r2 - com[2] * com[2]),
+    )
+    # a rigid-rotation field about the COM changes L(origin) by Ic*domega
+    # (its linear momentum is zero), so solve Ic*domega = dL_residual where
+    # dL_residual is dL evaluated about the COM = dL(origin) - com x dp; the
+    # linear projection has already zeroed dp, so dL_com = dL(origin).
+    domega[0] = (wp.inverse(Ic) @ dL) * (1.0 - float(wp.min(anchored[0], 1)))
+
+
+@wp.kernel
+def _pcorr_ang_apply_particles(
+    domega: wp.array[wp.vec3],
+    com: wp.array[wp.vec3],
+    q: wp.array[wp.vec3],
+    mass: wp.array[float],
+    qd: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    if mass[i] > 0.0:
+        qd[i] = qd[i] + wp.cross(domega[0], q[i] - com[0])
+
+
+@wp.kernel
+def _pcorr_ang_apply_bodies(
+    domega: wp.array[wp.vec3],
+    com: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    inv_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    jointed: wp.array[wp.int32],
+    qd: wp.array[wp.spatial_vector],
+):
+    b = wp.tid()
+    if jointed[b] != 0 or inv_mass[b] <= 0.0:
+        return
+    x = wp.transform_point(body_q[b], body_com[b])
+    dv = wp.cross(domega[0], x - com[0])
+    dw = domega[0]
+    qd[b] = qd[b] + wp.spatial_vector(dv[0], dv[1], dv[2], dw[0], dw[1], dw[2])
+
+
+@wp.kernel
+def _e0_accum_body_contact_force(
+    soft_contact_count: wp.array[wp.int32],
+    force_applied: wp.array[wp.vec3],
+    contact_shape: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    F_out: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    if i >= soft_contact_count[0] + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b < 0:
+        return
+    wp.atomic_add(F_out, b, -force_applied[i])  # reaction of the particle-side force
+
+
+@wp.kernel
+def _e0_vhat_bodies_from_forces(
+    qd_start: wp.array[wp.spatial_vector],
+    F: wp.array[wp.vec3],
+    inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    dt: float,
+    vhat: wp.array[wp.spatial_vector],
+):
+    b = wp.tid()
+    if jointed[b] != 0 or inv_mass[b] <= 0.0:
+        return  # jointed/static keep realized end-state vhat (kinematic boundary)
+    v = wp.vec3(qd_start[b][0], qd_start[b][1], qd_start[b][2]) + (gravity[0] + F[b] * inv_mass[b]) * dt
+    vhat[b] = wp.spatial_vector(v[0], v[1], v[2], qd_start[b][3], qd_start[b][4], qd_start[b][5])
+
+
+@wp.kernel
+def _pcorr_anchor_flag(
+    soft_contact_count: wp.array[wp.int32],
+    bound: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    jointed: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if i >= soft_contact_count[0] + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    # Isolation keys on CONTACT EXISTENCE with an external partner, not on
+    # binding: a pinch held purely by forces (no clamp cuts this substep) is
+    # still momentum-coupled to the robot (measured: keying on bindings let a
+    # force-held grasp launch the cloth).
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b < 0 or jointed[b] != 0:
+        anchored[0] = 1
 
 
 class SolverVBD(SolverBase, CouplingInterface):
@@ -485,6 +809,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_particle_vlost_residual = bool(rigid_particle_vlost_residual)
         self.rigid_body_vlost_residual = bool(rigid_body_vlost_residual)
         self.rigid_dat_trailing_refresh = bool(rigid_dat_trailing_refresh)
+        # NEWTON_EXCH_ACCUM: accumulate clamp-deleted motion across launches within
+        # a substep (instead of overwrite). Read once at init (graph-safe).
+        self._motion_lost_accumulate = 1.0 if _os.environ.get("NEWTON_EXCH_ACCUM") else 0.0
         self.rigid_dat_soft_side = bool(rigid_dat_soft_side)
         self._dat_soft_side = 1.0 if self.rigid_dat_soft_side else 0.0
         self.rigid_dat_derived_pinch_alpha = float(rigid_dat_derived_pinch_alpha)
@@ -2054,7 +2381,85 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._particle_q_substep_start.assign(state_in.particle_q)
         if self._exchange_active(contacts):
             self._momentum_exchange_prepare(contacts)
-
+        if _os.environ.get("NEWTON_P_CORRECT"):
+            if getattr(self, "_pcorr_buf", None) is None:
+                V = lambda: wp.zeros(1, dtype=wp.vec3, device=self.device)  # noqa: E731
+                F = lambda: wp.zeros(1, dtype=float, device=self.device)  # noqa: E731
+                # 0 p_start, 1 p_end, 2 m_tot, 3 dv, 4 scratch_m, 5 jext,
+                # 6 tau_ext, 7 L_start, 8 L_end, 9 mx, 10-12 I rows,
+                # 13 com, 14 domega, 15-18 scratch (mx, I rows) for entry
+                self._pcorr_buf = [
+                    V(),
+                    V(),
+                    F(),
+                    V(),
+                    F(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                    V(),
+                ]
+            pb = self._pcorr_buf
+            if getattr(self, "_pcorr_anchored", None) is None:
+                self._pcorr_anchored = wp.zeros(1, dtype=wp.int32, device=self.device)
+            if contacts is not None and (
+                self._exchange_soft_bound is None or self._exchange_soft_bound.shape[0] < int(contacts.soft_contact_max)
+            ):
+                # binding flags feed the isolation gate even without --momentum-exchange
+                self._exchange_soft_bound = wp.zeros(int(contacts.soft_contact_max), dtype=wp.int32, device=self.device)
+            self._pcorr_anchored.zero_()
+            if self._exchange_soft_bound is not None:
+                self._exchange_soft_bound.zero_()
+            pb[0].zero_()
+            pb[2].zero_()
+            pb[7].zero_()
+            if self.model.particle_count:
+                wp.launch(
+                    _pcorr_sum_particles,
+                    dim=self.model.particle_count,
+                    inputs=[state_in.particle_qd, self.model.particle_mass],
+                    outputs=[pb[0], pb[2]],
+                    device=self.device,
+                )
+                wp.launch(
+                    _pcorr_ang_particles,
+                    dim=self.model.particle_count,
+                    inputs=[state_in.particle_q, state_in.particle_qd, self.model.particle_mass],
+                    outputs=[pb[7], pb[15], pb[16], pb[17], pb[18]],
+                    device=self.device,
+                )
+            if self.model.body_count and not self.integrate_with_external_rigid_solver:
+                wp.launch(
+                    _pcorr_sum_bodies,
+                    dim=self.model.body_count,
+                    inputs=[state_in.body_qd, self.model.body_inv_mass, self.body_is_jointed],
+                    outputs=[pb[0], pb[2]],
+                    device=self.device,
+                )
+                wp.launch(
+                    _pcorr_ang_bodies,
+                    dim=self.model.body_count,
+                    inputs=[
+                        state_in.body_q,
+                        state_in.body_qd,
+                        self.model.body_inv_mass,
+                        self.model.body_inv_inertia,
+                        self.model.body_com,
+                        self.body_is_jointed,
+                    ],
+                    outputs=[pb[7], pb[15], pb[16], pb[17], pb[18]],
+                    device=self.device,
+                )
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
@@ -2101,6 +2506,161 @@ class SolverVBD(SolverBase, CouplingInterface):
         )
         self._finalize_particles(state_out, dt)
 
+        if _os.environ.get("NEWTON_P_CORRECT"):
+            # Substep momentum projection (see ctx/2026-07-20-momentum-projection-doc.md):
+            # deficit = p_start + g*M*dt + J_ext - p_end, re-injected as a uniform dv;
+            # then the angular deficit about the free-system COM as a rigid rotation.
+            # J_ext / tau_ext: impulses from static or jointed partners, read from the
+            # apply-once contact-force slots (final-iteration force x dt).
+            pb = self._pcorr_buf
+            pb[1].zero_()
+            pb[5].zero_()
+            pb[6].zero_()
+            g = self.model.gravity  # device array; read in-kernel (graph-capture safe)
+            if (
+                contacts is not None
+                and self.model.particle_count
+                and self.body_particle_contact_force_applied is not None
+            ):
+                wp.launch(
+                    _pcorr_sum_jext,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        self.body_particle_contact_force_applied,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_primitive,
+                        contacts.soft_contact_barycentric,
+                        self.model.tri_indices,
+                        state_out.particle_q,
+                        self.model.shape_body,
+                        self.body_is_jointed,
+                        dt,
+                    ],
+                    outputs=[pb[5], pb[6]],
+                    device=self.device,
+                )
+            if self.model.particle_count:
+                wp.launch(
+                    _pcorr_sum_particles,
+                    dim=self.model.particle_count,
+                    inputs=[state_out.particle_qd, self.model.particle_mass],
+                    outputs=[pb[1], pb[4]],
+                    device=self.device,
+                )
+            if self.model.body_count and not self.integrate_with_external_rigid_solver:
+                wp.launch(
+                    _pcorr_sum_bodies,
+                    dim=self.model.body_count,
+                    inputs=[state_out.body_qd, self.model.body_inv_mass, self.body_is_jointed],
+                    outputs=[pb[1], pb[4]],
+                    device=self.device,
+                )
+            if contacts is not None and self._exchange_soft_bound is not None:
+                # ISOLATION GATE (v1, scene-level): conservation applies only to
+                # systems whose binding contacts touch free partners exclusively.
+                # Any binding vs a static shape or an (anchored) jointed body
+                # marks the free system non-isolated: its momentum is owned by
+                # the external constraint -> inject nothing. Element-graph
+                # islands (per-cloth granularity) are the v2 refinement.
+                wp.launch(
+                    _pcorr_anchor_flag,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        self._exchange_soft_bound,
+                        contacts.soft_contact_shape,
+                        self.model.shape_body,
+                        self.body_is_jointed,
+                    ],
+                    outputs=[self._pcorr_anchored],
+                    device=self.device,
+                )
+            wp.launch(
+                _pcorr_dv,
+                dim=1,
+                inputs=[pb[0], pb[1], pb[2], g, pb[5], self._pcorr_anchored, dt],
+                outputs=[pb[3]],
+                device=self.device,
+            )
+            if self.model.particle_count:
+                wp.launch(
+                    _pcorr_apply_particles,
+                    dim=self.model.particle_count,
+                    inputs=[pb[3], self.model.particle_mass],
+                    outputs=[state_out.particle_qd],
+                    device=self.device,
+                )
+            if self.model.body_count and not self.integrate_with_external_rigid_solver:
+                wp.launch(
+                    _pcorr_apply_bodies,
+                    dim=self.model.body_count,
+                    inputs=[pb[3], self.model.body_inv_mass, self.body_is_jointed],
+                    outputs=[state_out.body_qd],
+                    device=self.device,
+                )
+            # Angular pass: sum L/inertia AFTER the linear correction, so the
+            # angular residual is evaluated with dp already zero (a rotation
+            # field about the COM then adds no linear momentum).
+            pb[8].zero_()
+            pb[9].zero_()
+            pb[10].zero_()
+            pb[11].zero_()
+            pb[12].zero_()
+            if self.model.particle_count:
+                wp.launch(
+                    _pcorr_ang_particles,
+                    dim=self.model.particle_count,
+                    inputs=[state_out.particle_q, state_out.particle_qd, self.model.particle_mass],
+                    outputs=[pb[8], pb[9], pb[10], pb[11], pb[12]],
+                    device=self.device,
+                )
+            if self.model.body_count and not self.integrate_with_external_rigid_solver:
+                wp.launch(
+                    _pcorr_ang_bodies,
+                    dim=self.model.body_count,
+                    inputs=[
+                        state_out.body_q,
+                        state_out.body_qd,
+                        self.model.body_inv_mass,
+                        self.model.body_inv_inertia,
+                        self.model.body_com,
+                        self.body_is_jointed,
+                    ],
+                    outputs=[pb[8], pb[9], pb[10], pb[11], pb[12]],
+                    device=self.device,
+                )
+            wp.launch(
+                _pcorr_ang_dv,
+                dim=1,
+                inputs=[pb[7], pb[8], pb[9], pb[2], pb[10], pb[11], pb[12], g, pb[6], self._pcorr_anchored, dt],
+                outputs=[pb[13], pb[14]],
+                device=self.device,
+            )
+            if self.model.particle_count:
+                wp.launch(
+                    _pcorr_ang_apply_particles,
+                    dim=self.model.particle_count,
+                    inputs=[pb[14], pb[13], state_out.particle_q, self.model.particle_mass],
+                    outputs=[state_out.particle_qd],
+                    device=self.device,
+                )
+            if self.model.body_count and not self.integrate_with_external_rigid_solver:
+                wp.launch(
+                    _pcorr_ang_apply_bodies,
+                    dim=self.model.body_count,
+                    inputs=[
+                        pb[14],
+                        pb[13],
+                        state_out.body_q,
+                        self.model.body_inv_mass,
+                        self.model.body_com,
+                        self.body_is_jointed,
+                    ],
+                    outputs=[state_out.body_qd],
+                    device=self.device,
+                )
+
         if self._exchange_active(contacts):
             self._momentum_exchange(state_in, state_out, contacts, dt)
 
@@ -2137,12 +2697,15 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._exchange_rigid_jt = wp.zeros(n_rigid, dtype=wp.vec3, device=self.device)
         self._momentum_exchange_zero()
 
-    def _momentum_exchange_zero(self):
-        """Zero slots, flags and accumulators (step start; mid-step re-detection)."""
-        self.body_motion_lost_rigid.zero_()
-        self.body_motion_lost_particle.zero_()
-        if self.particle_motion_lost is not None:
-            self.particle_motion_lost.zero_()
+    def _momentum_exchange_zero(self, keep_motion_lost: bool = False):
+        """Zero slots, flags and accumulators (step start; mid-step re-detection).
+        With ``keep_motion_lost`` the deleted-motion records survive mid-substep
+        boundaries (accumulated-exchange mode); flags/impulses still clear."""
+        if not keep_motion_lost:
+            self.body_motion_lost_rigid.zero_()
+            self.body_motion_lost_particle.zero_()
+            if self.particle_motion_lost is not None:
+                self.particle_motion_lost.zero_()
         if self.particle_bind_normal is not None:
             self.particle_bind_normal.zero_()
         if self.particle_cap_bound is not None:
@@ -2150,15 +2713,20 @@ class SolverVBD(SolverBase, CouplingInterface):
         if self.body_wall_bound is not None:
             self.body_wall_bound.zero_()
         for arr in (
-            self._exchange_soft_bound,
             self._exchange_soft_jn,
             self._exchange_soft_jt,
-            self._exchange_rigid_bound,
             self._exchange_rigid_jn,
             self._exchange_rigid_jt,
         ):
             if arr is not None:
                 arr.zero_()
+        if not keep_motion_lost:
+            # Binding FLAGS are idempotent (OR across launches) — under
+            # resolution/accumulation modes they persist within the substep so
+            # a pair that bound at ANY iteration stays resolution-eligible.
+            for arr in (self._exchange_soft_bound, self._exchange_rigid_bound):
+                if arr is not None:
+                    arr.zero_()
 
     def _residual_assemble_particle_forces(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
         """Assemble the full particle force vector at the substep's FINAL
@@ -2369,6 +2937,27 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         model = self.model
         inv_dt = 1.0 / dt
+        if _os.environ.get("NEWTON_RESOLVE_E0"):
+            # e=0 RESOLUTION MODE (2026-07-20): resolve each binding pair's
+            # RESIDUAL relative approach from realized end-state velocities —
+            # vhat = qd exactly. Deleted-motion records are zeroed: measured
+            # ill-posed under per-iteration clamps (overwrite ~0, sum -> inf).
+            # Partner classes emerge from effective mass in the sweep: free =
+            # reduced-mass split; static = w=0; jointed = w=0 + kinematic
+            # boundary velocity + no writeback (reactions reach the chain via
+            # the force channel next substep — the joint solve owns its state).
+            # OPEN QUESTION (user reservation): whether an anchored articulated
+            # chain deserves a finite apparent inverse inertia here instead of
+            # w=0. Decide by measurement (cube/grasp cells), not assumption.
+            self.body_motion_lost_rigid.zero_()
+            self.body_motion_lost_particle.zero_()
+            if self.particle_motion_lost is not None:
+                self.particle_motion_lost.zero_()
+        if _os.environ.get("NEWTON_EXCH_ALL_CONTACTS") and self._exchange_soft_bound is not None:
+            # EXPERIMENT: run the e=0 impulse sweep over every contact row, not
+            # just truncation-bound rows — inelastic contact velocity resolution
+            # as the (momentum-conserving) damping stage.
+            self._exchange_soft_bound.fill_(1)
         if self.rigid_body_vlost_residual:
             # EXPERIMENTAL (see kernel doc): overwrite the geometric slots with
             # the force-assembled residual reading — the unrealized
@@ -2407,6 +2996,43 @@ class SolverVBD(SolverBase, CouplingInterface):
             outputs=[self.body_vhat],
             device=self.device,
         )
+        if _os.environ.get("NEWTON_RESOLVE_E0") and model.body_count and contacts is not None:
+            # Force-predicted pre-clamp velocity for FREE bodies:
+            # vhat = v_start + dt*(g + F_contact/m). Reconstructs the momentum
+            # the clamps destroyed from forces (physical), not from deletion
+            # records (measured ill-posed). Jointed bodies keep realized
+            # end-state vhat (kinematic boundary).
+            if getattr(self, "_e0_body_force", None) is None:
+                self._e0_body_force = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
+            self._e0_body_force.zero_()
+            if self.body_particle_contact_force_applied is not None:
+                wp.launch(
+                    _e0_accum_body_contact_force,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        self.body_particle_contact_force_applied,
+                        contacts.soft_contact_shape,
+                        model.shape_body,
+                    ],
+                    outputs=[self._e0_body_force],
+                    device=self.device,
+                )
+            wp.launch(
+                _e0_vhat_bodies_from_forces,
+                dim=model.body_count,
+                inputs=[
+                    state_in.body_qd,
+                    self._e0_body_force,
+                    model.body_inv_mass,
+                    self.body_is_jointed,
+                    model.gravity,
+                    dt,
+                ],
+                outputs=[self.body_vhat],
+                device=self.device,
+            )
+
         if model.particle_count:
             if self.rigid_particle_vlost_residual and self._residual_forces is not None:
                 # Variant D (particle side): replace the per-pass geometric
@@ -2557,7 +3183,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
         if self._exchange_active(contacts):
-            self._momentum_exchange_zero()
+            self._momentum_exchange_zero(
+                keep_motion_lost=self._motion_lost_accumulate != 0.0 or bool(_os.environ.get("NEWTON_RESOLVE_E0"))
+            )
 
     def _midstep_collision_update(self, state_in: State, contacts: Contacts):
         """Alg. 3 mid-step commit + re-detect: advance DAT references to the current
@@ -2576,7 +3204,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         if self._exchange_active(contacts):
             # Boundary semantics v1 = "clear": bindings die with their planes and the
             # blocked motion is re-proposed against the fresh contacts (doc Sec. 2).
-            self._momentum_exchange_zero()
+            self._momentum_exchange_zero(
+                keep_motion_lost=self._motion_lost_accumulate != 0.0 or bool(_os.environ.get("NEWTON_RESOLVE_E0"))
+            )
         if self.particle_penalty_handed is not None:
             # Detection boundary: the handoff is re-derived against the fresh contacts.
             self.particle_penalty_handed.zero_()
@@ -2744,6 +3374,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 max_displacement,
                 max_displacement * self._substep_cap_windows,
                 self._particle_q_substep_start,
+                self._motion_lost_accumulate,
             ],
             outputs=[
                 self.particle_displacements,
@@ -2769,6 +3400,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     * 0.5
                     * self._substep_cap_windows,
                     self._body_q_substep_start,
+                    self._motion_lost_accumulate,
                 ],
                 outputs=[
                     body_q,
@@ -2890,6 +3522,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 * 0.5
                 * self._substep_cap_windows,
                 self._body_q_substep_start,
+                self._motion_lost_accumulate,
             ],
             outputs=[
                 body_q,
@@ -3400,6 +4033,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._bp_store_lam,
                     self._bp_store_lamt,
                 ],
+                device=self.device,
+            )
+
+        if _os.environ.get("NEWTON_EF_NO_KD") and self.body_particle_contact_material_kd is not None:
+            # EXPERIMENT: single-count contact damping — EF rows guard geometry
+            # (watertightness); vertex rows own the material response.
+            wp.launch(
+                kernel=_zero_ef_row_kd,
+                dim=self.body_particle_contact_material_kd.shape[0],
+                inputs=[contacts.soft_contact_count],
+                outputs=[self.body_particle_contact_material_kd],
                 device=self.device,
             )
 
