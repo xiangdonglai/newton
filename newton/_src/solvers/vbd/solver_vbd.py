@@ -426,6 +426,368 @@ def _pcorr_anchor_flag(
         anchored[0] = 1
 
 
+@wp.kernel
+def _lcomp_deficit(
+    motion_lost: wp.array[wp.spatial_vector],
+    inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    inv_dt: float,
+    deficit: wp.array[wp.vec3],
+    nhat: wp.array[wp.vec3],
+):
+    """Per-body clamp momentum deficit from the residual estimator's deleted
+    motion: dp = m * lost_lin / dt, with its unit direction. Zero for jointed,
+    static, and unbound bodies (the estimator leaves their slots zeroed)."""
+    b = wp.tid()
+    deficit[b] = wp.vec3(0.0)
+    nhat[b] = wp.vec3(0.0)
+    if jointed[b] != 0:
+        return
+    im = inv_mass[b]
+    if im <= 0.0:
+        return
+    ml = motion_lost[b]
+    dp = wp.vec3(ml[0], ml[1], ml[2]) * (inv_dt / im)
+    l = wp.length(dp)
+    if l <= 1.0e-12:
+        return
+    deficit[b] = dp
+    nhat[b] = dp / l
+
+
+@wp.kernel
+def _lcomp_membership(
+    soft_contact_count: wp.array[wp.int32],
+    bound: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    contact_primitive: wp.array[wp.int32],
+    contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[wp.int32],
+    jointed: wp.array[wp.int32],
+    bind_body: wp.array[wp.int32],
+    bind_ext: wp.array[wp.int32],
+):
+    """Pool membership from truncation-bound rows: a particle joins the
+    completion pool of the FREE body it is plane-held against; a particle
+    bound against a static or jointed partner is excluded outright (member
+    gate: its share of the interface momentum is owned by the external
+    constraint — completing it would fight the partner's clamp every substep)."""
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    if bound[i] == 0:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    external = b < 0 or jointed[b] != 0
+    prim = contact_primitive[i]
+    if prim < 0:
+        return
+    if i < c0:
+        if external:
+            bind_ext[prim] = 1
+        else:
+            bind_body[prim] = b
+    else:
+        bary = contact_barycentric[i]
+        for k in range(3):
+            if bary[k] > 0.0:
+                vi = tri_indices[prim, k]
+                if external:
+                    bind_ext[vi] = 1
+                else:
+                    bind_body[vi] = b
+
+
+@wp.kernel
+def _lcomp_impact_flag(
+    dt: float,
+    budget_frac: float,
+    soft_contact_count: wp.array[wp.int32],
+    bound: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    contact_primitive: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[wp.int32],
+    jointed: wp.array[wp.int32],
+    particle_radius: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_qd_entry: wp.array[wp.spatial_vector],
+    body_impact: wp.array[wp.int32],
+):
+    """Trigger gate: a body's completion activates only if some bound row
+    satisfied the adaptive impact criterion (entry anchor closing speed over
+    the substep exceeding the deadband — the same impact/quasi-static
+    discriminator the adaptive clamp schedule uses). Without it, quasi-static
+    support binding (clamp carrying a gravity load the weak force cannot)
+    reads as a deficit every substep and the completion converges to a
+    spurious common velocity of (m_b/m_S)*g*dt."""
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    if bound[i] == 0:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b < 0 or jointed[b] != 0:
+        return
+    prim = contact_primitive[i]
+    if prim < 0:
+        return
+    v0 = prim
+    if i >= c0:
+        v0 = tri_indices[prim, 0]  # radius is uniform across a triangle's corners
+    n = contact_normal[i]  # points rigid -> soft
+    X_wb = body_q[b]
+    bx = wp.transform_point(X_wb, contact_body_pos[i])
+    qd_b = body_qd_entry[b]
+    r_a = bx - wp.transform_point(X_wb, body_com[b])
+    v_anchor = wp.vec3(qd_b[0], qd_b[1], qd_b[2]) + wp.cross(wp.vec3(qd_b[3], qd_b[4], qd_b[5]), r_a)
+    w = wp.max(wp.dot(n, v_anchor), 0.0)
+    # Pure velocity deadband (no gap term): the bound flag already witnesses a
+    # real clamp this substep; the deadband only separates impact approach
+    # (mm-scale pending) from quasi-static support jitter (um-scale). A
+    # substep-end gap recomputation proved fragile (stale detection anchors on
+    # a rotating body), and its misses silently strand the exact budget as
+    # momentum loss.
+    if w * dt > budget_frac * particle_radius[v0]:
+        body_impact[b] = 1
+
+
+@wp.kernel
+def _lcomp_reduce(
+    bind_body: wp.array[wp.int32],
+    bind_ext: wp.array[wp.int32],
+    mass: wp.array[float],
+    qd: wp.array[wp.vec3],
+    nhat: wp.array[wp.vec3],
+    m_pool: wp.array[float],
+    p_pool: wp.array[float],
+):
+    i = wp.tid()
+    b = bind_body[i]
+    if b < 0 or bind_ext[i] != 0:
+        return
+    m = mass[i]
+    if m <= 0.0:
+        return
+    n = nhat[b]
+    if wp.length_sq(n) == 0.0:
+        return
+    wp.atomic_add(m_pool, b, m)
+    wp.atomic_add(p_pool, b, m * wp.dot(qd[i], n))
+
+
+@wp.kernel
+def _lcomp_rigid_anchor(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+):
+    """Rigid-rigid contacts are invisible to the soft-contact J_ext sum and
+    anchor flag; a FREE body exchanging momentum with a static/jointed body
+    through one (e.g. resting on the ground) is an un-budgeted external
+    channel — gMdt reads as deficit every substep. Any such row anchors the
+    scene (v1 scene-level semantics)."""
+    i = wp.tid()
+    if i >= rigid_contact_count[0]:
+        return
+    s0 = rigid_contact_shape0[i]
+    s1 = rigid_contact_shape1[i]
+    if s0 < 0 or s1 < 0:
+        return
+    b0 = shape_body[s0]
+    b1 = shape_body[s1]
+    ext0 = b0 < 0 or jointed[b0] != 0 or body_inv_mass[b0] <= 0.0
+    ext1 = b1 < 0 or jointed[b1] != 0 or body_inv_mass[b1] <= 0.0
+    if ext0 != ext1:  # exactly one side external, the other free
+        anchored[0] = 1
+
+
+@wp.kernel
+def _lcomp_pin_anchor(
+    particle_inv_mass: wp.array[float],
+    anchored: wp.array[wp.int32],
+):
+    """Pinned (kinematic) particles are position-level external constraints:
+    invisible to the contact-row J_ext sum AND to the contact-existence anchor
+    flag, yet they absorb momentum every substep (a pinned hammock eats
+    g*M*dt of gravity momentum). A budget blind to them reads that absorption
+    as deficit and pumps it back (measured: resting ball driven to punch-through
+    within ~2 frames once a pool armed). Scene-level v1 semantics, matching the
+    global projection's element-graph anchor precedent."""
+    i = wp.tid()
+    if particle_inv_mass[i] == 0.0:
+        anchored[0] = 1
+
+
+@wp.kernel
+def _lcomp_budget(
+    p_start: wp.array[wp.vec3],
+    p_end: wp.array[wp.vec3],
+    m_tot: wp.array[float],
+    gravity: wp.array[wp.vec3],
+    jext: wp.array[wp.vec3],
+    dt: float,
+    budget: wp.array[wp.vec3],
+):
+    budget[0] = p_start[0] + gravity[0] * (m_tot[0] * dt) + jext[0] - p_end[0]
+
+
+@wp.kernel
+def _lcomp_nhat_from_budget(
+    budget: wp.array[wp.vec3],
+    body_impact: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+    nhat: wp.array[wp.vec3],
+):
+    """Completion axis = direction of the EXACT budget (v3). Taking the axis
+    from the residual estimator (v2) let its one-point force-quadrature noise
+    flip the axis; the sign guard then stranded the budget as pure momentum
+    loss (measured: 0/+11/+9% losses across an N=3 ensemble). With the axis
+    read off the budget itself, the estimator is fully out of the loop for
+    single-pool scenes."""
+    b = wp.tid()
+    if body_impact[b] == 0 or anchored[0] != 0:
+        nhat[b] = wp.vec3(0.0)
+        return
+    l = wp.length(budget[0])
+    if l <= 1.0e-12:
+        nhat[b] = wp.vec3(0.0)
+        return
+    nhat[b] = budget[0] / l
+
+
+@wp.kernel
+def _lcomp_est_sum(
+    deficit: wp.array[wp.vec3],
+    m_pool: wp.array[float],
+    body_impact: wp.array[wp.int32],
+    est_sum: wp.array[float],
+    armed_count: wp.array[wp.int32],
+):
+    b = wp.tid()
+    if body_impact[b] == 0 or m_pool[b] <= 0.0:
+        return
+    wp.atomic_add(armed_count, 0, 1)
+    l = wp.length(deficit[b])
+    if l > 0.0:
+        wp.atomic_add(est_sum, 0, l)
+
+
+@wp.kernel
+def _lcomp_vc(
+    deficit: wp.array[wp.vec3],
+    nhat: wp.array[wp.vec3],
+    body_qd: wp.array[wp.spatial_vector],
+    inv_mass: wp.array[float],
+    m_pool: wp.array[float],
+    p_pool: wp.array[float],
+    body_impact: wp.array[wp.int32],
+    budget: wp.array[wp.vec3],
+    est_sum: wp.array[float],
+    armed_count: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+    vc: wp.array[float],
+    active: wp.array[wp.int32],
+):
+    """Common normal velocity of the completion pool {body} U {bound pocket}:
+    inject this pool's share of the EXACT substep momentum deficit (the
+    conservation identity p_start + g M dt - p_end over the free system) and
+    resolve the pool to the shared (perfectly inelastic) velocity along nhat.
+    The residual estimator provides only the RELATIVE pool weights, so its
+    one-point force-quadrature bias (measured: nondeterministic, both signs,
+    up to ~10% on the stress catch when injected directly) cancels from the
+    total. The pocket can never exceed the interface speed and the body
+    reabsorbs its own mass share — the delivery domain includes the momentum
+    reservoir, so there is no light-partner ejection cliff. A free system
+    bound to a static or jointed partner keeps its budget at zero (anchored
+    flag): its momentum is owned by the external constraint."""
+    b = wp.tid()
+    active[b] = 0
+    if body_impact[b] == 0 or anchored[0] != 0:
+        return
+    if m_pool[b] <= 0.0 or inv_mass[b] <= 0.0:
+        return
+    n = nhat[b]
+    if wp.length_sq(n) == 0.0:
+        return
+    # Pool weight: estimator deficits relatively (bias cancels in the total);
+    # equal split when the estimator reads zero everywhere.
+    w = float(0.0)
+    if est_sum[0] > 0.0:
+        w = wp.length(deficit[b]) / est_sum[0]
+    elif armed_count[0] > 0:
+        w = 1.0 / float(armed_count[0])
+    if w <= 0.0:
+        return
+    share = wp.length(budget[0]) * w
+    m_b = 1.0 / inv_mass[b]
+    v_b = wp.vec3(body_qd[b][0], body_qd[b][1], body_qd[b][2])
+    # NOTE a "capture guard" (skip when the pocket outruns the body along the
+    # axis, to stop pool momentum flowing back into a tunneling body) was
+    # built and REVERTED: at 30 m/s — beyond the stack's documented ~10 m/s
+    # anti-tunneling envelope — the guard chatters on/off as the two sides
+    # cross speeds, each re-fire SETs pocket particles across a ~20 m/s
+    # discontinuity, and the membrane NaNs. Unguarded, the same cell is finite
+    # and momentum-exact (partial-transfer pass-through with a bounded ~10%
+    # body re-acceleration artifact). Within the envelope the guard never
+    # fires; out of it, graceful degradation beats a blowup.
+    pool_p = m_b * wp.dot(v_b, n) + share + p_pool[b]
+    vc[b] = pool_p / (m_b + m_pool[b])
+    active[b] = 1
+
+
+@wp.kernel
+def _lcomp_apply_particles(
+    bind_body: wp.array[wp.int32],
+    bind_ext: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    vc: wp.array[float],
+    nhat: wp.array[wp.vec3],
+    mass: wp.array[float],
+    qd: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    b = bind_body[i]
+    if b < 0 or bind_ext[i] != 0:
+        return
+    if active[b] == 0 or mass[i] <= 0.0:
+        return
+    n = nhat[b]
+    qd[i] = qd[i] + (vc[b] - wp.dot(qd[i], n)) * n
+
+
+@wp.kernel
+def _lcomp_apply_bodies(
+    active: wp.array[wp.int32],
+    vc: wp.array[float],
+    nhat: wp.array[wp.vec3],
+    qd: wp.array[wp.spatial_vector],
+):
+    b = wp.tid()
+    if active[b] == 0:
+        return
+    n = nhat[b]
+    v = wp.vec3(qd[b][0], qd[b][1], qd[b][2])
+    v = v + (vc[b] - wp.dot(v, n)) * n
+    qd[b] = wp.spatial_vector(v[0], v[1], v[2], qd[b][3], qd[b][4], qd[b][5])
+
+
 class SolverVBD(SolverBase, CouplingInterface):
     """An implicit solver using Vertex Block Descent (VBD) for particles and Augmented VBD (AVBD) for rigid bodies.
 
@@ -2486,6 +2848,59 @@ class SolverVBD(SolverBase, CouplingInterface):
                     outputs=[pb[7], pb[15], pb[16], pb[17], pb[18]],
                     device=self.device,
                 )
+        if self._lcomp_active(contacts):
+            # LOCAL COMPLETION (env NEWTON_LOCAL_COMPLETION): deficit-recorded
+            # local inelastic completion over rigid-soft truncation pockets;
+            # buffers + binding flags prepared here, applied at substep end.
+            if getattr(self, "_lcomp_buf", None) is None:
+                nb = self.model.body_count
+                npart = self.model.particle_count
+                self._lcomp_buf = {
+                    "deficit": wp.zeros(nb, dtype=wp.vec3, device=self.device),
+                    "nhat": wp.zeros(nb, dtype=wp.vec3, device=self.device),
+                    "m_pool": wp.zeros(nb, dtype=float, device=self.device),
+                    "p_pool": wp.zeros(nb, dtype=float, device=self.device),
+                    "vc": wp.zeros(nb, dtype=float, device=self.device),
+                    "active": wp.zeros(nb, dtype=wp.int32, device=self.device),
+                    "bind": wp.full(npart, -1, dtype=wp.int32, device=self.device),
+                    "ext": wp.zeros(npart, dtype=wp.int32, device=self.device),
+                    "impact": wp.zeros(nb, dtype=wp.int32, device=self.device),
+                    "p_start": wp.zeros(1, dtype=wp.vec3, device=self.device),
+                    "p_end": wp.zeros(1, dtype=wp.vec3, device=self.device),
+                    "m_tot": wp.zeros(1, dtype=float, device=self.device),
+                    "m_scratch": wp.zeros(1, dtype=float, device=self.device),
+                    "jext": wp.zeros(1, dtype=wp.vec3, device=self.device),
+                    "tau_scratch": wp.zeros(1, dtype=wp.vec3, device=self.device),
+                    "budget": wp.zeros(1, dtype=wp.vec3, device=self.device),
+                    "est_sum": wp.zeros(1, dtype=float, device=self.device),
+                    "armed_count": wp.zeros(1, dtype=wp.int32, device=self.device),
+                    "anchored": wp.zeros(1, dtype=wp.int32, device=self.device),
+                }
+            if self.body_wall_bound is None:
+                self.body_wall_bound = wp.zeros(self.model.body_count, dtype=wp.int32, device=self.device)
+            if self._exchange_soft_bound is None or self._exchange_soft_bound.shape[0] < int(contacts.soft_contact_max):
+                self._exchange_soft_bound = wp.zeros(int(contacts.soft_contact_max), dtype=wp.int32, device=self.device)
+            self._exchange_soft_bound.zero_()
+            self.body_wall_bound.zero_()
+            # Exact-budget entry snapshot: free-system momentum before the solve.
+            lb = self._lcomp_buf
+            lb["p_start"].zero_()
+            lb["m_tot"].zero_()
+            if self.model.particle_count:
+                wp.launch(
+                    _pcorr_sum_particles,
+                    dim=self.model.particle_count,
+                    inputs=[state_in.particle_qd, self.model.particle_mass],
+                    outputs=[lb["p_start"], lb["m_tot"]],
+                    device=self.device,
+                )
+            wp.launch(
+                _pcorr_sum_bodies,
+                dim=self.model.body_count,
+                inputs=[state_in.body_qd, self.model.body_inv_mass, self.body_is_jointed],
+                outputs=[lb["p_start"], lb["m_tot"]],
+                device=self.device,
+            )
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
@@ -2527,7 +2942,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_body_vlost_residual
                     and iter_num == self.iterations - 1
                     and self._exchange_active(contacts)
-                ),
+                )
+                or (iter_num == self.iterations - 1 and self._lcomp_active(contacts)),
             )
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
@@ -2537,6 +2953,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             state_in, state_out, dt, apply_stick_deadzone=contacts is not None and self.rigid_contact_hard
         )
         self._finalize_particles(state_out, dt)
+
+        if self._lcomp_active(contacts):
+            # Runs BEFORE the global projection so the two compose: completion
+            # restores each covered pocket's deficit locally; a projection run
+            # afterwards sees only the uncovered remainder.
+            self._local_completion(state_out, contacts, dt)
 
         if _os.environ.get("NEWTON_P_CORRECT"):
             # Substep momentum projection (see ctx/2026-07-20-momentum-projection-doc.md):
@@ -2703,6 +3125,256 @@ class SolverVBD(SolverBase, CouplingInterface):
             and contacts is not None
             and self.model.body_count > 0
             and not self.integrate_with_external_rigid_solver
+        )
+
+    def _lcomp_active(self, contacts) -> bool:
+        return (
+            bool(_os.environ.get("NEWTON_LOCAL_COMPLETION"))
+            and self.rigid_enable_penetration_free
+            and contacts is not None
+            and self.model.body_count > 0
+            and self.model.particle_count > 0
+            and not self.integrate_with_external_rigid_solver
+        )
+
+    def _local_completion(self, state_out: State, contacts: Contacts, dt: float):
+        """Deficit-recorded local inelastic completion (env NEWTON_LOCAL_COMPLETION).
+
+        One-sided DAT clamps delete momentum from the body they truncate. The
+        deleted amount is recoverable from committed state without any
+        counterfactual: the residual estimator reads each free body's
+        unrealized motion toward its inertia target net of the share the
+        modeled contact forces account for (dual-consistent assembly at final
+        poses). The repair resolves the interface group — the body plus the
+        particles plane-held against it this substep — to the common velocity
+        along the deficit direction that restores the recorded deficit into
+        the group's momentum pool: a perfectly inelastic completion with
+        correct effective masses. Momentum enters at the contact and reaches
+        the bulk only through the membrane's own elasticity (wave-timed);
+        particles simultaneously bound to a static or jointed partner are
+        excluded (member gate — their interface momentum is owned by the
+        external constraint). Rigid-soft rows only: body-body contacts keep
+        their restituting AL resolution. Linear pass only (v1)."""
+        model = self.model
+        lb = self._lcomp_buf
+        self.body_motion_lost_rigid.zero_()
+        self.body_motion_lost_particle.zero_()
+        wp.launch(
+            kernel=momentum_exchange_body_vlost_residual,
+            dim=model.body_count,
+            inputs=[
+                dt,
+                state_out.body_q,
+                self.body_inertia_q,
+                model.body_com,
+                model.body_inv_mass,
+                model.body_inv_inertia,
+                self.body_is_jointed,
+                self.body_wall_bound,
+                self.body_forces,
+                self.body_torques,
+            ],
+            outputs=[self.body_motion_lost_rigid, self.body_motion_lost_particle],
+            device=self.device,
+        )
+        wp.launch(
+            _lcomp_deficit,
+            dim=model.body_count,
+            inputs=[self.body_motion_lost_rigid, model.body_inv_mass, self.body_is_jointed, 1.0 / dt],
+            outputs=[lb["deficit"], lb["nhat"]],
+            device=self.device,
+        )
+        lb["bind"].fill_(-1)
+        lb["ext"].zero_()
+        wp.launch(
+            _lcomp_membership,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                contacts.soft_contact_count,
+                self._exchange_soft_bound,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_primitive,
+                contacts.soft_contact_barycentric,
+                model.tri_indices,
+                model.shape_body,
+                self.body_is_jointed,
+            ],
+            outputs=[lb["bind"], lb["ext"]],
+            device=self.device,
+        )
+        lb["impact"].zero_()
+        qd_entry = self._dat_adaptive_body_qd
+        if qd_entry is None:
+            # Fallback (adaptive schedule off): end-state velocities under-read
+            # a clamped impactor's closing speed; the adaptive snapshots are
+            # the intended source (delivered config runs --dat-adaptive).
+            qd_entry = state_out.body_qd
+        wp.launch(
+            _lcomp_impact_flag,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                dt,
+                self.rigid_dat_adaptive_budget,
+                contacts.soft_contact_count,
+                self._exchange_soft_bound,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_primitive,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_normal,
+                model.tri_indices,
+                model.shape_body,
+                self.body_is_jointed,
+                model.particle_radius,
+                state_out.body_q,
+                model.body_com,
+                qd_entry,
+            ],
+            outputs=[lb["impact"]],
+            device=self.device,
+        )
+        # Exact substep budget: p_start + g M dt + J_ext - p_end over the free
+        # system (conservation identity — no estimator error), gated by the
+        # anchored flag exactly as the global projection is.
+        lb["p_end"].zero_()
+        lb["m_scratch"].zero_()
+        lb["jext"].zero_()
+        lb["tau_scratch"].zero_()
+        lb["anchored"].zero_()
+        lb["est_sum"].zero_()
+        wp.launch(
+            _pcorr_sum_particles,
+            dim=model.particle_count,
+            inputs=[state_out.particle_qd, model.particle_mass],
+            outputs=[lb["p_end"], lb["m_scratch"]],
+            device=self.device,
+        )
+        wp.launch(
+            _pcorr_sum_bodies,
+            dim=model.body_count,
+            inputs=[state_out.body_qd, model.body_inv_mass, self.body_is_jointed],
+            outputs=[lb["p_end"], lb["m_scratch"]],
+            device=self.device,
+        )
+        if self.body_particle_contact_force_applied is not None:
+            wp.launch(
+                _pcorr_sum_jext,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    self.body_particle_contact_force_applied,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_primitive,
+                    contacts.soft_contact_barycentric,
+                    model.tri_indices,
+                    state_out.particle_q,
+                    model.shape_body,
+                    self.body_is_jointed,
+                    dt,
+                ],
+                outputs=[lb["jext"], lb["tau_scratch"]],
+                device=self.device,
+            )
+        wp.launch(
+            _pcorr_anchor_flag,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                contacts.soft_contact_count,
+                self._exchange_soft_bound,
+                contacts.soft_contact_shape,
+                model.shape_body,
+                self.body_is_jointed,
+            ],
+            outputs=[lb["anchored"]],
+            device=self.device,
+        )
+        wp.launch(
+            _lcomp_pin_anchor,
+            dim=model.particle_count,
+            inputs=[model.particle_inv_mass],
+            outputs=[lb["anchored"]],
+            device=self.device,
+        )
+        if contacts.rigid_contact_max:
+            wp.launch(
+                _lcomp_rigid_anchor,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    model.shape_body,
+                    model.body_inv_mass,
+                    self.body_is_jointed,
+                ],
+                outputs=[lb["anchored"]],
+                device=self.device,
+            )
+        wp.launch(
+            _lcomp_budget,
+            dim=1,
+            inputs=[lb["p_start"], lb["p_end"], lb["m_tot"], model.gravity, lb["jext"], dt],
+            outputs=[lb["budget"]],
+            device=self.device,
+        )
+        # v3: completion axis from the budget itself; the estimator only sets
+        # relative pool weights (single armed pool -> weight 1, estimator out
+        # of the loop entirely).
+        wp.launch(
+            _lcomp_nhat_from_budget,
+            dim=model.body_count,
+            inputs=[lb["budget"], lb["impact"], lb["anchored"]],
+            outputs=[lb["nhat"]],
+            device=self.device,
+        )
+        lb["m_pool"].zero_()
+        lb["p_pool"].zero_()
+        wp.launch(
+            _lcomp_reduce,
+            dim=model.particle_count,
+            inputs=[lb["bind"], lb["ext"], model.particle_mass, state_out.particle_qd, lb["nhat"]],
+            outputs=[lb["m_pool"], lb["p_pool"]],
+            device=self.device,
+        )
+        lb["armed_count"].zero_()
+        wp.launch(
+            _lcomp_est_sum,
+            dim=model.body_count,
+            inputs=[lb["deficit"], lb["m_pool"], lb["impact"]],
+            outputs=[lb["est_sum"], lb["armed_count"]],
+            device=self.device,
+        )
+        wp.launch(
+            _lcomp_vc,
+            dim=model.body_count,
+            inputs=[
+                lb["deficit"],
+                lb["nhat"],
+                state_out.body_qd,
+                model.body_inv_mass,
+                lb["m_pool"],
+                lb["p_pool"],
+                lb["impact"],
+                lb["budget"],
+                lb["est_sum"],
+                lb["armed_count"],
+                lb["anchored"],
+            ],
+            outputs=[lb["vc"], lb["active"]],
+            device=self.device,
+        )
+        wp.launch(
+            _lcomp_apply_particles,
+            dim=model.particle_count,
+            inputs=[lb["bind"], lb["ext"], lb["active"], lb["vc"], lb["nhat"], model.particle_mass],
+            outputs=[state_out.particle_qd],
+            device=self.device,
+        )
+        wp.launch(
+            _lcomp_apply_bodies,
+            dim=model.body_count,
+            inputs=[lb["active"], lb["vc"], lb["nhat"]],
+            outputs=[state_out.body_qd],
+            device=self.device,
         )
 
     def _momentum_exchange_prepare(self, contacts: Contacts):

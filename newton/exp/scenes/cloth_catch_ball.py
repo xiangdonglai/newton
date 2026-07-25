@@ -45,6 +45,8 @@ Momentum-honest catch regime (strong contact, gentle ball; conserves to
 
 from __future__ import annotations
 
+import math
+
 import warp as wp
 
 from . import register
@@ -86,11 +88,21 @@ class ClothCatchBallScene(Scene):
     def __init__(self, args):
         super().__init__(args)
         self.impact_speed = float(getattr(args, "impact_speed", 2.0))
+        self.impact_angle = float(getattr(args, "impact_angle", 0.0))
+        self.settle = bool(getattr(args, "settle", False))
         self.contact_ke = float(getattr(args, "contact_ke", 1.0e4))
         self.contact_kd = float(getattr(args, "contact_kd", 1.0))
         self.cloth_mass = CLOTH_DENSITY * CLOTH_SIZE * CLOTH_SIZE
         self.ball_mass = self.cloth_mass  # equal masses: analytic capture at v0/2
         self._ball = -1
+        if self.settle:
+            # Gravity-settle stress cell: horizontal hammock (two edges pinned),
+            # ball dropped onto the center under gravity. Momentum is NOT
+            # conserved here (pins + gravity); the verdict is the ball's steady
+            # rest velocity — a repair scheme reading quasi-static support
+            # binding as an impact deficit shows up as a persistent spurious
+            # velocity (analysis: v* = (m_b/m_S) * g * dt).
+            self.gravity = -9.81  # instance shadow of the class attribute
 
     # -- world assembly ---------------------------------------------------
     def build_robot(self, builder, *, collapse_fixed_joints):
@@ -101,8 +113,14 @@ class ClothCatchBallScene(Scene):
         r = BALL_RADIUS
         i_val = 0.4 * self.ball_mass * r * r  # solid sphere inertia
         inertia = wp.mat33(i_val, 0.0, 0.0, 0.0, i_val, 0.0, 0.0, 0.0, i_val)
+        # Oblique launches start offset in -y so the angled trajectory still
+        # passes through the sheet center (a 40 deg launch from x=-1 otherwise
+        # sails past the sheet's half-width laterally).
+        start = wp.vec3(BALL_START_X, BALL_START_X * math.tan(math.radians(self.impact_angle)), 0.0)
+        if self.settle:
+            start = wp.vec3(0.0, 0.0, BALL_RADIUS + 0.05)  # just above the hammock center
         self._ball = builder.add_body(
-            xform=wp.transform(wp.vec3(BALL_START_X, 0.0, 0.0), wp.quat_identity()),
+            xform=wp.transform(start, wp.quat_identity()),
             mass=self.ball_mass,
             inertia=inertia,
             lock_inertia=True,
@@ -121,13 +139,19 @@ class ClothCatchBallScene(Scene):
         cell = CLOTH_SIZE / CLOTH_DIM
         n_particles = (CLOTH_DIM + 1) ** 2
         mass = self.cloth_mass / n_particles
-        # Vertical sheet with its normal along +x (the ball's flight direction),
-        # centered at the origin: add_cloth_grid builds the sheet in local XY
-        # (normal +z), so rotate +z onto +x (90 deg about Y) and offset the
-        # corner-anchored grid by the rotated half-extents.
-        rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 3.14159265 / 2.0)
-        half_local = wp.vec3(0.5 * CLOTH_SIZE, 0.5 * CLOTH_SIZE, 0.0)
-        origin = -wp.quat_rotate(rot, half_local)
+        if self.settle:
+            # Horizontal hammock (grid local XY = world XY, normal +z), two
+            # opposite edges pinned, centered under the ball.
+            rot = wp.quat_identity()
+            origin = wp.vec3(-0.5 * CLOTH_SIZE, -0.5 * CLOTH_SIZE, 0.0)
+        else:
+            # Vertical sheet with its normal along +x (the ball's flight direction),
+            # centered at the origin: add_cloth_grid builds the sheet in local XY
+            # (normal +z), so rotate +z onto +x (90 deg about Y) and offset the
+            # corner-anchored grid by the rotated half-extents.
+            rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 3.14159265 / 2.0)
+            half_local = wp.vec3(0.5 * CLOTH_SIZE, 0.5 * CLOTH_SIZE, 0.0)
+            origin = -wp.quat_rotate(rot, half_local)
         builder.add_cloth_grid(
             pos=origin,
             rot=rot,
@@ -143,13 +167,19 @@ class ClothCatchBallScene(Scene):
             edge_ke=CLOTH_EDGE_KE,
             edge_kd=CLOTH_EDGE_KD,
             particle_radius=CLOTH_PARTICLE_RADIUS,
+            fix_left=self.settle,
+            fix_right=self.settle,
             label="cloth",
         )
 
     # -- state ------------------------------------------------------------
     def init_state(self, model, state):
         qd = state.body_qd.numpy()
-        qd[self._ball][:3] = (self.impact_speed, 0.0, 0.0)
+        if self.settle:
+            qd[self._ball][:3] = (0.0, 0.0, 0.0)  # pure gravity drop
+        else:
+            a = math.radians(self.impact_angle)
+            qd[self._ball][:3] = (self.impact_speed * math.cos(a), self.impact_speed * math.sin(a), 0.0)
         state.body_qd.assign(qd)
 
     # -- diagnostics --------------------------------------------------------
@@ -161,9 +191,26 @@ class ClothCatchBallScene(Scene):
         p_cloth = float((pm * pv[:, 0]).sum())
         return self.ball_mass * v_ball + p_cloth, v_ball, p_cloth
 
+    def _settle_stats(self, model, state):
+        qd = state.body_qd.numpy()
+        v = qd[self._ball][:3]
+        q = state.body_q.numpy()
+        z = float(q[self._ball][2])
+        pv = state.particle_qd.numpy()
+        vmax = float((pv * pv).sum(axis=1).max() ** 0.5)
+        return float((v * v).sum() ** 0.5), z, vmax
+
     def diagnostics(self, model, state, frame):
+        if self.settle:
+            if frame % 30 == 0:
+                s, z, vmax = self._settle_stats(model, state)
+                print(f"[cloth_catch] f={frame:4d} |v_ball|={s:+.4f} z_ball={z:+.4f} vmax_cloth={vmax:.4f}", flush=True)
+            if frame >= int(getattr(self.args, "num_frames", 0)):
+                self.test_final(model, state)
+            return
         if not hasattr(self, "_p0"):
-            self._p0 = self.ball_mass * self.impact_speed  # analytic initial momentum
+            # analytic initial x-momentum (oblique launches carry cos(angle) of it)
+            self._p0 = self.ball_mass * self.impact_speed * math.cos(math.radians(self.impact_angle))
             print(
                 f"[cloth_catch] BEFORE (analytic): p_x = {self._p0:+.4f} N*s "
                 f"(ball {self.ball_mass:.3f} kg at {self.impact_speed:.2f} m/s; "
@@ -184,6 +231,15 @@ class ClothCatchBallScene(Scene):
         if getattr(self, "_audited", False):
             return
         self._audited = True
+        if self.settle:
+            s, z, vmax = self._settle_stats(model, state)
+            print("[cloth_catch] ===== settle audit =====", flush=True)
+            print(
+                f"[cloth_catch] |v_ball| = {s:.4f} m/s (quiet rest < 0.05)   z_ball = {z:+.4f} m "
+                f"(supported > {-BALL_RADIUS:.3f})   vmax_cloth = {vmax:.4f} m/s",
+                flush=True,
+            )
+            return
         px, v_ball, p_cloth = self._momentum(model, state)
         p0 = getattr(self, "_p0", self.ball_mass * self.impact_speed)
         print("[cloth_catch] ===== momentum audit =====", flush=True)
@@ -197,6 +253,19 @@ class ClothCatchBallScene(Scene):
             f"p_cloth = {p_cloth:+.4f} N*s",
             flush=True,
         )
+        if self.impact_angle != 0.0:
+            a = math.radians(self.impact_angle)
+            qd = state.body_qd.numpy()
+            pv = state.particle_qd.numpy()
+            pm = model.particle_mass.numpy()
+            py = self.ball_mass * float(qd[self._ball][1]) + float((pm * pv[:, 1]).sum())
+            py0 = self.ball_mass * self.impact_speed * math.sin(a)
+            vmax = float((pv * pv).sum(axis=1).max() ** 0.5)
+            print(
+                f"[cloth_catch] OBLIQUE: p_y BEFORE {py0:+.4f} AFTER {py:+.4f} "
+                f"(drift {py - py0:+.4f})   vmax_cloth = {vmax:.4f} m/s (fling detector)",
+                flush=True,
+            )
 
     # -- solver overrides ---------------------------------------------------
     def model_materials(self, solver_key):
@@ -252,6 +321,24 @@ class ClothCatchBallScene(Scene):
             default=8.0,
             dest="impact_speed",
             help="Ball speed along +x [m/s] (keep below the DAT motion cap, ~10 m/s at 40 substeps).",
+        )
+        parser.add_argument(
+            "--impact-angle",
+            type=float,
+            default=0.0,
+            dest="impact_angle",
+            help="Launch angle [deg] in the x-y plane (0 = head-on along the sheet normal). Oblique "
+            "launches stress single-axis momentum repairs: pocket contact normals fan away from the "
+            "aggregate deficit direction (watch the fling detector in the audit).",
+        )
+        parser.add_argument(
+            "--settle",
+            action="store_true",
+            dest="settle",
+            default=False,
+            help="Gravity-settle stress cell: horizontal hammock (two edges pinned), ball dropped on "
+            "the center under gravity. Verdict is the ball's steady rest speed — a repair scheme that "
+            "reads quasi-static support binding as impact deficit shows a persistent spurious velocity.",
         )
         parser.add_argument(
             "--contact-kd",
