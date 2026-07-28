@@ -25,6 +25,7 @@ import newton.examples
 
 from .controllers import CONTROLLERS, make_controller
 from .ik import IKController
+from .penetration import RigidSoftPenetrationTracker
 from .robots import gripper_body_ids
 from .scenes import SCENES, SceneHandles, make_scene
 from .solvers import SOLVERS, make_solver
@@ -94,6 +95,12 @@ class Experiment:
         self.state_1 = self.model.state()
         self.collision_pipeline = self.strategy.make_collision_pipeline(self.model, water_tight=self.args.water_tight)
         self.contacts = self.collision_pipeline.contacts()
+        self.penetration_tracker = None
+        if getattr(self.args, "measure_penetration", False):
+            self.penetration_tracker = RigidSoftPenetrationTracker(
+                self.model,
+                report_interval=self.args.penetration_report_interval,
+            )
         if int(getattr(self.args, "collision_interval", 0)) >= 1 and hasattr(
             self.solver, "set_collision_detection_hook"
         ):
@@ -260,6 +267,8 @@ class Experiment:
 
         self.strategy.reset_internal(self.state_0, self.device)
         self.controller.reset()
+        if self.penetration_tracker is not None:
+            self.penetration_tracker.reset()
         self.sim_time = 0.0
         if self.device.is_cuda:
             wp.synchronize_device()
@@ -338,6 +347,12 @@ class Experiment:
             else:
                 self.simulate()
         self.sim_time += self.frame_dt
+        if self.penetration_tracker is not None:
+            # Refresh contacts at the completed state. The simulation normally
+            # detects before solving, whose records would underestimate a
+            # post-step penetration excursion.
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.penetration_tracker.sample(self.state_0, self.contacts, self.sim_time)
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -410,6 +425,32 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         "division planes. Without this flag, the standard DAT crossing time is used.",
     )
     parser.add_argument(
+        "--dat-alm",
+        action="store_true",
+        default=False,
+        help="Enforce rigid-soft DAT division planes with projected augmented-Lagrangian constraints. "
+        "Independent of --dat hard truncation.",
+    )
+    parser.add_argument(
+        "--dat-alm-penalty",
+        type=float,
+        default=1.0e4,
+        help="Penalty coefficient for rigid-soft DAT-ALM half-space constraints [N/m].",
+    )
+    parser.add_argument(
+        "--measure-penetration",
+        action="store_true",
+        default=False,
+        help="Measure and report post-step raw-geometry penetration and collision-shell overlap "
+        "for each rigid-soft geometry pair.",
+    )
+    parser.add_argument(
+        "--penetration-report-interval",
+        type=int,
+        default=60,
+        help="Print running penetration maxima every N frames (0 prints only the final report).",
+    )
+    parser.add_argument(
         "--collision-interval",
         type=int,
         default=0,
@@ -469,6 +510,9 @@ def main(num_frames=600):
     try:
         newton.examples.run(experiment, args)
     finally:
+        penetration_tracker = getattr(experiment, "penetration_tracker", None)
+        if penetration_tracker is not None:
+            penetration_tracker.report()
         recorder = getattr(experiment, "_recorder", None)
         if recorder is not None:
             recorder.close()

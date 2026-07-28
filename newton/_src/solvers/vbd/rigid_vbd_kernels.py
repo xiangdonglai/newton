@@ -774,6 +774,27 @@ def _compute_body_particle_contact_force(
 
 
 @wp.func
+def evaluate_dat_plane_alm_constraint(
+    point: wp.vec3,
+    feasible_normal: wp.vec3,
+    plane_point: wp.vec3,
+    lambda_n: float,
+    penalty: float,
+):
+    """Evaluate a projected augmented-Lagrangian half-space constraint.
+
+    The feasible region is ``dot(feasible_normal, point - plane_point) >= 0``.
+    Returns the force toward the feasible side and its positive-semidefinite
+    Gauss-Newton Hessian.
+    """
+    gap = wp.dot(feasible_normal, point - plane_point)
+    force_magnitude = wp.max(lambda_n - penalty * gap, 0.0)
+    if force_magnitude <= 0.0:
+        return wp.vec3(0.0), wp.mat33(0.0)
+    return feasible_normal * force_magnitude, penalty * wp.outer(feasible_normal, feasible_normal)
+
+
+@wp.func
 def _eval_body_particle_contact(
     particle_index: int,
     particle_pos: wp.vec3,
@@ -2975,6 +2996,12 @@ def accumulate_body_particle_contacts_per_body(
     # Edge/face barycentric weights on the soft triangle; particle contacts leave this unused.
     soft_contact_barycentric: wp.array[wp.vec3],
     shape_margin: wp.array[float],
+    # DAT-ALM half-space constraints
+    dat_alm_enabled: int,
+    dat_alm_plane_point: wp.array[wp.vec3],
+    dat_alm_plane_normal: wp.array[wp.vec3],
+    dat_alm_lambda_rigid: wp.array[float],
+    dat_alm_penalty: float,
     # Per-body soft-contact adjacency (body-particle)
     body_particle_contact_buffer_pre_alloc: int,
     body_particle_contact_counts: wp.array[wp.int32],
@@ -3102,16 +3129,29 @@ def accumulate_body_particle_contacts_per_body(
                 dt,
             )
 
-        # Equal-and-opposite reaction on the body at the rigid contact point (shared by both kinds).
+        # Existing penalty/friction reaction plus the rigid side of the DAT-ALM plane.
         f_body = -f_soft
+        h_body = h_soft
+        if dat_alm_enabled != 0:
+            n_plane = dat_alm_plane_normal[contact_idx]
+            f_plane, h_plane = evaluate_dat_plane_alm_constraint(
+                cp_world,
+                -n_plane,
+                dat_alm_plane_point[contact_idx],
+                dat_alm_lambda_rigid[contact_idx],
+                dat_alm_penalty,
+            )
+            f_body += f_plane
+            h_body += h_plane
+
         r = cp_world - com_world
         tau_body = wp.cross(r, f_body)
         r_skew = wp.skew(r)
-        r_skew_T_K = wp.transpose(r_skew) * h_soft
+        r_skew_T_K = wp.transpose(r_skew) * h_body
 
         force_acc += f_body
         torque_acc += tau_body
-        h_ll_acc += h_soft
+        h_ll_acc += h_body
         h_al_acc += -r_skew_T_K
         h_aa_acc += r_skew_T_K * r_skew
 
@@ -3985,6 +4025,130 @@ def update_duals_body_particle_contacts(
 
     k = body_particle_contact_penalty_k[idx]
     body_particle_contact_penalty_k[idx] = wp.min(k + beta * penetration, stiffness)
+
+
+@wp.kernel
+def build_rigid_soft_dat_alm_planes(
+    soft_contact_count: wp.array[int],
+    soft_contact_primitive: wp.array[int],
+    soft_contact_shape: wp.array[int],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[int],
+    particle_q_ref: wp.array[wp.vec3],
+    particle_displacements: wp.array[wp.vec3],
+    body_q_ref: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    plane_point: wp.array[wp.vec3],
+    plane_normal: wp.array[wp.vec3],
+):
+    """Build one frozen DAT division plane for each rigid-soft contact row."""
+    idx = wp.tid()
+    c0 = soft_contact_count[0]
+    count = c0 + soft_contact_count[1] + soft_contact_count[2]
+    if idx >= count:
+        return
+
+    primitive = soft_contact_primitive[idx]
+    bary = wp.vec3(1.0, 0.0, 0.0)
+    v0 = primitive
+    v1 = int(-1)
+    v2 = int(-1)
+    if idx >= c0:
+        bary = soft_contact_barycentric[idx]
+        v0 = tri_indices[primitive, 0]
+        v1 = tri_indices[primitive, 1]
+        v2 = tri_indices[primitive, 2]
+
+    x_ref = bary[0] * particle_q_ref[v0]
+    dx_soft = bary[0] * particle_displacements[v0]
+    if v1 >= 0:
+        x_ref += bary[1] * particle_q_ref[v1]
+        dx_soft += bary[1] * particle_displacements[v1]
+    if v2 >= 0:
+        x_ref += bary[2] * particle_q_ref[v2]
+        dx_soft += bary[2] * particle_displacements[v2]
+
+    shape = soft_contact_shape[idx]
+    body = shape_body[shape]
+    X_ref = wp.transform_identity()
+    X_cur = wp.transform_identity()
+    if body >= 0:
+        X_ref = body_q_ref[body]
+        X_cur = body_q[body]
+
+    body_point_local = soft_contact_body_pos[idx]
+    bx_ref = wp.transform_point(X_ref, body_point_local)
+    bx = wp.transform_point(X_cur, body_point_local)
+    n = soft_contact_normal[idx]
+    gap = wp.max(wp.dot(n, x_ref - bx_ref), 0.0)
+
+    soft_approach = wp.max(-wp.dot(n, dx_soft), 0.0)
+    rigid_approach = wp.max(wp.dot(n, bx - bx_ref), 0.0)
+    lmbd = float(0.5)
+    if soft_approach + rigid_approach > 0.0:
+        lmbd = wp.clamp(rigid_approach / (rigid_approach + soft_approach), 0.05, 0.95)
+
+    plane_normal[idx] = n
+    plane_point[idx] = bx_ref + lmbd * gap * n
+
+
+@wp.kernel
+def update_rigid_soft_dat_alm_duals(
+    soft_contact_count: wp.array[int],
+    soft_contact_primitive: wp.array[int],
+    soft_contact_shape: wp.array[int],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[int],
+    particle_q: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    plane_point: wp.array[wp.vec3],
+    plane_normal: wp.array[wp.vec3],
+    penalty: float,
+    lambda_soft: wp.array[float],
+    lambda_rigid: wp.array[float],
+):
+    """Projected AL dual update for both sides of each frozen division plane."""
+    idx = wp.tid()
+    c0 = soft_contact_count[0]
+    count = c0 + soft_contact_count[1] + soft_contact_count[2]
+    if idx >= count:
+        return
+
+    primitive = soft_contact_primitive[idx]
+    bary = wp.vec3(1.0, 0.0, 0.0)
+    v0 = primitive
+    v1 = int(-1)
+    v2 = int(-1)
+    if idx >= c0:
+        bary = soft_contact_barycentric[idx]
+        v0 = tri_indices[primitive, 0]
+        v1 = tri_indices[primitive, 1]
+        v2 = tri_indices[primitive, 2]
+
+    x = bary[0] * particle_q[v0]
+    if v1 >= 0:
+        x += bary[1] * particle_q[v1]
+    if v2 >= 0:
+        x += bary[2] * particle_q[v2]
+
+    shape = soft_contact_shape[idx]
+    body = shape_body[shape]
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+    bx = wp.transform_point(X_wb, soft_contact_body_pos[idx])
+
+    n = plane_normal[idx]
+    d = plane_point[idx]
+    soft_gap = wp.dot(n, x - d)
+    rigid_gap = wp.dot(-n, bx - d)
+    lambda_soft[idx] = wp.max(lambda_soft[idx] - penalty * soft_gap, 0.0)
+    lambda_rigid[idx] = wp.max(lambda_rigid[idx] - penalty * rigid_gap, 0.0)
 
 
 # -----------------------------

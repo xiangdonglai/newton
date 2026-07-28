@@ -56,6 +56,7 @@ from .rigid_vbd_kernels import (
     apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
+    build_rigid_soft_dat_alm_planes,
     check_contact_overflow,
     compute_cable_dahl_parameters,
     compute_rigid_contact_forces,
@@ -72,6 +73,7 @@ from .rigid_vbd_kernels import (
     update_duals_body_body_contacts,
     update_duals_body_particle_contacts,
     update_duals_joint,
+    update_rigid_soft_dat_alm_duals,
 )
 from .tri_mesh_collision import (
     TriMeshCollisionDetector,
@@ -250,6 +252,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
         rigid_dat_enable_pinch_exemption: bool = False,  # Experimental slow-pinch anti-freeze relaxation
         rigid_dat_enable_bounded_advance: bool = False,  # Experimental finite-gap anti-freeze relaxation
+        rigid_enable_dat_alm: bool = False,  # Enforce rigid-soft DAT planes with projected AL constraints
+        rigid_dat_alm_penalty: float = 1.0e4,  # DAT-ALM half-space penalty [N/m]
     ):
         """
         Args:
@@ -383,6 +387,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_dat_enable_bounded_advance: Whether to enable the experimental DAT
                 relaxation that lets vertices parked on finite-gap division planes
                 advance by a bounded fraction of the gap. Defaults to ``False``.
+            rigid_enable_dat_alm: Whether to enforce rigid-soft DAT division planes
+                with projected augmented-Lagrangian half-space constraints.
+            rigid_dat_alm_penalty: Penalty coefficient for rigid-soft DAT-ALM
+                half-space constraints [N/m].
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -469,6 +477,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_dat_enable_pinch_exemption,
             rigid_dat_enable_bounded_advance,
         )
+        self._init_rigid_soft_dat_alm(model, rigid_enable_dat_alm, rigid_dat_alm_penalty)
 
         # Controls whether the next step() refreshes contact state derived from
         # the Contacts buffer or reuses the current rigid/body-particle contact state.
@@ -529,6 +538,21 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_bounding_radius = wp.array(bounding_radius, dtype=float, device=self.device)
 
         self._init_rigid_dat_body_vertices(model)
+
+    def _init_rigid_soft_dat_alm(self, model: Model, enabled: bool, penalty: float) -> None:
+        """Initialize rigid-soft DAT augmented-Lagrangian state."""
+        self.rigid_enable_dat_alm = bool(enabled)
+        self.rigid_dat_alm_penalty = float(penalty)
+        if not self.rigid_enable_dat_alm:
+            self.body_q_dat_alm_ref = wp.empty(0, dtype=wp.transform, device=self.device)
+            return
+        if self.rigid_dat_alm_penalty <= 0.0:
+            raise ValueError(f"rigid_dat_alm_penalty must be > 0, got {self.rigid_dat_alm_penalty}")
+        if model.body_count == 0 or model.particle_count == 0:
+            raise ValueError("rigid_enable_dat_alm requires both rigid bodies and particles.")
+        if self.integrate_with_external_rigid_solver:
+            raise ValueError("rigid_enable_dat_alm is not supported with an external rigid solver.")
+        self.body_q_dat_alm_ref = wp.zeros(model.body_count, dtype=wp.transform, device=self.device)
 
     # Bodies whose shapes provide more DAT vertices than this are uniformly subsampled
     # (weakens the per-vertex coverage; a warning is emitted).
@@ -951,6 +975,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_particle_contact_material_ke = wp.zeros(0, dtype=float, device=self.device)
         self.body_particle_contact_material_kd = wp.zeros(0, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(0, dtype=float, device=self.device)
+        self.body_particle_dat_alm_plane_point = wp.zeros(0, dtype=wp.vec3, device=self.device)
+        self.body_particle_dat_alm_plane_normal = wp.zeros(0, dtype=wp.vec3, device=self.device)
+        self.body_particle_dat_alm_lambda_soft = wp.zeros(0, dtype=float, device=self.device)
+        self.body_particle_dat_alm_lambda_rigid = wp.zeros(0, dtype=float, device=self.device)
         # Zero-length body poses for static-shape contact kernels when State.body_q is absent.
         self._empty_body_q = wp.empty(0, dtype=wp.transform, device=self.device)
         if model.particle_count > 0 and model.shape_count > 0:
@@ -1275,6 +1303,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_particle_contact_material_ke = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_kd = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(soft_contact_max, dtype=float, device=self.device)
+        self.body_particle_dat_alm_plane_point = wp.zeros(soft_contact_max, dtype=wp.vec3, device=self.device)
+        self.body_particle_dat_alm_plane_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, device=self.device)
+        self.body_particle_dat_alm_lambda_soft = wp.zeros(soft_contact_max, dtype=float, device=self.device)
+        self.body_particle_dat_alm_lambda_rigid = wp.zeros(soft_contact_max, dtype=float, device=self.device)
 
     def _init_rigid_contact_warmstart(self, rigid_contact_max: int) -> None:
         """Allocate rigid contact warm-start buffers."""
@@ -1861,9 +1893,12 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         if self.rigid_enable_penetration_free and self.model.body_count > 0:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self.rigid_enable_dat_alm:
+            wp.copy(dest=self.body_q_dat_alm_ref, src=state_in.body_q)
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, contacts, dt)
+        self._build_rigid_soft_dat_alm_planes(state_in, contacts)
 
         redetect_interval = self.rigid_collision_detection_interval
         for iter_num in range(self.iterations):
@@ -1877,6 +1912,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._midstep_collision_update(state_in, contacts)
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+            self._update_rigid_soft_dat_alm_duals(state_in, contacts)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
@@ -1909,14 +1945,21 @@ class SolverVBD(SolverBase, CouplingInterface):
             else:
                 self.pos_prev_collision_detection.assign(state_in.particle_q)
                 self.particle_displacements.zero_()
-        if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+        if (
+            self.rigid_enable_penetration_free
+            and model.body_count > 0
+            and not self.integrate_with_external_rigid_solver
+        ):
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self.rigid_enable_dat_alm:
+            wp.copy(dest=self.body_q_dat_alm_ref, src=state_in.body_q)
         # Re-detect on the committed state and rebuild the dependent contact state.
         self._collision_detection_hook(state_in)
         # Seed penalties at full material stiffness (k_start=-1 -> avg_ke): the system is
         # already mid-solve, so re-starting the AVBD penalty ramp every re-detection
         # would leave contacts permanently under-stiff (observed as the grasp slipping).
         self._rebuild_body_particle_contact_state(contacts, k_start=-1.0)
+        self._build_rigid_soft_dat_alm_planes(state_in, contacts)
 
     def _snapshot_rigid_contact_history(self, contacts: Contacts | None):
         """Write solved contact state for next frame's match-index warm-start."""
@@ -2613,6 +2656,67 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
+    def _build_rigid_soft_dat_alm_planes(self, state: State, contacts: Contacts | None) -> None:
+        """Freeze DAT-ALM planes for the current rigid-soft contact rows."""
+        if not self.rigid_enable_dat_alm or contacts is None or contacts.soft_contact_max == 0:
+            return
+        if self.body_particle_dat_alm_plane_point.shape[0] < contacts.soft_contact_max:
+            raise RuntimeError("DAT-ALM contact state was not allocated for the current contact capacity.")
+
+        self.body_particle_dat_alm_lambda_soft.zero_()
+        self.body_particle_dat_alm_lambda_rigid.zero_()
+        wp.launch(
+            kernel=build_rigid_soft_dat_alm_planes,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                contacts.soft_contact_count,
+                contacts.soft_contact_primitive,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_normal,
+                contacts.soft_contact_barycentric,
+                self.model.tri_indices,
+                self.model.shape_body,
+                self.pos_prev_collision_detection,
+                self.particle_displacements,
+                self.body_q_dat_alm_ref,
+                state.body_q,
+            ],
+            outputs=[
+                self.body_particle_dat_alm_plane_point,
+                self.body_particle_dat_alm_plane_normal,
+            ],
+            device=self.device,
+        )
+
+    def _update_rigid_soft_dat_alm_duals(self, state: State, contacts: Contacts | None) -> None:
+        """Project rigid-soft DAT-ALM multipliers after a complete primal sweep."""
+        if not self.rigid_enable_dat_alm or contacts is None or contacts.soft_contact_max == 0:
+            return
+        wp.launch(
+            kernel=update_rigid_soft_dat_alm_duals,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                contacts.soft_contact_count,
+                contacts.soft_contact_primitive,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_barycentric,
+                self.model.tri_indices,
+                self.model.shape_body,
+                state.particle_q,
+                state.body_q,
+                self.body_particle_dat_alm_plane_point,
+                self.body_particle_dat_alm_plane_normal,
+                self.rigid_dat_alm_penalty,
+            ],
+            outputs=[
+                self.body_particle_dat_alm_lambda_soft,
+                self.body_particle_dat_alm_lambda_rigid,
+            ],
+            device=self.device,
+        )
+
     def _solve_particle_iteration(
         self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
     ):
@@ -2683,6 +2787,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         # water-tight EDGE/FACE soft contacts (section 2)
                         model.tri_indices,
                         contacts.soft_contact_barycentric,
+                        int(self.rigid_enable_dat_alm),
+                        self.body_particle_dat_alm_plane_point,
+                        self.body_particle_dat_alm_plane_normal,
+                        self.body_particle_dat_alm_lambda_soft,
+                        self.rigid_dat_alm_penalty,
                     ],
                     outputs=[
                         self.particle_forces,
@@ -2894,6 +3003,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_normal,
                         contacts.soft_contact_barycentric,
                         model.shape_margin,
+                        int(self.rigid_enable_dat_alm),
+                        self.body_particle_dat_alm_plane_point,
+                        self.body_particle_dat_alm_plane_normal,
+                        self.body_particle_dat_alm_lambda_rigid,
+                        self.rigid_dat_alm_penalty,
                         self.body_particle_contact_buffer_pre_alloc,
                         self.body_particle_contact_counts,
                         self.body_particle_contact_indices,

@@ -2809,13 +2809,15 @@ def _build_sphere_drop_on_cloth(device):
     return model, body
 
 
-def _run_sphere_drop(device, enable_dat, drop_speed=8.0, frames=60):
+def _run_sphere_drop(device, enable_dat, enable_dat_alm=False, drop_speed=8.0, frames=60):
     model, body = _build_sphere_drop_on_cloth(device)
     margin = 0.1
     solver = newton.solvers.SolverVBD(
         model,
         iterations=4,
         rigid_enable_penetration_free=enable_dat,
+        rigid_enable_dat_alm=enable_dat_alm,
+        rigid_dat_alm_penalty=1.0e5,
         rigid_penetration_free_query_margin=margin,
         rigid_body_particle_contact_buffer_size=1024,
     )
@@ -2859,6 +2861,19 @@ def test_rigid_dat_sphere_drop_penetration_free(test, device):
         worst_pen_ctrl > 1.0e-3 or body_z_ctrl < -1.0,
         "control without DAT should penetrate or tunnel; if it no longer does, strengthen this stress",
     )
+
+
+def test_rigid_dat_alm_sphere_drop_reduces_penetration(test, device):
+    """Rigid-soft DAT-ALM reduces fast-impact penetration without hard DAT truncation."""
+    worst_pen_alm, body_z_alm = _run_sphere_drop(device, enable_dat=False, enable_dat_alm=True)
+    worst_pen_ctrl, body_z_ctrl = _run_sphere_drop(device, enable_dat=False, enable_dat_alm=False)
+    test.assertTrue(np.isfinite(worst_pen_alm) and np.isfinite(body_z_alm))
+    test.assertLess(
+        worst_pen_alm,
+        worst_pen_ctrl,
+        "DAT-ALM should reduce penetration relative to the penalty-only control",
+    )
+    test.assertGreater(body_z_alm, body_z_ctrl, "DAT-ALM should delay or prevent tunneling through the cloth")
 
 
 def _build_rigid_rigid_impact(device):
@@ -2958,6 +2973,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_sphere_drop_penetration_free",
     test_rigid_dat_sphere_drop_penetration_free,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_alm_sphere_drop_reduces_penetration",
+    test_rigid_dat_alm_sphere_drop_reduces_penetration,
     devices=devices,
 )
 add_function_test(

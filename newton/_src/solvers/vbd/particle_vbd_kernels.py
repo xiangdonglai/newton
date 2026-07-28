@@ -19,6 +19,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _eval_body_particle_contact,
     _eval_soft_ef_contact,
     evaluate_body_particle_contact,
+    evaluate_dat_plane_alm_constraint,
     planar_truncation_t,
 )
 
@@ -2299,6 +2300,12 @@ def accumulate_particle_body_contact_force_and_hessian(
     # water-tight EDGE/FACE soft contacts (section 2): same per-contact AVBD material as section 1
     tri_indices: wp.array2d[wp.int32],
     contact_barycentric: wp.array[wp.vec3],
+    # DAT-ALM half-space constraints
+    dat_alm_enabled: int,
+    dat_alm_plane_point: wp.array[wp.vec3],
+    dat_alm_plane_normal: wp.array[wp.vec3],
+    dat_alm_lambda_soft: wp.array[float],
+    dat_alm_penalty: float,
     # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
@@ -2340,6 +2347,16 @@ def accumulate_particle_body_contact_force_and_hessian(
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+            if dat_alm_enabled != 0:
+                plane_force, plane_hessian = evaluate_dat_plane_alm_constraint(
+                    pos[particle_idx],
+                    dat_alm_plane_normal[t_id],
+                    dat_alm_plane_point[t_id],
+                    dat_alm_lambda_soft[t_id],
+                    dat_alm_penalty,
+                )
+                wp.atomic_add(particle_forces, particle_idx, plane_force)
+                wp.atomic_add(particle_hessians, particle_idx, plane_hessian)
 
     # Section 2 — water-tight EDGE/FACE soft contacts.
     # Records pack contiguously after the legacy particle range: [c0, c0 + n_edge + n_face).
@@ -2378,6 +2395,19 @@ def accumulate_particle_body_contact_force_and_hessian(
             shape_margin,
             dt,
         )
+        if dat_alm_enabled != 0:
+            x = bary[0] * pos[tri_indices[tri, 0]]
+            x += bary[1] * pos[tri_indices[tri, 1]]
+            x += bary[2] * pos[tri_indices[tri, 2]]
+            plane_force, plane_hessian = evaluate_dat_plane_alm_constraint(
+                x,
+                dat_alm_plane_normal[t_id],
+                dat_alm_plane_point[t_id],
+                dat_alm_lambda_soft[t_id],
+                dat_alm_penalty,
+            )
+            ef_force += plane_force
+            ef_hessian += plane_hessian
 
         for i in range(3):
             w = bary[i]

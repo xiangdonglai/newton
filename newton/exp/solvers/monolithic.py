@@ -132,6 +132,9 @@ class MonolithicAvbdStrategy(SolverStrategy):
             vbd_kwargs["rigid_penetration_free_query_margin"] = 0.01
             vbd_kwargs["rigid_dat_enable_pinch_exemption"] = bool(args.dat_pinch_exemption)
             vbd_kwargs["rigid_dat_enable_bounded_advance"] = bool(args.dat_bounded_advance)
+        if getattr(args, "dat_alm", False):
+            vbd_kwargs["rigid_enable_dat_alm"] = True
+            vbd_kwargs["rigid_dat_alm_penalty"] = float(args.dat_alm_penalty)
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win
