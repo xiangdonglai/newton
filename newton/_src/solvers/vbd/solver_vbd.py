@@ -248,6 +248,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_collision_detection_interval: int = 0,  # Re-detect rigid-soft contacts every N iterations (0 = per-step only)
         rigid_penetration_free_query_margin: float = 0.01,  # Must match the collision pipeline's soft_contact_margin
         rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
+        rigid_dat_enable_pinch_exemption: bool = False,  # Experimental slow-pinch anti-freeze relaxation
+        rigid_dat_enable_bounded_advance: bool = False,  # Experimental finite-gap anti-freeze relaxation
     ):
         """
         Args:
@@ -375,6 +377,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_conservative_bound_relaxation: Relaxation factor in (0, 1) applied to rigid DAT truncation
                 scalars and the conservative motion bound. Only used when ``rigid_enable_penetration_free``
                 is ``True``.
+            rigid_dat_enable_pinch_exemption: Whether to enable the experimental DAT
+                relaxation that exempts slowly approaching pinched pairs from strict
+                truncation. Defaults to ``False``.
+            rigid_dat_enable_bounded_advance: Whether to enable the experimental DAT
+                relaxation that lets vertices parked on finite-gap division planes
+                advance by a bounded fraction of the gap. Defaults to ``False``.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -458,6 +466,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_collision_detection_interval,
             rigid_penetration_free_query_margin,
             rigid_conservative_bound_relaxation,
+            rigid_dat_enable_pinch_exemption,
+            rigid_dat_enable_bounded_advance,
         )
 
         # Controls whether the next step() refreshes contact state derived from
@@ -474,6 +484,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_collision_detection_interval: int,
         rigid_penetration_free_query_margin: float,
         rigid_conservative_bound_relaxation: float,
+        rigid_dat_enable_pinch_exemption: bool,
+        rigid_dat_enable_bounded_advance: bool,
     ):
         """Initialize rigid DAT truncation buffers and per-body bounding radii."""
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
@@ -482,6 +494,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._collision_detection_hook = None
         self.rigid_penetration_free_query_margin = rigid_penetration_free_query_margin
         self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
+        self.rigid_dat_enable_pinch_exemption = bool(rigid_dat_enable_pinch_exemption)
+        self.rigid_dat_enable_bounded_advance = bool(rigid_dat_enable_bounded_advance)
         # Threshold below which a displacement is treated as parallel to a division plane.
         self.rigid_dat_parallel_epsilon = 1e-5
 
@@ -2020,6 +2034,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_penetration_free_query_margin,
+                    int(self.rigid_dat_enable_pinch_exemption),
+                    int(self.rigid_dat_enable_bounded_advance),
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -2098,6 +2114,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.dat_body_vertices,
                     self.dat_body_vertex_radius,
                     self.rigid_conservative_bound_relaxation,
+                    int(self.rigid_dat_enable_pinch_exemption),
+                    int(self.rigid_dat_enable_bounded_advance),
                 ],
                 outputs=[
                     self.body_truncation_ts,
@@ -2131,6 +2149,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_penetration_free_query_margin,
+                    int(self.rigid_dat_enable_pinch_exemption),
+                    int(self.rigid_dat_enable_bounded_advance),
                 ],
                 outputs=[
                     self.truncation_ts,

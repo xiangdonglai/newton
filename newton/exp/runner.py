@@ -396,6 +396,20 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         "per-contact division planes so the gripper cannot penetrate the cloth within a step.",
     )
     parser.add_argument(
+        "--dat-pinch-exemption",
+        action="store_true",
+        default=False,
+        help="Enable the experimental DAT relaxation that permits slowly approaching pinched pairs. "
+        "Without this flag, pinched pairs use strict truncation.",
+    )
+    parser.add_argument(
+        "--dat-bounded-advance",
+        action="store_true",
+        default=False,
+        help="Enable the experimental DAT relaxation that permits bounded advance past finite-gap "
+        "division planes. Without this flag, the standard DAT crossing time is used.",
+    )
+    parser.add_argument(
         "--collision-interval",
         type=int,
         default=0,

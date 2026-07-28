@@ -2638,12 +2638,43 @@ def _rigid_trajectory_truncation_probe(
     angle: float,
     offset0: wp.vec3,
     gamma_r: float,
+    pair_gap: float,
+    enable_pinch_exemption: int,
+    enable_bounded_advance: int,
     t_out: wp.array[float],
 ):
-    t_out[0] = rigid_trajectory_truncation_t(n, d, c0, dx, axis, angle, offset0, gamma_r)
+    t_out[0] = rigid_trajectory_truncation_t(
+        n,
+        d,
+        c0,
+        dx,
+        axis,
+        angle,
+        offset0,
+        gamma_r,
+        1.0e-3,
+        0.0,
+        pair_gap,
+        enable_pinch_exemption,
+        enable_bounded_advance,
+    )
 
 
-def _probe_trajectory_truncation(device, n, d, c0, dx, axis, angle, offset0, gamma_r):
+def _probe_trajectory_truncation(
+    device,
+    n,
+    d,
+    c0,
+    dx,
+    axis,
+    angle,
+    offset0,
+    gamma_r,
+    *,
+    pair_gap=0.0,
+    enable_pinch_exemption=False,
+    enable_bounded_advance=False,
+):
     t_out = wp.zeros(1, dtype=float, device=device)
     wp.launch(
         _rigid_trajectory_truncation_probe,
@@ -2657,6 +2688,9 @@ def _probe_trajectory_truncation(device, n, d, c0, dx, axis, angle, offset0, gam
             angle,
             wp.vec3(*offset0),
             gamma_r,
+            pair_gap,
+            int(enable_pinch_exemption),
+            int(enable_bounded_advance),
         ],
         outputs=[t_out],
         device=device,
@@ -2678,6 +2712,48 @@ def test_rigid_dat_trajectory_truncation(test, device):
         device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, 0, 0), (0, 0, -1), math.pi / 2, (1, 0, 0), 1.0
     )
     test.assertEqual(t, 1.0)
+
+
+def test_rigid_dat_relaxations_are_opt_in(test, device):
+    """Strict DAT is the default; each anti-freeze relaxation requires an explicit flag."""
+    common = dict(
+        device=device,
+        n=(1.0, 0.0, 0.0),
+        d=(0.0, 0.0, 0.0),
+        c0=(0.0, 0.0, 0.0),
+        axis=(0.0, 0.0, 1.0),
+        angle=0.0,
+        offset0=(0.0, 0.0, 0.0),
+        gamma_r=0.85,
+    )
+
+    # A pinched point approaching by less than 1 mm freezes by default.
+    t_strict = _probe_trajectory_truncation(dx=(5.0e-4, 0.0, 0.0), **common)
+    t_exempt = _probe_trajectory_truncation(
+        dx=(5.0e-4, 0.0, 0.0),
+        enable_pinch_exemption=True,
+        **common,
+    )
+    test.assertEqual(t_strict, 0.0)
+    test.assertEqual(t_exempt, 1.0)
+
+    # A point crossing a finite-gap plane uses the standard crossing time by
+    # default; bounded advance can only increase it when explicitly enabled.
+    finite_gap = dict(common)
+    finite_gap["c0"] = (-1.0e-3, 0.0, 0.0)
+    finite_gap["offset0"] = (0.0, 0.0, 0.0)
+    t_strict = _probe_trajectory_truncation(
+        dx=(0.1, 0.0, 0.0),
+        pair_gap=0.1,
+        **finite_gap,
+    )
+    t_advance = _probe_trajectory_truncation(
+        dx=(0.1, 0.0, 0.0),
+        pair_gap=0.1,
+        enable_bounded_advance=True,
+        **finite_gap,
+    )
+    test.assertLess(t_strict, t_advance)
 
     # Pure translation degenerates to the straight-ray case: crossing at t=0.5.
     t = _probe_trajectory_truncation(
@@ -2870,6 +2946,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_relaxations_are_opt_in",
+    test_rigid_dat_relaxations_are_opt_in,
     devices=devices,
 )
 add_function_test(
