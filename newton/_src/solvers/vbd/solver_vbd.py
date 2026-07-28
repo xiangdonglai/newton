@@ -102,6 +102,14 @@ from .vbd_coupling_kernels import (
 
 __all__ = ["SolverVBD"]
 
+# Island label-propagation rounds for the local-completion budget. Each round
+# links components through the current contacts and then pointer-jumps once;
+# the contact graph linking a body to a cloth is one hop deep, so a handful of
+# rounds saturates. Fixed (not convergence-tested) to keep the launch sequence
+# static for CUDA graph capture; atomic_min is monotone, so extra rounds are
+# a no-op once labels settle.
+_LCOMP_ISLAND_PASSES = 6
+
 
 @wp.kernel
 def _zero_ef_row_kd(soft_contact_count: wp.array[wp.int32], material_kd: wp.array[wp.float32]):
@@ -521,6 +529,7 @@ def _lcomp_impact_flag(
     body_com: wp.array[wp.vec3],
     body_qd_entry: wp.array[wp.spatial_vector],
     body_impact: wp.array[wp.int32],
+    body_nsum: wp.array[wp.vec3],
 ):
     """Trigger gate: a body's completion activates only if some bound row
     satisfied the adaptive impact criterion (entry anchor closing speed over
@@ -562,6 +571,31 @@ def _lcomp_impact_flag(
     # momentum loss.
     if w * dt > budget_frac * particle_radius[v0]:
         body_impact[b] = 1
+        if body_nsum:
+            # Local completion axis: contact normals weighted by their closing
+            # speed. Geometric, so unlike the residual estimator's direction
+            # (v2) it carries no convergence noise that can flip the axis.
+            wp.atomic_add(body_nsum, b, n * w)
+
+
+@wp.kernel
+def _lcomp_nhat_local(
+    nsum: wp.array[wp.vec3],
+    body_impact: wp.array[wp.int32],
+    nhat: wp.array[wp.vec3],
+):
+    """Completion axis from this body's own contact normals, with no island
+    reduction. See :func:`_lcomp_nhat_local` accumulation in
+    :func:`_lcomp_impact_flag`."""
+    b = wp.tid()
+    nhat[b] = wp.vec3(0.0)
+    if body_impact[b] == 0:
+        return
+    v = nsum[b]
+    l = wp.length(v)
+    if l <= 1.0e-12:
+        return
+    nhat[b] = v / l
 
 
 @wp.kernel
@@ -636,6 +670,607 @@ def _lcomp_pin_anchor(
 
 
 @wp.kernel
+def _lcomp_ang_axis(
+    budget_l: wp.array[wp.vec3],
+    body_impact: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    ahat: wp.array[wp.vec3],
+):
+    """Completion axis for the rotational channel: the direction of the
+    island's own angular deficit. Taken from the identity for the same reason
+    the linear axis is (Section 9.5): magnitude and direction are one vector,
+    and supplying them from different sources is a third, invalid choice."""
+    b = wp.tid()
+    ahat[b] = wp.vec3(0.0)
+    if body_impact[b] == 0:
+        return
+    bud = budget_l[root[comp_of_body[b]]]
+    l = wp.length(bud)
+    if l <= 1.0e-12:
+        return
+    ahat[b] = bud / l
+
+
+@wp.kernel
+def _lcomp_ang_centroid(
+    bind_body: wp.array[wp.int32],
+    bind_ext: wp.array[wp.int32],
+    q: wp.array[wp.vec3],
+    mass: wp.array[float],
+    mx_pool: wp.array[wp.vec3],
+    m_pool_ang: wp.array[float],
+):
+    """Mass-weighted position and mass of each pool's pocket. The body's own
+    contribution is added by :func:`_lcomp_ang_centroid_body`, because the
+    rotation must be about the centre of mass of the WHOLE pool: a rigid
+    rotation about any other point injects net linear momentum."""
+    i = wp.tid()
+    b = bind_body[i]
+    if b < 0 or bind_ext[i] != 0:
+        return
+    m = mass[i]
+    if m <= 0.0:
+        return
+    wp.atomic_add(mx_pool, b, q[i] * m)
+    wp.atomic_add(m_pool_ang, b, m)
+
+
+@wp.kernel
+def _lcomp_ang_centroid_body(
+    body_impact: wp.array[wp.int32],
+    inv_mass: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    mx_pool: wp.array[wp.vec3],
+    m_pool_ang: wp.array[float],
+):
+    """The body's share of its pool's centre of mass."""
+    b = wp.tid()
+    if body_impact[b] == 0:
+        return
+    im = inv_mass[b]
+    if im <= 0.0:
+        return
+    m = 1.0 / im
+    x = wp.transform_point(body_q[b], body_com[b])
+    wp.atomic_add(mx_pool, b, x * m)
+    wp.atomic_add(m_pool_ang, b, m)
+
+
+@wp.kernel
+def _lcomp_ang_inertia(
+    bind_body: wp.array[wp.int32],
+    bind_ext: wp.array[wp.int32],
+    q: wp.array[wp.vec3],
+    mass: wp.array[float],
+    mx_pool: wp.array[wp.vec3],
+    m_pool_ang: wp.array[float],
+    ahat: wp.array[wp.vec3],
+    i_pool: wp.array[float],
+):
+    """Scalar moment of inertia of the pocket about the completion axis through
+    the pocket centroid: ``sum m_i * |r_perp|^2``."""
+    i = wp.tid()
+    b = bind_body[i]
+    if b < 0 or bind_ext[i] != 0:
+        return
+    m = mass[i]
+    if m <= 0.0:
+        return
+    mp = m_pool_ang[b]
+    if mp <= 0.0:
+        return
+    a = ahat[b]
+    if wp.length_sq(a) == 0.0:
+        return
+    r = q[i] - mx_pool[b] / mp
+    r_perp = r - a * wp.dot(r, a)
+    wp.atomic_add(i_pool, b, m * wp.dot(r_perp, r_perp))
+
+
+@wp.kernel
+def _lcomp_ang_domega(
+    budget_l: wp.array[wp.vec3],
+    ahat: wp.array[wp.vec3],
+    body_impact: wp.array[wp.int32],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_q: wp.array[wp.transform],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    est_sum: wp.array[float],
+    deficit: wp.array[wp.vec3],
+    armed_count: wp.array[wp.int32],
+    kappa: float,
+    i_pool: wp.array[float],
+    mx_pool: wp.array[wp.vec3],
+    m_pool_ang: wp.array[float],
+    inv_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    domega: wp.array[float],
+    ang_active: wp.array[wp.int32],
+):
+    """Rotation-rate increment for the pool: ``dw = share_L / I_total``.
+
+    Because the increment is applied to both body and pocket, the angular
+    momentum it adds along the axis is exactly ``I_total * dw = share_L`` — the
+    island's own deficit share, so the injection is bounded by the identity
+    rather than by a tuned constant.
+
+    CONDITIONING. The linear rule is unconditionally safe because its
+    denominator ``m_b + m_S`` is at least ``m_b > 0``. This one has no such
+    floor: a pocket is a nearly planar particle set, so ``I_pool`` about an
+    in-plane axis can approach zero and ``dw`` would diverge. The guard is
+    therefore RELATIVE — the pocket must be at least ``kappa`` times as stiff
+    rotationally as the body it is stopping — and it DECLINES rather than
+    clamps, leaving the remainder to the whole-system repair. Declining is
+    deliberate: Section 9.5 records that a guard which chatters on and off
+    across a discontinuity drives the membrane non-finite, whereas not arming
+    degrades gracefully."""
+    b = wp.tid()
+    domega[b] = 0.0
+    ang_active[b] = 0
+    if body_impact[b] == 0:
+        return
+    a = ahat[b]
+    if wp.length_sq(a) == 0.0:
+        return
+    isl = root[comp_of_body[b]]
+    w = float(0.0)
+    if est_sum[isl] > 0.0:
+        w = wp.length(deficit[b]) / est_sum[isl]
+    elif armed_count[isl] > 0:
+        w = 1.0 / float(armed_count[isl])
+    if w <= 0.0:
+        return
+    share = wp.dot(budget_l[isl], a) * w
+    r_mat = wp.quat_to_matrix(wp.transform_get_rotation(body_q[b]))
+    i_body_w = r_mat @ wp.inverse(body_inv_inertia[b]) @ wp.transpose(r_mat)
+    i_spin = wp.dot(a, i_body_w @ a)
+    # The deficit in these cells is ORBITAL (an impactor offset from the axis),
+    # not spin, so the body enters as a point mass orbiting the pool centroid
+    # as well as through its own spin inertia. Omitting the orbital term both
+    # understates I_tot and, worse, pairs it with a spin-only write-back, which
+    # delivers the deficit as impactor spin -- the artefact being removed.
+    mp = m_pool_ang[b]
+    if mp <= 0.0:
+        return
+    x_b = wp.transform_point(body_q[b], body_com[b])
+    r_b = x_b - mx_pool[b] / mp
+    r_perp = r_b - a * wp.dot(r_b, a)
+    m_b = 0.0
+    if inv_mass[b] > 0.0:
+        m_b = 1.0 / inv_mass[b]
+    i_orb = m_b * wp.dot(r_perp, r_perp)
+    i_body_a = i_spin + i_orb
+    i_tot = i_pool[b] + i_body_a
+    if i_pool[b] < kappa * i_body_a or i_tot <= 1.0e-12:
+        return
+    domega[b] = share / i_tot
+    ang_active[b] = 1
+
+
+@wp.kernel
+def _lcomp_ang_apply_particles(
+    bind_body: wp.array[wp.int32],
+    bind_ext: wp.array[wp.int32],
+    ang_active: wp.array[wp.int32],
+    domega: wp.array[float],
+    ahat: wp.array[wp.vec3],
+    q: wp.array[wp.vec3],
+    mx_pool: wp.array[wp.vec3],
+    m_pool_ang: wp.array[float],
+    qd: wp.array[wp.vec3],
+):
+    """Add the rigid-rotation velocity field of the increment about the pocket
+    centroid. An increment, not a re-orientation: the pocket's internal motion
+    is untouched."""
+    i = wp.tid()
+    b = bind_body[i]
+    if b < 0 or bind_ext[i] != 0 or ang_active[b] == 0:
+        return
+    mp = m_pool_ang[b]
+    if mp <= 0.0:
+        return
+    r = q[i] - mx_pool[b] / mp
+    qd[i] = qd[i] + wp.cross(ahat[b] * domega[b], r)
+
+
+@wp.kernel
+def _lcomp_ang_apply_bodies(
+    ang_active: wp.array[wp.int32],
+    domega: wp.array[float],
+    ahat: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    mx_pool: wp.array[wp.vec3],
+    m_pool_ang: wp.array[float],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """The body takes the same rotation-rate increment as the pocket, as both
+    an orbital velocity about the pool centroid and a spin. Together with the
+    particle pass this is one rigid rotation of the pool: it adds exactly
+    ``I_total * dw`` of angular momentum and, because the rotation is about the
+    pool's own centre of mass, no net linear momentum."""
+    b = wp.tid()
+    if ang_active[b] == 0:
+        return
+    mp = m_pool_ang[b]
+    if mp <= 0.0:
+        return
+    dw = ahat[b] * domega[b]
+    x_b = wp.transform_point(body_q[b], body_com[b])
+    dv = wp.cross(dw, x_b - mx_pool[b] / mp)
+    qd = body_qd[b]
+    body_qd[b] = wp.spatial_vector(
+        qd[0] + dv[0], qd[1] + dv[1], qd[2] + dv[2], qd[3] + dw[0], qd[4] + dw[1], qd[5] + dw[2]
+    )
+
+
+@wp.kernel
+def _lcomp_ang_accum_total(
+    budget_l: wp.array[wp.vec3],
+    total: wp.array[wp.vec3],
+):
+    """Running sum of every island's angular deficit across the whole run.
+
+    If the budget is correct this must converge on the angular momentum the
+    audit reports as lost, which is the Milestone 1 validation."""
+    wp.atomic_add(total, 0, budget_l[wp.tid()])
+
+
+@wp.kernel
+def _lcomp_ang_particles_island(
+    q: wp.array[wp.vec3],
+    qd: wp.array[wp.vec3],
+    mass: wp.array[float],
+    comp_of_particle: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    l_out: wp.array[wp.vec3],
+    mx_out: wp.array[wp.vec3],
+):
+    """Angular momentum about the ORIGIN and the mass-weighted position, per
+    island. Shifting to each island's own centre of mass is deferred to
+    :func:`_lcomp_ang_budget_island`, which needs the totals anyway."""
+    i = wp.tid()
+    m = mass[i]
+    if m <= 0.0:
+        return
+    isl = root[comp_of_particle[i]]
+    x = q[i]
+    wp.atomic_add(l_out, isl, wp.cross(x, qd[i] * m))
+    wp.atomic_add(mx_out, isl, x * m)
+
+
+@wp.kernel
+def _lcomp_ang_bodies_island(
+    body_q: wp.array[wp.transform],
+    qd: wp.array[wp.spatial_vector],
+    inv_mass: wp.array[float],
+    inv_inertia: wp.array[wp.mat33],
+    body_com: wp.array[wp.vec3],
+    jointed: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    l_out: wp.array[wp.vec3],
+    mx_out: wp.array[wp.vec3],
+):
+    """As :func:`_lcomp_ang_particles_island`, plus the body's own spin term
+    ``I_world * omega``. Jointed bodies are skipped: their momentum is owned by
+    the articulation, not the island (the v1 policy of Section 7)."""
+    b = wp.tid()
+    if jointed[b] != 0:
+        return
+    im = inv_mass[b]
+    if im <= 0.0:
+        return
+    m = 1.0 / im
+    isl = root[comp_of_body[b]]
+    x = wp.transform_point(body_q[b], body_com[b])
+    v = wp.vec3(qd[b][0], qd[b][1], qd[b][2])
+    w = wp.vec3(qd[b][3], qd[b][4], qd[b][5])
+    r_mat = wp.quat_to_matrix(wp.transform_get_rotation(body_q[b]))
+    i_w = r_mat @ wp.inverse(inv_inertia[b]) @ wp.transpose(r_mat)
+    wp.atomic_add(l_out, isl, wp.cross(x, v * m) + i_w @ w)
+    wp.atomic_add(mx_out, isl, x * m)
+
+
+@wp.kernel
+def _lcomp_ang_budget_island(
+    l_start: wp.array[wp.vec3],
+    l_end: wp.array[wp.vec3],
+    mx_start: wp.array[wp.vec3],
+    mx_end: wp.array[wp.vec3],
+    p_start: wp.array[wp.vec3],
+    p_end: wp.array[wp.vec3],
+    m_tot: wp.array[float],
+    tau_ext: wp.array[wp.vec3],
+    anchored: wp.array[wp.int32],
+    budget_l: wp.array[wp.vec3],
+):
+    """Angular deficit of an island, about its OWN centre of mass.
+
+    Taken about the COM rather than the origin so the gravity torque vanishes
+    identically (``sum r_i x m_i g = (sum m_i r_i) x g = 0`` there), which is
+    the rotational counterpart of how :func:`_lcomp_budget_island` handles
+    gravity analytically instead of by accumulation. The shift uses
+    ``L_com = L_origin - com x p``.
+
+    An anchored island keeps a zero budget for the same reason as the linear
+    pass: its interface momentum is owned by the external constraint."""
+    isl = wp.tid()
+    m = m_tot[isl]
+    if anchored[isl] != 0 or m <= 0.0:
+        budget_l[isl] = wp.vec3(0.0)
+        return
+    com_s = mx_start[isl] / m
+    com_e = mx_end[isl] / m
+    l_com_s = l_start[isl] - wp.cross(com_s, p_start[isl])
+    l_com_e = l_end[isl] - wp.cross(com_e, p_end[isl])
+    budget_l[isl] = l_com_s + tau_ext[isl] - l_com_e
+
+
+@wp.kernel
+def _lcomp_sum_particles_island(
+    qd: wp.array[wp.vec3],
+    mass: wp.array[float],
+    comp_of_particle: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    p_out: wp.array[wp.vec3],
+    m_out: wp.array[float],
+):
+    i = wp.tid()
+    m = mass[i]
+    if m <= 0.0:
+        return
+    isl = root[comp_of_particle[i]]
+    wp.atomic_add(p_out, isl, qd[i] * m)
+    wp.atomic_add(m_out, isl, m)
+
+
+@wp.kernel
+def _lcomp_sum_bodies_island(
+    qd: wp.array[wp.spatial_vector],
+    inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    p_out: wp.array[wp.vec3],
+    m_out: wp.array[float],
+):
+    b = wp.tid()
+    if jointed[b] != 0:
+        return
+    im = inv_mass[b]
+    if im <= 0.0:
+        return
+    m = 1.0 / im
+    isl = root[comp_of_body[b]]
+    v = wp.vec3(qd[b][0], qd[b][1], qd[b][2])
+    wp.atomic_add(p_out, isl, v * m)
+    wp.atomic_add(m_out, isl, m)
+
+
+@wp.kernel
+def _lcomp_jext_island(
+    soft_contact_count: wp.array[wp.int32],
+    force_applied: wp.array[wp.vec3],
+    contact_shape: wp.array[wp.int32],
+    contact_primitive: wp.array[wp.int32],
+    contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_is_jointed: wp.array[wp.int32],
+    comp_of_particle: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    dt: float,
+    jext: wp.array[wp.vec3],
+):
+    """External impulse, booked to the island of the PARTICLE side (the free
+    member): the partner is static or jointed and therefore in no island."""
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b >= 0 and body_is_jointed[b] == 0:
+        return  # free partner: internal to the island, cancels
+    prim = contact_primitive[i]
+    if prim < 0:
+        return
+    imp = force_applied[i] * dt
+    if i < c0:
+        wp.atomic_add(jext, root[comp_of_particle[prim]], imp)
+    else:
+        bary = contact_barycentric[i]
+        for k in range(3):
+            if bary[k] > 0.0:
+                wp.atomic_add(jext, root[comp_of_particle[tri_indices[prim, k]]], imp * bary[k])
+
+
+@wp.kernel
+def _lcomp_anchor_soft_island(
+    soft_contact_count: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    contact_primitive: wp.array[wp.int32],
+    contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[wp.int32],
+    jointed: wp.array[wp.int32],
+    comp_of_particle: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+):
+    """Only the TOUCHING island is anchored, not the whole scene."""
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b >= 0 and jointed[b] == 0:
+        return
+    prim = contact_primitive[i]
+    if prim < 0:
+        return
+    if i < c0:
+        anchored[root[comp_of_particle[prim]]] = 1
+    else:
+        bary = contact_barycentric[i]
+        for k in range(3):
+            if bary[k] > 0.0:
+                anchored[root[comp_of_particle[tri_indices[prim, k]]]] = 1
+
+
+@wp.kernel
+def _lcomp_anchor_pin_island(
+    particle_inv_mass: wp.array[float],
+    comp_of_particle: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if particle_inv_mass[i] == 0.0:
+        anchored[root[comp_of_particle[i]]] = 1
+
+
+@wp.kernel
+def _lcomp_anchor_rigid_island(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    jointed: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    anchored: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if i >= rigid_contact_count[0]:
+        return
+    s0 = rigid_contact_shape0[i]
+    s1 = rigid_contact_shape1[i]
+    if s0 < 0 or s1 < 0:
+        return
+    b0 = shape_body[s0]
+    b1 = shape_body[s1]
+    ext0 = b0 < 0 or jointed[b0] != 0 or body_inv_mass[b0] <= 0.0
+    ext1 = b1 < 0 or jointed[b1] != 0 or body_inv_mass[b1] <= 0.0
+    if ext0 == ext1:
+        return
+    if ext0:
+        anchored[root[comp_of_body[b1]]] = 1
+    else:
+        anchored[root[comp_of_body[b0]]] = 1
+
+
+@wp.kernel
+def _lcomp_budget_island(
+    p_start: wp.array[wp.vec3],
+    p_end: wp.array[wp.vec3],
+    m_tot: wp.array[float],
+    gravity: wp.array[wp.vec3],
+    jext: wp.array[wp.vec3],
+    anchored: wp.array[wp.int32],
+    dt: float,
+    budget: wp.array[wp.vec3],
+):
+    isl = wp.tid()
+    if anchored[isl] != 0 or m_tot[isl] <= 0.0:
+        budget[isl] = wp.vec3(0.0)
+        return
+    budget[isl] = p_start[isl] + gravity[0] * (m_tot[isl] * dt) + jext[isl] - p_end[isl]
+
+
+@wp.kernel
+def _lcomp_island_seed(root: wp.array[wp.int32]):
+    root[wp.tid()] = wp.tid()
+
+
+@wp.kernel
+def _lcomp_island_link_soft(
+    soft_contact_count: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    contact_primitive: wp.array[wp.int32],
+    contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    shape_body: wp.array[wp.int32],
+    comp_of_particle: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+):
+    """Merge the component of a body with the component of every particle it
+    is in contact with. Contact EXISTENCE links, not binding: two objects
+    that touch at all share a momentum budget for this substep."""
+    i = wp.tid()
+    c0 = soft_contact_count[0]
+    if i >= c0 + soft_contact_count[1] + soft_contact_count[2]:
+        return
+    shp = contact_shape[i]
+    if shp < 0:
+        return
+    b = shape_body[shp]
+    if b < 0:
+        return  # static partner: anchors, does not join an island
+    prim = contact_primitive[i]
+    if prim < 0:
+        return
+    cb = comp_of_body[b]
+    if i < c0:
+        cp = comp_of_particle[prim]
+        wp.atomic_min(root, cp, root[cb])
+        wp.atomic_min(root, cb, root[cp])
+    else:
+        bary = contact_barycentric[i]
+        for k in range(3):
+            if bary[k] > 0.0:
+                cp = comp_of_particle[tri_indices[prim, k]]
+                wp.atomic_min(root, cp, root[cb])
+                wp.atomic_min(root, cb, root[cp])
+
+
+@wp.kernel
+def _lcomp_island_link_rigid(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if i >= rigid_contact_count[0]:
+        return
+    s0 = rigid_contact_shape0[i]
+    s1 = rigid_contact_shape1[i]
+    if s0 < 0 or s1 < 0:
+        return
+    b0 = shape_body[s0]
+    b1 = shape_body[s1]
+    if b0 < 0 or b1 < 0:
+        return  # static partner anchors instead of joining
+    c0 = comp_of_body[b0]
+    c1 = comp_of_body[b1]
+    wp.atomic_min(root, c0, root[c1])
+    wp.atomic_min(root, c1, root[c0])
+
+
+@wp.kernel
+def _lcomp_island_flatten(root: wp.array[wp.int32]):
+    """One pointer-jumping pass. Repeated a fixed number of times so the pass
+    count is static (graph-capture safe); atomic_min is monotone, so extra
+    passes are harmless and the labels converge to each component's minimum."""
+    i = wp.tid()
+    wp.atomic_min(root, i, root[root[i]])
+
+
+@wp.kernel
 def _lcomp_budget(
     p_start: wp.array[wp.vec3],
     p_end: wp.array[wp.vec3],
@@ -652,24 +1287,27 @@ def _lcomp_budget(
 def _lcomp_nhat_from_budget(
     budget: wp.array[wp.vec3],
     body_impact: wp.array[wp.int32],
-    anchored: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
     nhat: wp.array[wp.vec3],
 ):
     """Completion axis = direction of the EXACT budget (v3). Taking the axis
-    from the residual estimator (v2) let its one-point force-quadrature noise
-    flip the axis; the sign guard then stranded the budget as pure momentum
-    loss (measured: 0/+11/+9% losses across an N=3 ensemble). With the axis
-    read off the budget itself, the estimator is fully out of the loop for
-    single-pool scenes."""
+    from the residual estimator (v2) let its convergence-residual noise flip
+    the axis; the sign guard then stranded the budget as pure momentum loss
+    (measured: 0/+11/+9% losses across an N=3 ensemble). With the axis read
+    off the budget itself, the estimator is fully out of the loop for
+    single-pool scenes. The estimator is exact only at stationarity, so its
+    error is the unconverged part of the contact force (see the method doc)."""
     b = wp.tid()
-    if body_impact[b] == 0 or anchored[0] != 0:
-        nhat[b] = wp.vec3(0.0)
+    nhat[b] = wp.vec3(0.0)
+    if body_impact[b] == 0:
         return
-    l = wp.length(budget[0])
+    # Anchoring is per island now: an anchored island carries a zeroed budget.
+    bud = budget[root[comp_of_body[b]]]
+    l = wp.length(bud)
     if l <= 1.0e-12:
-        nhat[b] = wp.vec3(0.0)
         return
-    nhat[b] = budget[0] / l
+    nhat[b] = bud / l
 
 
 @wp.kernel
@@ -677,16 +1315,21 @@ def _lcomp_est_sum(
     deficit: wp.array[wp.vec3],
     m_pool: wp.array[float],
     body_impact: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
     est_sum: wp.array[float],
     armed_count: wp.array[wp.int32],
 ):
+    """Weights normalise WITHIN an island: each island's budget is divided
+    only among the pools that belong to it."""
     b = wp.tid()
     if body_impact[b] == 0 or m_pool[b] <= 0.0:
         return
-    wp.atomic_add(armed_count, 0, 1)
+    isl = root[comp_of_body[b]]
+    wp.atomic_add(armed_count, isl, 1)
     l = wp.length(deficit[b])
     if l > 0.0:
-        wp.atomic_add(est_sum, 0, l)
+        wp.atomic_add(est_sum, isl, l)
 
 
 @wp.kernel
@@ -701,7 +1344,9 @@ def _lcomp_vc(
     budget: wp.array[wp.vec3],
     est_sum: wp.array[float],
     armed_count: wp.array[wp.int32],
-    anchored: wp.array[wp.int32],
+    comp_of_body: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    local_mag: float,
     vc: wp.array[float],
     active: wp.array[wp.int32],
 ):
@@ -719,23 +1364,37 @@ def _lcomp_vc(
     flag): its momentum is owned by the external constraint."""
     b = wp.tid()
     active[b] = 0
-    if body_impact[b] == 0 or anchored[0] != 0:
+    if body_impact[b] == 0:
         return
     if m_pool[b] <= 0.0 or inv_mass[b] <= 0.0:
         return
     n = nhat[b]
     if wp.length_sq(n) == 0.0:
-        return
-    # Pool weight: estimator deficits relatively (bias cancels in the total);
-    # equal split when the estimator reads zero everywhere.
+        return  # island anchored or budget empty (nhat zeroed upstream)
+    isl = root[comp_of_body[b]]
+    # Pool weight within the island: estimator deficits relatively (its bias
+    # cancels from the island total); equal split if the estimator reads zero.
     w = float(0.0)
-    if est_sum[0] > 0.0:
-        w = wp.length(deficit[b]) / est_sum[0]
-    elif armed_count[0] > 0:
-        w = 1.0 / float(armed_count[0])
+    if est_sum[isl] > 0.0:
+        w = wp.length(deficit[b]) / est_sum[isl]
+    elif armed_count[isl] > 0:
+        w = 1.0 / float(armed_count[isl])
     if w <= 0.0:
         return
-    share = wp.length(budget[0]) * w
+    # Component of the island budget along the axis actually used. Equal to
+    # |budget| when the axis is the budget's own direction (the identity
+    # source), correct rather than merely equal when it is not (the geometric
+    # axis). Clamped at zero: a negative projection means the axis opposes the
+    # deficit, and injecting along it would push the pool the wrong way.
+    share = wp.max(wp.dot(budget[isl], n), 0.0) * w
+    if local_mag != 0.0:
+        # DIAGNOSTIC (NEWTON_LCOMP_LOCAL_MAG): take the injected magnitude from
+        # this pool's own residual estimate instead of the exact identity,
+        # holding the axis at the identity's direction so the magnitude is the
+        # only variable. Reproduces the falsified v1 accounting; run against
+        # iteration count to test whether its error is under-convergence
+        # (shrinks with N) or structural (does not).
+        share = wp.length(deficit[b])
     m_b = 1.0 / inv_mass[b]
     v_b = wp.vec3(body_qd[b][0], body_qd[b][1], body_qd[b][2])
     # NOTE a "capture guard" (skip when the pocket outruns the body along the
@@ -1182,7 +1841,16 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._dat_adaptive_fire_count = None
         # NEWTON_EXCH_ACCUM: accumulate clamp-deleted motion across launches within
         # a substep (instead of overwrite). Read once at init (graph-safe).
-        self._motion_lost_accumulate = 1.0 if _os.environ.get("NEWTON_EXCH_ACCUM") else 0.0
+        # The correct mode follows the DAT reference, and pairing them wrongly makes
+        # the record useless: with a trailing reference each launch's (1-t)*dx is a
+        # DISJOINT increment, so the substep total is their sum and overwrite keeps
+        # only the last (near-zero at convergence — measured 57x under-read); with a
+        # fixed reference dx is cumulative from substep start, so successive launches
+        # re-measure the same blocked motion and only the last writer is the total.
+        # The env var forces accumulation for experiments that need it.
+        self._motion_lost_accumulate = (
+            1.0 if (_os.environ.get("NEWTON_EXCH_ACCUM") or bool(rigid_dat_trailing_refresh)) else 0.0
+        )
         self.rigid_dat_soft_side = bool(rigid_dat_soft_side)
         self._dat_soft_side = 1.0 if self.rigid_dat_soft_side else 0.0
         self.rigid_dat_derived_pinch_alpha = float(rigid_dat_derived_pinch_alpha)
@@ -1630,6 +2298,30 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_angular_beta = rigid_avbd_angular_beta
         self.rigid_contact_hard = int(rigid_contact_hard)
         self.rigid_contact_history = rigid_contact_history
+        # Predicted-violation dual update (experimental, NEWTON_PRED_DUAL): a
+        # division-plane clamp keeps the gap non-negative, so the dual update —
+        # which grows the multiplier only on actual violation — reads the
+        # constraint as satisfied and releases it, and the contact force never
+        # builds where the clamp is doing the work. When set, each row grows its
+        # multiplier on the violation its own closing rate predicts instead.
+        self._pred_dual = 1.0 if _os.environ.get("NEWTON_PRED_DUAL") else 0.0
+        # Constraint-space dual update (experimental, NEWTON_CSPACE_DUAL): solve
+        # for the contact impulse directly from the pair's inverse mass along the
+        # normal rather than accumulating it at the penalty stiffness's rate, so
+        # the multiplier is independent of a stiffness the clamp can suppress.
+        self._cspace_dual = 1.0 if _os.environ.get("NEWTON_CSPACE_DUAL") else 0.0
+        self._lcomp_local_dir = bool(_os.environ.get("NEWTON_LCOMP_LOCAL_DIR"))
+        # Angular completion, staged: NEWTON_LCOMP_ANG_DEBUG computes and reports
+        # the per-island angular budget without injecting, so the measurement can
+        # be validated against the known loss before anything acts on it.
+        self._lcomp_ang_debug = bool(_os.environ.get("NEWTON_LCOMP_ANG_DEBUG"))
+        # Angular injection (Milestone 2). Implies the budget computation.
+        self._lcomp_angular = bool(_os.environ.get("NEWTON_LCOMP_ANGULAR"))
+        if self._lcomp_angular:
+            self._lcomp_ang_debug = True
+        # Pocket must be at least this many times as stiff rotationally as the
+        # body about the axis before the increment is allowed to act.
+        self._lcomp_ang_kappa = float(_os.environ.get("NEWTON_LCOMP_ANG_KAPPA") or 1.0)
         if rigid_avbd_contact_alpha is not None:
             self.rigid_contact_alpha = rigid_avbd_contact_alpha
         else:
@@ -1719,6 +2411,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._exchange_rigid_jt = None
             self._coupling_body_q_prev_snapshot = wp.clone(model.body_q, device=self.device)
             self.body_inertia_q = wp.zeros_like(model.body_q, device=self.device)  # inertial target poses for AVBD
+
+            if _os.environ.get("NEWTON_LOCAL_COMPLETION"):
+                # Build eagerly: the component pass reads mesh topology to the
+                # host, which cannot run once a CUDA graph capture is open.
+                self._lcomp_setup()
 
             # Adjacency and dimensions
             self.rigid_adjacency = self._compute_rigid_force_element_adjacency(model).to(self.device)
@@ -2848,59 +3545,35 @@ class SolverVBD(SolverBase, CouplingInterface):
                     outputs=[pb[7], pb[15], pb[16], pb[17], pb[18]],
                     device=self.device,
                 )
+
         if self._lcomp_active(contacts):
             # LOCAL COMPLETION (env NEWTON_LOCAL_COMPLETION): deficit-recorded
             # local inelastic completion over rigid-soft truncation pockets;
             # buffers + binding flags prepared here, applied at substep end.
-            if getattr(self, "_lcomp_buf", None) is None:
-                nb = self.model.body_count
-                npart = self.model.particle_count
-                self._lcomp_buf = {
-                    "deficit": wp.zeros(nb, dtype=wp.vec3, device=self.device),
-                    "nhat": wp.zeros(nb, dtype=wp.vec3, device=self.device),
-                    "m_pool": wp.zeros(nb, dtype=float, device=self.device),
-                    "p_pool": wp.zeros(nb, dtype=float, device=self.device),
-                    "vc": wp.zeros(nb, dtype=float, device=self.device),
-                    "active": wp.zeros(nb, dtype=wp.int32, device=self.device),
-                    "bind": wp.full(npart, -1, dtype=wp.int32, device=self.device),
-                    "ext": wp.zeros(npart, dtype=wp.int32, device=self.device),
-                    "impact": wp.zeros(nb, dtype=wp.int32, device=self.device),
-                    "p_start": wp.zeros(1, dtype=wp.vec3, device=self.device),
-                    "p_end": wp.zeros(1, dtype=wp.vec3, device=self.device),
-                    "m_tot": wp.zeros(1, dtype=float, device=self.device),
-                    "m_scratch": wp.zeros(1, dtype=float, device=self.device),
-                    "jext": wp.zeros(1, dtype=wp.vec3, device=self.device),
-                    "tau_scratch": wp.zeros(1, dtype=wp.vec3, device=self.device),
-                    "budget": wp.zeros(1, dtype=wp.vec3, device=self.device),
-                    "est_sum": wp.zeros(1, dtype=float, device=self.device),
-                    "armed_count": wp.zeros(1, dtype=wp.int32, device=self.device),
-                    "anchored": wp.zeros(1, dtype=wp.int32, device=self.device),
-                }
+            lb = self._lcomp_buf
             if self.body_wall_bound is None:
                 self.body_wall_bound = wp.zeros(self.model.body_count, dtype=wp.int32, device=self.device)
             if self._exchange_soft_bound is None or self._exchange_soft_bound.shape[0] < int(contacts.soft_contact_max):
                 self._exchange_soft_bound = wp.zeros(int(contacts.soft_contact_max), dtype=wp.int32, device=self.device)
             self._exchange_soft_bound.zero_()
             self.body_wall_bound.zero_()
-            # Exact-budget entry snapshot: free-system momentum before the solve.
+            # Entry velocity snapshots. The island partition is built at substep
+            # END (from the final contact set) and then applied to THESE
+            # velocities for p_start, so both sides of the budget are summed
+            # over the same partition — mid-substep re-detection cannot leave
+            # p_start and p_end partitioned differently.
             lb = self._lcomp_buf
-            lb["p_start"].zero_()
-            lb["m_tot"].zero_()
             if self.model.particle_count:
-                wp.launch(
-                    _pcorr_sum_particles,
-                    dim=self.model.particle_count,
-                    inputs=[state_in.particle_qd, self.model.particle_mass],
-                    outputs=[lb["p_start"], lb["m_tot"]],
-                    device=self.device,
-                )
-            wp.launch(
-                _pcorr_sum_bodies,
-                dim=self.model.body_count,
-                inputs=[state_in.body_qd, self.model.body_inv_mass, self.body_is_jointed],
-                outputs=[lb["p_start"], lb["m_tot"]],
-                device=self.device,
-            )
+                wp.copy(dest=lb["qd_part_entry"], src=state_in.particle_qd)
+            wp.copy(dest=lb["qd_body_entry"], src=state_in.body_qd)
+            if self._lcomp_ang_debug:
+                # Angular momentum needs entry POSITIONS as well: evaluating
+                # L_start at the end-of-substep positions leaves an O(v dt x p)
+                # error, ~2% of L0 on the stress cell, comparable to the deficit
+                # being measured.
+                if self.model.particle_count:
+                    wp.copy(dest=lb["q_part_entry"], src=state_in.particle_q)
+                wp.copy(dest=lb["q_body_entry"], src=state_in.body_q)
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
@@ -3127,6 +3800,102 @@ class SolverVBD(SolverBase, CouplingInterface):
             and not self.integrate_with_external_rigid_solver
         )
 
+    def _lcomp_setup(self):
+        """Allocate local-completion state and build static components. Called
+        at construction: it reads mesh topology to the host, so it must not run
+        inside a CUDA graph capture."""
+        self._lcomp_build_components()
+        nb = self.model.body_count
+        npart = self.model.particle_count
+        nc = self._lcomp_n_comp
+        V = lambda n: wp.zeros(n, dtype=wp.vec3, device=self.device)  # noqa: E731
+        F = lambda n: wp.zeros(n, dtype=float, device=self.device)  # noqa: E731
+        I = lambda n: wp.zeros(n, dtype=wp.int32, device=self.device)  # noqa: E731
+        self._lcomp_buf = {
+            # per body
+            "deficit": V(nb),
+            "nhat": V(nb),
+            "nsum": V(nb),
+            "m_pool": F(nb),
+            "p_pool": F(nb),
+            "vc": F(nb),
+            "active": I(nb),
+            "impact": I(nb),
+            "qd_body_entry": wp.zeros(nb, dtype=wp.spatial_vector, device=self.device),
+            "q_body_entry": wp.zeros(nb, dtype=wp.transform, device=self.device),
+            # per particle
+            "bind": wp.full(npart, -1, dtype=wp.int32, device=self.device),
+            "ext": I(npart),
+            "qd_part_entry": V(npart),
+            "q_part_entry": V(npart),
+            # per island (component-indexed; root[] maps component -> island)
+            "root": I(nc),
+            "p_start": V(nc),
+            "p_end": V(nc),
+            "m_tot": F(nc),
+            "m_scratch": F(nc),
+            "jext": V(nc),
+            "budget": V(nc),
+            "l_start": V(nc),
+            "l_end": V(nc),
+            "mx_start": V(nc),
+            "mx_end": V(nc),
+            "tau_ext": V(nc),
+            "budget_l": V(nc),
+            # Allocated here, not lazily inside the completion: that path is
+            # captured into a CUDA graph and allocating during capture is illegal.
+            "ang_accum": V(1),
+            "ahat": V(nb),
+            "mx_pool": V(nb),
+            "m_pool_ang": F(nb),
+            "i_pool": F(nb),
+            "domega": F(nb),
+            "ang_active": I(nb),
+            "est_sum": F(nc),
+            "armed_count": I(nc),
+            "anchored": I(nc),
+        }
+
+    def _lcomp_build_components(self):
+        """Static connectivity labels, computed once: particles joined by any
+        simulation element (triangle, edge, spring) can exchange momentum
+        internally and therefore always share an island; each body starts in
+        its own. Contacts merge these components per substep (they are the only
+        part of the topology that changes), which keeps the per-substep
+        union-find over a handful of components rather than every particle."""
+        model = self.model
+        n_p = model.particle_count
+        parent = np.arange(n_p, dtype=np.int32)
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        for name, width in (("tri_indices", 3), ("edge_indices", 4), ("spring_indices", 2)):
+            arr = getattr(model, name, None)
+            if arr is None or len(arr) == 0:
+                continue
+            idx = arr.numpy().reshape(-1, width) if width != 2 else arr.numpy().reshape(-1, 2)
+            for row in idx:
+                verts = [int(v) for v in row if 0 <= int(v) < n_p]
+                for v in verts[1:]:
+                    union(verts[0], v)
+
+        roots = np.array([find(i) for i in range(n_p)], dtype=np.int32) if n_p else np.zeros(0, np.int32)
+        uniq, comp_p = np.unique(roots, return_inverse=True) if n_p else (np.zeros(0), np.zeros(0, np.int32))
+        n_comp_p = int(len(uniq))
+        comp_b = np.arange(n_comp_p, n_comp_p + model.body_count, dtype=np.int32)
+        self._lcomp_n_comp = n_comp_p + model.body_count
+        self._lcomp_comp_particle = wp.array(comp_p.astype(np.int32), dtype=wp.int32, device=self.device)
+        self._lcomp_comp_body = wp.array(comp_b, dtype=wp.int32, device=self.device)
+
     def _lcomp_active(self, contacts) -> bool:
         return (
             bool(_os.environ.get("NEWTON_LOCAL_COMPLETION"))
@@ -3209,6 +3978,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             # a clamped impactor's closing speed; the adaptive snapshots are
             # the intended source (delivered config runs --dat-adaptive).
             qd_entry = state_out.body_qd
+        lb["nsum"].zero_()
         wp.launch(
             _lcomp_impact_flag,
             dim=contacts.soft_contact_max,
@@ -3229,35 +3999,142 @@ class SolverVBD(SolverBase, CouplingInterface):
                 model.body_com,
                 qd_entry,
             ],
-            outputs=[lb["impact"]],
+            outputs=[lb["impact"], lb["nsum"]],
             device=self.device,
         )
-        # Exact substep budget: p_start + g M dt + J_ext - p_end over the free
-        # system (conservation identity — no estimator error), gated by the
-        # anchored flag exactly as the global projection is.
-        lb["p_end"].zero_()
-        lb["m_scratch"].zero_()
-        lb["jext"].zero_()
-        lb["tau_scratch"].zero_()
-        lb["anchored"].zero_()
-        lb["est_sum"].zero_()
-        wp.launch(
-            _pcorr_sum_particles,
-            dim=model.particle_count,
-            inputs=[state_out.particle_qd, model.particle_mass],
-            outputs=[lb["p_end"], lb["m_scratch"]],
-            device=self.device,
-        )
-        wp.launch(
-            _pcorr_sum_bodies,
-            dim=model.body_count,
-            inputs=[state_out.body_qd, model.body_inv_mass, self.body_is_jointed],
-            outputs=[lb["p_end"], lb["m_scratch"]],
-            device=self.device,
-        )
-        if self.body_particle_contact_force_applied is not None:
+        # ---- island partition ------------------------------------------
+        # Static components (cloth pieces, individual bodies) are merged by the
+        # contacts present at substep end; the resulting labels are then used
+        # for BOTH momentum sums, so p_start and p_end are always partitioned
+        # identically. Fixed pass count keeps this graph-capture safe.
+        nc = self._lcomp_n_comp
+        comp_p = self._lcomp_comp_particle
+        comp_b = self._lcomp_comp_body
+        root = lb["root"]
+        wp.launch(_lcomp_island_seed, dim=nc, inputs=[], outputs=[root], device=self.device)
+        for _ in range(_LCOMP_ISLAND_PASSES):
+            if model.particle_count:
+                wp.launch(
+                    _lcomp_island_link_soft,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_primitive,
+                        contacts.soft_contact_barycentric,
+                        model.tri_indices,
+                        model.shape_body,
+                        comp_p,
+                        comp_b,
+                    ],
+                    outputs=[root],
+                    device=self.device,
+                )
+            if contacts.rigid_contact_max:
+                wp.launch(
+                    _lcomp_island_link_rigid,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        model.shape_body,
+                        comp_b,
+                    ],
+                    outputs=[root],
+                    device=self.device,
+                )
+            wp.launch(_lcomp_island_flatten, dim=nc, inputs=[], outputs=[root], device=self.device)
+
+        # ---- per-island budget: p_start + g m dt + J_ext - p_end ---------
+        for key in ("p_start", "p_end", "m_tot", "m_scratch", "jext", "anchored", "est_sum", "armed_count"):
+            lb[key].zero_()
+        if model.particle_count:
             wp.launch(
-                _pcorr_sum_jext,
+                _lcomp_sum_particles_island,
+                dim=model.particle_count,
+                inputs=[lb["qd_part_entry"], model.particle_mass, comp_p, root],
+                outputs=[lb["p_start"], lb["m_tot"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_sum_particles_island,
+                dim=model.particle_count,
+                inputs=[state_out.particle_qd, model.particle_mass, comp_p, root],
+                outputs=[lb["p_end"], lb["m_scratch"]],
+                device=self.device,
+            )
+        wp.launch(
+            _lcomp_sum_bodies_island,
+            dim=model.body_count,
+            inputs=[lb["qd_body_entry"], model.body_inv_mass, self.body_is_jointed, comp_b, root],
+            outputs=[lb["p_start"], lb["m_tot"]],
+            device=self.device,
+        )
+        wp.launch(
+            _lcomp_sum_bodies_island,
+            dim=model.body_count,
+            inputs=[state_out.body_qd, model.body_inv_mass, self.body_is_jointed, comp_b, root],
+            outputs=[lb["p_end"], lb["m_scratch"]],
+            device=self.device,
+        )
+        if self._lcomp_ang_debug:
+            # Angular budget, measured alongside the linear one over the SAME
+            # island partition. Reported only (Milestone 1): validate it against
+            # the known loss before letting anything act on it.
+            for key in ("l_start", "l_end", "mx_start", "mx_end", "tau_ext", "budget_l"):
+                lb[key].zero_()
+            if model.particle_count:
+                wp.launch(
+                    _lcomp_ang_particles_island,
+                    dim=model.particle_count,
+                    inputs=[lb["q_part_entry"], lb["qd_part_entry"], model.particle_mass, comp_p, root],
+                    outputs=[lb["l_start"], lb["mx_start"]],
+                    device=self.device,
+                )
+                wp.launch(
+                    _lcomp_ang_particles_island,
+                    dim=model.particle_count,
+                    inputs=[state_out.particle_q, state_out.particle_qd, model.particle_mass, comp_p, root],
+                    outputs=[lb["l_end"], lb["mx_end"]],
+                    device=self.device,
+                )
+            wp.launch(
+                _lcomp_ang_bodies_island,
+                dim=model.body_count,
+                inputs=[
+                    lb["q_body_entry"],
+                    lb["qd_body_entry"],
+                    model.body_inv_mass,
+                    model.body_inv_inertia,
+                    model.body_com,
+                    self.body_is_jointed,
+                    comp_b,
+                    root,
+                ],
+                outputs=[lb["l_start"], lb["mx_start"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_bodies_island,
+                dim=model.body_count,
+                inputs=[
+                    state_out.body_q,
+                    state_out.body_qd,
+                    model.body_inv_mass,
+                    model.body_inv_inertia,
+                    model.body_com,
+                    self.body_is_jointed,
+                    comp_b,
+                    root,
+                ],
+                outputs=[lb["l_end"], lb["mx_end"]],
+                device=self.device,
+            )
+
+        if self.body_particle_contact_force_applied is not None and model.particle_count:
+            wp.launch(
+                _lcomp_jext_island,
                 dim=contacts.soft_contact_max,
                 inputs=[
                     contacts.soft_contact_count,
@@ -3266,37 +4143,42 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_primitive,
                     contacts.soft_contact_barycentric,
                     model.tri_indices,
-                    state_out.particle_q,
                     model.shape_body,
                     self.body_is_jointed,
+                    comp_p,
+                    root,
                     dt,
                 ],
-                outputs=[lb["jext"], lb["tau_scratch"]],
+                outputs=[lb["jext"]],
                 device=self.device,
             )
-        wp.launch(
-            _pcorr_anchor_flag,
-            dim=contacts.soft_contact_max,
-            inputs=[
-                contacts.soft_contact_count,
-                self._exchange_soft_bound,
-                contacts.soft_contact_shape,
-                model.shape_body,
-                self.body_is_jointed,
-            ],
-            outputs=[lb["anchored"]],
-            device=self.device,
-        )
-        wp.launch(
-            _lcomp_pin_anchor,
-            dim=model.particle_count,
-            inputs=[model.particle_inv_mass],
-            outputs=[lb["anchored"]],
-            device=self.device,
-        )
+            wp.launch(
+                _lcomp_anchor_soft_island,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_primitive,
+                    contacts.soft_contact_barycentric,
+                    model.tri_indices,
+                    model.shape_body,
+                    self.body_is_jointed,
+                    comp_p,
+                    root,
+                ],
+                outputs=[lb["anchored"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_anchor_pin_island,
+                dim=model.particle_count,
+                inputs=[model.particle_inv_mass, comp_p, root],
+                outputs=[lb["anchored"]],
+                device=self.device,
+            )
         if contacts.rigid_contact_max:
             wp.launch(
-                _lcomp_rigid_anchor,
+                _lcomp_anchor_rigid_island,
                 dim=contacts.rigid_contact_max,
                 inputs=[
                     contacts.rigid_contact_count,
@@ -3305,27 +4187,63 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.shape_body,
                     model.body_inv_mass,
                     self.body_is_jointed,
+                    comp_b,
+                    root,
                 ],
                 outputs=[lb["anchored"]],
                 device=self.device,
             )
         wp.launch(
-            _lcomp_budget,
-            dim=1,
-            inputs=[lb["p_start"], lb["p_end"], lb["m_tot"], model.gravity, lb["jext"], dt],
+            _lcomp_budget_island,
+            dim=nc,
+            inputs=[lb["p_start"], lb["p_end"], lb["m_tot"], model.gravity, lb["jext"], lb["anchored"], dt],
             outputs=[lb["budget"]],
             device=self.device,
         )
-        # v3: completion axis from the budget itself; the estimator only sets
-        # relative pool weights (single armed pool -> weight 1, estimator out
-        # of the loop entirely).
-        wp.launch(
-            _lcomp_nhat_from_budget,
-            dim=model.body_count,
-            inputs=[lb["budget"], lb["impact"], lb["anchored"]],
-            outputs=[lb["nhat"]],
-            device=self.device,
-        )
+        if self._lcomp_ang_debug:
+            wp.launch(
+                _lcomp_ang_budget_island,
+                dim=nc,
+                inputs=[
+                    lb["l_start"],
+                    lb["l_end"],
+                    lb["mx_start"],
+                    lb["mx_end"],
+                    lb["p_start"],
+                    lb["p_end"],
+                    lb["m_tot"],
+                    lb["tau_ext"],
+                    lb["anchored"],
+                ],
+                outputs=[lb["budget_l"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_accum_total,
+                dim=nc,
+                inputs=[lb["budget_l"]],
+                outputs=[lb["ang_accum"]],
+                device=self.device,
+            )
+
+        # Completion axis from each island's own budget; the estimator only
+        # sets relative pool weights within an island.
+        if self._lcomp_local_dir:
+            wp.launch(
+                _lcomp_nhat_local,
+                dim=model.body_count,
+                inputs=[lb["nsum"], lb["impact"]],
+                outputs=[lb["nhat"]],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _lcomp_nhat_from_budget,
+                dim=model.body_count,
+                inputs=[lb["budget"], lb["impact"], comp_b, root],
+                outputs=[lb["nhat"]],
+                device=self.device,
+            )
         lb["m_pool"].zero_()
         lb["p_pool"].zero_()
         wp.launch(
@@ -3339,7 +4257,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         wp.launch(
             _lcomp_est_sum,
             dim=model.body_count,
-            inputs=[lb["deficit"], lb["m_pool"], lb["impact"]],
+            inputs=[lb["deficit"], lb["m_pool"], lb["impact"], comp_b, root],
             outputs=[lb["est_sum"], lb["armed_count"]],
             device=self.device,
         )
@@ -3357,7 +4275,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 lb["budget"],
                 lb["est_sum"],
                 lb["armed_count"],
-                lb["anchored"],
+                comp_b,
+                root,
+                1.0 if _os.environ.get("NEWTON_LCOMP_LOCAL_MAG") else 0.0,
             ],
             outputs=[lb["vc"], lb["active"]],
             device=self.device,
@@ -3376,6 +4296,105 @@ class SolverVBD(SolverBase, CouplingInterface):
             outputs=[state_out.body_qd],
             device=self.device,
         )
+
+        if self._lcomp_angular and model.particle_count:
+            # Rotational pass, after the linear one so it sees the completed
+            # velocities. Same sources as the linear rule -- magnitude and axis
+            # both from the island identity (Section 9.5) -- applied as an
+            # increment about each pocket's own centroid.
+            for key in ("ahat", "mx_pool", "m_pool_ang", "i_pool", "domega", "ang_active"):
+                lb[key].zero_()
+            wp.launch(
+                _lcomp_ang_axis,
+                dim=model.body_count,
+                inputs=[lb["budget_l"], lb["impact"], comp_b, root],
+                outputs=[lb["ahat"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_centroid,
+                dim=model.particle_count,
+                inputs=[lb["bind"], lb["ext"], state_out.particle_q, model.particle_mass],
+                outputs=[lb["mx_pool"], lb["m_pool_ang"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_centroid_body,
+                dim=model.body_count,
+                inputs=[lb["impact"], model.body_inv_mass, state_out.body_q, model.body_com],
+                outputs=[lb["mx_pool"], lb["m_pool_ang"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_inertia,
+                dim=model.particle_count,
+                inputs=[
+                    lb["bind"],
+                    lb["ext"],
+                    state_out.particle_q,
+                    model.particle_mass,
+                    lb["mx_pool"],
+                    lb["m_pool_ang"],
+                    lb["ahat"],
+                ],
+                outputs=[lb["i_pool"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_domega,
+                dim=model.body_count,
+                inputs=[
+                    lb["budget_l"],
+                    lb["ahat"],
+                    lb["impact"],
+                    model.body_inv_inertia,
+                    state_out.body_q,
+                    comp_b,
+                    root,
+                    lb["est_sum"],
+                    lb["deficit"],
+                    lb["armed_count"],
+                    self._lcomp_ang_kappa,
+                    lb["i_pool"],
+                    lb["mx_pool"],
+                    lb["m_pool_ang"],
+                    model.body_inv_mass,
+                    model.body_com,
+                ],
+                outputs=[lb["domega"], lb["ang_active"]],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_apply_particles,
+                dim=model.particle_count,
+                inputs=[
+                    lb["bind"],
+                    lb["ext"],
+                    lb["ang_active"],
+                    lb["domega"],
+                    lb["ahat"],
+                    state_out.particle_q,
+                    lb["mx_pool"],
+                    lb["m_pool_ang"],
+                ],
+                outputs=[state_out.particle_qd],
+                device=self.device,
+            )
+            wp.launch(
+                _lcomp_ang_apply_bodies,
+                dim=model.body_count,
+                inputs=[
+                    lb["ang_active"],
+                    lb["domega"],
+                    lb["ahat"],
+                    state_out.body_q,
+                    model.body_com,
+                    lb["mx_pool"],
+                    lb["m_pool_ang"],
+                ],
+                outputs=[state_out.body_qd],
+                device=self.device,
+            )
 
     def _momentum_exchange_prepare(self, contacts: Contacts):
         """Lazy-allocate contact-row accumulators and zero all exchange state."""
@@ -4660,6 +5679,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_particle_contact_lambda,
                         self.body_particle_contact_lambda_t,
                         self.body_particle_contact_C0,
+                        self._pred_dual,
+                        self._cspace_dual,
+                        self._substep_dt,
+                        self.model.particle_inv_mass,
+                        self.model.body_inv_mass,
                         self._bp_store_shape,
                         self._bp_store_lam,
                         self._bp_store_lamt,
@@ -4712,7 +5736,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 soft_contact_launch_dim,
             )
             self._init_body_particle_contact_state(soft_contact_launch_dim)
-        if not self.rigid_particle_contact_hard:
+        if not self.rigid_particle_contact_hard and self.body_particle_contact_lambda is not None:
+            # None on particle-free models, where this state is never allocated.
             self.body_particle_contact_lambda.zero_()
         # Hard mode keeps lambda across contact-list rebuilds (v1 slot-persistence
         # warm start; correct when slots are stable, e.g. persistent single pairs.
@@ -5026,6 +6051,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_particle_contact_lambda,  # input/output
                         self.body_particle_contact_lambda_t,  # input/output
                         self.body_particle_contact_C0,
+                        self._pred_dual,
+                        self._cspace_dual,
+                        self._substep_dt,
+                        self.model.particle_inv_mass,
+                        self.model.body_inv_mass,
                         self._bp_store_shape,
                         self._bp_store_lam,
                         self._bp_store_lamt,
@@ -5200,7 +6230,14 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
 
         # Truncate the accumulated pose updates before the dual updates read them.
-        self._rigid_penetration_free_truncation(contacts, state_in.body_q)
+        # EXPERIMENT (NEWTON_DUAL_BEFORE_TRUNC): defer the truncation until after
+        # the dual updates, so the multipliers see the violation the clamp is
+        # about to remove rather than the satisfied constraint it leaves behind.
+        # Committed positions are still truncated — only what the duals read
+        # changes.
+        _defer_trunc = bool(_os.environ.get("NEWTON_DUAL_BEFORE_TRUNC"))
+        if not _defer_trunc:
+            self._rigid_penetration_free_truncation(contacts, state_in.body_q)
 
         if assemble_residual:
             # WFR dual-consistency (measured: assembling at exchange time, after
@@ -5279,12 +6316,22 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_particle_contact_lambda,  # input/output
                         self.body_particle_contact_lambda_t,  # input/output
                         self.body_particle_contact_C0,
+                        self._pred_dual,
+                        self._cspace_dual,
+                        self._substep_dt,
+                        self.model.particle_inv_mass,
+                        self.model.body_inv_mass,
                         self._bp_store_shape,
                         self._bp_store_lam,
                         self._bp_store_lamt,
                     ],
                     device=self.device,
                 )
+
+        if _defer_trunc:
+            # Deferred to here so the contact duals above read the untruncated
+            # violation; the committed pose is truncated exactly as before.
+            self._rigid_penetration_free_truncation(contacts, state_in.body_q)
 
         if model.joint_count > 0:
             wp.launch(

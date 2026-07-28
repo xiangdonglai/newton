@@ -4044,6 +4044,11 @@ def update_duals_body_particle_contacts(
     body_particle_contact_lambda: wp.array[float],
     body_particle_contact_lambda_t: wp.array[wp.vec3],
     body_particle_contact_C0: wp.array[float],
+    predictive: float,
+    cspace: float,
+    cspace_dt: float,
+    particle_inv_mass: wp.array[float],
+    body_inv_mass: wp.array[float],
     store_shape: wp.array2d[wp.int32],
     store_lam: wp.array2d[float],
     store_lamt: wp.array2d[wp.vec3],
@@ -4089,6 +4094,39 @@ def update_duals_body_particle_contacts(
 
     penetration = -(wp.dot(n, contact_pos - cp_world) - radius - margin)
     pen_signed = penetration  # signed: negative when separated (lambda release)
+
+    if predictive != 0.0:
+        # PREDICTED-VIOLATION DUAL (experimental, env NEWTON_PRED_DUAL).
+        # A division-plane clamp enforces non-penetration geometrically, so the
+        # gap it protects never goes negative and this update — which feeds on
+        # actual violation — reads "constraint satisfied" and releases lambda.
+        # The contact force therefore never builds precisely where the clamp is
+        # doing the work (measured: a ball stopped from 8 m/s in one substep
+        # while lambda stayed six orders of magnitude below the delivered
+        # force). Feed it instead the violation that WOULD occur if the pair
+        # kept closing at its current rate: each row derives this from its own
+        # gap and approach, so no attribution of which plane bound is needed.
+        # Approach rate comes from the previous positions in the same frame.
+        cp_prev = (
+            wp.transform_point(body_q_prev[body_idx], body_particle_contact_body_pos[idx])
+            if body_idx >= 0
+            else cp_world
+        )
+        if idx < c0:
+            contact_prev = particle_q_prev[prim]
+        else:
+            contact_prev = (
+                bary[0] * particle_q_prev[tri_indices[prim, 0]]
+                + bary[1] * particle_q_prev[tri_indices[prim, 1]]
+                + bary[2] * particle_q_prev[tri_indices[prim, 2]]
+            )
+        pen_prev = -(wp.dot(n, contact_prev - cp_prev) - radius - margin)
+        closing = penetration - pen_prev  # >0 when the gap is shrinking
+        if closing > 0.0:
+            # One step of extrapolation. Never reduces the reading, so genuine
+            # separation still releases the multiplier at full rate.
+            pen_signed = wp.max(pen_signed, penetration + closing)
+            penetration = wp.max(0.0, pen_signed)
     if mode == 1.0:
         # Snapshot pass (step start, hard mode): record the step-start violation.
         # The lambda update then targets C - alpha*C0, so during a recovery frame
@@ -4135,6 +4173,33 @@ def update_duals_body_particle_contacts(
         if c_stab < 0.0:
             k_rate = wp.max(k_new, 0.05 * k_enforce)
         lam_n_new = wp.max(0.0, lam + k_rate * c_stab)
+        if cspace != 0.0 and c_stab > 0.0:
+            # CONSTRAINT-SPACE UPDATE (experimental, NEWTON_CSPACE_DUAL).
+            # The rate-based form above reaches the correct multiplier only as
+            # fast as the penalty stiffness allows, so where a clamp suppresses
+            # the stiffness ramp the multiplier never gets near the force the
+            # contact is actually delivering (measured: lambda 0.27 against
+            # ~25 N required). Solve for the impulse directly instead: the
+            # increment that closes the violation in one step is C divided by
+            # dt^2 times the pair's inverse mass along the normal. This is
+            # rate-free -- no stiffness, no ramp, nothing for the clamp to
+            # starve -- and it is the same quantity for every contact class,
+            # differing only in what each side contributes to W.
+            w_p = float(0.0)
+            if idx < c0:
+                w_p = particle_inv_mass[prim]
+            else:
+                w_p = (
+                    bary[0] * bary[0] * particle_inv_mass[tri_indices[prim, 0]]
+                    + bary[1] * bary[1] * particle_inv_mass[tri_indices[prim, 1]]
+                    + bary[2] * bary[2] * particle_inv_mass[tri_indices[prim, 2]]
+                )
+            w_b = float(0.0)
+            if body_idx >= 0:
+                w_b = body_inv_mass[body_idx]  # linear term; angular omitted (v1)
+            w_sum = w_p + w_b
+            if w_sum > 0.0:
+                lam_n_new = wp.max(0.0, lam + c_stab / (cspace_dt * cspace_dt * w_sum))
         body_particle_contact_lambda[idx] = lam_n_new
 
         # Tangential multiplier (stick friction): accumulate against the per-step

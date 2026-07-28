@@ -131,10 +131,18 @@ class GraspAVBDClothScene(Scene):
             particle_radius=CLOTH_PARTICLE_RADIUS,
             label="cloth",
         )
-        self._pin_top_corners(builder, start, origin, cell)
+        if not bool(getattr(self.args, "unpin_cloth", False)):
+            self._pin_top_corners(builder, start, origin, cell)
 
     def _pin_top_corners(self, builder, start, origin, cell):
         """Pin the two highest (top) grid corners so the cloth hangs.
+
+        Skipped under ``--unpin-cloth``. A pinned particle makes its island
+        ANCHORED, and an anchored island's completion budget is zeroed as
+        suppression (its momentum is owned by the external constraint), so the
+        pinned scene cannot exercise the completion at any speed — measured:
+        1200 of 1200 mass-carrying islands anchored. Unpinning is what turns
+        this into a usable sweep cell for the jointed case.
 
         Mirrors the IsaacLab env, which fixes the two top corners as kinematic
         targets. A pinned particle is made kinematic here the same way
@@ -163,11 +171,49 @@ class GraspAVBDClothScene(Scene):
 
     def robot_gains(self, solver_key):
         # IsaacLab grasp_avbd_cloth FRANKA_PANDA_AVBD_CFG: arm damping 0.01.
-        return {"arm_damping": 0.01} if solver_key == "avbd" else {}
+        # 0.01 is the stack default and is ~5 orders below critical for the
+        # 1e6 joint stiffness, so the arm is wildly underdamped: commanding a
+        # fast jab drives it to hundreds of m/s rather than sweeping (measured
+        # 272 m/s under --punch-time 0.05), far outside the truncation
+        # schedule's ~10 m/s envelope where nothing is characterisable. Raise it
+        # with --arm-damping to get a controlled sweep.
+        if solver_key != "avbd":
+            return {}
+        return {"arm_damping": float(getattr(self.args, "arm_damping", 0.01))}
 
     # -- task -------------------------------------------------------------
     def home_pose(self):
         return np.array(HOME_POS, dtype=np.float64), np.array(HOME_QUAT, dtype=np.float64)
+
+    @classmethod
+    def add_args(cls, parser):
+        parser.add_argument(
+            "--arm-damping",
+            type=float,
+            default=0.01,
+            dest="arm_damping",
+            help="Joint target damping [N*m*s/rad]; the 0.01 default is far below critical (~2000 at 1e6 stiffness).",
+        )
+        parser.add_argument(
+            "--unpin-cloth",
+            action="store_true",
+            dest="unpin_cloth",
+            help="Leave the two top corners free, so the sheet's island is not anchored.",
+        )
+        parser.add_argument(
+            "--punch-dist",
+            type=float,
+            default=0.3,
+            dest="punch_dist",
+            help="Lateral jab distance in Y [m] for the quick_punch sequence.",
+        )
+        parser.add_argument(
+            "--punch-time",
+            type=float,
+            default=0.2,
+            dest="punch_time",
+            help="Duration of the jab [s]; distance/time is the sweep speed.",
+        )
 
     def sequences(self, home_pos, home_quat):
         from ..controllers.base import Keyframe
@@ -176,15 +222,21 @@ class GraspAVBDClothScene(Scene):
 
         home = np.asarray(home_pos)
         q = np.asarray(home_quat)
-        # Quick punch: jab the IK target +0.3 m in Y over a short interval.
+        # Quick punch: jab the IK target in Y over a short interval. Distance
+        # and duration are tunable so the sweep can be driven fast enough to
+        # force the division planes, rather than only at grasp speeds where the
+        # contact force is adequate and the clamps take nothing (see
+        # ctx/2026-07-27-jointed-pool-plan.md).
+        dist = float(getattr(self.args, "punch_dist", 0.3))
+        secs = float(getattr(self.args, "punch_time", 0.2))
         punch = home.copy()
-        punch[1] += 0.3
+        punch[1] += dist
         return {
             # Settle at home, then jab +0.3 m in Y and hold.
             "quick_punch": KeyframeSequence(
                 [
                     Keyframe(0.5, home, q, GRIP_OPEN),  # settle at home
-                    Keyframe(0.2, punch, q, GRIP_OPEN),  # quick +0.3 m in Y
+                    Keyframe(secs, punch, q, GRIP_OPEN),  # the jab itself
                     Keyframe(2.0, punch, q, GRIP_OPEN),  # hold at the punched pose
                 ]
             ),

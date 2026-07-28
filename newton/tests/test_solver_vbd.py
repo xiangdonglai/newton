@@ -37,6 +37,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     update_duals_body_body_contacts,
     update_duals_joint,
 )
+from newton._src.solvers.vbd.solver_vbd import _lcomp_nhat_local
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 devices = get_test_devices()
@@ -3155,6 +3156,53 @@ def test_exchange_disjoint_tranches(test, device):
     test.assertAlmostEqual(realized + total, dx_full, places=6)
 
 
+def test_lcomp_local_axis_from_contact_normals(test, device):
+    # The local completion axis is the closing-speed-weighted mean of the
+    # body's own contact normals, so a body with opposed contacts of equal
+    # weight has no axis and must not be armed.
+    def run(nsum, impact):
+        nsum_a = wp.array([wp.vec3(*nsum)], dtype=wp.vec3, device=device)
+        imp = wp.array([impact], dtype=wp.int32, device=device)
+        nhat = wp.array([wp.vec3(9.0, 9.0, 9.0)], dtype=wp.vec3, device=device)
+        wp.launch(_lcomp_nhat_local, dim=1, inputs=[nsum_a, imp], outputs=[nhat], device=device)
+        return nhat.numpy()[0]
+
+    n = run((3.0, 0.0, 4.0), 1)
+    test.assertAlmostEqual(float(np.linalg.norm(n)), 1.0, places=6)
+    test.assertAlmostEqual(float(n[0]), 0.6, places=6)
+    test.assertAlmostEqual(float(n[2]), 0.8, places=6)
+
+    # Not armed: the axis is cleared, never left holding the previous value.
+    test.assertAlmostEqual(float(np.linalg.norm(run((3.0, 0.0, 4.0), 0))), 0.0, places=7)
+    # Cancelling normals: no preferred direction, so no injection axis.
+    test.assertAlmostEqual(float(np.linalg.norm(run((0.0, 0.0, 0.0), 1))), 0.0, places=7)
+    # Below the length epsilon the axis is rejected rather than amplified.
+    test.assertAlmostEqual(float(np.linalg.norm(run((1.0e-14, 0.0, 0.0), 1))), 0.0, places=7)
+
+
+def test_lcomp_local_axis_is_scale_invariant(test, device):
+    # Weighting by closing speed must set the axis only, not its magnitude:
+    # doubling every contact's weight leaves the completion direction fixed.
+    def run(nsum):
+        nhat = wp.zeros(1, dtype=wp.vec3, device=device)
+        wp.launch(
+            _lcomp_nhat_local,
+            dim=1,
+            inputs=[
+                wp.array([wp.vec3(*nsum)], dtype=wp.vec3, device=device),
+                wp.array([1], dtype=wp.int32, device=device),
+            ],
+            outputs=[nhat],
+            device=device,
+        )
+        return nhat.numpy()[0]
+
+    a = run((0.3, -0.4, 0.5))
+    b = run((30.0, -40.0, 50.0))
+    for i in range(3):
+        test.assertAlmostEqual(float(a[i]), float(b[i]), places=6)
+
+
 class TestVBDMomentumExchange(unittest.TestCase):
     pass
 
@@ -3183,6 +3231,18 @@ add_function_test(
 )
 add_function_test(
     TestVBDMomentumExchange, "test_exchange_writeback_masking", test_exchange_writeback_masking, devices=devices
+)
+add_function_test(
+    TestVBDMomentumExchange,
+    "test_lcomp_local_axis_from_contact_normals",
+    test_lcomp_local_axis_from_contact_normals,
+    devices=devices,
+)
+add_function_test(
+    TestVBDMomentumExchange,
+    "test_lcomp_local_axis_is_scale_invariant",
+    test_lcomp_local_axis_is_scale_invariant,
+    devices=devices,
 )
 
 

@@ -179,7 +179,9 @@ class PickAVBDCubeScene(Scene):
 
     def robot_gains(self, solver_key):
         # IsaacLab pick_avbd_cube FRANKA_PANDA_AVBD_CFG: arm damping 0.1.
-        gains = {"finger_stiffness": 1.0e5, "finger_damping": 1.0} if solver_key == "avbd" else {}  # at this gain, watertight collision drop the cube but old one doesn't
+        gains = (
+            {"finger_stiffness": 1.0e5, "finger_damping": 1e3} if solver_key == "avbd" else {}
+        )  # at this gain, watertight collision drop the cube but old one doesn't
         # gains = {"finger_stiffness": 1.0e4, "finger_damping": 1.0} if solver_key == "avbd" else {}
         return gains
 

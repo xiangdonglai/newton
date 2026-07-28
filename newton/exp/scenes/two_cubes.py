@@ -44,6 +44,8 @@ class TwoCubesScene(Scene):
     def __init__(self, args):
         super().__init__(args)
         self.impact_speed = float(getattr(args, "impact_speed", 2.0))
+        self.contact_ke = float(getattr(args, "contact_ke", SHAPE_KE))
+        self.target_mass = float(getattr(args, "target_mass", CUBE_MASS))
         self._bodies: list[int] = []
 
     # -- world assembly ---------------------------------------------------
@@ -52,18 +54,19 @@ class TwoCubesScene(Scene):
         del collapse_fixed_joints
         builder.rigid_gap = RIGID_GAP
         builder.default_shape_cfg.margin = SHAPE_MARGIN
-        builder.default_shape_cfg.ke = SHAPE_KE
+        builder.default_shape_cfg.ke = self.contact_ke
 
         body_start = builder.body_count
         shape_start = builder.shape_count
         h = CUBE_HALF
         i_val = CUBE_MASS * (2.0 * h) ** 2 / 6.0  # uniform cube inertia
         inertia = wp.mat33(i_val, 0.0, 0.0, 0.0, i_val, 0.0, 0.0, 0.0, i_val)
-        for x in (0.0, START_X):  # A (target, at rest), B (projectile)
+        for x, m in ((0.0, self.target_mass), (START_X, CUBE_MASS)):  # A target at rest, B projectile
+            i_scaled = wp.mat33(*[c * (m / CUBE_MASS) for c in (i_val, 0.0, 0.0, 0.0, i_val, 0.0, 0.0, 0.0, i_val)])
             b = builder.add_body(
                 xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
-                mass=CUBE_MASS,
-                inertia=inertia,
+                mass=m,
+                inertia=i_scaled,
                 lock_inertia=True,
             )
             builder.add_shape_box(body=b, hx=h, hy=h, hz=h)
@@ -90,7 +93,7 @@ class TwoCubesScene(Scene):
     def _momentum(self, state):
         qd = state.body_qd.numpy()
         vA, vB = qd[self._bodies[0]][:3], qd[self._bodies[1]][:3]
-        return CUBE_MASS * (vA[0] + vB[0]), float(vA[0]), float(vB[0])
+        return self.target_mass * vA[0] + CUBE_MASS * vB[0], float(vA[0]), float(vB[0])
 
     def diagnostics(self, model, state, frame):
         px, vA, vB = self._momentum(state)
@@ -134,7 +137,14 @@ class TwoCubesScene(Scene):
         del solver_key
         # DAT's query margin must match the contact detection gap (0.01 default
         # elsewhere; this scene detects at RIGID_GAP).
-        return {"rigid_penetration_free_query_margin": RIGID_GAP}
+        ov = {"rigid_penetration_free_query_margin": RIGID_GAP}
+        if self.contact_ke != SHAPE_KE:
+            # Body-body penalty stiffness is seeded by rigid_contact_k_start, not
+            # by the shape material; the AVBD ramp is frozen so the requested
+            # stiffness is the one the collision actually sees.
+            ov["rigid_contact_k_start"] = self.contact_ke
+            ov["rigid_avbd_beta"] = 0.0
+        return ov
 
     # -- presentation -----------------------------------------------------
     def camera(self):
@@ -148,4 +158,24 @@ class TwoCubesScene(Scene):
             default=2.0,
             dest="impact_speed",
             help="Projectile cube speed along +x [m/s].",
+        )
+        parser.add_argument(
+            "--target-mass",
+            type=float,
+            default=CUBE_MASS,
+            dest="target_mass",
+            help="Mass of the struck cube [kg]. Far below the 1 kg projectile the contact must "
+            "accelerate the target enormously to absorb the impact, which a finite-stiffness force "
+            "cannot do within a substep -- the regime where the division planes stop the projectile "
+            "instead and delete its momentum.",
+        )
+        parser.add_argument(
+            "--contact-ke",
+            type=float,
+            default=SHAPE_KE,
+            dest="contact_ke",
+            help="Box-box contact stiffness. Well below the 1e6 default the force cannot stop the "
+            "projectile within a substep, so the division planes do the stopping instead — the "
+            "regime where truncation deletes the transferred momentum, on two rigid bodies with an "
+            "analytic answer (equal masses: v/2 each if perfectly inelastic).",
         )
