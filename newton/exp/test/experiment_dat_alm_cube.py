@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare the existing rigid-soft penalty with penalty plus DAT-ALM.
+"""Compare rigid-soft penalty, penalty plus DAT-ALM, and direct Contact-ALM.
 
 This is a headless research experiment, not a unit test. It reuses the
 pick-AVBD-cube tetrahedral mesh and material parameters in two controlled
@@ -33,6 +33,7 @@ import warp as wp
 import newton
 
 from ..scenes.pick_avbd_cube import (
+    _AVBD_MODEL_MATERIALS,
     CUBE_DENSITY,
     CUBE_DIM,
     CUBE_K_DAMP,
@@ -40,13 +41,22 @@ from ..scenes.pick_avbd_cube import (
     CUBE_K_MU,
     CUBE_PARTICLE_RADIUS,
     CUBE_SIZE,
-    _AVBD_MODEL_MATERIALS,
     _make_cube_tet_mesh,
 )
 
 DEFAULT_ITERATIONS = (1, 2, 4, 8, 16, 32)
-METHODS = ("penalty", "penalty_dat_alm")
+METHODS = ("penalty", "penalty_dat_alm", "penalty_contact_alm")
 SCENARIOS = ("quasi_static", "dynamic")
+METHOD_COLORS = {
+    "penalty": "#4c78a8",
+    "penalty_dat_alm": "#e45756",
+    "penalty_contact_alm": "#54a24b",
+}
+METHOD_LABELS = {
+    "penalty": "Penalty",
+    "penalty_dat_alm": "Penalty + DAT-ALM",
+    "penalty_contact_alm": "Penalty + Contact-ALM",
+}
 
 
 @dataclass
@@ -71,6 +81,8 @@ class RunResult:
     mean_active_contacts: float
     final_mean_penalty_k: float
     final_mean_soft_lambda: float
+    final_mean_contact_lambda_n: float
+    final_mean_contact_lambda_t: float
     elapsed_seconds: float
     milliseconds_per_step: float
 
@@ -95,16 +107,40 @@ class TracingSolverVBD(newton.solvers.SolverVBD):
         max_lambda_soft = 0.0
         mean_lambda_rigid = 0.0
         max_lambda_rigid = 0.0
+        mean_contact_lambda_n = 0.0
+        max_contact_lambda_n = 0.0
+        mean_contact_lambda_t = 0.0
+        max_contact_lambda_t = 0.0
         if active_count > 0:
             penalty_k = self.body_particle_contact_penalty_k.numpy()[:active_count]
             lambda_soft = self.body_particle_dat_alm_lambda_soft.numpy()[:active_count]
             lambda_rigid = self.body_particle_dat_alm_lambda_rigid.numpy()[:active_count]
+            lambda_contact = self.body_particle_contact_alm_lambda.numpy()[:active_count]
+            normals = contacts.soft_contact_normal.numpy()[:active_count]
+            contact_lambda_n = np.einsum("ij,ij->i", lambda_contact, normals)
+            contact_lambda_t = np.linalg.norm(
+                lambda_contact - contact_lambda_n[:, None] * normals,
+                axis=1,
+            )
             mean_k = float(np.mean(penalty_k))
             max_k = float(np.max(penalty_k))
             mean_lambda_soft = float(np.mean(lambda_soft))
             max_lambda_soft = float(np.max(lambda_soft))
             mean_lambda_rigid = float(np.mean(lambda_rigid))
             max_lambda_rigid = float(np.max(lambda_rigid))
+            mean_contact_lambda_n = float(np.mean(contact_lambda_n))
+            max_contact_lambda_n = float(np.max(contact_lambda_n))
+            mean_contact_lambda_t = float(np.mean(contact_lambda_t))
+            max_contact_lambda_t = float(np.max(contact_lambda_t))
+
+        mean_multiplier = 0.0
+        max_multiplier = 0.0
+        if self.trace_method == "penalty_dat_alm":
+            mean_multiplier = mean_lambda_soft
+            max_multiplier = max_lambda_soft
+        elif self.trace_method == "penalty_contact_alm":
+            mean_multiplier = mean_contact_lambda_n
+            max_multiplier = max_contact_lambda_n
 
         self.iteration_trace.append(
             {
@@ -120,6 +156,12 @@ class TracingSolverVBD(newton.solvers.SolverVBD):
                 "max_lambda_soft": max_lambda_soft,
                 "mean_lambda_rigid": mean_lambda_rigid,
                 "max_lambda_rigid": max_lambda_rigid,
+                "mean_contact_lambda_n": mean_contact_lambda_n,
+                "max_contact_lambda_n": max_contact_lambda_n,
+                "mean_contact_lambda_t": mean_contact_lambda_t,
+                "max_contact_lambda_t": max_contact_lambda_t,
+                "mean_multiplier": mean_multiplier,
+                "max_multiplier": max_multiplier,
             }
         )
 
@@ -130,6 +172,9 @@ class TracingSolverVBD(newton.solvers.SolverVBD):
 
     def _update_rigid_soft_dat_alm_duals(self, state, contacts) -> None:
         super()._update_rigid_soft_dat_alm_duals(state, contacts)
+
+    def _update_rigid_soft_contact_alm_duals(self, state, contacts) -> None:
+        super()._update_rigid_soft_contact_alm_duals(state, contacts)
         self._trace_iteration += 1
         self._record_iteration(state, contacts)
 
@@ -211,6 +256,8 @@ def _make_simulation(scenario: str, method: str, iterations: int, dt: float):
         rigid_body_particle_contact_buffer_size=2048,
         rigid_enable_dat_alm=method == "penalty_dat_alm",
         rigid_dat_alm_penalty=1.0e4,
+        rigid_enable_contact_alm=method == "penalty_contact_alm",
+        rigid_soft_contact_alm_alpha=0.0,
     )
     pipeline = newton.CollisionPipeline(
         model,
@@ -255,6 +302,8 @@ def _make_convergence_simulation(scenario: str, method: str, iterations: int):
         rigid_body_particle_contact_buffer_size=2048,
         rigid_enable_dat_alm=method == "penalty_dat_alm",
         rigid_dat_alm_penalty=1.0e4,
+        rigid_enable_contact_alm=method == "penalty_contact_alm",
+        rigid_soft_contact_alm_alpha=0.0,
         trace_scenario=scenario,
         trace_method=method,
     )
@@ -300,9 +349,7 @@ def run_case(
     duration: float,
 ) -> tuple[RunResult, list[dict[str, float | int | str]]]:
     """Run one scenario/method/iteration combination."""
-    model, solver, pipeline, state_0, state_1, control, contacts = _make_simulation(
-        scenario, method, iterations, dt
-    )
+    _model, solver, pipeline, state_0, state_1, control, contacts = _make_simulation(scenario, method, iterations, dt)
     steps = int(round(duration / dt))
     settled_steps = max(1, int(round(0.5 / dt)))
 
@@ -312,6 +359,8 @@ def run_case(
     trace: list[dict[str, float | int | str]] = []
     final_mean_k = 0.0
     final_mean_lambda = 0.0
+    final_mean_contact_lambda_n = 0.0
+    final_mean_contact_lambda_t = 0.0
 
     start = time.perf_counter()
     for step in range(steps):
@@ -347,6 +396,13 @@ def run_case(
             if method == "penalty_dat_alm":
                 lambda_values = solver.body_particle_dat_alm_lambda_soft.numpy()[:active_count]
                 final_mean_lambda = float(np.mean(lambda_values))
+            elif method == "penalty_contact_alm":
+                lambda_values = solver.body_particle_contact_alm_lambda.numpy()[:active_count]
+                normals = contacts.soft_contact_normal.numpy()[:active_count]
+                lambda_n = np.einsum("ij,ij->i", lambda_values, normals)
+                lambda_t = np.linalg.norm(lambda_values - lambda_n[:, None] * normals, axis=1)
+                final_mean_contact_lambda_n = float(np.mean(lambda_n))
+                final_mean_contact_lambda_t = float(np.mean(lambda_t))
 
     elapsed = time.perf_counter() - start
     raw = np.asarray(raw_depths)
@@ -373,6 +429,8 @@ def run_case(
         mean_active_contacts=float(np.mean(active_counts)),
         final_mean_penalty_k=final_mean_k,
         final_mean_soft_lambda=final_mean_lambda,
+        final_mean_contact_lambda_n=final_mean_contact_lambda_n,
+        final_mean_contact_lambda_t=final_mean_contact_lambda_t,
         elapsed_seconds=elapsed,
         milliseconds_per_step=1000.0 * elapsed / steps,
     )
@@ -394,9 +452,6 @@ def _plot_results(output_dir: Path, results: list[RunResult], traces: list[dict]
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = {"penalty": "#4c78a8", "penalty_dat_alm": "#e45756"}
-    labels = {"penalty": "Penalty", "penalty_dat_alm": "Penalty + DAT-ALM"}
-
     figure, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
     panels = (
         ("quasi_static", "max_raw_mm", "Quasi-static maximum raw penetration [mm]"),
@@ -414,14 +469,19 @@ def _plot_results(output_dir: Path, results: list[RunResult], traces: list[dict]
                 [row.iterations for row in selected],
                 [getattr(row, field) for row in selected],
                 marker="o",
-                color=colors[method],
-                label=labels[method],
+                color=METHOD_COLORS[method],
+                label=METHOD_LABELS[method],
             )
         axis.set_xscale("log", base=2)
         axis.set_xticks(DEFAULT_ITERATIONS, labels=[str(value) for value in DEFAULT_ITERATIONS])
         axis.set_xlabel("VBD iterations")
         axis.set_ylabel("Penetration [mm]")
         axis.set_title(title)
+        if scenario == "dynamic":
+            # Preserve the one-iteration Contact-ALM tunneling failure without
+            # flattening the useful 0--20 mm comparison between the other runs.
+            axis.set_yscale("symlog", linthresh=1.0)
+            axis.set_ylim(bottom=0.0)
         axis.grid(True, alpha=0.3)
     axes[0, 0].legend()
     figure.savefig(output_dir / "penetration_vs_iterations.png", dpi=180)
@@ -453,18 +513,18 @@ def _plot_results(output_dir: Path, results: list[RunResult], traces: list[dict]
                 selected = [
                     row
                     for row in traces
-                    if row["scenario"] == "dynamic"
-                    and row["method"] == method
-                    and row["iterations"] == iterations
+                    if row["scenario"] == "dynamic" and row["method"] == method and row["iterations"] == iterations
                 ]
                 axis.plot(
                     [row["time"] for row in selected],
                     [row[field] for row in selected],
-                    color=colors[method],
-                    label=labels[method],
+                    color=METHOD_COLORS[method],
+                    label=METHOD_LABELS[method],
                 )
             axis.set_ylabel(ylabel)
             axis.set_title(f"Dynamic drop, {iterations} VBD iteration{'s' if iterations != 1 else ''}")
+            axis.set_yscale("symlog", linthresh=0.1)
+            axis.set_ylim(bottom=0.0)
             axis.grid(True, alpha=0.3)
     axes[-1, 0].set_xlabel("Time [s]")
     axes[-1, 1].set_xlabel("Time [s]")
@@ -479,25 +539,20 @@ def _plot_convergence(output_dir: Path, rows: list[dict]) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = {"penalty": "#4c78a8", "penalty_dat_alm": "#e45756"}
-    labels = {"penalty": "Penalty", "penalty_dat_alm": "Penalty + DAT-ALM"}
-
     figure, axes = plt.subplots(2, 2, figsize=(11, 8), sharex=True, constrained_layout=True)
     metrics = (("raw_mm", "Raw penetration [mm]"), ("shell_mm", "Shell violation [mm]"))
     for row_index, scenario in enumerate(SCENARIOS):
         for column_index, (field, ylabel) in enumerate(metrics):
             axis = axes[row_index, column_index]
             for method in METHODS:
-                selected = [
-                    row for row in rows if row["scenario"] == scenario and row["method"] == method
-                ]
+                selected = [row for row in rows if row["scenario"] == scenario and row["method"] == method]
                 axis.plot(
                     [row["iteration"] for row in selected],
                     [row[field] for row in selected],
                     marker="o",
                     markersize=3,
-                    color=colors[method],
-                    label=labels[method],
+                    color=METHOD_COLORS[method],
+                    label=METHOD_LABELS[method],
                 )
             scenario_title = "Quasi-static loaded step" if scenario == "quasi_static" else "Dynamic impact step"
             axis.set_title(f"{scenario_title}: {ylabel.removesuffix(' [mm]')}")
@@ -514,33 +569,31 @@ def _plot_convergence(output_dir: Path, rows: list[dict]) -> None:
         stiffness_axis = axes[row_index, 0]
         multiplier_axis = axes[row_index, 1]
         for method in METHODS:
-            selected = [
-                row for row in rows if row["scenario"] == scenario and row["method"] == method
-            ]
+            selected = [row for row in rows if row["scenario"] == scenario and row["method"] == method]
             iterations = [row["iteration"] for row in selected]
             stiffness_axis.plot(
                 iterations,
                 [row["max_penalty_k"] for row in selected],
                 marker="o",
                 markersize=3,
-                color=colors[method],
-                label=labels[method],
+                color=METHOD_COLORS[method],
+                label=METHOD_LABELS[method],
             )
             multiplier_axis.plot(
                 iterations,
-                [row["max_lambda_soft"] for row in selected],
+                [row["max_multiplier"] for row in selected],
                 marker="o",
                 markersize=3,
-                color=colors[method],
-                label=labels[method],
+                color=METHOD_COLORS[method],
+                label=METHOD_LABELS[method],
             )
         scenario_title = "Quasi-static" if scenario == "quasi_static" else "Dynamic impact"
         stiffness_axis.set_title(f"{scenario_title}: maximum penalty stiffness")
         stiffness_axis.set_ylabel("Penalty stiffness [N/m]")
         stiffness_axis.set_yscale("log")
         stiffness_axis.grid(True, alpha=0.3)
-        multiplier_axis.set_title(f"{scenario_title}: maximum soft multiplier")
-        multiplier_axis.set_ylabel(r"$\lambda_{\mathrm{soft}}$ [N]")
+        multiplier_axis.set_title(f"{scenario_title}: maximum normal multiplier")
+        multiplier_axis.set_ylabel(r"$\lambda_n$ [N]")
         multiplier_axis.grid(True, alpha=0.3)
     axes[-1, 0].set_xlabel("Completed VBD iterations")
     axes[-1, 1].set_xlabel("Completed VBD iterations")
@@ -552,21 +605,74 @@ def _plot_convergence(output_dir: Path, rows: list[dict]) -> None:
 
 def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: list[dict]) -> None:
     lookup = {(row.scenario, row.method, row.iterations): row for row in results}
-    convergence_lookup = {
-        (row["scenario"], row["method"], row["iteration"]): row for row in convergence_rows
-    }
+    convergence_lookup = {(row["scenario"], row["method"], row["iteration"]): row for row in convergence_rows}
     convergence_iterations = sorted({int(row["iteration"]) for row in convergence_rows})
     reported_convergence_iterations = [
         value
         for value in convergence_iterations
         if value == 0 or value == convergence_iterations[-1] or (value & (value - 1)) == 0
     ]
+
+    def reduction_percent(baseline: float, treatment: float) -> float:
+        if baseline <= 0.0:
+            return 0.0
+        return 100.0 * (baseline - treatment) / baseline
+
+    def comparison_phrase(baseline: float, treatment: float) -> str:
+        change = abs(reduction_percent(baseline, treatment))
+        direction = "reduced" if treatment <= baseline else "increased"
+        return f"{direction} it by {change:.1f}%"
+
+    def first_zero_inner_iteration(scenario: str, method: str) -> int | None:
+        for iteration in convergence_iterations:
+            row = convergence_lookup[(scenario, method, iteration)]
+            if float(row["raw_mm"]) <= 1.0e-6:
+                return iteration
+        return None
+
+    low_budget = DEFAULT_ITERATIONS[0]
+    dynamic_budget = 4 if 4 in DEFAULT_ITERATIONS else DEFAULT_ITERATIONS[len(DEFAULT_ITERATIONS) // 2]
+    quasi_one = lookup[("quasi_static", "penalty", low_budget)]
+    quasi_one_dat = lookup[("quasi_static", "penalty_dat_alm", low_budget)]
+    quasi_one_contact = lookup[("quasi_static", "penalty_contact_alm", low_budget)]
+    dynamic_four = lookup[("dynamic", "penalty", dynamic_budget)]
+    dynamic_four_dat = lookup[("dynamic", "penalty_dat_alm", dynamic_budget)]
+    dynamic_four_contact = lookup[("dynamic", "penalty_contact_alm", dynamic_budget)]
+    high_budget = DEFAULT_ITERATIONS[-1]
+    quasi_high = lookup[("quasi_static", "penalty", high_budget)]
+    quasi_high_dat = lookup[("quasi_static", "penalty_dat_alm", high_budget)]
+    quasi_high_contact = lookup[("quasi_static", "penalty_contact_alm", high_budget)]
+    dynamic_high = lookup[("dynamic", "penalty", high_budget)]
+    dynamic_high_dat = lookup[("dynamic", "penalty_dat_alm", high_budget)]
+    dynamic_high_contact = lookup[("dynamic", "penalty_contact_alm", high_budget)]
+    inner_summary_iteration = max(
+        (iteration for iteration in convergence_iterations if iteration <= 4),
+        default=convergence_iterations[-1],
+    )
+    inner_last_iteration = convergence_iterations[-1]
+
+    def convergence_row(scenario: str, method: str, iteration: int) -> dict:
+        return convergence_lookup[(scenario, method, iteration)]
+
+    def zero_iteration_text(scenario: str, method: str) -> str:
+        value = first_zero_inner_iteration(scenario, method)
+        return "not reached" if value is None else str(value)
+
+    def peak_multiplier(scenario: str, method: str) -> float:
+        return max(
+            float(row["max_multiplier"])
+            for row in convergence_rows
+            if row["scenario"] == scenario and row["method"] == method
+        )
+
     lines = [
-        "# DAT-ALM deformable-cube experiments",
+        "# DAT-ALM and Contact-ALM deformable-cube experiments",
         "",
         "These experiments compare Newton's existing ramped rigid--soft penalty",
-        "contact against the same contact response augmented with `--dat-alm`.",
-        "It does not claim to isolate ALM as a replacement contact law.",
+        "contact against the DAT-plane constraint (`--dat-alm`) and the direct",
+        "rigid--soft contact-pair constraint (`--contact-alm`). Both AL methods",
+        "retain the existing ramped penalty, so this is an empirical comparison",
+        "of penalty against penalty plus ALM, not a pure-ALM ablation.",
         "",
         "## 1. Shared configuration and penetration metrics",
         "",
@@ -603,10 +709,38 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
         "",
         "The model reuses the `pick_avbd_cube` tetrahedral mesh, density, elastic",
         "parameters, particle radius, and contact materials. A body-attached",
-        "kinematic box provides a flat floor. Both modes retain the AVBD contact",
-        "penalty seed of $10^2$ and ramp rate of $10^5$; DAT-ALM uses",
-        "$\\rho=10^4\\,\\mathrm{N/m}$. Collision detection runs every step with",
+        "kinematic box provides a flat floor. All three modes retain the AVBD",
+        "contact penalty seed of $10^2$ and ramp rate of $10^5$; DAT-ALM uses",
+        "$\\rho=10^4\\,\\mathrm{N/m}$, while Contact-ALM uses each contact's",
+        "same ramped $k$ for its projected normal/tangential multiplier.",
+        "Collision detection runs every step with",
         "water-tight rigid--soft contacts enabled.",
+        "",
+        "The two AL treatments differ geometrically. DAT-ALM constrains its",
+        "frozen division plane,",
+        "",
+        "$$g_{\\mathrm{DAT}}=\\mathbf n\\cdot(\\mathbf x-\\mathbf d)\\ge0,$$",
+        "",
+        "with its independent penalty $\\rho$. Contact-ALM constrains the",
+        "ordinary contact-shell gap directly. With penetration",
+        "$p_{\\mathrm{VBD}}=-g_{\\mathrm{contact}}$, its normal law is",
+        "",
+        "$$p_{\\mathrm{eff}}=p_{\\mathrm{VBD}}-\\alpha p_0,\\qquad",
+        "f_n=\\max(kp_{\\mathrm{eff}}+\\lambda_n,0),$$",
+        "",
+        "and its projected dual update uses the same ramped contact $k$.",
+        "The implementation can apply a C0 offset using",
+        "",
+        "$$p_0=\\min(p_{\\mathrm{initial}},r+m_s),$$",
+        "",
+        "but these experiments set the Contact-ALM-specific stabilization",
+        "parameter to $\\alpha=0$. Consequently",
+        "$p_{\\mathrm{eff}}=p_{\\mathrm{VBD}}$ and C0 does not alter the",
+        "normal constraint target.",
+        "The upper bound $r+m_s$ is the shell depth corresponding to zero raw",
+        "penetration into the rigid geometry. The floor friction coefficient is",
+        "zero, so the Contact-ALM tangential multiplier is identically zero in",
+        "these experiments.",
         "",
         "## 2. Experiment 1: simulation-step iteration-budget sweep",
         "",
@@ -621,16 +755,19 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
         "",
         "### 2.2 Quasi-static settling",
         "",
-        "| Iterations | Baseline max raw [mm] | DAT-ALM max raw [mm] | Baseline max shell [mm] | DAT-ALM max shell [mm] | Baseline settled shell [mm] | DAT-ALM settled shell [mm] |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "| Iterations | Penalty raw [mm] | DAT-ALM raw [mm] | Contact-ALM raw [mm] | Penalty shell [mm] | DAT-ALM shell [mm] | Contact-ALM shell [mm] | Penalty settled shell [mm] | DAT-ALM settled shell [mm] | Contact-ALM settled shell [mm] |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for iterations in DEFAULT_ITERATIONS:
         baseline = lookup[("quasi_static", "penalty", iterations)]
-        treatment = lookup[("quasi_static", "penalty_dat_alm", iterations)]
+        dat_alm = lookup[("quasi_static", "penalty_dat_alm", iterations)]
+        contact_alm = lookup[("quasi_static", "penalty_contact_alm", iterations)]
         lines.append(
-            f"| {iterations} | {baseline.max_raw_mm:.6f} | {treatment.max_raw_mm:.6f} | "
-            f"{baseline.max_shell_mm:.6f} | {treatment.max_shell_mm:.6f} | "
-            f"{baseline.settled_mean_shell_mm:.6f} | {treatment.settled_mean_shell_mm:.6f} |"
+            f"| {iterations} | {baseline.max_raw_mm:.6f} | {dat_alm.max_raw_mm:.6f} | "
+            f"{contact_alm.max_raw_mm:.6f} | {baseline.max_shell_mm:.6f} | "
+            f"{dat_alm.max_shell_mm:.6f} | {contact_alm.max_shell_mm:.6f} | "
+            f"{baseline.settled_mean_shell_mm:.6f} | {dat_alm.settled_mean_shell_mm:.6f} | "
+            f"{contact_alm.settled_mean_shell_mm:.6f} |"
         )
 
     lines.extend(
@@ -638,16 +775,18 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
             "",
             "### 2.3 Dynamic drop",
             "",
-            "| Iterations | Baseline max raw [mm] | DAT-ALM max raw [mm] | Baseline max shell [mm] | DAT-ALM max shell [mm] |",
-            "|---:|---:|---:|---:|---:|",
+            "| Iterations | Penalty raw [mm] | DAT-ALM raw [mm] | Contact-ALM raw [mm] | Penalty shell [mm] | DAT-ALM shell [mm] | Contact-ALM shell [mm] |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for iterations in DEFAULT_ITERATIONS:
         baseline = lookup[("dynamic", "penalty", iterations)]
-        treatment = lookup[("dynamic", "penalty_dat_alm", iterations)]
+        dat_alm = lookup[("dynamic", "penalty_dat_alm", iterations)]
+        contact_alm = lookup[("dynamic", "penalty_contact_alm", iterations)]
         lines.append(
-            f"| {iterations} | {baseline.max_raw_mm:.6f} | {treatment.max_raw_mm:.6f} | "
-            f"{baseline.max_shell_mm:.6f} | {treatment.max_shell_mm:.6f} |"
+            f"| {iterations} | {baseline.max_raw_mm:.6f} | {dat_alm.max_raw_mm:.6f} | "
+            f"{contact_alm.max_raw_mm:.6f} | {baseline.max_shell_mm:.6f} | "
+            f"{dat_alm.max_shell_mm:.6f} | {contact_alm.max_shell_mm:.6f} |"
         )
 
     lines.extend(
@@ -657,21 +796,31 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
             "",
             "### 2.4 Experiment 1 findings",
             "",
-            "- In quasi-static settling, DAT-ALM reduced maximum raw penetration",
-            "  by 45.6% at one iteration and 35.1% at two iterations. The",
-            "  baseline already had zero raw penetration from four iterations",
-            "  onward.",
-            "- In the dynamic drop, DAT-ALM reduced maximum raw penetration by",
-            "  36.2% at one iteration, 53.0% at two iterations, and 99.0% at",
-            "  four iterations. At eight or more iterations, both modes had",
-            "  zero raw penetration.",
-            "- The settled shell violation was nearly unchanged except at one",
-            "  iteration. This is expected for the current DAT plane: it guards",
-            "  raw geometric separation, while the original penalty contact",
-            "  activates at the 5 mm particle collision shell.",
-            "- Therefore the empirical benefit in this test is improved",
-            "  low-iteration impact robustness, not lower converged shell",
-            "  compliance once the baseline is sufficiently resolved.",
+            f"- With {low_budget} quasi-static iteration{'s' if low_budget != 1 else ''}, "
+            f"maximum raw penetration is "
+            f"{quasi_one.max_raw_mm:.3f} mm for penalty, {quasi_one_dat.max_raw_mm:.3f} mm "
+            f"for DAT-ALM, and {quasi_one_contact.max_raw_mm:.3f} mm for Contact-ALM. "
+            f"Relative to penalty, DAT-ALM {comparison_phrase(quasi_one.max_raw_mm, quasi_one_dat.max_raw_mm)} "
+            f"and Contact-ALM {comparison_phrase(quasi_one.max_raw_mm, quasi_one_contact.max_raw_mm)}.",
+            f"- In the {dynamic_budget}-iteration dynamic drop, maximum raw penetration is "
+            f"{dynamic_four.max_raw_mm:.3f} mm for penalty, {dynamic_four_dat.max_raw_mm:.3f} mm "
+            f"for DAT-ALM, and {dynamic_four_contact.max_raw_mm:.3f} mm for Contact-ALM. "
+            f"Relative to penalty, DAT-ALM {comparison_phrase(dynamic_four.max_raw_mm, dynamic_four_dat.max_raw_mm)} "
+            f"and Contact-ALM {comparison_phrase(dynamic_four.max_raw_mm, dynamic_four_contact.max_raw_mm)}.",
+            "- With only one primal sweep per timestep, Contact-ALM cannot improve",
+            "  on penalty: its multiplier is updated after that only sweep, then",
+            "  reset when collision rows rebuild at the next timestep, so it never",
+            "  contributes to a later primal sweep. Two or more sweeps allow the",
+            "  updated multiplier to affect subsequent primal solves.",
+            f"- At {high_budget} sweeps, Contact-ALM has {quasi_high_contact.settled_mean_shell_mm:.3f} mm "
+            f"settled quasi-static shell violation versus {quasi_high.settled_mean_shell_mm:.3f} mm "
+            f"for penalty and {quasi_high_dat.settled_mean_shell_mm:.3f} mm for DAT-ALM. "
+            f"The corresponding dynamic maxima are {dynamic_high.max_shell_mm:.3f}, "
+            f"{dynamic_high_dat.max_shell_mm:.3f}, and {dynamic_high_contact.max_shell_mm:.3f} mm.",
+            "- DAT-ALM constrains a frozen division plane associated with raw geometric",
+            "  separation. Contact-ALM instead constrains the ordinary collision-shell",
+            "  gap. The raw and shell columns must therefore be considered together;",
+            "  the two AL methods do not enforce identical feasible sets.",
             "",
             "## 3. Experiment 2: inner-iteration convergence",
             "",
@@ -679,12 +828,12 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
             "",
             "The preceding sweep samples after complete simulation steps. This",
             "second experiment instruments one controlled timestep and samples",
-            "immediately after every complete VBD primal sweep and DAT-ALM dual",
-            "update. Iteration 0 is the forward-predicted state before any VBD",
+            "immediately after every complete VBD primal sweep and both possible dual",
+            "updates. Iteration 0 is the forward-predicted state before any VBD",
             "sweep. The quasi-static case begins with 2 mm of raw penetration",
             "and zero velocity. The dynamic case begins 0.5 mm outside",
             "the shell with an intentionally aggressive downward velocity of",
-            "$10\\,\\mathrm{m/s}$. Both methods start from identical states and",
+            "$10\\,\\mathrm{m/s}$. All methods start from identical states and",
             "contact records.",
             "",
             "The dynamic case enables the `pick_avbd_cube` self-contact",
@@ -708,10 +857,11 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
             "",
             "The stiffness plot reports the maximum ramped penalty stiffness",
             "among the current rigid--soft contact records. The multiplier plot",
-            "reports the maximum projected soft-side DAT-ALM multiplier. Pure",
-            "penalty has no DAT-ALM multiplier, so its curve remains zero. Each",
-            "multiplier sample is taken after the dual update and therefore",
-            "becomes an input to the following primal sweep.",
+            "reports the maximum projected normal multiplier: the soft-side",
+            "plane multiplier for DAT-ALM and the contact-normal component for",
+            "Contact-ALM. Pure penalty has no multiplier, so its curve remains",
+            "zero. Each multiplier sample is taken after the dual update and",
+            "therefore becomes an input to the following primal sweep.",
             "",
         ]
     )
@@ -721,7 +871,7 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
             [
                 f"### 3.{scenario_index} {scenario_title}",
                 "",
-                "| Iteration | Method | Raw [mm] | Shell [mm] | Max penalty $k$ [N/m] | Max $\\lambda_{\\mathrm{soft}}$ [N] |",
+                "| Iteration | Method | Raw [mm] | Shell [mm] | Max penalty $k$ [N/m] | Max projected $\\lambda_n$ [N] |",
                 "|---:|:---|---:|---:|---:|---:|",
             ]
         )
@@ -730,7 +880,7 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
                 row = convergence_lookup[(scenario, method, iteration)]
                 lines.append(
                     f"| {iteration} | {method} | {row['raw_mm']:.6f} | {row['shell_mm']:.6f} | "
-                    f"{row['max_penalty_k']:.6f} | {row['max_lambda_soft']:.6f} |"
+                    f"{row['max_penalty_k']:.6f} | {row['max_multiplier']:.6f} |"
                 )
         lines.append("")
 
@@ -738,43 +888,53 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
         [
             "### 3.4 Experiment 2 findings",
             "",
-            "- In the quasi-static correction, both methods start from the same",
-            "  2.170 mm forward-predicted raw penetration. After one iteration,",
-            "  penalty leaves 1.537 mm while penalty + DAT-ALM leaves 0.856 mm",
-            "  (44.3% less). DAT-ALM reaches zero raw penetration after two",
-            "  iterations; penalty still has 0.732 mm and reaches zero after",
-            "  four iterations.",
-            "- The quasi-static DAT-ALM multiplier peaks at 8.561 N after the",
-            "  first update, remains 7.781 N after the second, and projects",
-            "  back to zero by iteration four once the DAT-plane half-space",
-            "  constraint is satisfied. At iteration two, DAT-ALM is feasible",
-            "  with respect to raw geometry and has a lower maximum penalty",
-            "  stiffness: 1403 N/m versus 1471 N/m. This shows that the",
-            "  multiplier supplied part of the correction.",
-            "- The 42.5 mm cap admits the complete 41.84 mm dynamic prediction,",
-            "  which starts with 36.337 mm of raw penetration. At iteration two,",
-            "  penalty leaves 17.395 mm while penalty + DAT-ALM leaves 7.056 mm",
-            "  (59.4% less). At iteration four, the values are 9.756 mm and",
-            "  0.495 mm, respectively.",
-            "- DAT-ALM first reaches zero raw penetration at iteration five,",
-            "  compared with iteration nine for penalty. Neither curve is",
-            "  monotone: DAT-ALM briefly re-penetrates at iterations 6, 8, 10,",
-            "  and 12. Penalty remains at zero from iteration 11 onward, while",
-            "  DAT-ALM remains at zero from iteration 13 onward.",
-            "- The DAT-ALM multiplier peaks at 274.344 N after iteration two.",
-            "  At iteration four, its maximum penalty stiffness is 7999 N/m",
-            "  versus 10905 N/m for penalty, so the multiplier supplies much of",
-            "  the faster early correction.",
-            "- At iteration 32 both methods have zero raw penetration. Penalty",
-            "  has 1.628 mm of shell violation and 18051 N/m maximum stiffness;",
-            "  DAT-ALM has 1.919 mm and 14281 N/m. The larger query margins fix",
-            "  the earlier plane-coverage failure, but the projected ALM",
-            "  response introduces visible late-iteration oscillation.",
+            f"- At inner iteration {inner_summary_iteration}, quasi-static raw penetration is "
+            f"{convergence_row('quasi_static', 'penalty', inner_summary_iteration)['raw_mm']:.3f} mm "
+            f"for penalty, "
+            f"{convergence_row('quasi_static', 'penalty_dat_alm', inner_summary_iteration)['raw_mm']:.3f} mm "
+            f"for DAT-ALM, and "
+            f"{convergence_row('quasi_static', 'penalty_contact_alm', inner_summary_iteration)['raw_mm']:.3f} mm "
+            f"for Contact-ALM. Their first zero-raw iterations are "
+            f"{zero_iteration_text('quasi_static', 'penalty')}, "
+            f"{zero_iteration_text('quasi_static', 'penalty_dat_alm')}, and "
+            f"{zero_iteration_text('quasi_static', 'penalty_contact_alm')}, respectively.",
+            "- The quasi-static Contact-ALM trace deliberately starts already",
+            "  penetrated. Because this experiment sets $\\alpha=0$, the stored",
+            "  C0 reference contributes no normal offset: Contact-ALM targets",
+            "  zero shell violation rather than preserving the initial overlap.",
+            f"- At inner iteration {inner_summary_iteration}, dynamic raw penetration is "
+            f"{convergence_row('dynamic', 'penalty', inner_summary_iteration)['raw_mm']:.3f} mm "
+            f"for penalty, "
+            f"{convergence_row('dynamic', 'penalty_dat_alm', inner_summary_iteration)['raw_mm']:.3f} mm "
+            f"for DAT-ALM, and "
+            f"{convergence_row('dynamic', 'penalty_contact_alm', inner_summary_iteration)['raw_mm']:.3f} mm "
+            f"for Contact-ALM. Their first zero-raw iterations are "
+            f"{zero_iteration_text('dynamic', 'penalty')}, "
+            f"{zero_iteration_text('dynamic', 'penalty_dat_alm')}, and "
+            f"{zero_iteration_text('dynamic', 'penalty_contact_alm')}, respectively.",
+            "- The dynamic case also uses $\\alpha=0$, so Contact-ALM directly",
+            "  targets the current shell violation. Its early convergence and",
+            "  final shell value can therefore be compared without a shifted",
+            "  C0 target.",
+            f"- In the dynamic trace, the maximum projected normal multiplier peaks at "
+            f"{peak_multiplier('dynamic', 'penalty_dat_alm'):.3f} N for DAT-ALM and "
+            f"{peak_multiplier('dynamic', 'penalty_contact_alm'):.3f} N for Contact-ALM. "
+            "The floor is frictionless in this experiment, so Contact-ALM's tangential "
+            "multiplier remains zero; this cube test isolates its direct normal constraint.",
+            f"- At iteration {inner_last_iteration}, shell violation is "
+            f"{convergence_row('dynamic', 'penalty', inner_last_iteration)['shell_mm']:.3f} mm "
+            f"for penalty, "
+            f"{convergence_row('dynamic', 'penalty_dat_alm', inner_last_iteration)['shell_mm']:.3f} mm "
+            f"for DAT-ALM, and "
+            f"{convergence_row('dynamic', 'penalty_contact_alm', inner_last_iteration)['shell_mm']:.3f} mm "
+            "for Contact-ALM. This late-iteration value reveals whether faster early "
+            "correction also converges to a tighter collision shell.",
             "",
             "## 4. Output data and reproducibility",
             "",
             "The complete iteration-level measurements, including mean and",
-            "maximum soft/rigid multipliers and penalty stiffness, are in",
+            "maximum DAT soft/rigid multipliers, Contact-ALM normal/tangential",
+            "multipliers, the unified plotted normal multiplier, and penalty stiffness are in",
             "`iteration_convergence.csv`.",
             "",
             "The complete aggregate measurements for Experiment 1 are in",
@@ -787,66 +947,23 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
             "Running `python -m newton.exp.test.experiment_dat_alm_cube`",
             "regenerates both experiments, their plots, and this report.",
             "",
-            "## 5. Diagnostic from the earlier uncapped 10 m/s trial",
+            "## 5. Contact-ALM with $C_0$ stabilization disabled",
             "",
-            "Before enabling the self-contact displacement cap used by the",
-            "current dynamic run, the same 10 m/s case was tested with",
-            "self-contact disabled. That uncapped diagnostic produced 36.337 mm",
-            "of forward-predicted raw penetration and exposed why a multiplier",
-            "can vanish while global penetration remains.",
+            "The solver exposes a rigid-soft-specific stabilization parameter.",
+            "The examples map it to the CLI option",
+            "`--contact-alm-alpha`; it is independent of the alpha used by",
+            "rigid--rigid contacts. The Contact-ALM residual is",
             "",
-            "The DAT-ALM multiplier responds to its own frozen, per-contact",
-            "half-space constraint rather than directly to the global",
-            "penetration statistic. For contact $i$, the projected update is",
+            "$$p_{\\mathrm{eff}}=p_{\\mathrm{VBD}}-\\alpha p_0.$$",
             "",
-            "$$\\lambda_i^{k+1}=\\max\\!\\left(0,\\lambda_i^k-\\rho",
-            "g_i^{k+1}\\right),\\qquad",
-            "g_i=\\mathbf n_i\\cdot(\\mathbf x_i-\\mathbf d_i).$$",
+            "Both experiments use `--contact-alm-alpha 0`, equivalently",
+            "`rigid_soft_contact_alm_alpha=0.0`, giving",
             "",
-            "When a represented contact point moves to the feasible side",
-            "($g_i>0$), its multiplier decreases and may project to zero. This",
-            "update does not inspect the reported global raw penetration",
+            "$$p_{\\mathrm{eff}}=p_{\\mathrm{VBD}}.$$",
             "",
-            "$$p_{\\mathrm{raw}}=\\max_j\\max(0,-\\phi(\\mathbf x_j)),$$",
-            "",
-            "which is the deepest rigid-SDF violation among all 125 cube",
-            "particles.",
-            "",
-            "The 10 m/s stress test creates a mismatch between those two",
-            "quantities. Collision detection runs before forward prediction,",
-            "and its contact set and DAT planes remain frozen through all 32",
-            "iterations. A particle contact is initially generated only within",
-            "",
-            "$$r+m_{\\mathrm{query}}=5\\,\\mathrm{mm}+20\\,\\mathrm{mm}",
-            "=25\\,\\mathrm{mm}$$",
-            "",
-            "of the floor. The cube's particle layers initially lie at",
-            "approximately 5.5, 18.0, 30.5, 43.0, and 55.5 mm. Therefore only",
-            "the first two layers fall inside the query range. The 10 m/s",
-            "forward step moves the cube by approximately 41.84 mm, so the",
-            "initially uncovered 30.5 mm layer can move roughly 11 mm inside",
-            "the floor without having its own frozen DAT plane.",
-            "",
-            "DAT-ALM rapidly corrects the initially represented lower-layer",
-            "contacts. Their plane gaps become positive and their multipliers",
-            "project to zero, while an initially uncovered layer can still",
-            "determine the global minimum height. This is why the maximum",
-            "multiplier is zero by iteration 10 even though the measured global",
-            "raw penetration remains 5.142 mm.",
-            "",
-            "The ordinary penalty uses the same frozen contacts, but its",
-            "stiffness continues to ramp. Elastic coupling then transmits the",
-            "increasingly stiff response through the cube and eventually pulls",
-            "the uncovered particles out. DAT-ALM corrected its covered",
-            "contacts earlier, so its penalty stiffness ramped less; after its",
-            "multipliers vanished, the uncovered penetration was corrected more",
-            "slowly.",
-            "",
-            "Thus this result primarily exposes a frozen-contact and DAT-plane",
-            "coverage limitation under a displacement larger than the collision",
-            "query margin. Candidate remedies are intra-solve collision",
-            "redetection with plane rebuilding, a query margin larger than the",
-            "predicted displacement, or swept/continuous contact generation.",
+            "Thus the stored $p_0$ cannot create a nonzero shell plateau.",
+            "Contact-ALM directly targets zero collision-shell violation.",
+            "Rigid--rigid contacts retain their original C0 stabilization.",
             "",
         ]
     )
@@ -854,7 +971,7 @@ def _write_report(output_dir: Path, results: list[RunResult], convergence_rows: 
 
 
 def main() -> None:
-    global DEFAULT_ITERATIONS
+    global DEFAULT_ITERATIONS  # noqa: PLW0603
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -899,8 +1016,7 @@ def main() -> None:
             for method in METHODS:
                 run_index += 1
                 print(
-                    f"[{run_index:02d}/{total:02d}] scenario={scenario} "
-                    f"iterations={iterations} method={method}",
+                    f"[{run_index:02d}/{total:02d}] scenario={scenario} iterations={iterations} method={method}",
                     flush=True,
                 )
                 result, run_trace = run_case(
@@ -924,8 +1040,7 @@ def main() -> None:
     for scenario in SCENARIOS:
         for method in METHODS:
             print(
-                f"[convergence] scenario={scenario} method={method} "
-                f"iterations={args.convergence_iterations}",
+                f"[convergence] scenario={scenario} method={method} iterations={args.convergence_iterations}",
                 flush=True,
             )
             convergence_rows.extend(

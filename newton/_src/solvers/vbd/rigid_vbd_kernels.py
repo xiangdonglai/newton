@@ -749,14 +749,20 @@ def _compute_body_particle_contact_force(
     mu: float,
     friction_epsilon: float,
     dt: float,
+    lambda_n: float,
+    lambda_t: wp.vec3,
+    friction_c0: wp.vec3,
+    hard_contact: int,
 ):
-    """Pure force law for body-particle contacts: normal penalty + damping + friction.
+    """Body-particle contact law: projected AL normal/tangential force, damping, and friction.
 
     All geometry and kinematics (penetration, normal, relative displacement) are
     resolved by the caller.  This function only computes the contact force and
     Hessian from those scalar/vector inputs.
     """
-    f_n = penetration_depth * ke
+    f_n = wp.max(penetration_depth * ke + lambda_n, 0.0)
+    if f_n <= 0.0:
+        return wp.vec3(0.0), wp.mat33(0.0)
     force = n * f_n
     hessian = ke * wp.outer(n, n)
 
@@ -765,10 +771,21 @@ def _compute_body_particle_contact_force(
         hessian = hessian + damping_hessian
         force = force - damping_hessian * relative_translation
 
-    eps_u = friction_epsilon * dt
-    friction_force, friction_hessian = compute_projected_isotropic_friction(mu, f_n, n, relative_translation, eps_u)
-    force = force + friction_force
-    hessian = hessian + friction_hessian
+    if hard_contact != 0:
+        if mu > 0.0:
+            tangential_translation = relative_translation - n * wp.dot(n, relative_translation)
+            friction_force = ke * (-tangential_translation + friction_c0) + lambda_t
+            friction_force_length = wp.length(friction_force)
+            cone_limit = mu * f_n
+            if friction_force_length > cone_limit and friction_force_length > 0.0:
+                friction_force = friction_force * (cone_limit / friction_force_length)
+            force = force + friction_force
+            hessian = hessian + ke * (wp.identity(n=3, dtype=float) - wp.outer(n, n))
+    else:
+        eps_u = friction_epsilon * dt
+        friction_force, friction_hessian = compute_projected_isotropic_friction(mu, f_n, n, relative_translation, eps_u)
+        force = force + friction_force
+        hessian = hessian + friction_hessian
 
     return force, hessian
 
@@ -816,6 +833,11 @@ def _eval_body_particle_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    lambda_n: float,
+    lambda_t: wp.vec3,
+    penetration_stabilization: float,
+    friction_c0: wp.vec3,
+    hard_contact: int,
 ):
     """Particle-rigid contact force/Hessian - resolves geometry from arrays then
     delegates to ``_compute_body_particle_contact_force``.
@@ -837,7 +859,8 @@ def _eval_body_particle_contact(
 
     margin = shape_margin[shape_index] if shape_margin.shape[0] > 0 else 0.0
     penetration_depth = -(wp.dot(n, particle_pos - bx) - particle_radius[particle_index] - margin)
-    if penetration_depth > 0.0:
+    penetration_depth -= penetration_stabilization
+    if penetration_depth > 0.0 or lambda_n > 0.0:
         dx = particle_pos - particle_prev_pos
 
         if body_q_prev:
@@ -866,6 +889,10 @@ def _eval_body_particle_contact(
             friction_mu,
             friction_epsilon,
             dt,
+            lambda_n,
+            lambda_t,
+            friction_c0,
+            hard_contact,
         )
     else:
         return wp.vec3(0.0), wp.mat33(0.0)
@@ -895,6 +922,11 @@ def _eval_soft_ef_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    lambda_n: float,
+    lambda_t: wp.vec3,
+    penetration_stabilization: float,
+    friction_c0: wp.vec3,
+    hard_contact: int,
 ):
     """Edge/face soft-contact force/Hessian at a barycentric contact point on a soft triangle.
 
@@ -933,7 +965,8 @@ def _eval_soft_ef_contact(
     hessian = wp.mat33(0.0)
 
     penetration_depth = -(wp.dot(n, x - bx) - radius - margin)
-    if penetration_depth > 0.0:
+    penetration_depth -= penetration_stabilization
+    if penetration_depth > 0.0 or lambda_n > 0.0:
         dx = x - x_prev
 
         if body_q_prev:
@@ -964,6 +997,10 @@ def _eval_soft_ef_contact(
             contact_mu,
             friction_epsilon,
             dt,
+            lambda_n,
+            lambda_t,
+            friction_c0,
+            hard_contact,
         )
 
     return force, hessian, bx
@@ -1022,6 +1059,11 @@ def evaluate_body_particle_contact(
         contact_normal,
         shape_margin,
         dt,
+        0.0,
+        wp.vec3(0.0),
+        0.0,
+        wp.vec3(0.0),
+        0,
     )
 
 
@@ -3002,6 +3044,11 @@ def accumulate_body_particle_contacts_per_body(
     dat_alm_plane_normal: wp.array[wp.vec3],
     dat_alm_lambda_rigid: wp.array[float],
     dat_alm_penalty: float,
+    # Direct contact-pair ALM constraint
+    contact_alm_enabled: int,
+    contact_alm_lambda: wp.array[wp.vec3],
+    contact_alm_C0: wp.array[wp.vec3],
+    contact_alm_alpha: float,
     # Per-body soft-contact adjacency (body-particle)
     body_particle_contact_buffer_pre_alloc: int,
     body_particle_contact_counts: wp.array[wp.int32],
@@ -3081,29 +3128,58 @@ def accumulate_body_particle_contacts_per_body(
             s_idx = body_particle_contact_shape[contact_idx]
             margin = shape_margin[s_idx] if s_idx >= 0 and shape_margin.shape[0] > 0 else 0.0
             penetration_depth = -(wp.dot(n, particle_pos - cp_world) - radius - margin)
-            if penetration_depth <= 0.0:
+            lambda_n = float(0.0)
+            lambda_t = wp.vec3(0.0)
+            penetration_stabilization = float(0.0)
+            friction_c0 = wp.vec3(0.0)
+            if contact_alm_enabled != 0:
+                lambda_vec = contact_alm_lambda[contact_idx]
+                lambda_n = wp.dot(n, lambda_vec)
+                lambda_t = lambda_vec - n * lambda_n
+                C0_vec = contact_alm_C0[contact_idx]
+                C0_n = wp.dot(n, C0_vec)
+                penetration_stabilization = contact_alm_alpha * C0_n
+            penetration_depth -= penetration_stabilization
+            if penetration_depth <= 0.0 and lambda_n <= 0.0:
                 continue
 
-            bx_prev = wp.transform_point(X_wb_prev, cp_local)
-            bv = (cp_world - bx_prev) / dt + wp.transform_vector(X_wb, body_particle_contact_body_vel[contact_idx])
-            dx = particle_pos - particle_q_prev[particle_idx]
-            relative_translation = dx - bv * dt
+            if penetration_depth > 0.0 or lambda_n > 0.0:
+                bx_prev = wp.transform_point(X_wb_prev, cp_local)
+                bv = (cp_world - bx_prev) / dt + wp.transform_vector(X_wb, body_particle_contact_body_vel[contact_idx])
+                dx = particle_pos - particle_q_prev[particle_idx]
+                relative_translation = dx - bv * dt
 
-            f_soft, h_soft = _compute_body_particle_contact_force(
-                penetration_depth,
-                n,
-                relative_translation,
-                body_particle_contact_penalty_k[contact_idx],
-                body_particle_contact_material_kd[contact_idx],
-                body_particle_contact_material_mu[contact_idx],
-                friction_epsilon,
-                dt,
-            )
+                f_soft, h_soft = _compute_body_particle_contact_force(
+                    penetration_depth,
+                    n,
+                    relative_translation,
+                    body_particle_contact_penalty_k[contact_idx],
+                    body_particle_contact_material_kd[contact_idx],
+                    body_particle_contact_material_mu[contact_idx],
+                    friction_epsilon,
+                    dt,
+                    lambda_n,
+                    lambda_t,
+                    friction_c0,
+                    contact_alm_enabled,
+                )
         else:
             # Water-tight edge/face: barycentric contact point on a soft triangle. Uses the shared
             # force law via _eval_soft_ef_contact -- the same evaluation as particle-side section 2.
             tri = body_particle_contact_particle[contact_idx]
             bary = soft_contact_barycentric[contact_idx]
+            lambda_n = float(0.0)
+            lambda_t = wp.vec3(0.0)
+            penetration_stabilization = float(0.0)
+            friction_c0 = wp.vec3(0.0)
+            if contact_alm_enabled != 0:
+                n = body_particle_contact_normal[contact_idx]
+                lambda_vec = contact_alm_lambda[contact_idx]
+                lambda_n = wp.dot(n, lambda_vec)
+                lambda_t = lambda_vec - n * lambda_n
+                C0_vec = contact_alm_C0[contact_idx]
+                C0_n = wp.dot(n, C0_vec)
+                penetration_stabilization = contact_alm_alpha * C0_n
             f_soft, h_soft, cp_world = _eval_soft_ef_contact(
                 contact_idx,
                 tri,
@@ -3127,9 +3203,14 @@ def accumulate_body_particle_contacts_per_body(
                 body_particle_contact_normal,
                 shape_margin,
                 dt,
+                lambda_n,
+                lambda_t,
+                penetration_stabilization,
+                friction_c0,
+                contact_alm_enabled,
             )
 
-        # Existing penalty/friction reaction plus the rigid side of the DAT-ALM plane.
+        # Existing contact reaction plus the rigid side of the DAT-ALM plane.
         f_body = -f_soft
         h_body = h_soft
         if dat_alm_enabled != 0:
@@ -4025,6 +4106,143 @@ def update_duals_body_particle_contacts(
 
     k = body_particle_contact_penalty_k[idx]
     body_particle_contact_penalty_k[idx] = wp.min(k + beta * penetration, stiffness)
+
+
+@wp.kernel
+def initialize_rigid_soft_contact_alm_constraints(
+    soft_contact_count: wp.array[int],
+    soft_contact_primitive: wp.array[int],
+    soft_contact_shape: wp.array[int],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_radius: wp.array[float],
+    shape_body: wp.array[int],
+    shape_margin: wp.array[float],
+    particle_q: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    contact_C0: wp.array[wp.vec3],
+    contact_lambda: wp.array[wp.vec3],
+):
+    """Snapshot the initial normal/tangential residual and clear the multiplier."""
+    idx = wp.tid()
+    c0 = soft_contact_count[0]
+    count = c0 + soft_contact_count[1] + soft_contact_count[2]
+    if idx >= count:
+        return
+
+    primitive = soft_contact_primitive[idx]
+    if idx < c0:
+        x = particle_q[primitive]
+        radius = particle_radius[primitive]
+    else:
+        bary = soft_contact_barycentric[idx]
+        v0 = tri_indices[primitive, 0]
+        v1 = tri_indices[primitive, 1]
+        v2 = tri_indices[primitive, 2]
+        x = bary[0] * particle_q[v0] + bary[1] * particle_q[v1] + bary[2] * particle_q[v2]
+        radius = wp.max(particle_radius[v0], wp.max(particle_radius[v1], particle_radius[v2]))
+
+    shape = soft_contact_shape[idx]
+    body = shape_body[shape]
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+    bx = wp.transform_point(X_wb, soft_contact_body_pos[idx])
+    margin = shape_margin[shape] if shape >= 0 and shape_margin.shape[0] > 0 else 0.0
+    n = soft_contact_normal[idx]
+    penetration = -(wp.dot(n, x - bx) - radius - margin)
+    # Contact-ALM must not stabilize raw penetration into the rigid geometry
+    # as its target. Preserve harmless collision-shell overlap, but clamp the
+    # reference to the shell depth corresponding to zero raw penetration.
+    penetration = wp.min(penetration, radius + margin)
+    # Store only the normal reference. A rigid-soft witness may have a large
+    # tangential offset (especially for stale water-tight feature rows); making
+    # alpha control that offset pulls the cloth toward an arbitrary witness
+    # when alpha=0. Tangential AL instead resists incremental relative motion.
+    contact_C0[idx] = n * penetration
+    contact_lambda[idx] = wp.vec3(0.0)
+
+
+@wp.kernel
+def update_rigid_soft_contact_alm_duals(
+    soft_contact_count: wp.array[int],
+    soft_contact_primitive: wp.array[int],
+    soft_contact_shape: wp.array[int],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_radius: wp.array[float],
+    shape_body: wp.array[int],
+    shape_margin: wp.array[float],
+    particle_q: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    contact_penalty_k: wp.array[float],
+    contact_C0: wp.array[wp.vec3],
+    contact_alpha: float,
+    contact_mu: wp.array[float],
+    particle_q_prev: wp.array[wp.vec3],
+    body_q_prev: wp.array[wp.transform],
+    contact_lambda: wp.array[wp.vec3],
+):
+    """Update one projected, C0-stabilized normal/tangential multiplier per rigid-soft contact row."""
+    idx = wp.tid()
+    c0 = soft_contact_count[0]
+    count = c0 + soft_contact_count[1] + soft_contact_count[2]
+    if idx >= count:
+        return
+
+    primitive = soft_contact_primitive[idx]
+    if idx < c0:
+        x = particle_q[primitive]
+        radius = particle_radius[primitive]
+    else:
+        bary = soft_contact_barycentric[idx]
+        v0 = tri_indices[primitive, 0]
+        v1 = tri_indices[primitive, 1]
+        v2 = tri_indices[primitive, 2]
+        x = bary[0] * particle_q[v0] + bary[1] * particle_q[v1] + bary[2] * particle_q[v2]
+        radius = wp.max(particle_radius[v0], wp.max(particle_radius[v1], particle_radius[v2]))
+
+    shape = soft_contact_shape[idx]
+    body = shape_body[shape]
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+    bx = wp.transform_point(X_wb, soft_contact_body_pos[idx])
+    margin = shape_margin[shape] if shape >= 0 and shape_margin.shape[0] > 0 else 0.0
+    n = soft_contact_normal[idx]
+    penetration = -(wp.dot(n, x - bx) - radius - margin)
+    C0_vec = contact_C0[idx]
+    C0_n = wp.dot(n, C0_vec)
+    stabilized_penetration = penetration - contact_alpha * C0_n
+    # Match rigid-rigid hard contact: once the raw contact separates, release
+    # the multiplier using the full negative residual rather than the stabilized one.
+    if penetration < 0.0:
+        stabilized_penetration = penetration
+    lambda_vec = contact_lambda[idx]
+    lambda_n_old = wp.dot(n, lambda_vec)
+    lambda_n_new = wp.max(lambda_n_old + contact_penalty_k[idx] * stabilized_penetration, 0.0)
+
+    if idx < c0:
+        x_prev = particle_q_prev[primitive]
+    else:
+        x_prev = bary[0] * particle_q_prev[v0] + bary[1] * particle_q_prev[v1] + bary[2] * particle_q_prev[v2]
+    X_wb_prev = wp.transform_identity()
+    if body >= 0:
+        X_wb_prev = body_q_prev[body]
+    bx_prev = wp.transform_point(X_wb_prev, soft_contact_body_pos[idx])
+    relative_translation = (x - x_prev) - (bx - bx_prev)
+    tangential_translation = relative_translation - n * wp.dot(n, relative_translation)
+    lambda_t_old = lambda_vec - n * lambda_n_old
+    lambda_t_new = lambda_t_old - contact_penalty_k[idx] * tangential_translation
+    lambda_t_length = wp.length(lambda_t_new)
+    cone_limit = contact_mu[idx] * lambda_n_new
+    if lambda_t_length > cone_limit and lambda_t_length > 0.0:
+        lambda_t_new = lambda_t_new * (cone_limit / lambda_t_length)
+    contact_lambda[idx] = n * lambda_n_new + lambda_t_new
 
 
 @wp.kernel

@@ -37,18 +37,17 @@ CLOTH_PARTICLE_RADIUS = 0.01
 # init_state rot = -90 deg about X so the flat XY sheet hangs down in Z.
 CLOTH_SIZE = 0.3
 CLOTH_DIM = 15
-# CLOTH_POS = (0.75, 0.0, 0.66)
-CLOTH_POS = (0.55, 0.0, 0.66)
+CLOTH_POS = (0.75, 0.0, 0.66)
 CLOTH_ROT = (-0.7071067811865476, 0.0, 0.0, 0.7071067811865476)  # (qx, qy, qz, qw)
 
-# Franka spawn configuration (IsaacLab FRANKA_PANDA_CFG default ready pose).
-ROBOT_INIT_Q = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.04, 0.04]
-
 # Home / hover EE pose (IsaacLab grasp_avbd_cloth env _ee_tf).
-# HOME_POS = (0.7056, -0.2061, 0.6028)
-HOME_POS = (0.5056, -0.2061, 0.6028)
-# HOME_QUAT = (0.5677, 0.6285, 0.3893, -0.3620)  # (qx, qy, qz, qw)
-HOME_QUAT = (-0.4689, -0.5399, -0.4883, 0.5002)
+HOME_POS = (0.7056, -0.2061, 0.6028)
+HOME_QUAT = (-0.4689, -0.5399, -0.4883, 0.5002)  # (qx, qy, qz, qw)
+
+# Franka joint configuration obtained by solving the scene's IK objective at
+# HOME_POS/HOME_QUAT.  Spawning at the generic ready pose would command a large
+# sweep during the nominal pre-punch hold and carry the cloth before the punch.
+ROBOT_INIT_Q = [2.4054296, -1.2748810, -1.3999060, -0.4689209, 0.0759821, 1.2599304, -0.4929535, 0.04, 0.04]
 
 # Model-level contact params for the AVBD solver (IsaacLab grasp_avbd_cloth MODEL_CFG).
 _AVBD_MODEL_MATERIALS = {

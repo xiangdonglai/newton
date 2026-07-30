@@ -438,6 +438,20 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         help="Penalty coefficient for rigid-soft DAT-ALM half-space constraints [N/m].",
     )
     parser.add_argument(
+        "--contact-alm",
+        action="store_true",
+        default=False,
+        help="Use rigid-style normal/tangential augmented-Lagrangian constraints for direct rigid-soft contacts. "
+        "Independent of --dat and --dat-alm.",
+    )
+    parser.add_argument(
+        "--contact-alm-alpha",
+        type=float,
+        default=0.0,
+        help="C0 stabilization strength for rigid-soft Contact-ALM constraints. "
+        "Set to 0 to disable C0 stabilization without changing rigid-rigid contacts.",
+    )
+    parser.add_argument(
         "--measure-penetration",
         action="store_true",
         default=False,

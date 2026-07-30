@@ -23,6 +23,7 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     RigidContactHistory,
+    _compute_body_particle_contact_force,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     compute_rigid_contact_forces,
@@ -32,6 +33,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_rigid_contact_from_collision,
     init_body_body_contacts_avbd,
     init_body_particle_contacts,
+    initialize_rigid_soft_contact_alm_constraints,
     rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
     update_duals_body_body_contacts,
@@ -40,6 +42,56 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 devices = get_test_devices()
+
+
+@wp.kernel
+def _eval_contact_alm_constraint_kernel(
+    gaps: wp.array[float],
+    lambda_n: float,
+    penalty: float,
+    forces: wp.array[wp.vec3],
+    hessians: wp.array[wp.mat33],
+):
+    i = wp.tid()
+    force, hessian = _compute_body_particle_contact_force(
+        -gaps[i],
+        wp.vec3(0.0, 0.0, 1.0),
+        wp.vec3(0.0),
+        penalty,
+        0.0,
+        0.0,
+        1.0,
+        0.01,
+        lambda_n,
+        wp.vec3(0.0),
+        wp.vec3(0.0),
+        0,
+    )
+    forces[i] = force
+    hessians[i] = hessian
+
+
+@wp.kernel
+def _eval_contact_alm_friction_kernel(
+    forces: wp.array[wp.vec3],
+    hessians: wp.array[wp.mat33],
+):
+    force, hessian = _compute_body_particle_contact_force(
+        0.01,
+        wp.vec3(0.0, 0.0, 1.0),
+        wp.vec3(0.1, 0.0, 0.0),
+        100.0,
+        0.0,
+        0.5,
+        1.0,
+        0.01,
+        2.0,
+        wp.vec3(1.0, 0.0, 0.0),
+        wp.vec3(0.0),
+        1,
+    )
+    forces[0] = force
+    hessians[0] = hessian
 
 
 def _quat_rotate_np(q, v):
@@ -1197,6 +1249,15 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 # water-tight edge/face params (unused here: edge/face counts are 0)
                 wp.zeros((1, 3), dtype=wp.int32, device=device),
                 wp.zeros(4, dtype=wp.vec3, device=device),
+                0,
+                wp.zeros(4, dtype=wp.vec3, device=device),
+                wp.zeros(4, dtype=wp.vec3, device=device),
+                wp.zeros(4, dtype=float, device=device),
+                1.0,
+                0,
+                wp.zeros(4, dtype=wp.vec3, device=device),
+                wp.zeros(4, dtype=wp.vec3, device=device),
+                0.95,
             ],
             outputs=[forces, hessians],
             device=device,
@@ -2486,6 +2547,15 @@ def _run_face_section2(device, shape_margin):
             shape_margin,
             model.tri_indices,
             contacts.soft_contact_barycentric,
+            0,
+            wp.zeros(smax, dtype=wp.vec3, device=device),
+            wp.zeros(smax, dtype=wp.vec3, device=device),
+            wp.zeros(smax, dtype=float, device=device),
+            1.0,
+            0,
+            wp.zeros(smax, dtype=wp.vec3, device=device),
+            wp.zeros(smax, dtype=wp.vec3, device=device),
+            0.95,
         ],
         outputs=[forces, hessians],
         device=device,
@@ -2809,7 +2879,14 @@ def _build_sphere_drop_on_cloth(device):
     return model, body
 
 
-def _run_sphere_drop(device, enable_dat, enable_dat_alm=False, drop_speed=8.0, frames=60):
+def _run_sphere_drop(
+    device,
+    enable_dat,
+    enable_dat_alm=False,
+    enable_contact_alm=False,
+    drop_speed=8.0,
+    frames=60,
+):
     model, body = _build_sphere_drop_on_cloth(device)
     margin = 0.1
     solver = newton.solvers.SolverVBD(
@@ -2818,6 +2895,7 @@ def _run_sphere_drop(device, enable_dat, enable_dat_alm=False, drop_speed=8.0, f
         rigid_enable_penetration_free=enable_dat,
         rigid_enable_dat_alm=enable_dat_alm,
         rigid_dat_alm_penalty=1.0e5,
+        rigid_enable_contact_alm=enable_contact_alm,
         rigid_penetration_free_query_margin=margin,
         rigid_body_particle_contact_buffer_size=1024,
     )
@@ -2874,6 +2952,91 @@ def test_rigid_dat_alm_sphere_drop_reduces_penetration(test, device):
         "DAT-ALM should reduce penetration relative to the penalty-only control",
     )
     test.assertGreater(body_z_alm, body_z_ctrl, "DAT-ALM should delay or prevent tunneling through the cloth")
+
+
+def test_contact_alm_projected_force(test, device):
+    """Direct contact ALM activates on violation or multiplier load and releases when separated."""
+    gaps = wp.array([-0.01, 0.01, 0.03], dtype=float, device=device)
+    forces = wp.zeros(3, dtype=wp.vec3, device=device)
+    hessians = wp.zeros(3, dtype=wp.mat33, device=device)
+    wp.launch(
+        _eval_contact_alm_constraint_kernel,
+        dim=3,
+        inputs=[gaps, 2.0, 100.0],
+        outputs=[forces, hessians],
+        device=device,
+    )
+
+    force_np = forces.numpy()
+    hessian_np = hessians.numpy()
+    np.testing.assert_allclose(force_np[:, 2], [3.0, 1.0, 0.0], atol=1.0e-6)
+    np.testing.assert_allclose(force_np[:, :2], 0.0, atol=1.0e-6)
+    np.testing.assert_allclose(hessian_np[:2, 2, 2], 100.0, atol=1.0e-6)
+    np.testing.assert_allclose(hessian_np[2], 0.0, atol=1.0e-6)
+
+
+def test_contact_alm_tangential_force_uses_coulomb_cone(test, device):
+    """Rigid-soft hard friction includes lambda_t and clamps against the total normal load."""
+    forces = wp.zeros(1, dtype=wp.vec3, device=device)
+    hessians = wp.zeros(1, dtype=wp.mat33, device=device)
+    wp.launch(
+        _eval_contact_alm_friction_kernel,
+        dim=1,
+        outputs=[forces, hessians],
+        device=device,
+    )
+
+    # f_n = k*p + lambda_n = 3 N. The -9 N tangential trial is clamped
+    # to mu*f_n = 1.5 N.
+    np.testing.assert_allclose(forces.numpy()[0], [-1.5, 0.0, 3.0], atol=1.0e-6)
+    np.testing.assert_allclose(hessians.numpy()[0], np.eye(3) * 100.0, atol=1.0e-6)
+
+
+def test_contact_alm_initial_C0_has_no_tangential_witness_target(test, device):
+    """An offset water-tight witness must not become an artificial tangential position target."""
+    contact_C0 = wp.zeros(1, dtype=wp.vec3, device=device)
+    contact_lambda = wp.ones(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        initialize_rigid_soft_contact_alm_constraints,
+        dim=1,
+        inputs=[
+            wp.array([1, 0, 0], dtype=int, device=device),
+            wp.array([0], dtype=int, device=device),
+            wp.array([0], dtype=int, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0, 0, 0]], dtype=int, ndim=2, device=device),
+            wp.array([0.01], dtype=float, device=device),
+            wp.array([-1], dtype=int, device=device),
+            wp.array([0.0], dtype=float, device=device),
+            wp.array([[0.02, 0.03, 0.005]], dtype=wp.vec3, device=device),
+            wp.zeros(0, dtype=wp.transform, device=device),
+        ],
+        outputs=[contact_C0, contact_lambda],
+        device=device,
+    )
+
+    np.testing.assert_allclose(contact_C0.numpy()[0], [0.0, 0.0, 0.005], atol=1.0e-7)
+    np.testing.assert_allclose(contact_lambda.numpy()[0], 0.0, atol=1.0e-7)
+
+
+def test_contact_alm_sphere_drop_reduces_penetration(test, device):
+    """Direct contact-pair ALM reduces penetration without DAT plane constraints."""
+    worst_pen_alm, body_z_alm = _run_sphere_drop(
+        device,
+        enable_dat=False,
+        enable_contact_alm=True,
+        frames=30,
+    )
+    worst_pen_ctrl, body_z_ctrl = _run_sphere_drop(device, enable_dat=False, frames=30)
+    test.assertTrue(np.isfinite(worst_pen_alm) and np.isfinite(body_z_alm))
+    test.assertLess(
+        worst_pen_alm,
+        worst_pen_ctrl,
+        "contact ALM should reduce penetration relative to the penalty-only control",
+    )
+    test.assertGreater(body_z_alm, body_z_ctrl, "contact ALM should delay or prevent tunneling through the cloth")
 
 
 def _build_rigid_rigid_impact(device):
@@ -2979,6 +3142,30 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_alm_sphere_drop_reduces_penetration",
     test_rigid_dat_alm_sphere_drop_reduces_penetration,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_contact_alm_projected_force",
+    test_contact_alm_projected_force,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_contact_alm_tangential_force_uses_coulomb_cone",
+    test_contact_alm_tangential_force_uses_coulomb_cone,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_contact_alm_initial_C0_has_no_tangential_witness_target",
+    test_contact_alm_initial_C0_has_no_tangential_witness_target,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_contact_alm_sphere_drop_reduces_penetration",
+    test_contact_alm_sphere_drop_reduces_penetration,
     devices=devices,
 )
 add_function_test(

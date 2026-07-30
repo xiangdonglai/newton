@@ -1853,6 +1853,11 @@ def accumulate_contact_force_and_hessian_no_self_contact(
                 contact_normal,
                 shape_margin,
                 dt,
+                0.0,
+                wp.vec3(0.0),
+                0.0,
+                wp.vec3(0.0),
+                0,
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -2306,6 +2311,11 @@ def accumulate_particle_body_contact_force_and_hessian(
     dat_alm_plane_normal: wp.array[wp.vec3],
     dat_alm_lambda_soft: wp.array[float],
     dat_alm_penalty: float,
+    # Direct contact-pair ALM constraint
+    contact_alm_enabled: int,
+    contact_alm_lambda: wp.array[wp.vec3],
+    contact_alm_C0: wp.array[wp.vec3],
+    contact_alm_alpha: float,
     # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
@@ -2322,6 +2332,17 @@ def accumulate_particle_body_contact_force_and_hessian(
             contact_ke = body_particle_contact_penalty_k[t_id]
             contact_kd = body_particle_contact_material_kd[t_id]
             contact_mu = body_particle_contact_material_mu[t_id]
+            lambda_n = float(0.0)
+            lambda_t = wp.vec3(0.0)
+            penetration_stabilization = float(0.0)
+            if contact_alm_enabled != 0:
+                n = contact_normal[t_id]
+                lambda_vec = contact_alm_lambda[t_id]
+                lambda_n = wp.dot(n, lambda_vec)
+                lambda_t = lambda_vec - n * lambda_n
+                C0_vec = contact_alm_C0[t_id]
+                C0_n = wp.dot(n, C0_vec)
+                penetration_stabilization = contact_alm_alpha * C0_n
 
             body_contact_force, body_contact_hessian = _eval_body_particle_contact(
                 particle_idx,
@@ -2344,6 +2365,11 @@ def accumulate_particle_body_contact_force_and_hessian(
                 contact_normal,
                 shape_margin,
                 dt,
+                lambda_n,
+                lambda_t,
+                penetration_stabilization,
+                wp.vec3(0.0),
+                contact_alm_enabled,
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -2370,6 +2396,17 @@ def accumulate_particle_body_contact_force_and_hessian(
     if c0 <= t_id and t_id < c0 + n_ef:
         tri = body_particle_contact_particle[t_id]
         bary = contact_barycentric[t_id]
+        lambda_n = float(0.0)
+        lambda_t = wp.vec3(0.0)
+        penetration_stabilization = float(0.0)
+        if contact_alm_enabled != 0:
+            n = contact_normal[t_id]
+            lambda_vec = contact_alm_lambda[t_id]
+            lambda_n = wp.dot(n, lambda_vec)
+            lambda_t = lambda_vec - n * lambda_n
+            C0_vec = contact_alm_C0[t_id]
+            C0_n = wp.dot(n, C0_vec)
+            penetration_stabilization = contact_alm_alpha * C0_n
 
         ef_force, ef_hessian, _cp_world = _eval_soft_ef_contact(
             t_id,
@@ -2394,6 +2431,11 @@ def accumulate_particle_body_contact_force_and_hessian(
             contact_normal,
             shape_margin,
             dt,
+            lambda_n,
+            lambda_t,
+            penetration_stabilization,
+            wp.vec3(0.0),
+            contact_alm_enabled,
         )
         if dat_alm_enabled != 0:
             x = bary[0] * pos[tri_indices[tri, 0]]

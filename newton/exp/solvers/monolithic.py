@@ -12,6 +12,7 @@ targets through the AVBD augmented-Lagrangian coupling.
 from __future__ import annotations
 
 import newton
+import warp as wp
 from newton.solvers import SolverVBD
 
 from . import register
@@ -135,6 +136,9 @@ class MonolithicAvbdStrategy(SolverStrategy):
         if getattr(args, "dat_alm", False):
             vbd_kwargs["rigid_enable_dat_alm"] = True
             vbd_kwargs["rigid_dat_alm_penalty"] = float(args.dat_alm_penalty)
+        if getattr(args, "contact_alm", False):
+            vbd_kwargs["rigid_enable_contact_alm"] = True
+            vbd_kwargs["rigid_soft_contact_alm_alpha"] = float(args.contact_alm_alpha)
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win
@@ -149,6 +153,61 @@ class MonolithicAvbdStrategy(SolverStrategy):
         # IsaacLab's VBD manager rebuilds the particle BVH once per step.
         if hasattr(solver, "rebuild_bvh"):
             solver.rebuild_bvh(state)
+
+    def sync_initial(self, state):
+        """Synchronize VBD history after spawning the articulation away from model rest."""
+        self._reset_transient_state(state)
+
+    def reset_internal(self, state, device):
+        """Restore solver history after warm-up/reset without discarding warmed joint stiffness."""
+        self._reset_transient_state(state)
+
+    def _reset_transient_state(self, state):
+        solver = self.solver
+
+        # SolverVBD initializes these histories from model.body_q, but the
+        # experiment spawns the robot by modifying State after solver
+        # construction. Warm-up also advances them before Experiment.reset()
+        # restores the visible state. Both paths must be synchronized or the
+        # first visible contact residual uses a stale rigid pose.
+        if state.body_q is not None:
+            for name in (
+                "body_q_prev",
+                "_coupling_body_q_prev_snapshot",
+                "body_q_dat_ref",
+                "body_q_dat_alm_ref",
+            ):
+                array = getattr(solver, name, None)
+                if array is not None and array.shape[0] == state.body_q.shape[0]:
+                    wp.copy(array, state.body_q)
+
+        if state.particle_q is not None:
+            for name in ("particle_q_prev", "pos_prev_collision_detection"):
+                array = getattr(solver, name, None)
+                if array is not None and array.shape[0] == state.particle_q.shape[0]:
+                    wp.copy(array, state.particle_q)
+
+        # Preserve the joint penalty stiffness ramped by warm-up, but discard
+        # multipliers and C0/contact state derived from the discarded trajectory.
+        for name in (
+            "joint_lambda_lin",
+            "joint_lambda_ang",
+            "joint_C0_lin",
+            "joint_C0_ang",
+            "body_body_contact_lambda",
+            "body_body_contact_C0",
+            "body_body_contact_stick_flag",
+            "body_particle_contact_alm_lambda",
+            "body_particle_contact_alm_C0",
+            "body_particle_dat_alm_lambda_soft",
+            "body_particle_dat_alm_lambda_rigid",
+            "particle_displacements",
+            "truncation_ts",
+            "body_truncation_ts",
+        ):
+            array = getattr(solver, name, None)
+            if array is not None:
+                array.zero_()
 
     @classmethod
     def add_args(cls, parser):

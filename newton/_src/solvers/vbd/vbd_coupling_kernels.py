@@ -181,6 +181,11 @@ def _harvest_vbd_body_particle_contact_forces_on_proxy_bodies_kernel(
         body_particle_contact_normal,
         shape_margin,
         dt,
+        0.0,
+        wp.vec3(0.0),
+        0.0,
+        wp.vec3(0.0),
+        0,
     )
 
     force_on_body = -force_on_particle
@@ -325,6 +330,11 @@ def _harvest_vbd_proxy_particle_body_contact_forces_kernel(
         body_particle_contact_normal,
         shape_margin,
         dt,
+        0.0,
+        wp.vec3(0.0),
+        0.0,
+        wp.vec3(0.0),
+        0,
     )
     _vbd_add_proxy_particle_force(particle_idx, body_contact_force, particle_local_to_proxy_global, out_particle_f)
 
