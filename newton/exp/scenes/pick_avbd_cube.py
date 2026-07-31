@@ -5,8 +5,8 @@
 
 Ports the world layout of IsaacLab ``Isaac-Pick-AVBD-Cube-Direct-v0``: a 0.05 m
 deformable cube (FEM tetrahedra, Young's modulus 2.5e5, Poisson 0.25, density
-500) resting in front of the arm, plus the Franka at its default ready pose and
-the pre-grasp home EE pose from the env's ``_ee_tf``.
+500) resting in front of the arm, plus the Franka initialized at the pre-grasp
+home pose.
 
 Provides a scripted ``pick`` sequence (hover -> descend so the fingertips reach
 the settled cube's Z-center -> close the gripper -> lift -> hold), mirroring the
@@ -21,7 +21,9 @@ import warp as wp
 
 import newton
 
-from ..robots import HAND_BODY_SUFFIX, add_franka
+from ..controllers.base import Keyframe
+from ..controllers.sequences import KeyframeSequence
+from ..robots import GRIP_CLOSE, GRIP_OPEN, HAND_BODY_SUFFIX, add_franka
 from . import register
 from .base import Scene
 
@@ -53,8 +55,11 @@ CUBE_K_MU = CUBE_YOUNGS / (2.0 * (1.0 + CUBE_POISSON))
 CUBE_K_LAMBDA = CUBE_YOUNGS * CUBE_POISSON / ((1.0 + CUBE_POISSON) * (1.0 - 2.0 * CUBE_POISSON))
 CUBE_K_DAMP = 0.0  # IsaacLab material specifies no explicit damping
 
-# Franka spawn configuration (IsaacLab FRANKA_PANDA_CFG default ready pose).
-ROBOT_INIT_Q = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.04, 0.04]
+# Franka spawn configuration corresponding to HOME_POS/HOME_QUAT.  Keeping the
+# spawned arm at the first control target avoids an initialization sweep through
+# the falling cube after the AVBD joint penalties have been warmed up.
+# Original IsaacLab ready pose: [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.04, 0.04]
+ROBOT_INIT_Q = [0.0001405, 0.0191503, -0.0001392, -2.6975908, 0.0002149, 2.4605846, 0.7408495, 0.04, 0.04]
 
 # Pre-grasp home EE pose above the cube (IsaacLab pick_avbd_cube env _ee_tf).
 # HOME_POS = (0.3022, 0.0000, 0.1257)
@@ -179,8 +184,8 @@ class PickAVBDCubeScene(Scene):
 
     def robot_gains(self, solver_key):
         # IsaacLab pick_avbd_cube FRANKA_PANDA_AVBD_CFG: arm damping 0.1.
-        gains = {"finger_stiffness": 1.0e5, "finger_damping": 1.0} if solver_key == "avbd" else {}  # at this gain, watertight collision drop the cube but old one doesn't
-        # gains = {"finger_stiffness": 1.0e4, "finger_damping": 1.0} if solver_key == "avbd" else {}
+        # gains = {"finger_stiffness": 1.0e5, "finger_damping": 1.0} if solver_key == "avbd" else {}  # at this gain, watertight collision drop the cube but old one doesn't
+        gains = {"finger_stiffness": 1.0e4, "finger_damping": 1.0} if solver_key == "avbd" else {}
         return gains
 
     # -- task -------------------------------------------------------------
@@ -188,10 +193,6 @@ class PickAVBDCubeScene(Scene):
         return np.array(HOME_POS, dtype=np.float64), np.array(HOME_QUAT, dtype=np.float64)
 
     def sequences(self, home_pos, home_quat):
-        from ..controllers.base import Keyframe
-        from ..controllers.sequences import KeyframeSequence
-        from ..robots import GRIP_CLOSE, GRIP_OPEN
-
         home = np.asarray(home_pos)
         q = np.asarray(home_quat)
         # World point the fingertips aim for: the SETTLED cube's Z-center (see

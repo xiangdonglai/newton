@@ -1423,7 +1423,35 @@ class CollisionPipeline:
                 device=self.device,
             )
 
-        # Generate soft contacts for particles and shapes
+        self._launch_soft_contacts(state, contacts, soft_contact_margin)
+
+    def collide_soft(
+        self,
+        state: State,
+        contacts: Contacts,
+        *,
+        soft_contact_margin: float | None = None,
+    ) -> None:
+        """Refresh only rigid-soft contact rows, preserving all rigid-rigid rows.
+
+        This is intended for solver-internal collision refreshes whose
+        scheduling applies only to rigid-soft contact. Unlike :meth:`collide`,
+        it does not update shape broad-phase state, rigid contact matching, or
+        the global contact generation.
+
+        Args:
+            state: Current simulation state.
+            contacts: Contact buffer whose soft rows are replaced in-place.
+            soft_contact_margin: Soft-contact query margin [m]. If ``None``,
+                use the margin configured at construction.
+        """
+        contacts.soft_contact_count.zero_()
+        margin = self.soft_contact_margin if soft_contact_margin is None else soft_contact_margin
+        self._launch_soft_contacts(state, contacts, margin)
+
+    def _launch_soft_contacts(self, state: State, contacts: Contacts, soft_contact_margin: float) -> None:
+        """Generate particle, edge, and face contacts without clearing counters."""
+        model = self.model
         if state.particle_q and self.soft_contact_max > 0 and self.soft_rigid_contact_pair_count > 0:
             wp.launch(
                 kernel=create_soft_contacts,

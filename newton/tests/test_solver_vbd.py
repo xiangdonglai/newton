@@ -2884,6 +2884,8 @@ def _run_sphere_drop(
     enable_dat,
     enable_dat_alm=False,
     enable_contact_alm=False,
+    enable_checkpointed_dat=False,
+    collision_interval=0,
     drop_speed=8.0,
     frames=60,
 ):
@@ -2896,6 +2898,8 @@ def _run_sphere_drop(
         rigid_enable_dat_alm=enable_dat_alm,
         rigid_dat_alm_penalty=1.0e5,
         rigid_enable_contact_alm=enable_contact_alm,
+        rigid_enable_checkpointed_dat=enable_checkpointed_dat,
+        rigid_collision_detection_interval=collision_interval,
         rigid_penetration_free_query_margin=margin,
         rigid_body_particle_contact_buffer_size=1024,
     )
@@ -2903,6 +2907,11 @@ def _run_sphere_drop(
         model, broad_phase="nxn", soft_contact_margin=margin, enable_water_tight_rigid_soft_contact=True
     )
     contacts = pipeline.contacts()
+    if collision_interval >= 1:
+        if enable_checkpointed_dat:
+            solver.set_collision_detection_hook(lambda state: pipeline.collide_soft(state, contacts))
+        else:
+            solver.set_collision_detection_hook(lambda state: pipeline.collide(state, contacts))
     state_in, state_out = model.state(), model.state()
     qd = state_in.body_qd.numpy()
     qd[body][:3] = [0.0, 0.0, -drop_speed]
@@ -3039,7 +3048,429 @@ def test_contact_alm_sphere_drop_reduces_penetration(test, device):
     test.assertGreater(body_z_alm, body_z_ctrl, "contact ALM should delay or prevent tunneling through the cloth")
 
 
-def _build_rigid_rigid_impact(device):
+def test_checkpointed_dat_requires_dat_and_an_alm_proposal(test, device):
+    """Checkpointing requires hard DAT and either supported rigid-soft ALM proposal."""
+    model, _body = _build_sphere_drop_on_cloth(device)
+    with test.assertRaisesRegex(ValueError, "requires rigid_enable_penetration_free"):
+        newton.solvers.SolverVBD(
+            model,
+            rigid_enable_contact_alm=True,
+            rigid_enable_checkpointed_dat=True,
+        )
+    with test.assertRaisesRegex(ValueError, "requires rigid_enable_contact_alm=True or rigid_enable_dat_alm=True"):
+        newton.solvers.SolverVBD(
+            model,
+            rigid_enable_penetration_free=True,
+            rigid_enable_checkpointed_dat=True,
+        )
+
+    # Either proposal formulation is sufficient on its own.
+    newton.solvers.SolverVBD(
+        model,
+        rigid_enable_penetration_free=True,
+        rigid_enable_contact_alm=True,
+        rigid_enable_checkpointed_dat=True,
+    )
+    newton.solvers.SolverVBD(
+        model,
+        rigid_enable_penetration_free=True,
+        rigid_enable_dat_alm=True,
+        rigid_enable_checkpointed_dat=True,
+    )
+
+
+def test_checkpointed_dat_preserves_proposal_and_commits_safe_final_state(test, device):
+    """A refresh exposes a DAT-safe copy while preserving proposal and self-contact state."""
+    model, body = _build_sphere_drop_on_cloth(device)
+    margin = 0.1
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=2,
+        rigid_enable_penetration_free=True,
+        rigid_enable_dat_alm=True,
+        rigid_enable_contact_alm=True,
+        rigid_enable_checkpointed_dat=True,
+        rigid_collision_detection_interval=1,
+        rigid_penetration_free_query_margin=margin,
+        rigid_body_particle_contact_buffer_size=1024,
+    )
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_margin=margin,
+        enable_water_tight_rigid_soft_contact=True,
+    )
+    contacts = pipeline.contacts()
+    state = model.state()
+
+    # Start from a safe configuration inside the query margin.
+    body_q = state.body_q.numpy().copy()
+    body_q[body, 2] = 0.30
+    state.body_q.assign(body_q)
+    pipeline.collide(state, contacts)
+    solver.pos_prev_collision_detection.assign(state.particle_q)
+    solver.particle_displacements.zero_()
+    solver.checkpointed_dat_particle_q_ref.assign(state.particle_q)
+    solver.body_q_dat_ref.assign(state.body_q)
+    solver.checkpointed_dat_body_q_ref.assign(state.body_q)
+    # Deliberately poison the independently owned self-contact reference state.
+    # A checkpointed DAT-ALM rebuild must not consume either array.
+    stale_particle_ref = state.particle_q.numpy().copy()
+    stale_particle_ref = stale_particle_ref + np.array([0.037, -0.019, 0.011], dtype=np.float32)
+    solver.pos_prev_collision_detection.assign(stale_particle_ref)
+    stale_displacements = np.tile(np.array([0.013, 0.007, -0.009], dtype=np.float32), (len(stale_particle_ref), 1))
+    solver.particle_displacements.assign(stale_displacements)
+
+    hook_body_q = []
+    hook_particle_q = []
+
+    def collision_hook(current):
+        hook_body_q.append(current.body_q.numpy().copy())
+        hook_particle_q.append(current.particle_q.numpy().copy())
+        pipeline.collide_soft(current, contacts)
+
+    solver.set_collision_detection_hook(collision_hook)
+
+    # Preserve a proposal that moves the sphere through the cloth.
+    proposal_body_q = state.body_q.numpy().copy()
+    proposal_body_q[body, 2] = 0.05
+    state.body_q.assign(proposal_body_q)
+    proposal_particle_q = state.particle_q.numpy().copy()
+
+    solver._checkpoint_rigid_soft_dat(
+        state,
+        contacts,
+        preserve_proposal=True,
+        refresh_contacts=True,
+    )
+
+    np.testing.assert_allclose(state.body_q.numpy(), proposal_body_q, atol=1.0e-6)
+    np.testing.assert_allclose(state.particle_q.numpy(), proposal_particle_q, atol=1.0e-6)
+    test.assertEqual(len(hook_body_q), 1)
+    test.assertGreater(
+        float(hook_body_q[0][body, 2]),
+        float(proposal_body_q[body, 2]),
+        "collision detection must observe the DAT-safe state rather than the restored proposal",
+    )
+    np.testing.assert_allclose(
+        solver.particle_displacements.numpy(),
+        stale_displacements,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        solver.pos_prev_collision_detection.numpy(),
+        stale_particle_ref,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        solver.checkpointed_dat_particle_q_ref.numpy(),
+        proposal_particle_q,
+        atol=1.0e-6,
+    )
+    test.assertGreater(
+        float(solver.checkpointed_dat_body_q_ref.numpy()[body, 2]),
+        float(proposal_body_q[body, 2]),
+        "the collision reference must be the DAT-safe prefix, not the penetrating proposal",
+    )
+    np.testing.assert_allclose(
+        solver.body_q_dat_ref.numpy(),
+        body_q,
+        atol=1.0e-6,
+        err_msg="rigid-soft checkpoints must not advance the legacy rigid-rigid DAT reference",
+    )
+
+    # Refreshed DAT-ALM planes must use the coherent safe-reference -> preserved-
+    # proposal trajectory, not the poisoned particle self-contact buffers.
+    counts = contacts.soft_contact_count.numpy()
+    active = int(np.sum(counts[:3]))
+    c0 = int(counts[0])
+    primitives = contacts.soft_contact_primitive.numpy()[:active]
+    shapes = contacts.soft_contact_shape.numpy()[:active]
+    body_pos = contacts.soft_contact_body_pos.numpy()[:active]
+    normals = contacts.soft_contact_normal.numpy()[:active]
+    barycentrics = contacts.soft_contact_barycentric.numpy()[:active]
+    tri_indices = model.tri_indices.numpy()
+    shape_body = model.shape_body.numpy()
+    safe_particles = hook_particle_q[0]
+    safe_bodies = hook_body_q[0]
+    expected_points = np.empty((active, 3), dtype=np.float64)
+    for index in range(active):
+        primitive = int(primitives[index])
+        if index < c0:
+            vertices = np.array([primitive], dtype=np.int32)
+            weights = np.array([1.0], dtype=np.float64)
+        else:
+            vertices = tri_indices[primitive]
+            weights = barycentrics[index].astype(np.float64)
+        x_ref = np.sum(safe_particles[vertices] * weights[:, None], axis=0)
+        x_proposal = np.sum(proposal_particle_q[vertices] * weights[:, None], axis=0)
+        n = normals[index].astype(np.float64)
+        shape = int(shapes[index])
+        body_index = int(shape_body[shape])
+        bx_ref = _transform_contact_point_np(safe_bodies, body_index, body_pos[index])
+        bx_proposal = _transform_contact_point_np(proposal_body_q, body_index, body_pos[index])
+        gap = max(float(np.dot(n, x_ref - bx_ref)), 0.0)
+        soft_approach = max(float(-np.dot(n, x_proposal - x_ref)), 0.0)
+        rigid_approach = max(float(np.dot(n, bx_proposal - bx_ref)), 0.0)
+        fraction = 0.5
+        if soft_approach + rigid_approach > 0.0:
+            fraction = np.clip(rigid_approach / (rigid_approach + soft_approach), 0.05, 0.95)
+        expected_points[index] = bx_ref + fraction * gap * n
+
+    np.testing.assert_allclose(
+        solver.body_particle_dat_alm_plane_point.numpy()[:active],
+        expected_points,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        solver.body_particle_dat_alm_plane_normal.numpy()[:active],
+        normals,
+        atol=1.0e-6,
+    )
+
+    solver._checkpoint_rigid_soft_dat(
+        state,
+        contacts,
+        preserve_proposal=False,
+        refresh_contacts=False,
+    )
+    test.assertGreater(
+        float(state.body_q.numpy()[body, 2]),
+        float(proposal_body_q[body, 2]),
+        "the final checkpoint must commit the safe state instead of the proposal",
+    )
+
+
+def test_checkpointed_dat_sphere_drop_is_penetration_free(test, device):
+    """Method 1 removes penetration left by Contact-ALM in a fast-impact stress test."""
+    worst_pen, body_z = _run_sphere_drop(
+        device,
+        enable_dat=True,
+        enable_contact_alm=True,
+        enable_checkpointed_dat=True,
+        collision_interval=2,
+        frames=30,
+    )
+    test.assertTrue(np.isfinite(worst_pen) and np.isfinite(body_z))
+    test.assertLessEqual(worst_pen, 1.0e-4)
+    test.assertGreater(body_z, -0.5, "the sphere should not tunnel through the cloth")
+
+    # Use the same collision refresh interval for the ALM-only control so the
+    # only experimental variable is the final and intermediate DAT checkpoint.
+    worst_pen_alm, body_z_alm = _run_sphere_drop(
+        device,
+        enable_dat=False,
+        enable_contact_alm=True,
+        collision_interval=2,
+        frames=30,
+    )
+    test.assertTrue(np.isfinite(worst_pen_alm) and np.isfinite(body_z_alm))
+    test.assertGreater(
+        worst_pen_alm,
+        worst_pen + 1.0e-3,
+        "the matched Contact-ALM-only control should expose meaningful raw penetration",
+    )
+
+
+def test_checkpointed_dat_with_dat_alm_sphere_drop_is_penetration_free(test, device):
+    """DAT-ALM may drive the proposal without enabling direct Contact-ALM."""
+    worst_pen, body_z = _run_sphere_drop(
+        device,
+        enable_dat=True,
+        enable_dat_alm=True,
+        enable_contact_alm=False,
+        enable_checkpointed_dat=True,
+        collision_interval=2,
+        frames=30,
+    )
+    test.assertTrue(np.isfinite(worst_pen) and np.isfinite(body_z))
+    test.assertLessEqual(worst_pen, 1.0e-4)
+    test.assertGreater(body_z, -0.5, "the sphere should not tunnel through the cloth")
+
+    # DAT-ALM alone already prevents raw penetration in this scene. Keep the
+    # matched control explicit so this test does not overstate checkpointing's
+    # contribution to that result.
+    worst_pen_alm, body_z_alm = _run_sphere_drop(
+        device,
+        enable_dat=False,
+        enable_dat_alm=True,
+        collision_interval=2,
+        frames=30,
+    )
+    test.assertTrue(np.isfinite(worst_pen_alm) and np.isfinite(body_z_alm))
+    test.assertLessEqual(worst_pen_alm, 1.0e-4)
+    test.assertGreater(body_z_alm, -0.5, "DAT-ALM alone should not tunnel through the cloth")
+
+
+def test_checkpointed_dat_keeps_rigid_soft_reference_across_self_contact_refresh(test, device):
+    """Particle self-contact refresh must not replace Method 1's last safe reference."""
+    model, body = _build_sphere_drop_on_cloth(device)
+    margin = 0.1
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=2,
+        particle_enable_self_contact=True,
+        particle_self_contact_radius=0.005,
+        particle_self_contact_margin=0.01,
+        particle_collision_detection_interval=1,
+        rigid_enable_penetration_free=True,
+        rigid_enable_contact_alm=True,
+        rigid_enable_checkpointed_dat=True,
+        rigid_penetration_free_query_margin=margin,
+        rigid_body_particle_contact_buffer_size=1024,
+    )
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_margin=margin,
+        enable_water_tight_rigid_soft_contact=True,
+    )
+    contacts = pipeline.contacts()
+    state = model.state()
+    body_q = state.body_q.numpy().copy()
+    body_q[body, 2] = 0.30
+    state.body_q.assign(body_q)
+    pipeline.collide(state, contacts)
+
+    safe_particle_q = state.particle_q.numpy().copy()
+    solver.checkpointed_dat_particle_q_ref.assign(state.particle_q)
+    solver.body_q_dat_ref.assign(state.body_q)
+    solver.checkpointed_dat_body_q_ref.assign(state.body_q)
+
+    proposal_particle_q = safe_particle_q.copy()
+    proposal_particle_q[:, 2] += 0.40
+    state.particle_q.assign(proposal_particle_q)
+
+    # This independently scheduled refresh intentionally points the
+    # self-contact reference at the unsafe proposal.
+    solver._collision_detection_penetration_free(state)
+    np.testing.assert_allclose(solver.pos_prev_collision_detection.numpy(), proposal_particle_q, atol=1.0e-6)
+    np.testing.assert_allclose(solver.checkpointed_dat_particle_q_ref.numpy(), safe_particle_q, atol=1.0e-6)
+
+    solver._checkpoint_rigid_soft_dat(
+        state,
+        contacts,
+        preserve_proposal=False,
+        refresh_contacts=False,
+    )
+    test.assertGreater(
+        float(np.max(np.linalg.norm(state.particle_q.numpy() - proposal_particle_q, axis=1))),
+        1.0e-4,
+        "the final rigid-soft checkpoint must still truncate from its own safe reference",
+    )
+
+
+def test_checkpointed_dat_final_velocities_match_accepted_state(test, device):
+    """Final particle and rigid linear velocities must use the committed DAT-safe state."""
+    model, body = _build_sphere_drop_on_cloth(device)
+    margin = 0.1
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=4,
+        rigid_enable_penetration_free=True,
+        rigid_enable_contact_alm=True,
+        rigid_enable_checkpointed_dat=True,
+        rigid_collision_detection_interval=2,
+        rigid_penetration_free_query_margin=margin,
+        rigid_body_particle_contact_buffer_size=1024,
+    )
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_margin=margin,
+        enable_water_tight_rigid_soft_contact=True,
+    )
+    contacts = pipeline.contacts()
+    solver.set_collision_detection_hook(lambda state: pipeline.collide_soft(state, contacts))
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][:3] = [0.0, 0.0, -8.0]
+    state_in.body_qd.assign(qd)
+    particle_q_before = state_in.particle_q.numpy().copy()
+    body_q_before = state_in.body_q.numpy().copy()
+    dt = 1.0 / 60.0
+
+    pipeline.collide(state_in, contacts)
+    solver.step(state_in, state_out, None, contacts, dt)
+
+    np.testing.assert_allclose(
+        state_out.particle_qd.numpy(),
+        (state_out.particle_q.numpy() - particle_q_before) / dt,
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    np.testing.assert_allclose(
+        state_out.body_qd.numpy()[body, :3],
+        (state_out.body_q.numpy()[body, :3] - body_q_before[body, :3]) / dt,
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+
+
+def test_collide_soft_matches_full_rigid_soft_rows(test, device):
+    """Soft-only refresh must reproduce full collision's water-tight soft rows."""
+    model, body = _build_sphere_drop_on_cloth(device)
+    margin = 0.1
+    pipeline_full = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_margin=margin,
+        enable_water_tight_rigid_soft_contact=True,
+    )
+    pipeline_soft = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_margin=margin,
+        enable_water_tight_rigid_soft_contact=True,
+    )
+    contacts_full = pipeline_full.contacts()
+    contacts_soft = pipeline_soft.contacts()
+    state = model.state()
+    body_q = state.body_q.numpy()
+    body_q[body, 2] = 0.30
+    state.body_q.assign(body_q)
+
+    pipeline_full.collide(state, contacts_full)
+    pipeline_soft.collide_soft(state, contacts_soft)
+
+    counts_full = contacts_full.soft_contact_count.numpy()
+    counts_soft = contacts_soft.soft_contact_count.numpy()
+    np.testing.assert_array_equal(counts_soft, counts_full)
+    active = int(np.sum(counts_full))
+    kinds = np.repeat(np.arange(3, dtype=np.int32), counts_full)
+
+    def contact_order(contacts):
+        key = np.column_stack(
+            (
+                kinds,
+                contacts.soft_contact_primitive.numpy()[:active],
+                contacts.soft_contact_shape.numpy()[:active],
+                np.round(contacts.soft_contact_barycentric.numpy()[:active], decimals=6),
+                np.round(contacts.soft_contact_body_pos.numpy()[:active], decimals=6),
+                np.round(contacts.soft_contact_normal.numpy()[:active], decimals=6),
+            )
+        )
+        return np.lexsort(tuple(key[:, i] for i in reversed(range(key.shape[1]))))
+
+    order_full = contact_order(contacts_full)
+    order_soft = contact_order(contacts_soft)
+    for name in (
+        "soft_contact_primitive",
+        "soft_contact_barycentric",
+        "soft_contact_shape",
+        "soft_contact_body_pos",
+        "soft_contact_body_vel",
+        "soft_contact_normal",
+    ):
+        np.testing.assert_allclose(
+            getattr(contacts_soft, name).numpy()[:active][order_soft],
+            getattr(contacts_full, name).numpy()[:active][order_full],
+            atol=1.0e-6,
+            err_msg=f"collide_soft disagrees with collide for {name}",
+        )
+
+
+def _build_rigid_rigid_impact(device, with_dummy_particle=False):
     """A fast sphere shot at a resting sphere above a ground plane.
 
     ``rigid_gap`` makes the pipeline emit rigid-rigid contacts (and thus DAT division
@@ -3063,21 +3494,79 @@ def _build_rigid_rigid_impact(device):
         )
         builder.add_shape_sphere(body=body, radius=radius)
         bodies.append(body)
+    if with_dummy_particle:
+        builder.add_particle(wp.vec3(10.0, 10.0, 10.0), wp.vec3(0.0), 1.0, radius=0.01)
     builder.color()
     model = builder.finalize(device=device)
     return model, bodies, radius
 
 
-def _run_rigid_rigid_impact(device, enable_dat, speed=8.0, frames=90):
-    model, bodies, radius = _build_rigid_rigid_impact(device)
+def _run_rigid_rigid_impact(device, enable_dat, speed=8.0, frames=90, enable_checkpointed_dat=False):
+    model, bodies, radius = _build_rigid_rigid_impact(device, with_dummy_particle=enable_checkpointed_dat)
     solver = newton.solvers.SolverVBD(
         model,
         iterations=6,
         rigid_enable_penetration_free=enable_dat,
+        rigid_enable_contact_alm=enable_checkpointed_dat,
+        rigid_enable_checkpointed_dat=enable_checkpointed_dat,
+        rigid_collision_detection_interval=1 if enable_checkpointed_dat else 0,
+        rigid_avbd_beta=1.0e5 if enable_checkpointed_dat else 0.0,
+        rigid_contact_history=enable_checkpointed_dat,
         rigid_penetration_free_query_margin=0.05,
     )
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        contact_matching="latest" if enable_checkpointed_dat else "disabled",
+    )
     contacts = pipeline.contacts()
+    if enable_checkpointed_dat:
+        soft_refresh_verified = [False]
+        rigid_dat_ref_expected = [None]
+        rigid_dat_ref_verified = [False]
+
+        def soft_only_hook(state):
+            if not rigid_dat_ref_verified[0]:
+                np.testing.assert_allclose(
+                    solver.body_q_dat_ref.numpy(),
+                    rigid_dat_ref_expected[0],
+                    atol=1.0e-6,
+                    err_msg="a rigid-soft checkpoint advanced the legacy rigid-rigid DAT reference",
+                )
+                rigid_dat_ref_verified[0] = True
+            if not soft_refresh_verified[0]:
+                rigid_attributes = (
+                    "rigid_contact_count",
+                    "contact_generation",
+                    "rigid_contact_point_id",
+                    "rigid_contact_shape0",
+                    "rigid_contact_shape1",
+                    "rigid_contact_point0",
+                    "rigid_contact_point1",
+                    "rigid_contact_offset0",
+                    "rigid_contact_offset1",
+                    "rigid_contact_normal",
+                    "rigid_contact_margin0",
+                    "rigid_contact_margin1",
+                    "rigid_contact_tids",
+                    "rigid_contact_match_index",
+                )
+                rigid_before = {
+                    name: getattr(contacts, name).numpy().copy()
+                    for name in rigid_attributes
+                    if getattr(contacts, name) is not None
+                }
+            pipeline.collide_soft(state, contacts)
+            if not soft_refresh_verified[0]:
+                for name, before in rigid_before.items():
+                    np.testing.assert_array_equal(
+                        getattr(contacts, name).numpy(),
+                        before,
+                        err_msg=f"collide_soft modified {name}",
+                    )
+                soft_refresh_verified[0] = True
+
+        solver.set_collision_detection_hook(soft_only_hook)
     state_in, state_out = model.state(), model.state()
     qd = state_in.body_qd.numpy()
     qd[bodies[1]][:3] = [speed, 0.0, 0.0]
@@ -3087,6 +3576,9 @@ def _run_rigid_rigid_impact(device, enable_dat, speed=8.0, frames=90):
     worst_sphere_ground = 0.0
     for _frame in range(frames):
         pipeline.collide(state_in, contacts)
+        if enable_checkpointed_dat:
+            rigid_dat_ref_expected[0] = state_in.body_q.numpy().copy()
+            rigid_dat_ref_verified[0] = False
         solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
         state_in, state_out = state_out, state_in
         body_q = state_in.body_q.numpy()
@@ -3114,6 +3606,17 @@ def test_rigid_dat_rigid_rigid_impact(test, device):
         1.0e-3,
         "control without DAT should penetrate the ground; if it no longer does, strengthen this stress",
     )
+
+
+def test_checkpointed_dat_preserves_legacy_rigid_rigid_dat(test, device):
+    """Method 1 must not disable the pre-existing rigid-rigid DAT pass."""
+    sphere_pen, ground_pen = _run_rigid_rigid_impact(
+        device,
+        enable_dat=True,
+        enable_checkpointed_dat=True,
+    )
+    test.assertLessEqual(sphere_pen, 1.0e-4, "checkpoint mode must preserve sphere-sphere DAT")
+    test.assertLessEqual(ground_pen, 1.0e-4, "checkpoint mode must preserve sphere-ground DAT")
 
 
 class TestVBDRigidDAT(unittest.TestCase):
@@ -3170,8 +3673,56 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
+    "test_checkpointed_dat_requires_dat_and_an_alm_proposal",
+    test_checkpointed_dat_requires_dat_and_an_alm_proposal,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_checkpointed_dat_preserves_proposal_and_commits_safe_final_state",
+    test_checkpointed_dat_preserves_proposal_and_commits_safe_final_state,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_checkpointed_dat_sphere_drop_is_penetration_free",
+    test_checkpointed_dat_sphere_drop_is_penetration_free,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_checkpointed_dat_with_dat_alm_sphere_drop_is_penetration_free",
+    test_checkpointed_dat_with_dat_alm_sphere_drop_is_penetration_free,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_checkpointed_dat_keeps_rigid_soft_reference_across_self_contact_refresh",
+    test_checkpointed_dat_keeps_rigid_soft_reference_across_self_contact_refresh,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_checkpointed_dat_final_velocities_match_accepted_state",
+    test_checkpointed_dat_final_velocities_match_accepted_state,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_collide_soft_matches_full_rigid_soft_rows",
+    test_collide_soft_matches_full_rigid_soft_rows,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_rigid_dat_rigid_rigid_impact",
     test_rigid_dat_rigid_rigid_impact,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_checkpointed_dat_preserves_legacy_rigid_rigid_dat",
+    test_checkpointed_dat_preserves_legacy_rigid_rigid_dat,
     devices=devices,
 )
 

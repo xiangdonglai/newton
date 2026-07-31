@@ -49,6 +49,10 @@ class Scene:
     ik_iters: int = 24
     #: Default named task sequence (see :meth:`sequences`).
     default_sequence: str = "pick"
+    #: Optional scene-specific physics steps per rendered/control frame.
+    physics_decimation: int | None = None
+    #: Optional default rigid shape gap; the experiment runner otherwise uses 1 cm.
+    rigid_gap: float | None = None
 
     def __init__(self, args):
         self.args = args
@@ -75,6 +79,9 @@ class Scene:
     def add_deformables(self, builder) -> None:
         """Add cloth / cable / soft bodies."""
         raise NotImplementedError
+
+    def initialize_state(self, state) -> None:
+        """Apply scene-specific initial velocities or state after model assembly."""
 
     # -- task definition --------------------------------------------------
     def home_pose(self):
@@ -114,6 +121,11 @@ class Scene:
         ``solver_key`` because the gains are per-task in IsaacLab
         (e.g. the AVBD arm damping is 0.01 for cloth but 0.1 for the cube).
         """
+        del solver_key
+        return {}
+
+    def collision_pipeline_overrides(self, solver_key: str) -> dict:
+        """Scene-specific keyword overrides for :class:`newton.CollisionPipeline`."""
         del solver_key
         return {}
 

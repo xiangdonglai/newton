@@ -38,6 +38,7 @@ from .particle_vbd_kernels import (
     apply_truncation_ts,
     # Solver kernels (particle VBD)
     forward_step,
+    rebase_particle_displacements,
     solve_elasticity,
     solve_elasticity_tile,
     update_velocity,
@@ -258,6 +259,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_dat_alm_penalty: float = 1.0e4,  # DAT-ALM half-space penalty [N/m]
         rigid_enable_contact_alm: bool = False,  # Use rigid-style AL constraints for direct rigid-soft contacts
         rigid_soft_contact_alm_alpha: float | None = None,  # C0 alpha; None uses rigid contact alpha
+        rigid_enable_checkpointed_dat: bool = False,  # Preserve proposal; apply rigid-soft DAT at refresh checkpoints
     ):
         """
         Args:
@@ -406,6 +408,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                 but clamps the normal C0 residual to the collision-shell depth corresponding to
                 zero raw penetration into the rigid geometry. Each collision row's normal and
                 rigid local anchor remain fixed until collision detection refreshes it.
+            rigid_enable_checkpointed_dat: Whether to preserve the rigid-soft
+                VBD/AVBD proposal and apply hard DAT only to a temporary safe state
+                before collision refreshes and timestep finalization. Requires
+                ``rigid_enable_penetration_free`` and at least one rigid-soft ALM
+                proposal method: ``rigid_enable_contact_alm`` or
+                ``rigid_enable_dat_alm``. This mode does not checkpoint rigid-rigid
+                DAT; its existing per-sweep behavior is preserved.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -495,6 +504,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         )
         self._init_rigid_soft_dat_alm(model, rigid_enable_dat_alm, rigid_dat_alm_penalty)
         self._init_rigid_soft_contact_alm(model, rigid_enable_contact_alm)
+        self._init_checkpointed_rigid_soft_dat(model, rigid_enable_checkpointed_dat)
 
         # Controls whether the next step() refreshes contact state derived from
         # the Contacts buffer or reuses the current rigid/body-particle contact state.
@@ -578,6 +588,30 @@ class SolverVBD(SolverBase, CouplingInterface):
             return
         if model.shape_count == 0 or model.particle_count == 0:
             raise ValueError("rigid_enable_contact_alm requires collision shapes and particles.")
+
+    def _init_checkpointed_rigid_soft_dat(self, model: Model, enabled: bool) -> None:
+        """Allocate proposal backups for opt-in rigid-soft DAT checkpoints."""
+        self.rigid_enable_checkpointed_dat = bool(enabled)
+        if not self.rigid_enable_checkpointed_dat:
+            self.checkpointed_dat_particle_q_proposal = wp.empty(0, dtype=wp.vec3, device=self.device)
+            self.checkpointed_dat_body_q_proposal = wp.empty(0, dtype=wp.transform, device=self.device)
+            self.checkpointed_dat_particle_q_ref = wp.empty(0, dtype=wp.vec3, device=self.device)
+            self.checkpointed_dat_body_q_ref = wp.empty(0, dtype=wp.transform, device=self.device)
+            self.checkpointed_dat_particle_displacements = wp.empty(0, dtype=wp.vec3, device=self.device)
+            return
+        if not self.rigid_enable_penetration_free:
+            raise ValueError("rigid_enable_checkpointed_dat requires rigid_enable_penetration_free=True.")
+        if not (self.rigid_enable_contact_alm or self.rigid_enable_dat_alm):
+            raise ValueError(
+                "rigid_enable_checkpointed_dat requires rigid_enable_contact_alm=True or rigid_enable_dat_alm=True."
+            )
+        if model.particle_count == 0 or model.body_count == 0:
+            raise ValueError("rigid_enable_checkpointed_dat requires both particles and rigid bodies.")
+        self.checkpointed_dat_particle_q_proposal = wp.empty_like(model.particle_q, device=self.device)
+        self.checkpointed_dat_body_q_proposal = wp.empty_like(model.body_q, device=self.device)
+        self.checkpointed_dat_particle_q_ref = wp.empty_like(model.particle_q, device=self.device)
+        self.checkpointed_dat_body_q_ref = wp.empty_like(model.body_q, device=self.device)
+        self.checkpointed_dat_particle_displacements = wp.empty_like(model.particle_q, device=self.device)
 
     # Bodies whose shapes provide more DAT vertices than this are uniformly subsampled
     # (weakens the per-vertex coverage; a warning is emitted).
@@ -1928,6 +1962,9 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         if self.rigid_enable_penetration_free and self.model.body_count > 0:
             wp.copy(dest=self.body_q_dat_ref, src=state_in.body_q)
+        if self.rigid_enable_checkpointed_dat:
+            wp.copy(dest=self.checkpointed_dat_particle_q_ref, src=state_in.particle_q)
+            wp.copy(dest=self.checkpointed_dat_body_q_ref, src=state_in.body_q)
         if self.rigid_enable_dat_alm:
             wp.copy(dest=self.body_q_dat_alm_ref, src=state_in.body_q)
 
@@ -1954,6 +1991,17 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._update_rigid_soft_dat_alm_duals(state_in, contacts)
             self._update_rigid_soft_contact_alm_duals(state_in, contacts)
 
+        if self.rigid_enable_checkpointed_dat:
+            # Commit only the rigid-soft DAT-safe prefix of the final proposal.
+            self._checkpoint_rigid_soft_dat(
+                state_in,
+                contacts,
+                preserve_proposal=False,
+                refresh_contacts=False,
+            )
+            if self.model.particle_count > 0:
+                wp.copy(dest=state_out.particle_q, src=state_in.particle_q)
+
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
         self._finalize_rigid_bodies(
@@ -1969,7 +2017,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         committed by advancing the DAT references, the hook re-runs collision
         detection on the committed state, and the body-particle contact state is
         rebuilt. The hook must be graph-capture-safe (a fixed kernel sequence,
-        e.g. ``CollisionPipeline.collide``).
+        e.g. ``CollisionPipeline.collide``). In checkpointed DAT mode, the hook
+        must preserve rigid-rigid rows and refresh only rigid-soft rows, as
+        :meth:`CollisionPipeline.collide_soft` does.
         """
         self._collision_detection_hook = hook
 
@@ -1977,6 +2027,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Alg. 3 mid-step commit + re-detect: advance DAT references to the current
         state, refresh contacts via the hook, and rebuild body-particle contact state.
         The inertia target and rigid-rigid contact state are deliberately untouched."""
+        if self.rigid_enable_checkpointed_dat:
+            self._checkpoint_rigid_soft_dat(
+                state_in,
+                contacts,
+                preserve_proposal=True,
+                refresh_contacts=True,
+            )
+            return
+
         model = self.model
         # Commit: DAT truncates against the last-detection state from here on.
         if model.particle_count > 0:
@@ -2001,6 +2060,108 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._rebuild_body_particle_contact_state(contacts, k_start=-1.0)
         self._initialize_rigid_soft_contact_alm_constraints(state_in, contacts)
         self._build_rigid_soft_dat_alm_planes(state_in, contacts)
+
+    def _checkpoint_rigid_soft_dat(
+        self,
+        state_in: State,
+        contacts: Contacts | None,
+        *,
+        preserve_proposal: bool,
+        refresh_contacts: bool,
+    ) -> None:
+        """Apply joint rigid-soft DAT to a safe checkpoint.
+
+        Mid-step checkpoints temporarily replace the live proposal with its
+        DAT-safe prefix for collision detection, then restore the proposal.
+        A dedicated displacement represents the proposal relative to the last
+        rigid-soft-safe reference. The final checkpoint leaves the safe state
+        committed.
+        Rigid-rigid DAT and particle-only DAT are deliberately outside this
+        method.
+        """
+        if not self.rigid_enable_checkpointed_dat:
+            return
+        if contacts is None:
+            return
+
+        model = self.model
+        if preserve_proposal:
+            wp.copy(dest=self.checkpointed_dat_particle_q_proposal, src=state_in.particle_q)
+            wp.copy(dest=self.checkpointed_dat_body_q_proposal, src=state_in.body_q)
+
+        wp.launch(
+            kernel=rebase_particle_displacements,
+            dim=model.particle_count,
+            inputs=[
+                self.checkpointed_dat_particle_q_ref,
+                state_in.particle_q,
+            ],
+            outputs=[self.checkpointed_dat_particle_displacements],
+            device=self.device,
+        )
+
+        # Ordinary checkpointed sweeps bypass rigid-soft DAT. Force only that
+        # joint pass here; particle self-contact and rigid-rigid DAT keep their
+        # existing independent schedules.
+        self._penetration_free_truncation(
+            state_in.particle_q,
+            contacts,
+            state_in.body_q,
+            force_rigid_dat=True,
+            include_particle_self_contact=False,
+            particle_reference=self.checkpointed_dat_particle_q_ref,
+            particle_displacements=self.checkpointed_dat_particle_displacements,
+            body_reference=self.checkpointed_dat_body_q_ref,
+        )
+
+        if refresh_contacts:
+            # Advance only the rigid-soft DAT references to the safe state.
+            # Particle self-contact owns pos_prev_collision_detection and
+            # particle_displacements on its independent refresh schedule.
+            self.checkpointed_dat_particle_q_ref.assign(state_in.particle_q)
+            wp.copy(dest=self.checkpointed_dat_body_q_ref, src=state_in.body_q)
+            if self.rigid_enable_dat_alm:
+                wp.copy(dest=self.body_q_dat_alm_ref, src=state_in.body_q)
+
+            if self._collision_detection_hook is None:
+                raise RuntimeError("checkpointed DAT collision refresh requires a collision detection hook.")
+            self._collision_detection_hook(state_in)
+
+            # Refreshed rows and C0 snapshots are constructed at the safe state.
+            self._rebuild_body_particle_contact_state(contacts, k_start=-1.0)
+            self._initialize_rigid_soft_contact_alm_constraints(state_in, contacts)
+            if self.rigid_enable_dat_alm:
+                if preserve_proposal:
+                    # Build refreshed DAT-ALM planes from one coherent trajectory:
+                    # the newly accepted safe checkpoint -> the retained proposal.
+                    # The collision rows/normals come from the safe state, while the
+                    # adaptive plane fraction observes the motion that ALM will resume.
+                    wp.launch(
+                        kernel=rebase_particle_displacements,
+                        dim=model.particle_count,
+                        inputs=[
+                            self.checkpointed_dat_particle_q_ref,
+                            self.checkpointed_dat_particle_q_proposal,
+                        ],
+                        outputs=[self.checkpointed_dat_particle_displacements],
+                        device=self.device,
+                    )
+                    dat_alm_body_q = self.checkpointed_dat_body_q_proposal
+                else:
+                    self.checkpointed_dat_particle_displacements.zero_()
+                    dat_alm_body_q = state_in.body_q
+                self._build_rigid_soft_dat_alm_planes(
+                    state_in,
+                    contacts,
+                    particle_reference=self.checkpointed_dat_particle_q_ref,
+                    particle_displacements=self.checkpointed_dat_particle_displacements,
+                    body_reference=self.checkpointed_dat_body_q_ref,
+                    body_q=dat_alm_body_q,
+                )
+
+        if preserve_proposal:
+            wp.copy(dest=state_in.particle_q, src=self.checkpointed_dat_particle_q_proposal)
+            wp.copy(dest=state_in.body_q, src=self.checkpointed_dat_body_q_proposal)
 
     def _snapshot_rigid_contact_history(self, contacts: Contacts | None):
         """Write solved contact state for next frame's match-index warm-start."""
@@ -2047,7 +2208,18 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-    def _penetration_free_truncation(self, particle_q_out=None, contacts: Contacts | None = None, body_q=None):
+    def _penetration_free_truncation(
+        self,
+        particle_q_out=None,
+        contacts: Contacts | None = None,
+        body_q=None,
+        *,
+        force_rigid_dat: bool = False,
+        include_particle_self_contact: bool = True,
+        particle_reference=None,
+        particle_displacements=None,
+        body_reference=None,
+    ):
         """
         Modify displacements_in in-place, also modify particle_q if its not None.
 
@@ -2056,12 +2228,26 @@ class SolverVBD(SolverBase, CouplingInterface):
         ``self.body_q_prev``) against the rigid-soft division planes, in the same pass
         that truncates the soft side.
         """
-        rigid_dat_active = self.rigid_enable_penetration_free and contacts is not None and body_q is not None
+        if particle_reference is None:
+            particle_reference = self.pos_prev_collision_detection
+        if particle_displacements is None:
+            particle_displacements = self.particle_displacements
+        if body_reference is None:
+            # Particle-only VBD models do not allocate rigid DAT state.  The
+            # reference is only consumed when ``rigid_dat_active`` below is true.
+            body_reference = getattr(self, "body_q_dat_ref", None)
+
+        rigid_dat_active = (
+            self.rigid_enable_penetration_free
+            and contacts is not None
+            and body_q is not None
+            and (force_rigid_dat or not self.rigid_enable_checkpointed_dat)
+        )
 
         # Max displacement between collision detections (0.5 * margin * relaxation per side);
         # displacements beyond it degenerate to isotropic truncation.
         max_displacement = wp.inf
-        if self.particle_enable_self_contact:
+        if self.particle_enable_self_contact and include_particle_self_contact:
             max_displacement = self.particle_self_contact_margin * self.particle_conservative_bound_relaxation * 0.5
         if rigid_dat_active:
             max_displacement = min(
@@ -2071,13 +2257,13 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self.truncation_ts.fill_(1.0)
 
-        if self.particle_enable_self_contact:
+        if self.particle_enable_self_contact and include_particle_self_contact:
             ##  parallel by collision and atomic operation
             wp.launch(
                 kernel=apply_planar_truncation_parallel_by_collision,
                 inputs=[
-                    self.pos_prev_collision_detection,  # pos_prev_collision_detection: wp.array[wp.vec3],
-                    self.particle_displacements,  # particle_displacements: wp.array[wp.vec3],
+                    particle_reference,
+                    particle_displacements,
                     self.model.tri_indices,
                     self.model.edge_indices,
                     self.trimesh_collision_info,
@@ -2107,9 +2293,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_barycentric,
                     self.model.tri_indices,
                     self.model.shape_body,
-                    self.pos_prev_collision_detection,
-                    self.particle_displacements,
-                    self.body_q_dat_ref,
+                    particle_reference,
+                    particle_displacements,
+                    body_reference,
                     body_q,
                     self.model.body_com,
                     self.dat_body_vertex_start,
@@ -2132,13 +2318,13 @@ class SolverVBD(SolverBase, CouplingInterface):
             kernel=apply_truncation_ts,
             dim=self.model.particle_count,
             inputs=[
-                self.pos_prev_collision_detection,
-                self.particle_displacements,
+                particle_reference,
+                particle_displacements,
                 self.truncation_ts,
                 max_displacement,
             ],
             outputs=[
-                self.particle_displacements,
+                particle_displacements,
                 particle_q_out,
             ],
             device=self.device,
@@ -2149,7 +2335,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=apply_body_truncation_ts,
                 dim=self.model.body_count,
                 inputs=[
-                    self.body_q_dat_ref,
+                    body_reference,
                     self.model.body_com,
                     self.body_truncation_ts,
                     self.body_bounding_radius,
@@ -2207,7 +2393,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
-        if self.model.particle_count > 0 and contacts.soft_contact_max > 0:
+        if not self.rigid_enable_checkpointed_dat and self.model.particle_count > 0 and contacts.soft_contact_max > 0:
             # Also respect the rigid-soft planes; the write to truncation_ts is a
             # harmless side effect (it is refilled before its next particle-phase use).
             wp.launch(
@@ -2738,12 +2924,30 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-    def _build_rigid_soft_dat_alm_planes(self, state: State, contacts: Contacts | None) -> None:
+    def _build_rigid_soft_dat_alm_planes(
+        self,
+        state: State,
+        contacts: Contacts | None,
+        *,
+        particle_reference=None,
+        particle_displacements=None,
+        body_reference=None,
+        body_q=None,
+    ) -> None:
         """Freeze DAT-ALM planes for the current rigid-soft contact rows."""
         if not self.rigid_enable_dat_alm or contacts is None or contacts.soft_contact_max == 0:
             return
         if self.body_particle_dat_alm_plane_point.shape[0] < contacts.soft_contact_max:
             raise RuntimeError("DAT-ALM contact state was not allocated for the current contact capacity.")
+
+        if particle_reference is None:
+            particle_reference = self.pos_prev_collision_detection
+        if particle_displacements is None:
+            particle_displacements = self.particle_displacements
+        if body_reference is None:
+            body_reference = self.body_q_dat_alm_ref
+        if body_q is None:
+            body_q = state.body_q
 
         self.body_particle_dat_alm_lambda_soft.zero_()
         self.body_particle_dat_alm_lambda_rigid.zero_()
@@ -2759,10 +2963,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                 contacts.soft_contact_barycentric,
                 self.model.tri_indices,
                 self.model.shape_body,
-                self.pos_prev_collision_detection,
-                self.particle_displacements,
-                self.body_q_dat_alm_ref,
-                state.body_q,
+                particle_reference,
+                particle_displacements,
+                body_reference,
+                body_q,
             ],
             outputs=[
                 self.body_particle_dat_alm_plane_point,

@@ -53,7 +53,7 @@ class _FrameRecorder:
         h, w = img.shape[:2]
         img = img[: h - (h % 2), : w - (w % 2)]
         if self._writer is None:
-            import imageio.v2 as imageio
+            import imageio.v2 as imageio  # noqa: PLC0415 - optional recording dependency
 
             self._writer = imageio.get_writer(self.path, fps=self.fps, macro_block_size=1)
         self._writer.append_data(img)
@@ -83,7 +83,8 @@ class Experiment:
         # Timing (IsaacLab: sim.dt = 1/60, num_substeps VBD sub-steps per sim
         # step, decimation sim steps per control/env step).
         self.num_substeps = max(1, int(args.substeps))
-        self.decimation = max(1, int(self.strategy.decimation))
+        scene_decimation = self.scene.physics_decimation
+        self.decimation = max(1, int(self.strategy.decimation if scene_decimation is None else scene_decimation))
         self.substeps_per_step = self.num_substeps * self.decimation
         self.sim_dt = (1.0 / _BASE_FPS) / self.num_substeps
         self.frame_dt = self.decimation / _BASE_FPS
@@ -106,9 +107,14 @@ class Experiment:
         ):
             # Alg. 3 mid-step re-detection: the solver commits + re-detects every
             # --collision-interval iterations via this hook (graph-capture-safe).
-            self.solver.set_collision_detection_hook(
-                lambda state: self.collision_pipeline.collide(state, self.contacts)
-            )
+            if getattr(self.args, "dat_checkpointed", False):
+                self.solver.set_collision_detection_hook(
+                    lambda state: self.collision_pipeline.collide_soft(state, self.contacts)
+                )
+            else:
+                self.solver.set_collision_detection_hook(
+                    lambda state: self.collision_pipeline.collide(state, self.contacts)
+                )
         self.control = self.model.control()
 
         newton.examples.configure_coupled_view(self, args)
@@ -140,9 +146,15 @@ class Experiment:
             state.joint_q.assign(jq)
             state.joint_qd.zero_()
             newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+        # Initial velocities belong to the input state. The output state is a
+        # solver destination and intentionally remains zeroed, matching direct
+        # SolverVBD usage in the numerical regression fixtures.
+        self.scene.initialize_state(self.state_0)
         self.strategy.sync_initial(self.state_0)
 
         self.rest_particle_q = wp.clone(self.state_0.particle_q)
+        self.rest_body_q = wp.clone(self.state_0.body_q)
+        self.rest_body_qd = (wp.clone(self.state_0.body_qd), wp.clone(self.state_1.body_qd))
         self.init_joint_q = np.array(self.state_0.joint_q.numpy(), copy=True)
 
         self.controller = make_controller(args.control, args, self)
@@ -157,7 +169,7 @@ class Experiment:
         # times to ramp the penalties, then restore the clean spawn state:
         # reset() keeps the warmed penalties (its reset_internal is a no-op for
         # the monolithic VBD solver).
-        warmup_steps = int(getattr(self.strategy, "warmup_steps", 0))
+        warmup_steps = int(getattr(self.strategy, "warmup_steps", 0)) if self.handles.robot_joints else 0
         for _ in range(warmup_steps):
             self.step()
         if warmup_steps:
@@ -169,6 +181,12 @@ class Experiment:
     # Assembly
     # ------------------------------------------------------------------
     def _build_ik(self):
+        if not self.handles.robot_bodies:
+            self.ik = None
+            self._ik_on_full = False
+            self._meas_q = None
+            self._meas_qd = None
+            return
         # IsaacLab solves IK on the full simulation model and re-seeds from the
         # measured joint state each control update (_apply_ik_action). We do the
         # same when the IK target link exists in the full model (it does for the
@@ -198,7 +216,7 @@ class Experiment:
 
     def _build_model(self):
         builder = newton.ModelBuilder(gravity=-9.81)
-        builder.rigid_gap = 0.01
+        builder.rigid_gap = 0.01 if self.scene.rigid_gap is None else float(self.scene.rigid_gap)
         self.strategy.register_attributes(builder)
 
         robot_bodies, robot_joints, robot_shapes = self.scene.build_robot(
@@ -220,13 +238,14 @@ class Experiment:
             # out of rigid-rigid collision).
             from .robots import gripper_body_ids_from_labels  # noqa: PLC0415
 
-            gripper_bodies = gripper_body_ids_from_labels(builder.body_label, robot_bodies)
-            for shape_index in range(len(builder.shape_type)):
-                if (
-                    builder.shape_body[shape_index] in gripper_bodies
-                    and builder.shape_type[shape_index] == newton.GeoType.MESH
-                ):
-                    builder.shape_flags[shape_index] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
+            if robot_bodies:
+                gripper_bodies = gripper_body_ids_from_labels(builder.body_label, robot_bodies)
+                for shape_index in range(len(builder.shape_type)):
+                    if (
+                        builder.shape_body[shape_index] in gripper_bodies
+                        and builder.shape_type[shape_index] == newton.GeoType.MESH
+                    ):
+                        builder.shape_flags[shape_index] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
             # Opt in to volume SDFs for the rigid meshes (e.g. the gripper) that
             # will collide with the cloth; finalize() then builds them. Analytic
             # primitives use their closed-form SDF and are skipped.
@@ -240,7 +259,7 @@ class Experiment:
             robot_joints=robot_joints,
             robot_shapes=robot_shapes,
             static_shapes=static_shapes,
-            gripper_bodies=gripper_body_ids(self.model, robot_bodies),
+            gripper_bodies=gripper_body_ids(self.model, robot_bodies) if robot_bodies else [],
             particle_count=self.model.particle_count,
         )
         self.handles = handles
@@ -251,19 +270,20 @@ class Experiment:
     # Reset
     # ------------------------------------------------------------------
     def reset(self):
-        for state in (self.state_0, self.state_1):
+        for state_index, state in enumerate((self.state_0, self.state_1)):
             state.joint_q.assign(self.init_joint_q)
             state.joint_qd.zero_()
             newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+            wp.copy(state.body_q, self.rest_body_q)
+            wp.copy(state.body_qd, self.rest_body_qd[state_index])
             wp.copy(state.particle_q, self.rest_particle_q)
             state.particle_qd.zero_()
             state.clear_forces()
-            if getattr(state, "body_qd", None) is not None:
-                state.body_qd.zero_()
 
         self.control.clear()
-        self.ik.seed(self.init_joint_q)
-        wp.copy(self.control.joint_target_q, self.ik.joint_q, count=self.ik.n_coords)
+        if self.ik is not None:
+            self.ik.seed(self.init_joint_q)
+            wp.copy(self.control.joint_target_q, self.ik.joint_q, count=self.ik.n_coords)
 
         self.strategy.reset_internal(self.state_0, self.device)
         self.controller.reset()
@@ -275,6 +295,8 @@ class Experiment:
 
     def _stage_home_target(self):
         """Solve IK to the home pose and write it as the control target."""
+        if self.ik is None:
+            return
         self.ik.set_target(
             wp.vec3(*[float(x) for x in self.home_pos]),
             wp.vec4(*[float(x) for x in self.home_quat]),
@@ -322,7 +344,7 @@ class Experiment:
         # (mirrors IsaacLab _apply_ik_action). This is the single point where
         # the per-step target is produced, before it is fed to the IK solve.
         self._ik_print_count = getattr(self, "_ik_print_count", 0)
-        if self._ik_print_count % 60 == 0:
+        if self.ik is not None and self._ik_print_count % 60 == 0:
             print(
                 f"[IK Target] step={self._ik_print_count} t={self.sim_time:6.2f}s  "
                 f"pos=({float(pos[0]):.4f}, {float(pos[1]):.4f}, {float(pos[2]):.4f})  "
@@ -333,14 +355,15 @@ class Experiment:
         if self.controller.consume_reset():
             self.reset()
         for _ in range(self.decimation):
-            if self._ik_on_full:
-                # Re-seed IK from the measured joint state (IsaacLab _apply_ik_action).
-                newton.eval_ik(self.model, self.state_0, self._meas_q, self._meas_qd)
-                wp.copy(self.ik.joint_q, self._meas_q, count=self.ik.n_coords)
-            self.ik.set_target(pos, quat)
-            self.ik.set_finger(finger)
-            self.ik.solve()
-            self.ik.write_control(self.control)
+            if self.ik is not None:
+                if self._ik_on_full:
+                    # Re-seed IK from the measured joint state (IsaacLab _apply_ik_action).
+                    newton.eval_ik(self.model, self.state_0, self._meas_q, self._meas_qd)
+                    wp.copy(self.ik.joint_q, self._meas_q, count=self.ik.n_coords)
+                self.ik.set_target(pos, quat)
+                self.ik.set_finger(finger)
+                self.ik.solve()
+                self.ik.write_control(self.control)
             if self.graph is not None:
                 with wp.ScopedDevice(self.device):
                     wp.capture_launch(self.graph)
@@ -452,6 +475,14 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         "Set to 0 to disable C0 stabilization without changing rigid-rigid contacts.",
     )
     parser.add_argument(
+        "--dat-checkpointed",
+        action="store_true",
+        default=False,
+        help="Experimental rigid-soft Method 1: preserve the ALM proposal and apply --dat only to a safe state "
+        "at --collision-interval refreshes and timestep end. Requires --dat and either --contact-alm or "
+        "--dat-alm. Does not add checkpointed rigid-rigid or particle self-contact handling.",
+    )
+    parser.add_argument(
         "--measure-penetration",
         action="store_true",
         default=False,
@@ -498,8 +529,10 @@ def build_parser(scene_cls, solver_cls, controller_cls):
         default=True,
         help="Disable CUDA graph capture.",
     )
-    scene_cls.add_args(parser)
     solver_cls.add_args(parser)
+    # Scene defaults may specialize solver arguments (for example, a visual
+    # regression scene can select the iteration count used by its test fixture).
+    scene_cls.add_args(parser)
     controller_cls.add_args(parser)
     return parser
 

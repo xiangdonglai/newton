@@ -1474,6 +1474,17 @@ def update_velocity(dt: float, pos_prev: wp.array[wp.vec3], pos: wp.array[wp.vec
 
 
 @wp.kernel
+def rebase_particle_displacements(
+    reference_pos: wp.array[wp.vec3],
+    proposal_pos: wp.array[wp.vec3],
+    particle_displacements: wp.array[wp.vec3],
+):
+    """Express a preserved particle proposal relative to a new DAT-safe reference."""
+    particle = wp.tid()
+    particle_displacements[particle] = proposal_pos[particle] - reference_pos[particle]
+
+
+@wp.kernel
 def convert_body_particle_contact_data_kernel(
     # inputs
     body_particle_contact_buffer_pre_alloc: int,

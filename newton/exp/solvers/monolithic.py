@@ -47,6 +47,8 @@ class MonolithicAvbdStrategy(SolverStrategy):
         SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
 
     def configure_robot(self, builder, robot_bodies, robot_joints):
+        if not robot_joints:
+            return
         gains = {
             "arm_stiffness": ARM_STIFFNESS,
             "arm_damping": ARM_DAMPING,
@@ -90,7 +92,8 @@ class MonolithicAvbdStrategy(SolverStrategy):
 
     def post_finalize(self, model, handles):
         # VBD uses model.body_q as the articulation rest pose.
-        newton.eval_fk(model, model.joint_q, model.joint_qd, model)
+        if handles.robot_joints:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, model)
         self._robot_joints = handles.robot_joints
 
     def build_solver(self, model, handles, args):
@@ -139,6 +142,8 @@ class MonolithicAvbdStrategy(SolverStrategy):
         if getattr(args, "contact_alm", False):
             vbd_kwargs["rigid_enable_contact_alm"] = True
             vbd_kwargs["rigid_soft_contact_alm_alpha"] = float(args.contact_alm_alpha)
+        if getattr(args, "dat_checkpointed", False):
+            vbd_kwargs["rigid_enable_checkpointed_dat"] = True
         if int(getattr(args, "collision_interval", 0)) >= 1:
             vbd_kwargs["rigid_collision_detection_interval"] = int(args.collision_interval)
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win

@@ -79,9 +79,13 @@ class SolverStrategy:
         """
         import newton
 
-        return newton.CollisionPipeline(
-            model, broad_phase="explicit", enable_water_tight_rigid_soft_contact=water_tight
-        )
+        kwargs = {
+            "broad_phase": "explicit",
+            "enable_water_tight_rigid_soft_contact": water_tight,
+        }
+        if self.scene is not None:
+            kwargs.update(self.scene.collision_pipeline_overrides(self.key))
+        return newton.CollisionPipeline(model, **kwargs)
 
     def pre_substeps(self, solver, state):
         """Hook before each control update's sub-steps (e.g. VBD rebuild_bvh)."""
