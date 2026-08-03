@@ -30,9 +30,11 @@ from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     # Topological filtering helper functions
+    accumulate_dat_alm_branch_corrections,
     accumulate_particle_body_contact_force_and_hessian,
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
+    apply_dat_alm_branch_corrections,
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
@@ -570,6 +572,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Initialize rigid-soft DAT augmented-Lagrangian state."""
         self.rigid_enable_dat_alm = bool(enabled)
         self.rigid_dat_alm_penalty = float(penalty)
+        # Private ablation switch used by the single-particle diagnostic. Production
+        # DAT-ALM always reselects the projected branch at its Newton candidate.
+        self._rigid_dat_alm_branch_consistent = True
         if not self.rigid_enable_dat_alm:
             self.body_q_dat_alm_ref = wp.empty(0, dtype=wp.transform, device=self.device)
             return
@@ -580,6 +585,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         if self.integrate_with_external_rigid_solver:
             raise ValueError("rigid_enable_dat_alm is not supported with an external rigid solver.")
         self.body_q_dat_alm_ref = wp.zeros(model.body_count, dtype=wp.transform, device=self.device)
+        self.particle_solve_forces = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.particle_solve_hessians = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self.particle_candidate_delta = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.particle_dat_alm_correction_forces = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.particle_dat_alm_correction_hessians = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
 
     def _init_rigid_soft_contact_alm(self, model: Model, enabled: bool) -> None:
         """Initialize direct rigid-soft normal and tangential augmented-Lagrangian state."""
@@ -816,6 +826,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Particle force and hessian storage
         self.particle_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.particle_hessians = wp.zeros(self.model.particle_count, dtype=wp.mat33, device=self.device)
+        self.particle_solve_forces = wp.empty(0, dtype=wp.vec3, device=self.device)
+        self.particle_solve_hessians = wp.empty(0, dtype=wp.mat33, device=self.device)
+        self.particle_candidate_delta = wp.empty(0, dtype=wp.vec3, device=self.device)
+        self.particle_dat_alm_correction_forces = wp.empty(0, dtype=wp.vec3, device=self.device)
+        self.particle_dat_alm_correction_hessians = wp.empty(0, dtype=wp.mat33, device=self.device)
 
         # Validation
         if len(self.model.particle_color_groups) == 0:
@@ -3075,6 +3090,9 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         # Iterate over color groups
         for color in range(len(self.model.particle_color_groups)):
+            self.particle_solve_forces.zero_()
+            self.particle_solve_hessians.zero_()
+            self.particle_candidate_delta.zero_()
             if contacts is not None:
                 wp.launch(
                     kernel=accumulate_particle_body_contact_force_and_hessian,
@@ -3197,9 +3215,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.particle_adjacency,
                         self.particle_forces,
                         self.particle_hessians,
+                        int(self.rigid_enable_dat_alm and self._rigid_dat_alm_branch_consistent),
                     ],
                     outputs=[
                         self.particle_displacements,
+                        self.particle_solve_forces,
+                        self.particle_solve_hessians,
+                        self.particle_candidate_delta,
                     ],
                     device=self.device,
                 )
@@ -3229,12 +3251,68 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.particle_adjacency,
                         self.particle_forces,
                         self.particle_hessians,
+                        int(self.rigid_enable_dat_alm and self._rigid_dat_alm_branch_consistent),
                     ],
                     outputs=[
                         self.particle_displacements,
+                        self.particle_solve_forces,
+                        self.particle_solve_hessians,
+                        self.particle_candidate_delta,
                     ],
                     device=self.device,
                 )
+            if self.rigid_enable_dat_alm and self._rigid_dat_alm_branch_consistent and contacts is not None:
+                # Projected AL is piecewise quadratic. The first Newton candidate can
+                # cross C=lambda/rho even though the branch selected at the current
+                # coordinate was inactive (or vice versa). Re-select the contact-plane
+                # branches at the candidate and recompute the same local Newton solve.
+                # Two fixed active-set refinements avoid a host synchronization and let
+                # coupled multiple-plane changes settle while remaining graph-capturable.
+                for _active_set_iteration in range(2):
+                    self.particle_dat_alm_correction_forces.zero_()
+                    self.particle_dat_alm_correction_hessians.zero_()
+                    wp.launch(
+                        kernel=accumulate_dat_alm_branch_corrections,
+                        dim=contacts.soft_contact_max,
+                        inputs=[
+                            color,
+                            state_in.particle_q,
+                            self.model.particle_colors,
+                            self.particle_candidate_delta,
+                            contacts.soft_contact_primitive,
+                            contacts.soft_contact_count,
+                            contacts.soft_contact_max,
+                            contacts.soft_contact_barycentric,
+                            self.model.tri_indices,
+                            self.body_particle_dat_alm_plane_point,
+                            self.body_particle_dat_alm_plane_normal,
+                            self.body_particle_dat_alm_lambda_soft,
+                            self.rigid_dat_alm_penalty,
+                        ],
+                        outputs=[
+                            self.particle_dat_alm_correction_forces,
+                            self.particle_dat_alm_correction_hessians,
+                        ],
+                        device=self.device,
+                    )
+                    wp.launch(
+                        kernel=apply_dat_alm_branch_corrections,
+                        dim=self.model.particle_color_groups[color].size,
+                        inputs=[
+                            self.model.particle_color_groups[color],
+                            self.model.particle_flags,
+                            self.model.particle_mass,
+                            self.particle_solve_forces,
+                            self.particle_solve_hessians,
+                            self.particle_dat_alm_correction_forces,
+                            self.particle_dat_alm_correction_hessians,
+                        ],
+                        outputs=[
+                            self.particle_candidate_delta,
+                            self.particle_displacements,
+                        ],
+                        device=self.device,
+                    )
             self._penetration_free_truncation(
                 state_in.particle_q, contacts, state_in.body_q if model.body_count > 0 else None
             )

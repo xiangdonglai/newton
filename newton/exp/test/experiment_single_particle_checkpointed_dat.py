@@ -246,7 +246,7 @@ def _build_model(config: ExperimentConfig):
     return model
 
 
-def _run_method(config: ExperimentConfig, method: str):
+def _run_method(config: ExperimentConfig, method: str, *, dat_alm_branch_consistent: bool = True):
     model = _build_model(config)
     solver = TracingSolverVBD(
         model,
@@ -267,6 +267,7 @@ def _run_method(config: ExperimentConfig, method: str):
         rigid_body_particle_contact_buffer_size=16,
         rigid_avbd_beta=0.0,
     )
+    solver._rigid_dat_alm_branch_consistent = dat_alm_branch_consistent
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_margin=config.contact_margin)
     contacts = pipeline.contacts()
     solver.set_collision_detection_hook(lambda state: pipeline.collide_soft(state, contacts))
@@ -323,8 +324,8 @@ def _validate(config: ExperimentConfig, iteration_rows: list[dict], checkpoint_r
             raise AssertionError(f"{method}: one-dimensional symmetry was not preserved")
         if int(rows[-1]["active_contacts"]) != 1:
             raise AssertionError(f"{method}: expected exactly one active rigid-soft contact")
-        if not bool(events[0]["truncated"]) or bool(events[1]["truncated"]):
-            raise AssertionError(f"{method}: expected truncation only at the midstep checkpoint")
+        if not bool(events[0]["truncated"]):
+            raise AssertionError(f"{method}: expected the first midstep checkpoint to truncate")
         if float(events[-1]["safe_z_m"]) < config.box_top_z:
             raise AssertionError(f"{method}: final checkpoint committed raw penetration")
 
@@ -443,7 +444,13 @@ def _plot(config: ExperimentConfig, iteration_rows: list[dict], checkpoint_rows:
     plt.close(fig)
 
 
-def _plot_checkpoint_cycle(output_dir: Path, base_config: ExperimentConfig, method: str) -> None:
+def _plot_checkpoint_cycle(
+    output_dir: Path,
+    base_config: ExperimentConfig,
+    method: str,
+    *,
+    dat_alm_branch_consistent: bool = True,
+) -> None:
     """Plot an ALM/checkpoint cycle with enough iterations to expose repeated resets."""
     import matplotlib
 
@@ -451,8 +458,10 @@ def _plot_checkpoint_cycle(output_dir: Path, base_config: ExperimentConfig, meth
     import matplotlib.pyplot as plt
 
     config = replace(base_config, iterations=20, collision_interval=5)
-    rows, events = _run_method(config, method)
+    rows, events = _run_method(config, method, dat_alm_branch_consistent=dat_alm_branch_consistent)
     method_slug = "contact_alm" if method == "contact_alm_checkpointed_dat" else "dat_alm"
+    if not dat_alm_branch_consistent:
+        method_slug += "_legacy"
     cycle_dir = output_dir / f"{method_slug}_interval5_iterations20"
     cycle_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(cycle_dir / "iteration_trace.csv", rows)
@@ -541,10 +550,14 @@ def _plot_checkpoint_cycle(output_dir: Path, base_config: ExperimentConfig, meth
     axes[0].legend(loc="lower right", ncols=2)
 
     axes[1].set_xticks(trace_positions, trace_labels, rotation=45, ha="right")
-    fig.suptitle(f"{METHOD_LABELS[method]}: interval 5, 20 VBD iterations")
+    title = f"{METHOD_LABELS[method]}: interval 5, 20 VBD iterations"
+    if not dat_alm_branch_consistent:
+        title += " (legacy branch selection)"
+    fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(cycle_dir / f"{method_slug}_interval5_iterations20.png", dpi=180)
     plt.close(fig)
+
 
 def _format_iteration_table(rows: list[dict]) -> str:
     lines = [
@@ -633,8 +646,9 @@ def _write_report(
         "",
         "The matched DAT-ALM run behaves differently because every refresh both resets the soft-plane "
         "multiplier and rebuilds its ALM plane. After the first five iterations converge near the initial "
-        "2 mm plane, the subsequent five-iteration blocks alternate between penetrating and correcting "
-        "proposals. Hard DAT truncates at every checkpoint, moving the safe reference through 7.700, "
+        "2 mm plane, the branch-consistent local solve makes each subsequent five-iteration block converge "
+        "smoothly toward its refreshed plane instead of alternating between penetrating and correcting "
+        "proposals. Hard DAT still truncates at every checkpoint, moving the safe reference through 7.700, "
         "1.482, 0.285, and 0.055 mm while its checkpoint plane moves through 2.000, 0.385, 0.074, and "
         "0.014 mm.",
         "",
@@ -825,33 +839,52 @@ def _write_report(
             "dual progress observed when `--collision-interval` makes the sphere/cloth example worse.",
             "",
             "For DAT-ALM, the refreshed plane is at $z=0.385$ mm. The restored proposal initially satisfies "
-            "that plane, so its projected DAT-ALM term is inactive during iteration 2. The ordinary contact "
-            f"solve then overshoots to {1000.0 * float(dat_iter2['z_m']):.3f} mm. The following dual update "
-            f"jumps to {float(dat_iter2['active_multiplier']):.3f} N, and iteration 3 corrects the proposal "
-            f"to {1000.0 * float(dat_iter3['z_m']):.3f} mm while the multiplier releases to "
-            f"{float(dat_iter3['active_multiplier']):.3f} N. Intermediate penetration is allowed by Method 1; "
-            "only checkpointed states are intended to be safe.",
+            "that plane, so its projected DAT-ALM term is inactive at the beginning of iteration 2. The "
+            "ordinary Newton candidate would cross to $-3.382$ mm. The branch-consistency check detects that "
+            "crossing and recomputes the same local solve with the active DAT-ALM quadratic, producing "
+            f"{1000.0 * float(dat_iter2['z_m']):.3f} mm and a {float(dat_iter2['active_multiplier']):.3f} N "
+            f"dual. Iteration 3 then advances smoothly to {1000.0 * float(dat_iter3['z_m']):.3f} mm with "
+            f"$\\lambda_s={float(dat_iter3['active_multiplier']):.3f}$ N instead of entering the previous "
+            "active/inactive oscillation.",
             "",
             "### Final checkpoint and bug assessment",
             "",
-            f"The final proposals are {1000.0 * float(contact_final['safe_z_m']):.3f} mm for Contact-ALM and "
-            f"{1000.0 * float(dat_final['safe_z_m']):.3f} mm for DAT-ALM. Both remain above the raw box surface "
-            "and on the allowed side of their refreshed DAT planes, so the final checkpoint reports $t=1$ "
-            "and commits them unchanged. Their centers remain inside the 5 mm collision shell; hard DAT in "
-            "this formulation protects the raw division plane, not the particle-radius shell.",
+            f"The final Contact-ALM checkpoint accepts {1000.0 * float(contact_final['safe_z_m']):.3f} mm "
+            f"unchanged with $t={float(contact_final['truncation_t']):.3f}$. The final DAT-ALM proposal is "
+            f"{1000.0 * float(dat_final['proposal_z_m']):.3f} mm; conservative hard DAT applies "
+            f"$t={float(dat_final['truncation_t']):.3f}$ and commits the safe value "
+            f"{1000.0 * float(dat_final['safe_z_m']):.3f} mm. Both committed states are above the raw box "
+            "surface, although their centers remain inside the 5 mm collision shell. Hard DAT protects the "
+            "raw division plane rather than the particle-radius shell.",
             "",
-            "No arithmetic or sign error is evident: the coordinates and multiplier changes agree with the "
-            "closed-form one-dimensional updates. Two algorithmic limitations are clear, however:",
+            "The corrected particle coordinates and multiplier changes agree with the closed-form "
+            "piecewise-quadratic updates. Two qualifications remain:",
             "",
             "1. Refreshed rigid-soft rows discard their multipliers, so frequent checkpoints can restart or "
-            "cycle the AL solve instead of accelerating convergence. Stable contact identity and multiplier "
+            "restart the AL solve instead of accelerating convergence. Stable contact identity and multiplier "
             "transport are needed to fix this.",
-            "2. A newly refreshed DAT-ALM inequality can be inactive at the start of a VBD sweep and then be "
-            "crossed by that sweep. The projected dual only reacts afterward. Hard DAT still protects the next "
-            "committed checkpoint, but DAT-ALM alone does not make every intermediate iterate safe.",
+            "2. The new active-set correction currently covers the particle/soft side of rigid-soft DAT-ALM. "
+            "A corresponding branch-consistency treatment is still needed for a dynamic rigid body's nonlinear "
+            "pose update. Hard DAT continues to protect committed checkpoints in the meantime.",
             "",
             "The conservative $\\gamma$ retreat is expected DAT behavior rather than a code defect, but this "
             "minimal case shows its cost clearly and makes it a useful tuning target.",
+            "",
+            "## Appendix: DAT-ALM before branch-consistent candidate correction",
+            "",
+            "For comparison, the figure below preserves the previous local solve. It selected the projected "
+            "DAT-ALM branch only at the coordinate before the Newton update. After checkpoint 5, the retained "
+            "proposal satisfied the rebuilt plane, so the inactive solve crossed to $-3.382$ mm. The delayed "
+            "dual response then pushed the following iterate back above the plane, creating the alternating "
+            "high/low multiplier and coordinate pattern. This ablation differs from the main DAT-ALM figure "
+            "only by disabling candidate-based branch reselection.",
+            "",
+            "![Legacy oscillating DAT-ALM checkpoint cycle]"
+            "(dat_alm_legacy_interval5_iterations20/dat_alm_legacy_interval5_iterations20.png)",
+            "",
+            "The corresponding ablation data are in "
+            "`dat_alm_legacy_interval5_iterations20/iteration_trace.csv` and "
+            "`dat_alm_legacy_interval5_iterations20/checkpoint_trace.csv`.",
             "",
             "Raw data are in `iteration_trace.csv` and `checkpoint_trace.csv`.",
         ]
@@ -888,6 +921,12 @@ def main() -> None:
     _plot(config, iteration_rows, checkpoint_rows, output_dir)
     _plot_checkpoint_cycle(output_dir, config, "contact_alm_checkpointed_dat")
     _plot_checkpoint_cycle(output_dir, config, "dat_alm_checkpointed_dat")
+    _plot_checkpoint_cycle(
+        output_dir,
+        config,
+        "dat_alm_checkpointed_dat",
+        dat_alm_branch_consistent=False,
+    )
     _write_report(config, iteration_rows, checkpoint_rows, output_dir)
 
     for method in METHODS:

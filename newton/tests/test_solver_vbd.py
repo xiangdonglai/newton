@@ -12,7 +12,9 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
+    accumulate_dat_alm_branch_corrections,
     accumulate_particle_body_contact_force_and_hessian,
+    apply_dat_alm_branch_corrections,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
     evaluate_self_contact_force_norm,
@@ -2963,6 +2965,93 @@ def test_rigid_dat_alm_sphere_drop_reduces_penetration(test, device):
     test.assertGreater(body_z_alm, body_z_ctrl, "DAT-ALM should delay or prevent tunneling through the cloth")
 
 
+def test_dat_alm_particle_candidate_reselects_projected_branch(test, device):
+    """An inactive local model is replaced when its Newton candidate crosses the AL kink."""
+    old_z = 0.002
+    plane_z = 0.000385
+    ordinary_candidate_z = -0.0033823529
+    penalty = 1.0e5
+    base_hessian_z = 1.36e4
+
+    pos = wp.array([[0.0, 0.0, old_z]], dtype=wp.vec3, device=device)
+    colors = wp.array([0], dtype=wp.int32, device=device)
+    candidate_delta = wp.array(
+        [[0.0, 0.0, ordinary_candidate_z - old_z]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    contact_primitive = wp.array([0], dtype=wp.int32, device=device)
+    contact_count = wp.array([1, 0, 0], dtype=wp.int32, device=device)
+    contact_barycentric = wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    tri_indices = wp.empty((0, 3), dtype=wp.int32, device=device)
+    plane_point = wp.array([[0.0, 0.0, plane_z]], dtype=wp.vec3, device=device)
+    plane_normal = wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device)
+    lambda_soft = wp.zeros(1, dtype=float, device=device)
+    correction_force = wp.zeros(1, dtype=wp.vec3, device=device)
+    correction_hessian = wp.zeros(1, dtype=wp.mat33, device=device)
+
+    wp.launch(
+        kernel=accumulate_dat_alm_branch_corrections,
+        dim=1,
+        inputs=[
+            0,
+            pos,
+            colors,
+            candidate_delta,
+            contact_primitive,
+            contact_count,
+            1,
+            contact_barycentric,
+            tri_indices,
+            plane_point,
+            plane_normal,
+            lambda_soft,
+            penalty,
+        ],
+        outputs=[correction_force, correction_hessian],
+        device=device,
+    )
+
+    solve_force = wp.array(
+        [[0.0, 0.0, base_hessian_z * (ordinary_candidate_z - old_z)]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    solve_hessian = wp.array(
+        [[[base_hessian_z, 0.0, 0.0], [0.0, base_hessian_z, 0.0], [0.0, 0.0, base_hessian_z]]],
+        dtype=wp.mat33,
+        device=device,
+    )
+    particle_flags = wp.array([int(newton.ParticleFlags.ACTIVE)], dtype=wp.int32, device=device)
+    mass = wp.ones(1, dtype=float, device=device)
+    displacements = wp.clone(candidate_delta)
+    wp.launch(
+        kernel=apply_dat_alm_branch_corrections,
+        dim=1,
+        inputs=[
+            colors,
+            particle_flags,
+            mass,
+            solve_force,
+            solve_hessian,
+            correction_force,
+            correction_hessian,
+        ],
+        outputs=[candidate_delta, displacements],
+        device=device,
+    )
+
+    corrected_z = old_z + float(candidate_delta.numpy()[0, 2])
+    expected_z = (base_hessian_z * ordinary_candidate_z + penalty * plane_z) / (base_hessian_z + penalty)
+    test.assertAlmostEqual(corrected_z, expected_z, places=7)
+    test.assertLess(corrected_z, plane_z, "the recomputed candidate must be consistent with the active branch")
+    test.assertGreater(
+        corrected_z,
+        ordinary_candidate_z,
+        "the active DAT-ALM quadratic must prevent the full inactive-branch overshoot",
+    )
+
+
 def test_contact_alm_projected_force(test, device):
     """Direct contact ALM activates on violation or multiplier load and releases when separated."""
     gaps = wp.array([-0.01, 0.01, 0.03], dtype=float, device=device)
@@ -3645,6 +3734,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_alm_sphere_drop_reduces_penetration",
     test_rigid_dat_alm_sphere_drop_reduces_penetration,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_dat_alm_particle_candidate_reselects_projected_branch",
+    test_dat_alm_particle_candidate_reselects_projected_branch,
     devices=devices,
 )
 add_function_test(

@@ -2474,6 +2474,111 @@ def accumulate_particle_body_contact_force_and_hessian(
 
 
 @wp.kernel
+def accumulate_dat_alm_branch_corrections(
+    current_color: int,
+    pos: wp.array[wp.vec3],
+    particle_colors: wp.array[int],
+    candidate_delta: wp.array[wp.vec3],
+    contact_primitive: wp.array[wp.int32],
+    contact_count: wp.array[wp.int32],
+    contact_max: int,
+    contact_barycentric: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    plane_point: wp.array[wp.vec3],
+    plane_normal: wp.array[wp.vec3],
+    lambda_soft: wp.array[float],
+    penalty: float,
+    correction_force: wp.array[wp.vec3],
+    correction_hessian: wp.array[wp.mat33],
+):
+    """Correct projected DAT-ALM branches selected by a particle Newton candidate.
+
+    Contact accumulation selects the projected branch at the current coordinate. A
+    full Newton step can cross the kink ``C=lambda/rho``. This kernel compares that
+    provisional candidate with the original branch and atomically adds/removes the
+    active quadratic so the local solve can be repeated with a consistent active set.
+    """
+    contact_index = wp.tid()
+    count_particle = contact_count[0]
+    count_total = min(contact_max, count_particle + contact_count[1] + contact_count[2])
+    if contact_index >= count_total:
+        return
+
+    n = plane_normal[contact_index]
+    d = plane_point[contact_index]
+    lambda_n = lambda_soft[contact_index]
+
+    if contact_index < count_particle:
+        particle_index = contact_primitive[contact_index]
+        if particle_colors[particle_index] != current_color:
+            return
+        point = pos[particle_index]
+        candidate = point + candidate_delta[particle_index]
+        old_measure = lambda_n - penalty * wp.dot(n, point - d)
+        candidate_measure = lambda_n - penalty * wp.dot(n, candidate - d)
+        old_active = old_measure > 0.0
+        candidate_active = candidate_measure > 0.0
+        if old_active != candidate_active:
+            sign = float(1.0)
+            if old_active:
+                sign = -1.0
+            wp.atomic_add(correction_force, particle_index, sign * old_measure * n)
+            wp.atomic_add(correction_hessian, particle_index, sign * penalty * wp.outer(n, n))
+        return
+
+    tri = contact_primitive[contact_index]
+    bary = contact_barycentric[contact_index]
+    point = bary[0] * pos[tri_indices[tri, 0]]
+    point += bary[1] * pos[tri_indices[tri, 1]]
+    point += bary[2] * pos[tri_indices[tri, 2]]
+    old_measure = lambda_n - penalty * wp.dot(n, point - d)
+    old_active = old_measure > 0.0
+
+    for i in range(3):
+        weight = bary[i]
+        if weight > 0.0:
+            particle_index = tri_indices[tri, i]
+            if particle_colors[particle_index] == current_color:
+                candidate = point + weight * candidate_delta[particle_index]
+                candidate_measure = lambda_n - penalty * wp.dot(n, candidate - d)
+                candidate_active = candidate_measure > 0.0
+                if old_active != candidate_active:
+                    sign = float(1.0)
+                    if old_active:
+                        sign = -1.0
+                    wp.atomic_add(correction_force, particle_index, sign * weight * old_measure * n)
+                    wp.atomic_add(
+                        correction_hessian,
+                        particle_index,
+                        sign * weight * weight * penalty * wp.outer(n, n),
+                    )
+
+
+@wp.kernel
+def apply_dat_alm_branch_corrections(
+    particle_ids_in_color: wp.array[wp.int32],
+    particle_flags: wp.array[wp.int32],
+    mass: wp.array[float],
+    solve_force: wp.array[wp.vec3],
+    solve_hessian: wp.array[wp.mat33],
+    correction_force: wp.array[wp.vec3],
+    correction_hessian: wp.array[wp.mat33],
+    candidate_delta: wp.array[wp.vec3],
+    particle_displacements: wp.array[wp.vec3],
+):
+    """Replace the provisional Newton displacement with its branch-consistent value."""
+    particle_index = particle_ids_in_color[wp.tid()]
+    if not particle_flags[particle_index] & ParticleFlags.ACTIVE or mass[particle_index] == 0.0:
+        return
+
+    h = solve_hessian[particle_index] + correction_hessian[particle_index]
+    if abs(wp.determinant(h)) > 1.0e-8:
+        corrected_delta = wp.inverse(h) * (solve_force[particle_index] + correction_force[particle_index])
+        particle_displacements[particle_index] += corrected_delta - candidate_delta[particle_index]
+        candidate_delta[particle_index] = corrected_delta
+
+
+@wp.kernel
 def solve_elasticity_tile(
     dt: float,
     particle_ids_in_color: wp.array[wp.int32],
@@ -2496,8 +2601,12 @@ def solve_elasticity_tile(
     particle_adjacency: MeshAdjacencyData,
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
-    # output
+    record_solve_system: int,
+    # outputs
     particle_displacements: wp.array[wp.vec3],
+    solve_force: wp.array[wp.vec3],
+    solve_hessian: wp.array[wp.mat33],
+    candidate_delta: wp.array[wp.vec3],
 ):
     tid = wp.tid()
     block_idx = tid // TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
@@ -2507,6 +2616,10 @@ def solve_elasticity_tile(
     if not particle_flags[particle_index] & ParticleFlags.ACTIVE or mass[particle_index] == 0:
         if thread_idx == 0:
             particle_displacements[particle_index] = wp.vec3(0.0)
+            if record_solve_system != 0:
+                solve_force[particle_index] = wp.vec3(0.0)
+                solve_hessian[particle_index] = wp.mat33(0.0)
+                candidate_delta[particle_index] = wp.vec3(0.0)
         return
 
     dt_sqr_reciprocal = 1.0 / (dt * dt)
@@ -2634,7 +2747,12 @@ def solve_elasticity_tile(
                 + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
                 + particle_forces[particle_index]
             )
-            particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f_total
+            delta = h_inv * f_total
+            if record_solve_system != 0:
+                solve_force[particle_index] = f_total
+                solve_hessian[particle_index] = h_total
+                candidate_delta[particle_index] = delta
+            particle_displacements[particle_index] = particle_displacements[particle_index] + delta
 
 
 @wp.kernel
@@ -2660,8 +2778,12 @@ def solve_elasticity(
     particle_adjacency: MeshAdjacencyData,
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
-    # output
+    record_solve_system: int,
+    # outputs
     particle_displacements: wp.array[wp.vec3],
+    solve_force: wp.array[wp.vec3],
+    solve_hessian: wp.array[wp.mat33],
+    candidate_delta: wp.array[wp.vec3],
 ):
     t_id = wp.tid()
 
@@ -2669,6 +2791,10 @@ def solve_elasticity(
 
     if not particle_flags[particle_index] & ParticleFlags.ACTIVE or mass[particle_index] == 0:
         particle_displacements[particle_index] = wp.vec3(0.0)
+        if record_solve_system != 0:
+            solve_force[particle_index] = wp.vec3(0.0)
+            solve_hessian[particle_index] = wp.mat33(0.0)
+            candidate_delta[particle_index] = wp.vec3(0.0)
         return
 
     dt_sqr_reciprocal = 1.0 / (dt * dt)
@@ -2775,7 +2901,12 @@ def solve_elasticity(
 
     if abs(wp.determinant(h)) > 1e-8:
         h_inv = wp.inverse(h)
-        particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f
+        delta = h_inv * f
+        if record_solve_system != 0:
+            solve_force[particle_index] = f
+            solve_hessian[particle_index] = h
+            candidate_delta[particle_index] = delta
+        particle_displacements[particle_index] = particle_displacements[particle_index] + delta
 
 
 @wp.kernel
