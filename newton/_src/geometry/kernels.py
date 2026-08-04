@@ -1018,6 +1018,7 @@ def create_soft_contacts(
     soft_contact_count: wp.array[int],
     soft_contact_primitive: wp.array[int],
     soft_contact_shape: wp.array[int],
+    soft_contact_rigid_face: wp.array[int],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
@@ -1066,6 +1067,7 @@ def create_soft_contacts(
     d = 1.0e6
     n = wp.vec3()
     v = wp.vec3()
+    rigid_face = int(-1)
 
     if geo_type == GeoType.SPHERE:
         d = sdf_sphere(x_local, geo_scale[0])
@@ -1108,6 +1110,7 @@ def create_soft_contacts(
         if query.result:
             sign = query.sign
             face_index = query.face
+            rigid_face = face_index
             face_u = query.u
             face_v = query.v
 
@@ -1144,6 +1147,7 @@ def create_soft_contacts(
             world_normal = wp.transform_vector(X_ws, n)
 
             soft_contact_shape[index] = shape_index
+            soft_contact_rigid_face[index] = rigid_face
             soft_contact_body_pos[index] = body_pos
             soft_contact_body_vel[index] = body_vel
             soft_contact_primitive[index] = particle_index

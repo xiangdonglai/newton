@@ -637,9 +637,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         capsule segment endpoints with their radius (exact for their round geometry),
         cylinder/cone rim polygons with the chord sagitta as a covering radius.
         """
-        from ...geometry import GeoType  # noqa: PLC0415
+        from ...geometry import GeoType, ShapeFlags  # noqa: PLC0415
 
         shape_body = model.shape_body.numpy()
+        shape_flags = model.shape_flags.numpy()
         shape_type = model.shape_type.numpy()
         shape_scale = model.shape_scale.numpy()
         shape_transform = model.shape_transform.numpy()
@@ -691,6 +692,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         for shape_index in range(model.shape_count):
             body_index = shape_body[shape_index]
             if body_index < 0:
+                continue
+            if not (shape_flags[shape_index] & int(ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES)):
                 continue
             pts, radii = shape_local_vertices(shape_index)
             if len(pts) == 0:
@@ -2303,11 +2306,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_count,
                     contacts.soft_contact_primitive,
                     contacts.soft_contact_shape,
+                    contacts.soft_contact_rigid_face,
                     contacts.soft_contact_body_pos,
                     contacts.soft_contact_normal,
                     contacts.soft_contact_barycentric,
                     self.model.tri_indices,
                     self.model.shape_body,
+                    self.model.shape_type,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
                     particle_reference,
                     particle_displacements,
                     body_reference,
@@ -2418,11 +2426,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_count,
                     contacts.soft_contact_primitive,
                     contacts.soft_contact_shape,
+                    contacts.soft_contact_rigid_face,
                     contacts.soft_contact_body_pos,
                     contacts.soft_contact_normal,
                     contacts.soft_contact_barycentric,
                     self.model.tri_indices,
                     self.model.shape_body,
+                    self.model.shape_type,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
                     self.body_q_dat_ref,

@@ -229,23 +229,17 @@ class Experiment:
 
         builder.color()
         if self.args.water_tight:
-            # The gripper's URDF particle-collision geometry is a handful of small box
-            # pads; the finger/hand MESH shapes are visual-only (COLLIDE_PARTICLES off).
-            # Cloth then only sees the pads and can sink well inside the visible finger
-            # surface — no contact records means neither penalty forces nor DAT division
-            # planes can act there. Make the gripper bodies' mesh shapes
-            # particle-colliding so the cloth collides with the real surfaces (they stay
-            # out of rigid-rigid collision).
-            from .robots import gripper_body_ids_from_labels  # noqa: PLC0415
+            # The URDF approximates each finger with four collision boxes while its two
+            # watertight MESH shapes describe the real surface. For water-tight runs use
+            # those meshes consistently for both rigid and soft collision: this removes
+            # overlapping box/mesh soft contacts and gives every finger contact an exact
+            # rigid triangle identity for DAT. Keep the existing hand-mesh soft-contact
+            # behavior when fixed joints are not collapsed, but only replace geometry on
+            # bodies whose label is explicitly a finger.
+            from .robots import configure_watertight_gripper_collision  # noqa: PLC0415
 
             if robot_bodies:
-                gripper_bodies = gripper_body_ids_from_labels(builder.body_label, robot_bodies)
-                for shape_index in range(len(builder.shape_type)):
-                    if (
-                        builder.shape_body[shape_index] in gripper_bodies
-                        and builder.shape_type[shape_index] == newton.GeoType.MESH
-                    ):
-                        builder.shape_flags[shape_index] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
+                configure_watertight_gripper_collision(builder, robot_bodies)
             # Opt in to volume SDFs for the rigid meshes (e.g. the gripper) that
             # will collide with the cloth; finalize() then builds them. Analytic
             # primitives use their closed-form SDF and are skipped.

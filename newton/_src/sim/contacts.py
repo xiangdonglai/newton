@@ -326,7 +326,7 @@ class Contacts:
             # [particle, edge, face], where particle is the legacy vertex-vs-surface pass.
             self.soft_contact_count = self.contact_counters[1:4]
             # The soft-contact data arrays below (soft_contact_primitive / _barycentric / _shape /
-            # _body_pos / _body_vel / _normal / _tids) are all length soft_contact_max, share one
+            # _rigid_face / _body_pos / _body_vel / _normal / _tids) are all length soft_contact_max, share one
             # index space, and pack contiguously by kind into three consecutive ranges:
             #   particle  [0, c0)                              -- legacy vertex-vs-surface pass
             #   edge      [c0, c0 + n_edge)                    -- water-tight soft-edge pass
@@ -339,6 +339,8 @@ class Contacts:
             self.soft_contact_barycentric = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Barycentric coordinates on the soft triangle for edge/face contacts [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_shape = wp.full(soft_contact_max, -1, dtype=int)
+            self.soft_contact_rigid_face = wp.full(soft_contact_max, -1, dtype=int)
+            """Source-mesh triangle for the rigid witness, or ``-1`` for analytic shapes, shape (soft_contact_max,), dtype int32."""
             self.soft_contact_body_pos = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact position on body [m], shape (soft_contact_max,), dtype :class:`vec3`.
 
@@ -423,6 +425,7 @@ class Contacts:
 
             self.soft_contact_primitive.fill_(-1)
             self.soft_contact_shape.fill_(-1)
+            self.soft_contact_rigid_face.fill_(-1)
             self.soft_contact_tids.fill_(-1)
         # else: Optimized path (default) - only counter clear needed
         #   Collision detection overwrites all active contacts [0, contact_count)

@@ -155,3 +155,26 @@ def gripper_body_ids_from_labels(body_labels: list[str], robot_bodies: list[int]
     if not ids:
         raise RuntimeError("Could not locate Franka gripper bodies")
     return ids
+
+
+def configure_watertight_gripper_collision(builder, robot_bodies: list[int]) -> None:
+    """Use the FR3 finger meshes for both rigid and soft collision in water-tight runs.
+
+    The bundled URDF gives each finger two watertight visual meshes and four analytic
+    collision boxes. The boxes and meshes overlap, and box contacts cannot name a rigid
+    triangle for DAT. Enable both collision flags on the finger meshes and disable both
+    on the boxes. When an uncollapsed hand body exists, preserve the existing behavior
+    of enabling its mesh only for soft contact.
+    """
+    gripper_bodies = gripper_body_ids_from_labels(builder.body_label, robot_bodies)
+    finger_bodies = {body_index for body_index in robot_bodies if "finger" in builder.body_label[body_index]}
+    collide_both = int(newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES)
+    for shape_index, geo_type in enumerate(builder.shape_type):
+        body_index = builder.shape_body[shape_index]
+        if body_index in gripper_bodies and geo_type == newton.GeoType.MESH:
+            builder.shape_flags[shape_index] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
+        if body_index in finger_bodies:
+            if geo_type == newton.GeoType.MESH:
+                builder.shape_flags[shape_index] |= collide_both
+            elif geo_type == newton.GeoType.BOX:
+                builder.shape_flags[shape_index] &= ~collide_both

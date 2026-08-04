@@ -698,6 +698,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
     soft_contact_count = wp.zeros(1, dtype=wp.int32, device=device)
     soft_contact_particle = wp.empty(1, dtype=wp.int32, device=device)
     soft_contact_shape = wp.empty(1, dtype=wp.int32, device=device)
+    soft_contact_rigid_face = wp.empty(1, dtype=wp.int32, device=device)
     soft_contact_body_pos = wp.empty(1, dtype=wp.vec3, device=device)
     soft_contact_body_vel = wp.empty(1, dtype=wp.vec3, device=device)
     soft_contact_normal = wp.empty(1, dtype=wp.vec3, device=device)
@@ -732,6 +733,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             soft_contact_count,
             soft_contact_particle,
             soft_contact_shape,
+            soft_contact_rigid_face,
             soft_contact_body_pos,
             soft_contact_body_vel,
             soft_contact_normal,
@@ -741,6 +743,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
     )
 
     test.assertEqual(int(soft_contact_count.numpy()[0]), 1)
+    test.assertGreaterEqual(int(soft_contact_rigid_face.numpy()[0]), 0)
     normal = np.asarray(soft_contact_normal.numpy()[0], dtype=np.float32)
     test.assertGreater(float(np.dot(normal, np.array([1.0, 0.0, 0.0], dtype=np.float32))), 0.99)
 
@@ -2417,6 +2420,7 @@ def test_soft_contact_schema(test, device):
     # New / renamed fields sized to soft_contact_max.
     test.assertEqual(contacts.soft_contact_primitive.shape[0], contacts.soft_contact_max)
     test.assertEqual(contacts.soft_contact_barycentric.shape[0], contacts.soft_contact_max)
+    test.assertEqual(contacts.soft_contact_rigid_face.shape[0], contacts.soft_contact_max)
 
     # soft_contact_particle is a deprecated alias for soft_contact_primitive.
     with test.assertWarns(DeprecationWarning):
@@ -2820,6 +2824,8 @@ def test_water_tight_catches_what_particles_miss(test, device):
     counts = contacts_on.soft_contact_count.numpy()
     test.assertEqual(int(counts[0]), 0)  # still no per-particle contact
     test.assertGreater(int(counts[1]) + int(counts[2]), 0)  # caught by edge/face
+    active = int(np.sum(counts))
+    test.assertTrue(np.all(contacts_on.soft_contact_rigid_face.numpy()[:active] == -1))
 
 
 for _name, _fn in (
@@ -2868,6 +2874,10 @@ def test_mesh_sdf_provisioned_and_emits(test, device):
     counts = contacts.soft_contact_count.numpy()
     # The mesh's volume SDF feeds the edge/face passes -> records emitted.
     test.assertGreater(int(counts[1]) + int(counts[2]), 0)
+    active = int(np.sum(counts))
+    rigid_faces = contacts.soft_contact_rigid_face.numpy()[:active]
+    test.assertTrue(np.all(rigid_faces >= 0))
+    test.assertTrue(np.all(rigid_faces < len(box_mesh.indices) // 3))
 
 
 def test_optimize_against_mesh_texture_sdf(test, device):

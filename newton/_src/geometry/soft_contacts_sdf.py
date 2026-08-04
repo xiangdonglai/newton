@@ -220,6 +220,24 @@ def _shape_frames(
 
 
 @wp.func
+def _rigid_mesh_face(
+    geo: wp.int32,
+    scale: wp.vec3,
+    x: wp.vec3,
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_index: wp.int32,
+) -> wp.int32:
+    """Return the source-mesh face nearest an SDF witness, or ``-1`` for analytic shapes."""
+    face = int(-1)
+    if geo == GeoType.MESH or geo == GeoType.CONVEX_MESH:
+        mesh = shape_source_ptr[shape_index]
+        query = wp.mesh_query_point_no_sign(mesh, wp.cw_div(x, scale), 1.0e6)
+        if query.result:
+            face = query.face
+    return face
+
+
+@wp.func
 def _emit_soft_ef_contact(
     base: wp.int32,
     slot: wp.int32,
@@ -228,12 +246,14 @@ def _emit_soft_ef_contact(
     soft_contact_primitive: wp.array[wp.int32],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_shape: wp.array[wp.int32],
+    soft_contact_rigid_face: wp.array[wp.int32],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
     prim_id: wp.int32,
     bary: wp.vec3,
     shape_index: wp.int32,
+    rigid_face: wp.int32,
     body_pos: wp.vec3,
     body_vel: wp.vec3,
     normal: wp.vec3,
@@ -251,6 +271,7 @@ def _emit_soft_ef_contact(
         soft_contact_primitive[idx] = prim_id
         soft_contact_barycentric[idx] = bary
         soft_contact_shape[idx] = shape_index
+        soft_contact_rigid_face[idx] = rigid_face
         soft_contact_body_pos[idx] = body_pos
         soft_contact_body_vel[idx] = body_vel
         soft_contact_normal[idx] = normal
@@ -267,6 +288,7 @@ def create_soft_face_contacts(
     shape_flags: wp.array[wp.int32],
     shape_transform: wp.array[wp.transform],
     shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
     body_q: wp.array[wp.transform],
     shape_sdf_index: wp.array[wp.int32],
     texture_sdf_table: wp.array[TextureSDFData],
@@ -278,6 +300,7 @@ def create_soft_face_contacts(
     soft_contact_primitive: wp.array[wp.int32],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_shape: wp.array[wp.int32],
+    soft_contact_rigid_face: wp.array[wp.int32],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
@@ -324,6 +347,7 @@ def create_soft_face_contacts(
     )
     if phi < threshold:
         y = x - phi * grad
+        rigid_face = _rigid_mesh_face(geo, scale, y, shape_source_ptr, shape_index)
         base = soft_contact_count[0] + soft_contact_count[1]  # particle + edge counts (both final)
         _emit_soft_ef_contact(
             base,
@@ -333,12 +357,14 @@ def create_soft_face_contacts(
             soft_contact_primitive,
             soft_contact_barycentric,
             soft_contact_shape,
+            soft_contact_rigid_face,
             soft_contact_body_pos,
             soft_contact_body_vel,
             soft_contact_normal,
             t,
             bary,
             shape_index,
+            rigid_face,
             wp.transform_point(X_bs, y),
             wp.vec3(0.0, 0.0, 0.0),
             wp.transform_vector(X_ws, grad),
@@ -358,6 +384,7 @@ def create_soft_edge_contacts(
     shape_flags: wp.array[wp.int32],
     shape_transform: wp.array[wp.transform],
     shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
     body_q: wp.array[wp.transform],
     shape_sdf_index: wp.array[wp.int32],
     texture_sdf_table: wp.array[TextureSDFData],
@@ -368,6 +395,7 @@ def create_soft_edge_contacts(
     soft_contact_primitive: wp.array[wp.int32],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_shape: wp.array[wp.int32],
+    soft_contact_rigid_face: wp.array[wp.int32],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
@@ -424,6 +452,7 @@ def create_soft_edge_contacts(
     u, x, phi, grad = optimize_edge_sdf(geo, scale, p_s, q_s, sdf_idx, texture_sdf_table, sdf_edge_iters)
     if phi < threshold:
         y = x - phi * grad
+        rigid_face = _rigid_mesh_face(geo, scale, y, shape_source_ptr, shape_index)
         if k == 0:
             bary = wp.vec3(1.0 - u, u, 0.0)
         elif k == 1:
@@ -439,12 +468,14 @@ def create_soft_edge_contacts(
             soft_contact_primitive,
             soft_contact_barycentric,
             soft_contact_shape,
+            soft_contact_rigid_face,
             soft_contact_body_pos,
             soft_contact_body_vel,
             soft_contact_normal,
             t0,
             bary,
             shape_index,
+            rigid_face,
             wp.transform_point(X_bs, y),
             wp.vec3(0.0, 0.0, 0.0),
             wp.transform_vector(X_ws, grad),
@@ -476,6 +507,7 @@ def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, ed
         model.shape_flags,
         model.shape_transform,
         model.shape_scale,
+        model.shape_source_ptr,
         state.body_q,
         model._shape_sdf_index,
         model._texture_sdf_data,
@@ -485,6 +517,7 @@ def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, ed
         contacts.soft_contact_primitive,
         contacts.soft_contact_barycentric,
         contacts.soft_contact_shape,
+        contacts.soft_contact_rigid_face,
         contacts.soft_contact_body_pos,
         contacts.soft_contact_body_vel,
         contacts.soft_contact_normal,

@@ -24,8 +24,10 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_volumetric_neo_hookean_force_and_hessian,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
+    DAT_THREADS_PER_CONTACT,
     RigidContactHistory,
     _compute_body_particle_contact_force,
+    apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     compute_rigid_contact_forces,
@@ -2786,18 +2788,75 @@ def test_rigid_dat_trajectory_truncation(test, device):
     test.assertEqual(t, 1.0)
 
 
+def test_rigid_dat_uses_associated_mesh_face_outside_locality(test, device):
+    """A mesh contact constrains its source face even when every corner is outside the proxy locality radius."""
+    mesh = wp.Mesh(
+        points=wp.array(
+            [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=wp.vec3,
+            device=device,
+        ),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    truncation_ts = wp.ones(1, dtype=float, device=device)
+    body_truncation_ts = wp.ones(1, dtype=float, device=device)
+
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=DAT_THREADS_PER_CONTACT,
+        inputs=[
+            wp.array([1, 0, 0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.empty((0, 3), dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([int(newton.GeoType.MESH)], dtype=wp.int32, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([mesh.id], dtype=wp.uint64, device=device),
+            wp.array([[0.0, 0.0, 0.01]], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array(
+                [wp.transform(wp.vec3(0.0, 0.0, 0.02), wp.quat_identity())],
+                dtype=wp.transform,
+                device=device,
+            ),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array([[10.0, 10.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=float, device=device),
+            1.0e-5,
+            0.85,
+            0.01,
+            0,
+            0,
+        ],
+        outputs=[truncation_ts, body_truncation_ts],
+        device=device,
+    )
+
+    body_t = float(body_truncation_ts.numpy()[0])
+    test.assertGreater(body_t, 0.39)
+    test.assertLess(body_t, 0.42)
+
+
 def test_rigid_dat_relaxations_are_opt_in(test, device):
     """Strict DAT is the default; each anti-freeze relaxation requires an explicit flag."""
-    common = dict(
-        device=device,
-        n=(1.0, 0.0, 0.0),
-        d=(0.0, 0.0, 0.0),
-        c0=(0.0, 0.0, 0.0),
-        axis=(0.0, 0.0, 1.0),
-        angle=0.0,
-        offset0=(0.0, 0.0, 0.0),
-        gamma_r=0.85,
-    )
+    common = {
+        "device": device,
+        "n": (1.0, 0.0, 0.0),
+        "d": (0.0, 0.0, 0.0),
+        "c0": (0.0, 0.0, 0.0),
+        "axis": (0.0, 0.0, 1.0),
+        "angle": 0.0,
+        "offset0": (0.0, 0.0, 0.0),
+        "gamma_r": 0.85,
+    }
 
     # A pinched point approaching by less than 1 mm freezes by default.
     t_strict = _probe_trajectory_truncation(dx=(5.0e-4, 0.0, 0.0), **common)
@@ -3716,6 +3775,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_uses_associated_mesh_face_outside_locality",
+    test_rigid_dat_uses_associated_mesh_face_outside_locality,
     devices=devices,
 )
 add_function_test(

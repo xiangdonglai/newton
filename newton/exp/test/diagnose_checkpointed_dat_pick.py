@@ -9,6 +9,7 @@ runner control flow are unchanged.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import numpy as np
@@ -16,7 +17,7 @@ import numpy as np
 from newton.exp import runner
 
 TARGET_SHAPE_LABEL = "fr3_link7/shape_41"
-RAW_GAP_TOLERANCE = -1.0e-7
+RAW_GAP_TOLERANCE = float(os.environ.get("NEWTON_DAT_DIAGNOSTIC_GAP_TOLERANCE", "-1.0e-7"))
 # The first frame-level breach is frame 99. The scene executes 20 solver steps
 # per displayed frame, so skip host synchronization until shortly beforehand.
 TRACE_FIRST_SOLVER_STEP = 1900
@@ -52,6 +53,7 @@ def _snapshot_rows(model, contacts, particle_q: np.ndarray, body_q: np.ndarray) 
     primitive = contacts.soft_contact_primitive.numpy()[:total]
     barycentric = contacts.soft_contact_barycentric.numpy()[:total]
     shapes = contacts.soft_contact_shape.numpy()[:total]
+    rigid_faces = contacts.soft_contact_rigid_face.numpy()[:total]
     body_pos = contacts.soft_contact_body_pos.numpy()[:total]
     normals = contacts.soft_contact_normal.numpy()[:total]
     shape_body = model.shape_body.numpy()
@@ -85,6 +87,7 @@ def _snapshot_rows(model, contacts, particle_q: np.ndarray, body_q: np.ndarray) 
                 "weights": weights,
                 "shape": shape_index,
                 "shape_name": _shape_name(model, shape_index),
+                "rigid_face": int(rigid_faces[index]),
                 "body": body_index,
                 "body_pos_local": np.asarray(body_pos[index], dtype=np.float64),
                 "normal": normal,
@@ -105,6 +108,7 @@ def _row_summary(row: dict) -> dict:
         "weights": row["weights"].tolist(),
         "shape": row["shape"],
         "shape_name": row["shape_name"],
+        "rigid_face": row["rigid_face"],
         "body": row["body"],
         "normal": row["normal"].tolist(),
         "soft_point": row["soft_point"].tolist(),

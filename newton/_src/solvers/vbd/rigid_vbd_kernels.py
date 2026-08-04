@@ -20,6 +20,7 @@ Organization:
 import warp as wp
 
 from newton._src.core.types import MAXVAL
+from newton._src.geometry import GeoType
 from newton._src.math import quat_velocity
 from newton._src.sim import JointType
 from newton._src.sim.contacts import contact_surface_point, contact_surface_separation
@@ -4874,11 +4875,16 @@ def apply_rigid_soft_truncation(
     soft_contact_count: wp.array[wp.int32],
     soft_contact_primitive: wp.array[wp.int32],
     soft_contact_shape: wp.array[wp.int32],
+    soft_contact_rigid_face: wp.array[wp.int32],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
     soft_contact_barycentric: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
     shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_transform: wp.array[wp.transform],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
     pos_prev_collision_detection: wp.array[wp.vec3],
     particle_displacements: wp.array[wp.vec3],
     body_q_ref: wp.array[wp.transform],
@@ -4898,9 +4904,9 @@ def apply_rigid_soft_truncation(
 ):
     """Joint DAT truncation for one rigid-soft contact: build the division plane from the
     reference configuration and atomically min-reduce the truncation scalars of the soft
-    vertices (straight rays) and of the rigid body (curved trajectories of ALL of its DAT
-    vertices — paper: t_b = min over the body's vertices and planes — with per-vertex
-    motion-bound culling before the bisection).
+    vertices (straight rays) and of the rigid body. Mesh contacts use the three vertices
+    of the source triangle identified by collision detection; analytic contacts retain
+    the body's conservative support-proxy sweep.
 
     Both sides of each contact are constrained against the same plane within a single
     launch, which is what preserves the separating property of the plane. Launched with
@@ -5019,7 +5025,33 @@ def apply_rigid_soft_truncation(
         soft_shift = wp.dot(n, dx_soft)
         vertex_start = dat_body_vertex_start[body_index]
         vertex_end = dat_body_vertex_start[body_index + 1]
-        if vertex_end > vertex_start:
+        rigid_face = soft_contact_rigid_face[contact_index]
+        geo = shape_type[shape_index]
+        if rigid_face >= 0 and (geo == GeoType.MESH or geo == GeoType.CONVEX_MESH):
+            t_b = 1.0
+            if lane < 3:
+                mesh = shape_source_ptr[shape_index]
+                # mesh_get_point() takes a flattened face-vertex slot and applies
+                # the mesh index buffer internally.
+                v_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_face * 3 + lane), shape_scale[shape_index])
+                v_body = wp.transform_point(shape_transform[shape_index], v_shape)
+                v_ref = wp.transform_point(X_wb_ref, v_body)
+                t_b = rigid_trajectory_truncation_t(
+                    n,
+                    d,
+                    c0,
+                    dx_body,
+                    rot_axis,
+                    rot_angle,
+                    v_ref - c0,
+                    gamma,
+                    1e-3,
+                    soft_shift,
+                    gap,
+                    enable_pinch_exemption,
+                    enable_bounded_advance,
+                )
+        elif vertex_end > vertex_start:
             t_b = rigid_body_vertices_truncation_min(
                 n,
                 d,

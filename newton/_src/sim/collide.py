@@ -1481,6 +1481,7 @@ class CollisionPipeline:
                     contacts.soft_contact_count,
                     contacts.soft_contact_primitive,
                     contacts.soft_contact_shape,
+                    contacts.soft_contact_rigid_face,
                     contacts.soft_contact_body_pos,
                     contacts.soft_contact_body_vel,
                     contacts.soft_contact_normal,
