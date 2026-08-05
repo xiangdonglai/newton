@@ -4990,9 +4990,13 @@ def apply_rigid_soft_truncation(
     d = bx0 + (lmbd * gap) * n
 
     # Soft side (lane 0): straight-ray truncation per involved vertex. Vertices within the
-    # pinch band that keep approaching are frozen; vertices clearly on the rigid side of
-    # the plane are not part of the local contact geometry (e.g. a triangle draped past
-    # the shape) and are skipped.
+    # pinch band that keep approaching are frozen. Preserve the legacy edge/face
+    # behavior: an individual vertex clearly on the rigid side is skipped because the
+    # SDF-derived plane represents a barycentric contact point and is not guaranteed to
+    # separate the complete soft triangle after the reference invariant has been lost.
+    # This is a recovery heuristic, not the primitive-separation construction assumed by
+    # Planar-DAT. A particle row has exact soft feature identity, so an already-penetrating
+    # particle is still prevented from advancing deeper while ALM drives it back out.
     if lane == 0:
         for i in range(3):
             vi = int(-1)
@@ -5011,11 +5015,12 @@ def apply_rigid_soft_truncation(
                         wp.atomic_min(truncation_ts, vi, t_v)
                 elif (
                     enable_pinch_exemption == 0
-                    and s_v > -DAT_PINCH_BAND
+                    and (contact_index < count_particle or s_v > -DAT_PINCH_BAND)
                     and wp.dot(n, particle_displacements[vi]) < 0.0
                 ):
-                    # Strict DAT behavior: a soft vertex already on the plane
-                    # cannot move farther toward the rigid side.
+                    # Strict DAT behavior: a local soft feature already on the
+                    # plane (or an exact particle feature behind it) cannot move
+                    # farther toward the rigid side.
                     wp.atomic_min(truncation_ts, vi, 0.0)
 
     # Rigid side: curved-trajectory truncation over the body's DAT vertices (all lanes).
