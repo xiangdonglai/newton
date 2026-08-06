@@ -2788,16 +2788,8 @@ def test_rigid_dat_trajectory_truncation(test, device):
     test.assertEqual(t, 1.0)
 
 
-def test_rigid_dat_uses_associated_mesh_face_outside_locality(test, device):
-    """A mesh contact constrains its source face even when every corner is outside the proxy locality radius."""
-    mesh = wp.Mesh(
-        points=wp.array(
-            [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
-            dtype=wp.vec3,
-            device=device,
-        ),
-        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
-    )
+def test_rigid_soft_dat_uses_stored_sdf_point(test, device):
+    """A rigid-soft SDF row truncates the stored body-local surface point."""
     truncation_ts = wp.ones(1, dtype=float, device=device)
     body_truncation_ts = wp.ones(1, dtype=float, device=device)
 
@@ -2808,16 +2800,11 @@ def test_rigid_dat_uses_associated_mesh_face_outside_locality(test, device):
             wp.array([1, 0, 0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
             wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
             wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
             wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
             wp.empty((0, 3), dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
-            wp.array([int(newton.GeoType.MESH)], dtype=wp.int32, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-            wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
-            wp.array([mesh.id], dtype=wp.uint64, device=device),
             wp.array([[0.0, 0.0, 0.01]], dtype=wp.vec3, device=device),
             wp.zeros(1, dtype=wp.vec3, device=device),
             wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
@@ -2827,12 +2814,8 @@ def test_rigid_dat_uses_associated_mesh_face_outside_locality(test, device):
                 device=device,
             ),
             wp.zeros(1, dtype=wp.vec3, device=device),
-            wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([[10.0, 10.0, 0.0]], dtype=wp.vec3, device=device),
-            wp.zeros(1, dtype=float, device=device),
             1.0e-5,
             0.85,
-            0.01,
             0,
             0,
         ],
@@ -3779,8 +3762,8 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_rigid_dat_uses_associated_mesh_face_outside_locality",
-    test_rigid_dat_uses_associated_mesh_face_outside_locality,
+    "test_rigid_soft_dat_uses_stored_sdf_point",
+    test_rigid_soft_dat_uses_stored_sdf_point,
     devices=devices,
 )
 add_function_test(

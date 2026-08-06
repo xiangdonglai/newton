@@ -7,17 +7,15 @@ Run from the repository root with::
 
     python -m unittest -v newton.exp.test.test_apply_rigid_soft_truncation
 
-The first test uses small analytic primitive fixtures and is also the data source
-for ``visualize_rigid_soft_truncation.py``. The other tests build the real shirt
-cloth and bundled FR3 arm, then apply controlled translation and rotation proposals
-to actual finger-mesh triangles. These are kernel tests: contact rows and proposed
-displacements are constructed explicitly so each expected crossing time is
-unambiguous.
+The analytic fixtures are also data sources for
+``visualize_rigid_soft_truncation.py``. Other tests exercise particle, edge, and
+face rows, the default FR3 collision flags, and controlled rigid witness motion.
+Contact rows and proposed displacements are constructed explicitly so each expected
+result is unambiguous.
 """
 
 from __future__ import annotations
 
-import itertools
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -27,11 +25,9 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.rigid_vbd_kernels import DAT_THREADS_PER_CONTACT, apply_rigid_soft_truncation
-from newton.exp.robots import configure_watertight_gripper_collision
 from newton.exp.scenes.shirt_pick import GRASP_Z, ShirtPickScene
 
 GAMMA = 0.85
-QUERY_MARGIN = 0.01
 PARALLEL_EPS = 1.0e-5
 
 
@@ -72,6 +68,17 @@ PRIMITIVE_CASES = (
         body_displacement=(0.0, 0.0, 0.10),
     ),
     PrimitiveTruncationCase(
+        name="box_into_particle",
+        description="A box translates its stored top-face SDF point through a stationary particle.",
+        shape_type=int(newton.GeoType.BOX),
+        shape_scale=(0.20, 0.20, 0.05),
+        contact_anchor_body=(0.0, 0.0, 0.05),
+        normal=(0.0, 0.0, 1.0),
+        particle_reference=(0.0, 0.0, 0.10),
+        particle_displacement=(0.0, 0.0, 0.0),
+        body_displacement=(0.0, 0.0, 0.10),
+    ),
+    PrimitiveTruncationCase(
         name="particle_away_from_box",
         description="A particle moves away from a stationary box; DAT stays inactive.",
         shape_type=int(newton.GeoType.BOX),
@@ -83,19 +90,6 @@ PRIMITIVE_CASES = (
         body_displacement=(0.0, 0.0, 0.0),
     ),
 )
-
-
-def _primitive_dat_vertices(case: PrimitiveTruncationCase) -> tuple[np.ndarray, np.ndarray]:
-    scale = np.asarray(case.shape_scale, dtype=np.float32)
-    if case.shape_type == int(newton.GeoType.BOX):
-        vertices = np.asarray(
-            [[sx * scale[0], sy * scale[1], sz * scale[2]] for sx, sy, sz in itertools.product((-1, 1), repeat=3)],
-            dtype=np.float32,
-        )
-        return vertices, np.zeros(8, dtype=np.float32)
-    if case.shape_type == int(newton.GeoType.SPHERE):
-        return np.zeros((1, 3), dtype=np.float32), np.asarray([scale[0]], dtype=np.float32)
-    raise ValueError(f"Unsupported primitive fixture type {case.shape_type}")
 
 
 def _plane_for_primitive_case(case: PrimitiveTruncationCase) -> tuple[np.ndarray, float]:
@@ -116,7 +110,6 @@ def _plane_for_primitive_case(case: PrimitiveTruncationCase) -> tuple[np.ndarray
 
 def run_primitive_truncation_case(case: PrimitiveTruncationCase, device: str = "cpu") -> dict[str, object]:
     """Launch ``apply_rigid_soft_truncation`` for one primitive fixture."""
-    dat_vertices, dat_radii = _primitive_dat_vertices(case)
     particle_reference = np.asarray([case.particle_reference], dtype=np.float32)
     particle_displacement = np.asarray([case.particle_displacement], dtype=np.float32)
     body_displacement = np.asarray(case.body_displacement, dtype=np.float32)
@@ -133,27 +126,18 @@ def run_primitive_truncation_case(case: PrimitiveTruncationCase, device: str = "
             wp.array([1, 0, 0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
-            wp.array([-1], dtype=wp.int32, device=device),
             wp.array([case.contact_anchor_body], dtype=wp.vec3, device=device),
             wp.array([case.normal], dtype=wp.vec3, device=device),
             wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
             wp.empty((0, 3), dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
-            wp.array([case.shape_type], dtype=wp.int32, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-            wp.array([case.shape_scale], dtype=wp.vec3, device=device),
-            wp.zeros(1, dtype=wp.uint64, device=device),
             wp.array(particle_reference, dtype=wp.vec3, device=device),
             wp.array(particle_displacement, dtype=wp.vec3, device=device),
             wp.array(body_ref, dtype=wp.transform, device=device),
             wp.array(body_proposal, dtype=wp.transform, device=device),
             wp.zeros(1, dtype=wp.vec3, device=device),
-            wp.array([0, len(dat_vertices)], dtype=wp.int32, device=device),
-            wp.array(dat_vertices, dtype=wp.vec3, device=device),
-            wp.array(dat_radii, dtype=float, device=device),
             PARALLEL_EPS,
             GAMMA,
-            QUERY_MARGIN,
             0,
             0,
         ],
@@ -180,6 +164,103 @@ def run_primitive_truncation_case(case: PrimitiveTruncationCase, device: str = "
         "body_reference": body_ref[0, :3].astype(np.float64),
         "body_proposal": body_proposal[0, :3].astype(np.float64),
         "body_truncated": (body_ref[0, :3] + body_fraction * body_displacement).astype(np.float64),
+    }
+
+
+def _run_soft_feature_active_boundary_case(feature: str, device: str) -> dict[str, object]:
+    """Exercise the per-vertex active boundary using one constructed SDF row."""
+    if feature == "particle":
+        counts = [1, 0, 0]
+        positions = [[0.0, 0.0, -0.01]]
+        displacements = [[0.0, 0.0, -0.01]]
+        barycentric = [1.0, 0.0, 0.0]
+        triangles = np.empty((0, 3), dtype=np.int32)
+    elif feature == "edge":
+        counts = [0, 1, 0]
+        positions = [[-0.1, 0.0, -0.01], [0.1, 0.0, 0.03], [0.0, 0.1, -0.02]]
+        displacements = [[0.0, 0.0, -0.01], [0.0, 0.0, 0.0], [0.0, 0.0, -0.01]]
+        barycentric = [0.5, 0.5, 0.0]
+        triangles = np.asarray([[0, 1, 2]], dtype=np.int32)
+    elif feature == "face":
+        counts = [0, 0, 1]
+        positions = [[-0.1, 0.0, -0.01], [0.1, 0.0, 0.02], [0.0, 0.1, 0.02]]
+        displacements = [[0.0, 0.0, -0.01], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        barycentric = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
+        triangles = np.asarray([[0, 1, 2]], dtype=np.int32)
+    else:
+        raise ValueError(f"Unknown soft feature {feature!r}")
+
+    particle_t = wp.ones(len(positions), dtype=float, device=device)
+    body_t = wp.ones(1, dtype=float, device=device)
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=DAT_THREADS_PER_CONTACT,
+        inputs=[
+            wp.array(counts, dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([barycentric], dtype=wp.vec3, device=device),
+            wp.array(triangles, dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array(positions, dtype=wp.vec3, device=device),
+            wp.array(displacements, dtype=wp.vec3, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            PARALLEL_EPS,
+            GAMMA,
+            0,
+            0,
+        ],
+        outputs=[particle_t, body_t],
+        device=device,
+    )
+    return {
+        "particle_t": particle_t.numpy(),
+        "body_t": body_t.numpy(),
+    }
+
+
+def _run_rotating_box_witness_limitation(device: str) -> dict[str, float]:
+    """Show that a box corner may cross while the stored SDF point retreats."""
+    half_angle = 0.25 * np.pi
+    proposal = wp.transform(wp.vec3(0.0), wp.quat(0.0, np.sin(half_angle), 0.0, np.cos(half_angle)))
+    particle_t = wp.ones(1, dtype=float, device=device)
+    body_t = wp.ones(1, dtype=float, device=device)
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=DAT_THREADS_PER_CONTACT,
+        inputs=[
+            wp.array([1, 0, 0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.05]], dtype=wp.vec3, device=device),
+            wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.empty((0, 3), dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.10]], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([proposal], dtype=wp.transform, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            PARALLEL_EPS,
+            GAMMA,
+            0,
+            0,
+        ],
+        outputs=[particle_t, body_t],
+        device=device,
+    )
+    # At zero relative approach the plane is halfway through the 50 mm gap.
+    plane_z = 0.075
+    corner = np.asarray([-0.2, -0.2, 0.05], dtype=np.float64)
+    rotated_corner_z = -corner[0]
+    return {
+        "body_t": float(body_t.numpy()[0]),
+        "corner_plane_distance": float(rotated_corner_z - plane_z),
     }
 
 
@@ -275,7 +356,11 @@ def _launch_fr3_face_case(device: str, *, approach: bool, motion_type: str = "tr
     scene = ShirtPickScene(SimpleNamespace(grasp_z=GRASP_Z, solver="avbd"))
     builder = newton.ModelBuilder(gravity=-9.81)
     robot_bodies, _robot_joints, _robot_shapes = scene.build_robot(builder, collapse_fixed_joints=True)
-    configure_watertight_gripper_collision(builder, robot_bodies)
+    # This fixture deliberately selects a visual finger mesh to document the local
+    # witness behavior. Production examples retain the URDF's analytic finger boxes.
+    for shape_index, geo_type in enumerate(builder.shape_type):
+        if builder.shape_body[shape_index] in robot_bodies and geo_type == newton.GeoType.MESH:
+            builder.shape_flags[shape_index] |= int(newton.ShapeFlags.COLLIDE_PARTICLES)
     scene.add_deformables(builder)
     model = builder.finalize(device=device)
     newton.eval_fk(model, model.joint_q, model.joint_qd, model)
@@ -412,27 +497,18 @@ def _launch_fr3_face_case(device: str, *, approach: bool, motion_type: str = "tr
             wp.array([1, 0, 0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([shape_index], dtype=wp.int32, device=device),
-            wp.array([rigid_face], dtype=wp.int32, device=device),
             wp.array([anchor_body], dtype=wp.vec3, device=device),
             wp.array([normal_world], dtype=wp.vec3, device=device),
             wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
             model.tri_indices,
             model.shape_body,
-            model.shape_type,
-            model.shape_transform,
-            model.shape_scale,
-            model.shape_source_ptr,
             wp.array(particle_reference, dtype=wp.vec3, device=device),
             wp.array(particle_displacement, dtype=wp.vec3, device=device),
             wp.array(body_ref_np, dtype=wp.transform, device=device),
             wp.array(body_proposal_np, dtype=wp.transform, device=device),
             model.body_com,
-            wp.zeros(model.body_count + 1, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.vec3, device=device),
-            wp.empty(0, dtype=float, device=device),
             PARALLEL_EPS,
             GAMMA,
-            QUERY_MARGIN,
             0,
             0,
         ],
@@ -448,6 +524,9 @@ def _launch_fr3_face_case(device: str, *, approach: bool, motion_type: str = "tr
         truncated_shape_vertices = shape_vertices_world + body_fraction * translation
         truncated_triangle_world = triangle_world + body_fraction * translation
         minimum_crossing = float(np.min(-s_reference / (s_proposal - s_reference)) if approach else 1.0)
+        witness_crossing = float(
+            np.dot(normal_world, plane_world - anchor_world) / np.dot(normal_world, translation) if approach else 1.0
+        )
     else:
         body_proposal = np.mean(proposal_triangle_world, axis=0)
         truncated_shape_vertices = _rotate_about_axis(
@@ -459,6 +538,14 @@ def _launch_fr3_face_case(device: str, *, approach: bool, motion_type: str = "tr
         body_truncated = np.mean(truncated_triangle_world, axis=0)
         minimum_crossing = _first_rotation_crossing(
             triangle_world,
+            center_of_mass_world,
+            rotation_axis,
+            signed_motion,
+            normal_world,
+            plane_world,
+        )
+        witness_crossing = _first_rotation_crossing(
+            anchor_world[None, :],
             center_of_mass_world,
             rotation_axis,
             signed_motion,
@@ -504,12 +591,30 @@ def _launch_fr3_face_case(device: str, *, approach: bool, motion_type: str = "tr
         "selected_triangle_proposal": proposal_triangle_world,
         "selected_triangle_truncated": truncated_triangle_world,
         "minimum_crossing": minimum_crossing,
+        "witness_crossing": witness_crossing,
         "proposal_max_plane_distance": float(np.max(s_proposal)),
         "truncated_max_plane_distance": float(np.max((truncated_triangle_world - plane_world) @ normal_world)),
     }
 
 
 class TestApplyRigidSoftTruncation(unittest.TestCase):
+    def test_fr3_fingers_keep_default_box_collision_geometry(self):
+        scene = ShirtPickScene(SimpleNamespace(grasp_z=GRASP_Z, solver="avbd"))
+        builder = newton.ModelBuilder(gravity=-9.81)
+        robot_bodies, _robot_joints, _robot_shapes = scene.build_robot(builder, collapse_fixed_joints=True)
+        collide_both = int(newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES)
+        finger_shapes = [
+            shape
+            for shape, body in enumerate(builder.shape_body)
+            if body in robot_bodies and "finger" in builder.body_label[body]
+        ]
+        boxes = [shape for shape in finger_shapes if builder.shape_type[shape] == newton.GeoType.BOX]
+        meshes = [shape for shape in finger_shapes if builder.shape_type[shape] == newton.GeoType.MESH]
+        self.assertEqual(len(boxes), 8)
+        self.assertEqual(len(meshes), 4)
+        self.assertTrue(all(builder.shape_flags[shape] & collide_both == collide_both for shape in boxes))
+        self.assertTrue(all(builder.shape_flags[shape] & collide_both == 0 for shape in meshes))
+
     def test_analytic_primitive_examples(self):
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
         for device in devices:
@@ -520,11 +625,32 @@ class TestApplyRigidSoftTruncation(unittest.TestCase):
             with self.subTest(device=device, case="sphere_into_particle"):
                 self.assertEqual(results["sphere_into_particle"]["particle_t"], 1.0)
                 self.assertAlmostEqual(results["sphere_into_particle"]["body_t"], 0.40375, delta=2.0e-3)
+            with self.subTest(device=device, case="box_into_particle"):
+                self.assertEqual(results["box_into_particle"]["particle_t"], 1.0)
+                self.assertAlmostEqual(results["box_into_particle"]["body_t"], 0.40375, delta=2.0e-3)
             with self.subTest(device=device, case="particle_away_from_box"):
                 self.assertEqual(results["particle_away_from_box"]["particle_t"], 1.0)
                 self.assertEqual(results["particle_away_from_box"]["body_t"], 1.0)
 
-    def test_shirt_particle_against_fr3_finger_mesh_face(self):
+    def test_particle_edge_and_face_rows_share_active_boundary_rule(self):
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            for feature in ("particle", "edge", "face"):
+                result = _run_soft_feature_active_boundary_case(feature, device)
+                with self.subTest(device=device, feature=feature):
+                    self.assertEqual(float(result["particle_t"][0]), 0.0)
+                    if feature != "particle":
+                        np.testing.assert_array_equal(result["particle_t"][1:], 1.0)
+
+    def test_rotating_box_documents_witness_only_limitation(self):
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            result = _run_rotating_box_witness_limitation(device)
+            with self.subTest(device=device):
+                self.assertEqual(result["body_t"], 1.0)
+                self.assertGreater(result["corner_plane_distance"], 0.0)
+
+    def test_shirt_particle_against_fr3_finger_mesh_witness(self):
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
         for device in devices:
             approach = _launch_fr3_face_case(device, approach=True)
@@ -539,16 +665,15 @@ class TestApplyRigidSoftTruncation(unittest.TestCase):
                 self.assertEqual(retreat["particle_t"], 1.0)
                 self.assertEqual(retreat["body_t"], 1.0)
 
-    def test_rotating_fr3_finger_mesh_face_against_shirt_particle(self):
+    def test_rotating_fr3_finger_uses_stored_sdf_point(self):
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
         for device in devices:
             approach = _launch_fr3_face_case(device, approach=True, motion_type="rotation")
             retreat = _launch_fr3_face_case(device, approach=False, motion_type="rotation")
-            expected_crossing = approach["minimum_crossing"]
+            expected_crossing = approach["witness_crossing"]
             expected_t = min(GAMMA * expected_crossing, expected_crossing - 1.0e-3)
             with self.subTest(device=device, motion="rotational approach"):
                 self.assertGreater(approach["proposal_max_plane_distance"], 0.0)
-                self.assertLess(approach["truncated_max_plane_distance"], 0.0)
                 self.assertAlmostEqual(approach["body_t"], expected_t, delta=2.0e-3)
             with self.subTest(device=device, motion="rotational retreat"):
                 self.assertLess(retreat["proposal_max_plane_distance"], 0.0)

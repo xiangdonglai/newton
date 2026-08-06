@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end rigid-mesh collision detection and DAT truncation regressions.
+"""End-to-end rigid-mesh collision detection and SDF-DAT truncation regressions.
 
 Unlike ``test_apply_rigid_soft_truncation.py``, these fixtures do not construct
-the rigid face contact row manually.  The complete ``CollisionPipeline`` first
-detects particle--tetrahedron contacts and records ``soft_contact_rigid_face``;
-the resulting arrays are then consumed directly by ``apply_rigid_soft_truncation``.
+the contact row manually. The complete ``CollisionPipeline`` first detects
+particle--tetrahedron contacts; the resulting SDF surface point and normal are then
+consumed directly by ``apply_rigid_soft_truncation``. Face identity is checked as
+collision-pipeline metadata but is intentionally not used by the SDF truncation path.
 
 Run from the repository root with::
 
@@ -25,7 +26,6 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import DAT_THREADS_PER_CONTACT, a
 from newton.exp.test.test_apply_rigid_soft_truncation import (
     GAMMA,
     PARALLEL_EPS,
-    QUERY_MARGIN,
     _first_rotation_crossing,
     _quat_multiply,
     _rotate_about_axis,
@@ -111,6 +111,30 @@ def _build_detected_contacts(device: str, face_gaps: dict[int, float]):
     return model, state, contacts, body, shape, vertices, faces, particle_to_face
 
 
+def _build_detected_box_contact(device: str):
+    """Detect one particle against the top face of an analytic box."""
+    builder = newton.ModelBuilder(gravity=0.0)
+    body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(0.0),
+        inertia=wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        mass=1.0,
+        lock_inertia=True,
+        is_kinematic=True,
+        label="analytic_box_body",
+    )
+    shape = builder.add_shape_box(body=body, hx=0.2, hy=0.2, hz=0.05, label="analytic_box")
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.07), vel=wp.vec3(0.0), mass=1.0, radius=0.005)
+    model = builder.finalize(device=device)
+    state = model.state()
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_margin=0.05)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    if tuple(contacts.soft_contact_count.numpy()) != (1, 0, 0):
+        raise AssertionError(f"expected one analytic-box particle contact, got {contacts.soft_contact_count.numpy()}")
+    return model, state, contacts, body, shape
+
+
 def _launch_detected_contacts(
     model,
     state,
@@ -128,27 +152,18 @@ def _launch_detected_contacts(
             contacts.soft_contact_count,
             contacts.soft_contact_primitive,
             contacts.soft_contact_shape,
-            contacts.soft_contact_rigid_face,
             contacts.soft_contact_body_pos,
             contacts.soft_contact_normal,
             contacts.soft_contact_barycentric,
             model.tri_indices,
             model.shape_body,
-            model.shape_type,
-            model.shape_transform,
-            model.shape_scale,
-            model.shape_source_ptr,
             state.particle_q,
             wp.array(particle_displacements, dtype=wp.vec3, device=model.device),
             state.body_q,
             wp.array(body_proposal, dtype=wp.transform, device=model.device),
             model.body_com,
-            wp.zeros(model.body_count + 1, dtype=wp.int32, device=model.device),
-            wp.empty(0, dtype=wp.vec3, device=model.device),
-            wp.empty(0, dtype=float, device=model.device),
             PARALLEL_EPS,
             GAMMA,
-            QUERY_MARGIN,
             0,
             0,
         ],
@@ -161,6 +176,36 @@ def _launch_detected_contacts(
 
 def _standard_truncation_fraction(crossing: float) -> float:
     return max(min(GAMMA * crossing, crossing - 1.0e-3), 0.0)
+
+
+def _run_detected_box_translation(device: str) -> dict[str, float | int]:
+    model, state, contacts, body, shape = _build_detected_box_contact(device)
+    normal = contacts.soft_contact_normal.numpy()[0].astype(np.float64)
+    anchor = contacts.soft_contact_body_pos.numpy()[0].astype(np.float64)
+    particle = state.particle_q.numpy()[0].astype(np.float64)
+    translation = 0.06 * normal
+    body_proposal = state.body_q.numpy().copy()
+    body_proposal[body, :3] += translation
+    particle_t, body_t = _launch_detected_contacts(
+        model,
+        state,
+        contacts,
+        body,
+        body_proposal,
+        np.zeros((model.particle_count, 3), dtype=np.float32),
+    )
+    gap = float(np.dot(normal, particle - anchor))
+    plane = anchor + 0.95 * gap * normal
+    crossing = float(np.dot(normal, plane - anchor) / np.dot(normal, translation))
+    accepted_anchor = anchor + float(body_t[body]) * translation
+    return {
+        "shape": int(contacts.soft_contact_shape.numpy()[0]),
+        "expected_shape": shape,
+        "body_t": float(body_t[body]),
+        "particle_t": float(particle_t[0]),
+        "crossing": crossing,
+        "accepted_witness_distance": float(np.dot(accepted_anchor - plane, normal)),
+    }
 
 
 def _run_single_face_translation(device: str) -> dict[str, float | int]:
@@ -215,18 +260,22 @@ def _run_single_face_rotation(device: str) -> dict[str, float | int]:
     if rigid_shift <= 0.0:
         raise AssertionError("rotation fixture does not advance the rigid contact anchor")
     plane = anchor + 0.95 * gap * normal
-    crossing = _first_rotation_crossing(triangle, center, axis, angle, normal, plane)
+    triangle_crossing = _first_rotation_crossing(triangle, center, axis, angle, normal, plane)
+    witness_crossing = _first_rotation_crossing(anchor[None, :], center, axis, angle, normal, plane)
 
     particle_t, body_t = _launch_detected_contacts(model, state, contacts, body, body_proposal, particle_displacements)
     accepted_triangle = _rotate_about_axis(triangle, center, axis, float(body_t[body]) * angle)
+    accepted_anchor = _rotate_about_axis(anchor[None, :], center, axis, float(body_t[body]) * angle)[0]
     proposed_triangle = _rotate_about_axis(triangle, center, axis, angle)
     return {
         "face": int(contacts.soft_contact_rigid_face.numpy()[0]),
         "body_t": float(body_t[body]),
         "particle_t": float(particle_t[0]),
-        "crossing": crossing,
+        "triangle_crossing": triangle_crossing,
+        "witness_crossing": witness_crossing,
         "proposal_max_distance": float(np.max((proposed_triangle - plane) @ normal)),
         "accepted_max_distance": float(np.max((accepted_triangle - plane) @ normal)),
+        "accepted_witness_distance": float(np.dot(accepted_anchor - plane, normal)),
     }
 
 
@@ -296,6 +345,17 @@ def _run_existing_particle_penetration(device: str) -> dict[str, float | int]:
 
 
 class TestRigidSoftDatPipeline(unittest.TestCase):
+    def test_detected_analytic_box_contact_uses_stored_witness(self):
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            result = _run_detected_box_translation(device)
+            with self.subTest(device=device):
+                self.assertEqual(result["shape"], result["expected_shape"])
+                self.assertEqual(result["particle_t"], 1.0)
+                self.assertAlmostEqual(
+                    result["body_t"], _standard_truncation_fraction(result["crossing"]), delta=2.0e-3
+                )
+                self.assertLess(result["accepted_witness_distance"], 0.0)
+
     def test_detected_penetrating_particle_cannot_advance_deeper(self):
         for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
             result = _run_existing_particle_penetration(device)
@@ -304,7 +364,7 @@ class TestRigidSoftDatPipeline(unittest.TestCase):
                 self.assertEqual(result["particle_t"], 0.0)
                 self.assertEqual(result["body_t"], 1.0)
 
-    def test_detected_mesh_face_drives_translational_truncation(self):
+    def test_detected_mesh_contact_uses_witness_for_translational_truncation(self):
         for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
             result = _run_single_face_translation(device)
             with self.subTest(device=device):
@@ -315,7 +375,7 @@ class TestRigidSoftDatPipeline(unittest.TestCase):
                 )
                 self.assertLess(result["accepted_max_distance"], 0.0)
 
-    def test_detected_mesh_face_drives_rotational_truncation(self):
+    def test_detected_mesh_contact_uses_witness_for_rotational_truncation(self):
         for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
             result = _run_single_face_rotation(device)
             with self.subTest(device=device):
@@ -323,9 +383,9 @@ class TestRigidSoftDatPipeline(unittest.TestCase):
                 self.assertEqual(result["particle_t"], 1.0)
                 self.assertGreater(result["proposal_max_distance"], 0.0)
                 self.assertAlmostEqual(
-                    result["body_t"], _standard_truncation_fraction(result["crossing"]), delta=2.0e-3
+                    result["body_t"], _standard_truncation_fraction(result["witness_crossing"]), delta=2.0e-3
                 )
-                self.assertLess(result["accepted_max_distance"], 0.0)
+                self.assertLess(result["accepted_witness_distance"], 0.0)
 
     def test_multiple_detected_contacts_reduce_independently(self):
         for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):

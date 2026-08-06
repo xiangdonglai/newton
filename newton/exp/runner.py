@@ -229,17 +229,6 @@ class Experiment:
 
         builder.color()
         if self.args.water_tight:
-            # The URDF approximates each finger with four collision boxes while its two
-            # watertight MESH shapes describe the real surface. For water-tight runs use
-            # those meshes consistently for both rigid and soft collision: this removes
-            # overlapping box/mesh soft contacts and gives every finger contact an exact
-            # rigid triangle identity for DAT. Keep the existing hand-mesh soft-contact
-            # behavior when fixed joints are not collapsed, but only replace geometry on
-            # bodies whose label is explicitly a finger.
-            from .robots import configure_watertight_gripper_collision  # noqa: PLC0415
-
-            if robot_bodies:
-                configure_watertight_gripper_collision(builder, robot_bodies)
             # Opt in to volume SDFs for the rigid meshes (e.g. the gripper) that
             # will collide with the cloth; finalize() then builds them. Analytic
             # primitives use their closed-form SDF and are skipped.

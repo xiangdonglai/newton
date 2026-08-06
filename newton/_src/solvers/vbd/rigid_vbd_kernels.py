@@ -20,7 +20,6 @@ Organization:
 import warp as wp
 
 from newton._src.core.types import MAXVAL
-from newton._src.geometry import GeoType
 from newton._src.math import quat_velocity
 from newton._src.sim import JointType
 from newton._src.sim.contacts import contact_surface_point, contact_surface_separation
@@ -4875,27 +4874,18 @@ def apply_rigid_soft_truncation(
     soft_contact_count: wp.array[wp.int32],
     soft_contact_primitive: wp.array[wp.int32],
     soft_contact_shape: wp.array[wp.int32],
-    soft_contact_rigid_face: wp.array[wp.int32],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
     soft_contact_barycentric: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
     shape_body: wp.array[wp.int32],
-    shape_type: wp.array[wp.int32],
-    shape_transform: wp.array[wp.transform],
-    shape_scale: wp.array[wp.vec3],
-    shape_source_ptr: wp.array[wp.uint64],
     pos_prev_collision_detection: wp.array[wp.vec3],
     particle_displacements: wp.array[wp.vec3],
     body_q_ref: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
-    dat_body_vertex_start: wp.array[wp.int32],
-    dat_body_vertices: wp.array[wp.vec3],
-    dat_body_vertex_radius: wp.array[float],
     parallel_eps: float,
     gamma: float,
-    query_margin: float,
     enable_pinch_exemption: int,
     enable_bounded_advance: int,
     # outputs
@@ -4904,14 +4894,11 @@ def apply_rigid_soft_truncation(
 ):
     """Joint DAT truncation for one rigid-soft contact: build the division plane from the
     reference configuration and atomically min-reduce the truncation scalars of the soft
-    vertices (straight rays) and of the rigid body. Mesh contacts use the three vertices
-    of the source triangle identified by collision detection; analytic contacts retain
-    the body's conservative support-proxy sweep.
+    vertices (straight rays) and of the rigid body's stored SDF surface point.
 
     Both sides of each contact are constrained against the same plane within a single
-    launch, which is what preserves the separating property of the plane. Launched with
-    DAT_THREADS_PER_CONTACT cooperating lanes per contact; lane 0 handles the soft side
-    and plane bookkeeping, all lanes stride the body's vertex table.
+    launch. Launched with DAT_THREADS_PER_CONTACT lanes per contact; lane 0 performs the
+    work while the other lanes are reserved for a future explicit primitive-pair path.
 
     A pinched contact (reference gap ~ 0, e.g. cloth squeezed between a gripper and the
     ground) keeps its plane at the contact anchor: approach is blocked (stall), separation
@@ -4920,6 +4907,13 @@ def apply_rigid_soft_truncation(
     tid = wp.tid()
     contact_index = tid // DAT_THREADS_PER_CONTACT
     lane = tid % DAT_THREADS_PER_CONTACT
+
+    # The current SDF path constrains one stored rigid surface point and therefore
+    # needs only lane 0. Preserve the cooperative launch layout so the forthcoming
+    # explicit primitive-pair path can use the remaining lanes without changing the
+    # solver's launch contract.
+    if lane > 0:
+        return
 
     count_particle = soft_contact_count[0]
     count_total = count_particle + soft_contact_count[1] + soft_contact_count[2]
@@ -4989,14 +4983,9 @@ def apply_rigid_soft_truncation(
         lmbd = wp.clamp(delta_rigid / (delta_rigid + delta_soft), 0.05, 0.95)
     d = bx0 + (lmbd * gap) * n
 
-    # Soft side (lane 0): straight-ray truncation per involved vertex. Vertices within the
-    # pinch band that keep approaching are frozen. Preserve the legacy edge/face
-    # behavior: an individual vertex clearly on the rigid side is skipped because the
-    # SDF-derived plane represents a barycentric contact point and is not guaranteed to
-    # separate the complete soft triangle after the reference invariant has been lost.
-    # This is a recovery heuristic, not the primitive-separation construction assumed by
-    # Planar-DAT. A particle row has exact soft feature identity, so an already-penetrating
-    # particle is still prevented from advancing deeper while ALM drives it back out.
+    # Soft side (lane 0): apply the same active-boundary rule to every involved vertex.
+    # A far-negative edge/face vertex indicates that this local SDF plane does not
+    # separate the complete primitive. We nevertheless stop deeper motion conservatively.
     if lane == 0:
         for i in range(3):
             vi = int(-1)
@@ -5013,90 +5002,33 @@ def apply_rigid_soft_truncation(
                     t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, parallel_eps, gamma)
                     if t_v < 1.0:
                         wp.atomic_min(truncation_ts, vi, t_v)
-                elif (
-                    enable_pinch_exemption == 0
-                    and (contact_index < count_particle or s_v > -DAT_PINCH_BAND)
-                    and wp.dot(n, particle_displacements[vi]) < 0.0
-                ):
-                    # Strict DAT behavior: a local soft feature already on the
-                    # plane (or an exact particle feature behind it) cannot move
-                    # farther toward the rigid side.
-                    wp.atomic_min(truncation_ts, vi, 0.0)
+                else:
+                    if enable_pinch_exemption == 0 and wp.dot(n, particle_displacements[vi]) < 0.0:
+                        # Strict DAT behavior: any represented soft vertex already on
+                        # or behind the shared plane cannot move farther inward.
+                        wp.atomic_min(truncation_ts, vi, 0.0)
 
-    # Rigid side: curved-trajectory truncation over the body's DAT vertices (all lanes).
-    # The soft point's realized displacement along n opens co-moving allowance for
-    # pinched contacts (grasp transport); see rigid_trajectory_truncation_t.
-    if body_is_moving:
+    # Rigid SDF side: constrain exactly the stored body-local surface point that generated
+    # this row. The SDF query provides no rigid primitive whose other vertices could be
+    # swept consistently. This is a local safeguard; under rotation another unsupported
+    # point on an analytic shape may cross first and must be found by checkpointed queries.
+    if body_is_moving and lane == 0:
         soft_shift = wp.dot(n, dx_soft)
-        vertex_start = dat_body_vertex_start[body_index]
-        vertex_end = dat_body_vertex_start[body_index + 1]
-        rigid_face = soft_contact_rigid_face[contact_index]
-        geo = shape_type[shape_index]
-        if rigid_face >= 0 and (geo == GeoType.MESH or geo == GeoType.CONVEX_MESH):
-            t_b = 1.0
-            if lane < 3:
-                mesh = shape_source_ptr[shape_index]
-                # mesh_get_point() takes a flattened face-vertex slot and applies
-                # the mesh index buffer internally.
-                v_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_face * 3 + lane), shape_scale[shape_index])
-                v_body = wp.transform_point(shape_transform[shape_index], v_shape)
-                v_ref = wp.transform_point(X_wb_ref, v_body)
-                t_b = rigid_trajectory_truncation_t(
-                    n,
-                    d,
-                    c0,
-                    dx_body,
-                    rot_axis,
-                    rot_angle,
-                    v_ref - c0,
-                    gamma,
-                    1e-3,
-                    soft_shift,
-                    gap,
-                    enable_pinch_exemption,
-                    enable_bounded_advance,
-                )
-        elif vertex_end > vertex_start:
-            t_b = rigid_body_vertices_truncation_min(
-                n,
-                d,
-                c0,
-                dx_body,
-                rot_axis,
-                rot_angle,
-                X_wb_ref,
-                dat_body_vertices,
-                dat_body_vertex_radius,
-                vertex_start,
-                vertex_end,
-                lane,
-                gamma,
-                soft_shift,
-                gap,
-                x_ref,
-                gap + 0.5 * gamma * query_margin,
-                enable_pinch_exemption,
-                enable_bounded_advance,
-            )
-        elif lane == 0:
-            # No DAT vertices provisioned for this body: fall back to the contact anchor.
-            t_b = rigid_trajectory_truncation_t(
-                n,
-                d,
-                c0,
-                dx_body,
-                rot_axis,
-                rot_angle,
-                bx0 - c0,
-                gamma,
-                1e-3,
-                soft_shift,
-                gap,
-                enable_pinch_exemption,
-                enable_bounded_advance,
-            )
-        else:
-            t_b = 1.0
+        t_b = rigid_trajectory_truncation_t(
+            n,
+            d,
+            c0,
+            dx_body,
+            rot_axis,
+            rot_angle,
+            bx0 - c0,
+            gamma,
+            1e-3,
+            soft_shift,
+            gap,
+            enable_pinch_exemption,
+            enable_bounded_advance,
+        )
         if t_b < 1.0:
             wp.atomic_min(body_truncation_ts, body_index, t_b)
 
