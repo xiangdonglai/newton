@@ -676,6 +676,23 @@ def launch_rigid_soft_bvh_contacts(
             record_tape=False,
         )
 
+    # Candidate layout: [family, soft_feature, rigid_shape_index, rigid_feature].
+    #
+    # family | soft_feature          | rigid_feature
+    # -------+-----------------------+------------------------------------------
+    # VF     | particle index        | face index local to the rigid shape's mesh
+    # FV     | soft triangle index   | row in rigid_vertex_table
+    # EE     | soft edge-table index | row in rigid_edge_table
+    #
+    # rigid_vertex_table[row] = [rigid_shape_index, mesh_local_vertex_index]
+    # rigid_edge_table[row] = [rigid_shape_index, mesh_local_vertex_0, mesh_local_vertex_1]
+    # Thus, for FV and EE, rigid_feature is a model-wide packed-table row index,
+    # not a vertex or edge index local to one mesh.
+    #
+    # For FV and EE, rigid_shape_index duplicates the shape ID stored in the referenced
+    # rigid feature-table row. Keeping it here lets the emission kernel access
+    # per-shape data without another table lookup.
+
     if candidate_max > 0:
         wp.launch(
             emit_rigid_soft_bvh_contacts,
