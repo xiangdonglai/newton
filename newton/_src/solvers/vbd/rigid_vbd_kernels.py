@@ -5661,10 +5661,10 @@ def apply_body_truncation_ts(
 #
 # Instead of rebuilding division planes from the detection-time reference state at every
 # truncation pass, each contact's plane (n, p) is stored explicitly and refreshed AFTER
-# every truncation pass — i.e. always at a penetration-free committed state. Rigid rays
-# then anchor at the last committed pose (body_q_prev_commit), while the r/2 motion
-# budget keeps being measured from the detection-time reference so contact-set
-# completeness is preserved. See the rigid-DAT task notes for the guarantee analysis.
+# every truncation pass — i.e. always at a penetration-free committed state. Rigid and
+# soft rays then anchor at their last committed states, while the r/2 motion budgets keep
+# being measured from the detection-time references so contact-set completeness is
+# preserved. See the rigid-DAT task notes for the guarantee analysis.
 # =====================================================================================
 
 
@@ -5679,7 +5679,7 @@ def refresh_rigid_soft_dat_planes(
     soft_contact_barycentric: wp.array[wp.vec3],
     shape_body: wp.array[wp.int32],
     particle_q: wp.array[wp.vec3],
-    particle_displacements: wp.array[wp.vec3],
+    particle_q_commit_ref: wp.array[wp.vec3],
     body_q_commit_ref: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -5706,12 +5706,13 @@ def refresh_rigid_soft_dat_planes(
     bary = soft_contact_barycentric[contact_index]
 
     x_cur = bary[0] * particle_q[indices[0]]
-    dx_soft = bary[0] * particle_displacements[indices[0]]
+    x_prev = bary[0] * particle_q_commit_ref[indices[0]]
     for i in range(1, 3):
         vi = indices[i]
         if vi >= 0:
             x_cur += bary[i] * particle_q[vi]
-            dx_soft += bary[i] * particle_displacements[vi]
+            x_prev += bary[i] * particle_q_commit_ref[vi]
+    dx_soft = x_cur - x_prev
 
     shape_index = soft_contact_shape[contact_index]
     body_index = shape_body[shape_index]
@@ -5852,6 +5853,7 @@ def apply_rigid_soft_truncation_persistent(
     soft_contact_barycentric: wp.array[wp.vec3],
     shape_body: wp.array[wp.int32],
     pos_prev_collision_detection: wp.array[wp.vec3],
+    particle_q_commit_ref: wp.array[wp.vec3],
     particle_displacements: wp.array[wp.vec3],
     body_q_commit_ref: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
@@ -5869,10 +5871,10 @@ def apply_rigid_soft_truncation_persistent(
 
     Identical enforcement to apply_rigid_soft_truncation, but the plane is read from the
     persisted (n, p) buffers (refreshed post-truncation at penetration-free states)
-    instead of being rebuilt from the detection-time reference, and the rigid rays anchor
-    at the last committed pose. Soft rays keep their detection-time anchoring, so the
-    wrong-side guards silently skip vertices whose detection position lies behind a
-    refreshed plane — part of what the persistent-plane experiment measures.
+    instead of being rebuilt from the detection-time reference. Both rigid and soft rays
+    anchor at their last committed states, where the persisted plane was refreshed. The
+    particle proposal remains stored relative to the collision-detection reference so
+    that contact-set motion budgets retain their original epoch.
     """
     tid = wp.tid()
     contact_index = tid // DAT_THREADS_PER_CONTACT
@@ -5897,13 +5899,15 @@ def apply_rigid_soft_truncation_persistent(
         for i in range(3):
             vi = indices[i]
             if vi >= 0 and (i == 0 or bary[i] > 0.0):
-                x_v = pos_prev_collision_detection[vi]
+                x_v = particle_q_commit_ref[vi]
+                x_proposed = pos_prev_collision_detection[vi] + particle_displacements[vi]
+                dx_v = x_proposed - x_v
                 s_v = wp.dot(n, x_v - d)
                 if s_v > DAT_PINCH_BAND:
-                    t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, parallel_eps, gamma)
+                    t_v = planar_truncation_t(x_v, dx_v, n, d, parallel_eps, gamma)
                     if t_v < 1.0:
                         wp.atomic_min(truncation_ts, vi, t_v)
-                elif s_v > -DAT_PINCH_BAND and wp.dot(n, particle_displacements[vi]) < 0.0:
+                elif s_v > -DAT_PINCH_BAND and wp.dot(n, dx_v) < 0.0:
                     wp.atomic_min(truncation_ts, vi, 0.0)
 
     # Rigid side: curved-trajectory truncation over the body's DAT vertices, anchored at

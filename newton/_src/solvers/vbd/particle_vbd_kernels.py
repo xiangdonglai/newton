@@ -2299,6 +2299,34 @@ def apply_truncation_ts(
 
 
 @wp.kernel
+def apply_truncation_ts_commit(
+    pos_prev_collision_detection: wp.array[wp.vec3],
+    pos_prev_commit: wp.array[wp.vec3],
+    displacement_from_detection: wp.array[wp.vec3],
+    truncation_ts: wp.array[float],
+    displacement_out: wp.array[wp.vec3],
+    pos_out: wp.array[wp.vec3],
+):
+    """Apply a commit-referenced truncation while retaining detection-referenced storage.
+
+    ``displacement_from_detection`` continues to encode the proposal relative to the
+    last collision-detection position. The caller must first clamp that proposal to the
+    detection-centered motion bound. ``truncation_ts``, however, parameterizes the
+    incremental segment from the last committed position to the bounded proposal.
+    """
+    i = wp.tid()
+    x_detect = pos_prev_collision_detection[i]
+    x_commit = pos_prev_commit[i]
+    x_proposed = x_detect + displacement_from_detection[i]
+    x_new = x_commit + truncation_ts[i] * (x_proposed - x_commit)
+
+    displacement = x_new - x_detect
+    displacement_out[i] = displacement
+    if pos_out:
+        pos_out[i] = x_new
+
+
+@wp.kernel
 def accumulate_particle_body_contact_force_and_hessian(
     # inputs
     dt: float,

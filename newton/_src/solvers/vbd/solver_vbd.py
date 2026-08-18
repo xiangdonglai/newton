@@ -44,6 +44,7 @@ from .particle_vbd_kernels import (
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
+    apply_truncation_ts_commit,
     # Solver kernels (particle VBD)
     forward_step,
     reset_particle_state,
@@ -287,6 +288,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_enable_penetration_free: bool = False,  # Truncate rigid pose updates against per-contact division planes
         rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
         rigid_dat_persistent_planes: bool = False,  # EXPERIMENTAL: persist (n, p) and refresh planes post-truncation
+        rigid_dat_persistent_soft_commit_reference: bool = True,  # TEMPORARY A/B toggle for persistent soft rays
         deterministic: wp.DeterministicMode | None = None,
         pipeline=None,  # CollisionPipeline | None: solver-owned collision pipeline
         collision_frequency: list[int] | None = None,
@@ -434,12 +436,17 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_dat_persistent_planes: EXPERIMENTAL. Persist each contact's division plane
                 (n, p) explicitly and refresh it after every truncation pass — i.e. always at a
                 penetration-free committed state — instead of rebuilding planes from the
-                detection-time reference. Rigid rays then anchor at the last committed pose; the
-                per-body motion budget keeps being measured from the detection-time reference.
-                Planes track the live geometry between detections (better normals under sliding
-                and rotation) at the cost of a weaker formal guarantee for the soft side, whose
-                rays keep detection-time anchoring. Only used when
+                detection-time reference. Rigid and soft rays then anchor at their last committed
+                states, while conservative motion budgets remain centered at the detection-time
+                references. Planes track live geometry between detections, including changing
+                normals under sliding and rotation. This mode remains experimental because its
+                guarantee also depends on collision-pair coverage and refresh frequency. Only used when
                 ``rigid_enable_penetration_free`` is ``True``.
+            rigid_dat_persistent_soft_commit_reference: TEMPORARY diagnostic toggle for persistent
+                rigid-soft DAT. When ``True`` (default), soft rays start at the last committed state
+                where the plane was refreshed. When ``False``, reproduce the original experimental
+                detection-referenced soft-ray behavior for A/B testing. Only used when
+                ``rigid_dat_persistent_planes`` is ``True``.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -685,6 +692,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_enable_penetration_free,
             rigid_conservative_bound_relaxation,
             rigid_dat_persistent_planes,
+            rigid_dat_persistent_soft_commit_reference,
         )
 
         # Controls whether the next step() refreshes contact state derived from
@@ -2270,6 +2278,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_enable_penetration_free: bool,
         rigid_conservative_bound_relaxation: float,
         rigid_dat_persistent_planes: bool = False,
+        rigid_dat_persistent_soft_commit_reference: bool = True,
     ):
         """Initialize rigid DAT truncation state: per-body truncation scalars, reference
         poses, DAT vertex tables, and per-body motion budgets derived from the owned
@@ -2277,6 +2286,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
         self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
         self.rigid_dat_persistent_planes = rigid_dat_persistent_planes
+        # TEMPORARY diagnostic switch. False faithfully retains the original persistent-plane
+        # experiment's detection-referenced soft trajectory for before/after comparisons.
+        self.rigid_dat_persistent_soft_commit_reference = rigid_dat_persistent_soft_commit_reference
         # Threshold below which a displacement is treated as parallel to a division plane.
         self.rigid_dat_parallel_epsilon = 1e-5
 
@@ -2369,6 +2381,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             # Rigid ray anchor: the last committed (post-truncation) pose, where the
             # persisted planes were refreshed.
             self.body_q_prev_commit = wp.clone(model.body_q, device=self.device)
+            # Soft ray anchor at the same committed epoch. Keep this separate from
+            # pos_prev_collision_detection, which remains the center of the conservative
+            # collision-set motion bound.
+            self.particle_q_prev_commit = wp.clone(model.particle_q, device=self.device)
 
     def _init_rigid_dat_body_vertices(self, model: Model):
         """Build the per-body DAT vertex tables used by the trajectory truncation kernels.
@@ -2507,6 +2523,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             # (Re)initialize the persisted planes and the commit anchor from the fresh
             # contact records at the detection state.
             self.body_q_prev_commit.assign(state.body_q)
+            if self.model.particle_count > 0 and state.particle_q is not None:
+                self.particle_q_prev_commit.assign(state.particle_q)
             self._rigid_dat_refresh_planes(self._pipeline_contacts, state.particle_q, state.body_q, initialize=True)
 
     def _rigid_dat_refresh_planes(self, contacts: Contacts, particle_q, body_q, initialize: bool = False):
@@ -2515,6 +2533,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         if contacts is None or body_q is None:
             return
         if self.model.particle_count > 0 and contacts.soft_contact_max > 0 and particle_q is not None:
+            soft_motion_reference = (
+                self.particle_q_prev_commit
+                if self.rigid_dat_persistent_soft_commit_reference
+                else self.pos_prev_collision_detection
+            )
             wp.launch(
                 kernel=refresh_rigid_soft_dat_planes,
                 dim=contacts.soft_contact_max,
@@ -2527,7 +2550,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_barycentric,
                     self.model.shape_body,
                     particle_q,
-                    self.particle_displacements,
+                    soft_motion_reference,
                     self.body_q_prev_commit,
                     body_q,
                     self.model.body_com,
@@ -2539,6 +2562,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ],
                 device=self.device,
             )
+            self.particle_q_prev_commit.assign(particle_q)
         if contacts.rigid_contact_max > 0:
             wp.launch(
                 kernel=refresh_rigid_rigid_dat_planes,
@@ -2639,6 +2663,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             # Also respect the rigid-soft planes; the write to truncation_ts is a
             # harmless side effect (it is refilled before its next particle-phase use).
             if self.rigid_dat_persistent_planes:
+                soft_ray_reference = (
+                    self.particle_q_prev_commit
+                    if self.rigid_dat_persistent_soft_commit_reference
+                    else self.pos_prev_collision_detection
+                )
                 wp.launch(
                     kernel=apply_rigid_soft_truncation_persistent,
                     dim=contacts.soft_contact_max * DAT_THREADS_PER_CONTACT,
@@ -2651,6 +2680,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_barycentric,
                         self.model.shape_body,
                         self.pos_prev_collision_detection,
+                        soft_ray_reference,
                         self.particle_displacements,
                         self.body_q_prev_commit,
                         body_q,
@@ -2715,11 +2745,39 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+        if rigid_dat_active and self.rigid_dat_persistent_planes and self.rigid_dat_persistent_soft_commit_reference:
+            # First apply detection-referenced self-contact truncation (if any) and
+            # clamp the proposal to the collision-set motion ball. Persistent
+            # rigid-soft DAT then truncates the segment from the last commit to this
+            # already-bounded proposal. Both the ball and the plane half-spaces are
+            # convex, so the final segment stays inside both invariants.
+            wp.launch(
+                kernel=apply_truncation_ts,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.pos_prev_collision_detection,
+                    self.particle_displacements,
+                    self.truncation_ts,
+                    max_displacement,
+                ],
+                outputs=[
+                    self.particle_displacements,
+                    particle_q_out,
+                ],
+                device=self.device,
+            )
+            self.truncation_ts.fill_(1.0)
+
         if rigid_dat_active:
             # Joint rigid-soft pass: both sides of every contact are constrained against
             # the same division plane within this launch.
             self.body_truncation_ts.fill_(1.0)
             if self.rigid_dat_persistent_planes:
+                soft_ray_reference = (
+                    self.particle_q_prev_commit
+                    if self.rigid_dat_persistent_soft_commit_reference
+                    else self.pos_prev_collision_detection
+                )
                 wp.launch(
                     kernel=apply_rigid_soft_truncation_persistent,
                     dim=contacts.soft_contact_max * DAT_THREADS_PER_CONTACT,
@@ -2732,6 +2790,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_barycentric,
                         self.model.shape_body,
                         self.pos_prev_collision_detection,
+                        soft_ray_reference,
                         self.particle_displacements,
                         self.body_q_prev_commit,
                         body_q,
@@ -2751,21 +2810,38 @@ class SolverVBD(SolverBase, CouplingInterface):
             else:
                 self._launch_rigid_soft_truncation(contacts, body_q)
 
-        wp.launch(
-            kernel=apply_truncation_ts,
-            dim=self.model.particle_count,
-            inputs=[
-                self.pos_prev_collision_detection,
-                self.particle_displacements,
-                self.truncation_ts,
-                max_displacement,
-            ],
-            outputs=[
-                self.particle_displacements,
-                particle_q_out,
-            ],
-            device=self.device,
-        )
+        if rigid_dat_active and self.rigid_dat_persistent_planes and self.rigid_dat_persistent_soft_commit_reference:
+            wp.launch(
+                kernel=apply_truncation_ts_commit,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.pos_prev_collision_detection,
+                    self.particle_q_prev_commit,
+                    self.particle_displacements,
+                    self.truncation_ts,
+                ],
+                outputs=[
+                    self.particle_displacements,
+                    particle_q_out,
+                ],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                kernel=apply_truncation_ts,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.pos_prev_collision_detection,
+                    self.particle_displacements,
+                    self.truncation_ts,
+                    max_displacement,
+                ],
+                outputs=[
+                    self.particle_displacements,
+                    particle_q_out,
+                ],
+                device=self.device,
+            )
 
         if rigid_dat_active:
             self._apply_body_truncation(body_q)

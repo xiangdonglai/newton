@@ -13,6 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     accumulate_particle_body_contact_force_and_hessian,
+    apply_truncation_ts_commit,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
     evaluate_self_contact_force_norm,
@@ -22,7 +23,9 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_volumetric_neo_hookean_force_and_hessian,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
+    DAT_THREADS_PER_CONTACT,
     RigidContactHistory,
+    apply_rigid_soft_truncation_persistent,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     compute_rigid_contact_forces,
@@ -3805,6 +3808,137 @@ def test_rigid_dat_trajectory_truncation(test, device):
     test.assertEqual(t, 1.0)
 
 
+def _run_persistent_soft_reference_probe(device, use_commit_reference):
+    """One-dimensional refreshed-plane counterexample for the soft DAT ray origin.
+
+    The detection point x=0.5 was safe for an older plane. The particle has since
+    committed at x=2 and the persistent plane was refreshed to x=1. The next proposal
+    is x=0. A detection-anchored guard sees its old point behind the new plane and skips;
+    a commit-anchored ray starts at x=2 and truncates the crossing.
+    """
+    x_detect = wp.array([[0.5, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    x_commit_value = 2.0 if use_commit_reference else 0.5
+    x_commit = wp.array([[x_commit_value, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    # Proposal x=0, stored in the solver's detection-referenced representation.
+    displacement = wp.array([[-0.5, 0.0, 0.0]], dtype=wp.vec3, device=device)
+
+    truncation_t = wp.ones(1, dtype=float, device=device)
+    body_truncation_t = wp.ones(1, dtype=float, device=device)
+    wp.launch(
+        kernel=apply_rigid_soft_truncation_persistent,
+        dim=DAT_THREADS_PER_CONTACT,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
+            x_detect,
+            x_commit,
+            displacement,
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([0, 0], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=float, device=device),
+            1.0e-5,
+            0.85,
+        ],
+        outputs=[truncation_t, body_truncation_t],
+        device=device,
+    )
+
+    q_out = wp.empty(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel=apply_truncation_ts_commit,
+        dim=1,
+        inputs=[x_detect, x_commit, displacement, truncation_t],
+        outputs=[displacement, q_out],
+        device=device,
+    )
+    return float(truncation_t.numpy()[0]), float(q_out.numpy()[0, 0])
+
+
+def test_rigid_dat_persistent_soft_commit_reference(test, device):
+    """A refreshed soft plane must truncate from the state where it was constructed."""
+    t_old, x_old = _run_persistent_soft_reference_probe(device, use_commit_reference=False)
+    test.assertEqual(t_old, 1.0, "detection-anchored wrong-side guard should reproduce the old missed crossing")
+    test.assertLess(x_old, 1.0, "the old detection-anchored path should cross the refreshed plane")
+
+    t_new, x_new = _run_persistent_soft_reference_probe(device, use_commit_reference=True)
+    test.assertLess(t_new, 1.0, "commit-anchored path must detect the crossing")
+    test.assertGreater(x_new, 1.0, "gamma backoff must leave the particle on the permitted side")
+
+
+def _run_persistent_moving_box_particle(device, use_commit_reference=True, frames=30):
+    """A rising box transports one soft particle while persistent planes move.
+
+    This integrated scene exercises the same epoch mismatch as the focused probe: the
+    plane follows the moving box/particle contact over several VBD passes while the
+    collision-detection anchor remains fixed for the detection interval.
+    """
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0, 0.0, -9.8))
+    builder.rigid_gap = 0.05
+    particle = builder.add_particle(wp.vec3(0.0, 0.0, 0.13), wp.vec3(0.0), 0.1, radius=0.005)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0), wp.quat_identity()),
+        mass=100.0,
+        inertia=wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        lock_inertia=True,
+    )
+    box_half_height = 0.1
+    builder.add_shape_box(body, hx=0.2, hy=0.2, hz=box_half_height)
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 100.0
+    model.soft_contact_kd = 0.0
+    model.soft_contact_mu = 0.0
+
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.1)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=2,
+        rigid_enable_penetration_free=True,
+        rigid_dat_persistent_planes=True,
+        rigid_dat_persistent_soft_commit_reference=use_commit_reference,
+        rigid_body_particle_contact_buffer_size=64,
+        pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    body_qd = state_in.body_qd.numpy()
+    body_qd[body][:3] = [0.0, 0.0, 1.0]
+    state_in.body_qd.assign(body_qd)
+
+    worst_raw_penetration = 0.0
+    for _ in range(frames):
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+        particle_z = float(state_in.particle_q.numpy()[particle, 2])
+        box_z = float(state_in.body_q.numpy()[body, 2])
+        worst_raw_penetration = max(worst_raw_penetration, box_z + box_half_height - particle_z)
+    return worst_raw_penetration
+
+
+def test_rigid_dat_persistent_moving_box_particle(test, device):
+    """Commit-referenced persistent DAT prevents the moving-plane integration miss.
+
+    At the parent branch tip afab8c2e, this scene reaches 3.333 mm raw penetration
+    because the refreshed-plane guard still reads the detection-time soft position.
+    """
+    old_penetration = _run_persistent_moving_box_particle(device, use_commit_reference=False)
+    corrected_penetration = _run_persistent_moving_box_particle(device, use_commit_reference=True)
+
+    test.assertGreater(
+        old_penetration,
+        1.0e-3,
+        "the detection-referenced toggle should reproduce the original moving-plane miss",
+    )
+    test.assertLessEqual(corrected_penetration, 1.0e-4)
+
+
 def _build_sphere_drop_on_cloth(device):
     """A heavy rigid sphere shot at a pinned cloth grid: a stress scene where penalty
     forces alone cannot prevent penetration within a step."""
@@ -4040,6 +4174,18 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_persistent_soft_commit_reference",
+    test_rigid_dat_persistent_soft_commit_reference,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_persistent_moving_box_particle",
+    test_rigid_dat_persistent_moving_box_particle,
     devices=devices,
 )
 add_function_test(
