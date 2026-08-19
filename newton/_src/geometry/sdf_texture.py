@@ -857,9 +857,11 @@ def _read_cell_corners(
 ) -> tuple[vec8f, float, float, float]:
     """Locate the fine-grid cell containing *f* and read 8 corner texel values.
 
-    Point-samples each corner at integer+0.5 coordinates (exact texel centres)
-    so the caller can perform full float32 trilinear interpolation, avoiding
-    the 8-bit fixed-point weight precision of CUDA hardware texture filtering.
+    Point-samples at integer+0.5 coordinates (exact texel centres) so the
+    caller can perform full float32 trilinear interpolation, avoiding the
+    8-bit fixed-point weight precision of CUDA hardware texture filtering.
+    Paired-X textures return both X corners in one ``vec2`` fetch (four reads
+    total); scalar textures use the equivalent eight reads.
 
     Args:
         sdf: texture SDF data.
@@ -894,14 +896,24 @@ def _read_cell_corners(
         tx = coarse_f[0] - cx
         ty = coarse_f[1] - cy
         tz = coarse_f[2] - cz
-        v000 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 0.5, cz + 0.5), sdf.paired_samples)
-        v100 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 0.5, cz + 0.5), sdf.paired_samples)
-        v010 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 1.5, cz + 0.5), sdf.paired_samples)
-        v110 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 1.5, cz + 0.5), sdf.paired_samples)
-        v001 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 0.5, cz + 1.5), sdf.paired_samples)
-        v101 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 0.5, cz + 1.5), sdf.paired_samples)
-        v011 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 1.5, cz + 1.5), sdf.paired_samples)
-        v111 = _texture_sample_sdf_x0(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 1.5, cz + 1.5), sdf.paired_samples)
+        if sdf.paired_samples:
+            v00 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 0.5, cz + 0.5), dtype=wp.vec2)
+            v10 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 1.5, cz + 0.5), dtype=wp.vec2)
+            v01 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 0.5, cz + 1.5), dtype=wp.vec2)
+            v11 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 1.5, cz + 1.5), dtype=wp.vec2)
+            v000, v100 = v00[0], v00[1]
+            v010, v110 = v10[0], v10[1]
+            v001, v101 = v01[0], v01[1]
+            v011, v111 = v11[0], v11[1]
+        else:
+            v000 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 0.5, cz + 0.5), dtype=float)
+            v100 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 0.5, cz + 0.5), dtype=float)
+            v010 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 1.5, cz + 0.5), dtype=float)
+            v110 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 1.5, cz + 0.5), dtype=float)
+            v001 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 0.5, cz + 1.5), dtype=float)
+            v101 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 0.5, cz + 1.5), dtype=float)
+            v011 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 0.5, cy + 1.5, cz + 1.5), dtype=float)
+            v111 = wp.texture_sample(sdf.coarse_texture, wp.vec3f(cx + 1.5, cy + 1.5, cz + 1.5), dtype=float)
     else:
         block_x = float(loc.start_slot & wp.uint32(0x3FF))
         block_y = float((loc.start_slot >> wp.uint32(10)) & wp.uint32(0x3FF))
@@ -912,14 +924,24 @@ def _read_cell_corners(
         ox = block_x * sdf.subgrid_samples_f + lx + 0.5
         oy = block_y * sdf.subgrid_samples_f + ly + 0.5
         oz = block_z * sdf.subgrid_samples_f + lz + 0.5
-        v000 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox, oy, oz), sdf.paired_samples)
-        v100 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy, oz), sdf.paired_samples)
-        v010 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox, oy + 1.0, oz), sdf.paired_samples)
-        v110 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy + 1.0, oz), sdf.paired_samples)
-        v001 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox, oy, oz + 1.0), sdf.paired_samples)
-        v101 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy, oz + 1.0), sdf.paired_samples)
-        v011 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox, oy + 1.0, oz + 1.0), sdf.paired_samples)
-        v111 = _texture_sample_sdf_x0(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy + 1.0, oz + 1.0), sdf.paired_samples)
+        if sdf.paired_samples:
+            v00 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy, oz), dtype=wp.vec2)
+            v10 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy + 1.0, oz), dtype=wp.vec2)
+            v01 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy, oz + 1.0), dtype=wp.vec2)
+            v11 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy + 1.0, oz + 1.0), dtype=wp.vec2)
+            v000, v100 = v00[0], v00[1]
+            v010, v110 = v10[0], v10[1]
+            v001, v101 = v01[0], v01[1]
+            v011, v111 = v11[0], v11[1]
+        else:
+            v000 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy, oz), dtype=float)
+            v100 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy, oz), dtype=float)
+            v010 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy + 1.0, oz), dtype=float)
+            v110 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy + 1.0, oz), dtype=float)
+            v001 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy, oz + 1.0), dtype=float)
+            v101 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy, oz + 1.0), dtype=float)
+            v011 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox, oy + 1.0, oz + 1.0), dtype=float)
+            v111 = wp.texture_sample(sdf.subgrid_texture, wp.vec3f(ox + 1.0, oy + 1.0, oz + 1.0), dtype=float)
         v000 = apply_subgrid_sdf_scale(v000, sdf.subgrids_min_sdf_value, sdf.subgrids_sdf_value_range)
         v100 = apply_subgrid_sdf_scale(v100, sdf.subgrids_min_sdf_value, sdf.subgrids_sdf_value_range)
         v010 = apply_subgrid_sdf_scale(v010, sdf.subgrids_min_sdf_value, sdf.subgrids_sdf_value_range)

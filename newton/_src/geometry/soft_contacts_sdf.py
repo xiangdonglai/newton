@@ -157,18 +157,45 @@ def optimize_edge_sdf(
     fc, _fc_a, _gc = eval_shape_sdf(geo, scale, (1.0 - c) * p + c * q, shape_sdf_index, texture_sdf_table)
     fd, _fd_a, _gd = eval_shape_sdf(geo, scale, (1.0 - d) * p + d * q, shape_sdf_index, texture_sdf_table)
     for _i in range(n_iter):
-        if fc < fd:
+        tie_tol = 1.0e-6 * wp.max(1.0, wp.max(wp.abs(fc), wp.abs(fd)))
+        if fc < fd - tie_tol:
             hi = d
             d = c
             fd = fc
             c = hi - (hi - lo) * inv_phi
             fc, _fc_a, _gc = eval_shape_sdf(geo, scale, (1.0 - c) * p + c * q, shape_sdf_index, texture_sdf_table)
-        else:
+        elif fd < fc - tie_tol:
             lo = c
             c = d
             fc = fd
             d = lo + (hi - lo) * inv_phi
             fd, _fd_a, _gd = eval_shape_sdf(geo, scale, (1.0 - d) * p + d * q, shape_sdf_index, texture_sdf_table)
+        else:
+            # Equal probes bracket the minimizer for a unimodal restriction, but arbitrary
+            # texture SDFs can be multimodal. Only shrink symmetrically when the midpoint is no
+            # higher; otherwise retain the left subinterval deterministically rather than
+            # collapsing onto a possible central maximum.
+            mid = 0.5 * (lo + hi)
+            fm, _fm_a, _gm = eval_shape_sdf(geo, scale, (1.0 - mid) * p + mid * q, shape_sdf_index, texture_sdf_table)
+            if fm <= wp.min(fc, fd) + tie_tol:
+                lo = c
+                hi = d
+                c = hi - (hi - lo) * inv_phi
+                d = lo + (hi - lo) * inv_phi
+                fc, _fc_a, _gc = eval_shape_sdf(geo, scale, (1.0 - c) * p + c * q, shape_sdf_index, texture_sdf_table)
+                fd, _fd_a, _gd = eval_shape_sdf(geo, scale, (1.0 - d) * p + d * q, shape_sdf_index, texture_sdf_table)
+            elif fc <= fd:
+                hi = d
+                d = c
+                fd = fc
+                c = hi - (hi - lo) * inv_phi
+                fc, _fc_a, _gc = eval_shape_sdf(geo, scale, (1.0 - c) * p + c * q, shape_sdf_index, texture_sdf_table)
+            else:
+                lo = c
+                c = d
+                fc = fd
+                d = lo + (hi - lo) * inv_phi
+                fd, _fd_a, _gd = eval_shape_sdf(geo, scale, (1.0 - d) * p + d * q, shape_sdf_index, texture_sdf_table)
     u = 0.5 * (lo + hi)
     x = (1.0 - u) * p + u * q
     _phi_l, phi, grad = eval_shape_sdf(geo, scale, x, shape_sdf_index, texture_sdf_table)

@@ -297,6 +297,20 @@ def _sample_texture_sdf_from_array_kernel(
 
 
 @wp.kernel
+def _sample_texture_sdf_grad_from_array_kernel(
+    sdf_table: wp.array[TextureSDFData],
+    sdf_idx: int,
+    query_points: wp.array[wp.vec3],
+    results: wp.array[float],
+    gradients: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    value, gradient = texture_sample_sdf_grad(sdf_table[sdf_idx], query_points[tid])
+    results[tid] = value
+    gradients[tid] = gradient
+
+
+@wp.kernel
 def _bvh_ground_truth_kernel(
     mesh: wp.uint64,
     query_points: wp.array[wp.vec3],
@@ -809,6 +823,44 @@ def test_texture_sdf_array_indexing(test, device):
     # Box2 is smaller, so origin should be closer to its surface (less negative)
     test.assertGreater(
         val1, val0, f"Origin should be closer to surface in smaller box: val0={val0:.4f}, val1={val1:.4f}"
+    )
+
+
+def test_texture_sdf_gradient_array_indexing_preserves_paired_layout(test, device):
+    """Value+gradient sampling from a struct array must honor packed-X texture channels."""
+    mesh = _create_box_mesh(half_extents=(0.5, 0.5, 0.5))
+    wp_mesh = wp.Mesh(
+        points=wp.array(mesh.vertices, dtype=wp.vec3, device=device),
+        indices=wp.array(mesh.indices, dtype=wp.int32, device=device),
+        support_winding_number=True,
+    )
+    tex_sdf, _coarse, _subgrid = create_texture_sdf_from_mesh(
+        wp_mesh,
+        margin=0.1,
+        narrow_band_range=(-0.1, 0.1),
+        max_resolution=64,
+        paired_samples=True,
+        device=device,
+    )
+    sdf_array = wp.array([tex_sdf], dtype=TextureSDFData, device=device)
+    query_np = np.array([[0.45, 0.0, 0.0], [-0.45, 0.0, 0.0], [0.0, 0.0, 0.45]], dtype=np.float32)
+    query = wp.array(query_np, dtype=wp.vec3, device=device)
+    values = wp.zeros(len(query_np), dtype=float, device=device)
+    gradients = wp.zeros(len(query_np), dtype=wp.vec3, device=device)
+    wp.launch(
+        _sample_texture_sdf_grad_from_array_kernel,
+        dim=len(query_np),
+        inputs=[sdf_array, 0, query, values, gradients],
+        device=device,
+    )
+
+    np.testing.assert_allclose(values.numpy(), -0.05, atol=2.0e-4)
+    gradient_np = gradients.numpy()
+    gradient_np /= np.linalg.norm(gradient_np, axis=1, keepdims=True)
+    np.testing.assert_allclose(
+        gradient_np,
+        np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        atol=2.0e-4,
     )
 
 
@@ -1810,6 +1862,12 @@ add_function_test(
 )
 add_function_test(TestTextureSDF, "test_texture_sdf_extrapolation", test_texture_sdf_extrapolation, devices=devices)
 add_function_test(TestTextureSDF, "test_texture_sdf_array_indexing", test_texture_sdf_array_indexing, devices=devices)
+add_function_test(
+    TestTextureSDF,
+    "test_texture_sdf_gradient_array_indexing_preserves_paired_layout",
+    test_texture_sdf_gradient_array_indexing_preserves_paired_layout,
+    devices=devices,
+)
 add_function_test(
     TestTextureSDF, "test_texture_sdf_multi_resolution", test_texture_sdf_multi_resolution, devices=devices
 )

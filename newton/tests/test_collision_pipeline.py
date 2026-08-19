@@ -3090,6 +3090,27 @@ def _edge_opt_kernel(
 
 
 @wp.kernel
+def _edge_opt_with_grad_kernel(
+    geo: wp.int32,
+    scale: wp.vec3,
+    p: wp.vec3,
+    q: wp.vec3,
+    shape_sdf_index: wp.int32,
+    table: wp.array[TextureSDFData],
+    n_iter: wp.int32,
+    out_u: wp.array[float],
+    out_phi: wp.array[float],
+    out_x: wp.array[wp.vec3],
+    out_grad: wp.array[wp.vec3],
+):
+    u, x, phi, grad = optimize_edge_sdf(geo, scale, p, q, shape_sdf_index, table, n_iter)
+    out_u[0] = u
+    out_phi[0] = phi
+    out_x[0] = x
+    out_grad[0] = grad
+
+
+@wp.kernel
 def _face_opt_kernel(
     geo: wp.int32,
     scale: wp.vec3,
@@ -3141,6 +3162,33 @@ def test_optimize_edge_sdf_box(test, device):
     pa, qa, ha = np.array(p), np.array(q), np.array(half)
     phi_brute = min(_box_sdf_np((1.0 - u) * pa + u * qa, ha) for u in np.linspace(0.0, 1.0, 20001))
     test.assertLess(abs(phi_opt - phi_brute), 1.0e-4)
+
+
+def test_optimize_edge_sdf_box_flat_minimum(test, device):
+    """Equal golden probes retain the center of a box SDF's flat minimum."""
+    out_u = wp.zeros(1, dtype=float, device=device)
+    out_phi = wp.zeros(1, dtype=float, device=device)
+    out_x = wp.zeros(1, dtype=wp.vec3, device=device)
+    out_grad = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        _edge_opt_with_grad_kernel,
+        dim=1,
+        inputs=[
+            int(GeoType.BOX),
+            wp.vec3(0.1, 0.5, 0.1),
+            wp.vec3(-0.4, 0.47, 0.0),
+            wp.vec3(0.4, 0.47, 0.0),
+            -1,
+            _empty_sdf_table(device),
+            SDF_EDGE_ITERS,
+        ],
+        outputs=[out_u, out_phi, out_x, out_grad],
+        device=device,
+    )
+    test.assertAlmostEqual(float(out_u.numpy()[0]), 0.5, places=5)
+    test.assertAlmostEqual(float(out_phi.numpy()[0]), -0.03, places=5)
+    test.assertTrue(np.allclose(out_x.numpy()[0], (0.0, 0.47, 0.0), atol=1.0e-5))
+    test.assertTrue(np.allclose(out_grad.numpy()[0], (0.0, 1.0, 0.0), atol=1.0e-5))
 
 
 def test_optimize_face_sdf_box(test, device):
@@ -3495,6 +3543,7 @@ def test_full_surface_catches_what_particles_miss(test, device):
 
 for _name, _fn in (
     ("test_optimize_edge_sdf_box", test_optimize_edge_sdf_box),
+    ("test_optimize_edge_sdf_box_flat_minimum", test_optimize_edge_sdf_box_flat_minimum),
     ("test_optimize_face_sdf_box", test_optimize_face_sdf_box),
     ("test_optimize_edge_sdf_sphere", test_optimize_edge_sdf_sphere),
     ("test_optimize_face_sdf_sphere", test_optimize_face_sdf_sphere),
