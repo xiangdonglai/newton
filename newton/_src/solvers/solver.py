@@ -325,11 +325,6 @@ class SolverBase:
             if len(collision_frequency_type) != 2:
                 raise ValueError(f"collision_frequency_type must have length 2, got {len(collision_frequency_type)}")
             ftype = [Frequency(t) for t in collision_frequency_type]
-            if ftype[SolverBase._COLLISION_SLOT_RIGID] == Frequency.PRE_POST_INIT:
-                raise ValueError(
-                    "collision_frequency_type: PRE_POST_INIT is invalid for the rigid slot; "
-                    "the rigid pass has no post-initialization detection point."
-                )
             if self.pipeline is None and ftype[SolverBase._COLLISION_SLOT_RIGID] not in (
                 Frequency.NONE,
                 Frequency.AUTO,
@@ -374,6 +369,11 @@ class SolverBase:
 
     def _run_rigid_collision(self, state: State) -> None:
         """Run the owned pipeline into the owned contacts buffer."""
+        # Dense rigid-soft TV/EE queries read the shared soft triangle/edge BVHs.
+        # CollisionPipeline.collide() intentionally never refits those trees, while
+        # an owning solver promises to keep them current at each detection instant.
+        if self.pipeline._full_surface_bvh_needs_detector:
+            self.pipeline.refit_soft_contact_bvh(state)
         self.pipeline.collide(state, self._pipeline_contacts)
 
     def _set_module_options(self, options: dict[str, Any], module: Any) -> None:

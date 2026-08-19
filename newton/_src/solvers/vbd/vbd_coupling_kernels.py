@@ -146,6 +146,7 @@ def _harvest_vbd_body_particle_contact_forces_on_proxy_bodies_kernel(
     body_particle_contact_material_kd: wp.array[float],
     body_particle_contact_material_mu: wp.array[float],
     body_particle_contact_count: wp.array[int],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     soft_contact_indices: wp.array[wp.vec3i],
     soft_contact_barycentric: wp.array[wp.vec3],
     body_particle_contact_shape: wp.array[int],
@@ -158,6 +159,8 @@ def _harvest_vbd_body_particle_contact_forces_on_proxy_bodies_kernel(
 ):
     contact_idx = wp.tid()
     if contact_idx >= body_particle_contact_count[0]:
+        return
+    if body_particle_contact_force_eligible[contact_idx] == 0:
         return
 
     shape_idx = body_particle_contact_shape[contact_idx]
@@ -285,6 +288,7 @@ def _harvest_vbd_proxy_particle_body_contact_forces_kernel(
     friction_epsilon: float,
     particle_radius: wp.array[float],
     body_particle_contact_count: wp.array[int],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     body_particle_contact_particle: wp.array[int],
     body_particle_contact_penalty_k: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
@@ -306,6 +310,8 @@ def _harvest_vbd_proxy_particle_body_contact_forces_kernel(
 ):
     contact_idx = wp.tid()
     if contact_idx >= body_particle_contact_count[0]:
+        return
+    if body_particle_contact_force_eligible[contact_idx] == 0:
         return
 
     particle_idx = body_particle_contact_particle[contact_idx]

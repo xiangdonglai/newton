@@ -17,12 +17,11 @@ Unlike the SDF back-end this needs no provisioned volume SDF and resolves exact 
 .. note:: **Dense-query contract / consumer responsibility.** Because emission is unfiltered, a
     soft feature near a mesh edge or corner receives one record per nearby rigid primitive, and a
     record whose sign check failed (the soft point lies behind that one triangle's plane, e.g.
-    resting on the adjacent face) carries the rigid feature's outward normal. A consumer that
-    treats every record as an independent penetration -- as
-    :class:`~newton.solvers.SolverVBD`'s soft-contact force currently does -- will apply spurious
-    lateral forces at such edges. Updating VBD's collision handling for dense queries (per-record
-    validity filtering, the design doc's shared-validity-utility future work) is tracked as
-    follow-up work; until then the SDF back-end remains the artifact-free choice for VBD.
+    resting on the adjacent face) carries the rigid feature's outward normal. SolverVBD recomputes
+    this local orientation test before applying penalty forces, while retaining every row for DAT,
+    which needs the complete nearby primitive set to maintain separation from a collision-free
+    state. Recovering an already-intersecting surface is outside this local validity rule; it
+    requires a globally coherent contact owner rather than enabling every wrong-side row.
 """
 
 from __future__ import annotations
@@ -49,7 +48,6 @@ if TYPE_CHECKING:
 # 1e-6 m sits well above float32 cancellation noise for meter-scale coordinates (~1e-8 absolute
 # error on the subtraction), where a smaller epsilon would let rounding noise pass as a direction.
 CONTACT_NORMAL_DEGENERATE_EPS = wp.constant(1.0e-6)
-
 
 # ---------------------------------------------------------------------------
 # Host-side rigid feature tables
@@ -822,8 +820,8 @@ def launch_soft_bvh_contacts(
         )
 
     # Detection must still run at zero capacity: candidate_count records the
-    # attempted count, which lets diagnostics and safety consumers fail closed
-    # instead of mistaking an unprovisioned candidate buffer for an empty query.
+    # attempted count, which lets diagnostics and DAT fail closed instead of
+    # mistaking an unprovisioned candidate buffer for an empty query.
     if candidate_max == 0:
         return
 

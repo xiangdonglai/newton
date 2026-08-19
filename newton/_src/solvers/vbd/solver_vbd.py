@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import warp as wp
@@ -60,9 +60,12 @@ from .rigid_vbd_kernels import (
     _fill_adjacent_joints,
     accumulate_body_body_contacts_per_body,
     accumulate_body_particle_contacts_per_body,
+    apply_body_truncation_ts,
+    apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
+    compute_body_particle_contact_force_eligibility,
     compute_cable_dahl_parameters,
     compute_rigid_contact_forces,
     forward_step_rigid_bodies,
@@ -247,6 +250,33 @@ class SolverVBD(SolverBase, CouplingInterface):
 
     supports_collision_pipeline = True
 
+    class _CollisionSchedule(NamedTuple):
+        """Resolved collision mode and effective iteration frequency."""
+
+        mode: SolverBase.CollisionFrequencyType
+        frequency: int
+
+        @property
+        def detects_before_initialization(self) -> bool:
+            """Whether this schedule includes the baseline pre-initialization pass."""
+            Frequency = SolverBase.CollisionFrequencyType
+            return self.mode in (Frequency.PRE_INIT, Frequency.PRE_POST_INIT, Frequency.ITERATIONS)
+
+        def is_due(self, iter_num: int) -> bool:
+            """Whether collision detection is due before this zero-based solver iteration."""
+            Frequency = SolverBase.CollisionFrequencyType
+            if self.mode == Frequency.PRE_POST_INIT:
+                return iter_num == 0
+            if self.mode == Frequency.ITERATIONS:
+                return iter_num > 0 and iter_num % self.frequency == 0
+            return False
+
+        def is_equivalent_to(self, other: SolverVBD._CollisionSchedule) -> bool:
+            """Whether two schedules produce the same collision checkpoints."""
+            if self.mode != other.mode:
+                return False
+            return self.mode != SolverBase.CollisionFrequencyType.ITERATIONS or self.frequency == other.frequency
+
     class JointSlot:
         """Named constraint slot indices for :meth:`set_joint_constraint_mode`.
 
@@ -319,6 +349,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_angular_k_start: float = 1.0e1,  # Legacy AVBD angular joint penalty ramp seed
         rigid_joint_linear_kd: float = 0.0,  # Absolute damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-cable angular joint constraints
+        # Rigid body - penetration-free DAT truncation
+        rigid_enable_penetration_free: bool = False,  # Truncate rigid pose updates against per-contact division planes
+        rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
         deterministic: wp.DeterministicMode | None = None,
         pipeline: CollisionPipeline | None = None,
         collision_frequency: list[int] | None = None,
@@ -503,6 +536,22 @@ class SolverVBD(SolverBase, CouplingInterface):
                 Negative values are clamped to 0.
             rigid_joint_angular_kd: Damping coefficient for non-cable angular joint constraints [N·m·s/rad].
                 Negative values are clamped to 0.
+            rigid_enable_penetration_free: Whether to apply Divide-and-Truncate (DAT) penetration-free
+                truncation to rigid-soft contacts, symmetric to particle self-contact truncation.
+                Each rigid-soft contact reported by the owned collision pipeline defines a division
+                plane at its detection-time reference configuration; rigid pose updates and particle
+                displacements are jointly truncated so neither side crosses it. Rigid rotation makes
+                trajectories curved, so crossing times use sampling and bisection for the rigid
+                primitive identified by a BVH row, or the stored surface point for an analytic SDF
+                row. Requires a solver-owned pipeline (``pipeline=``); each side's motion budget
+                between detections is 0.5 x relaxation x soft-contact gap. With
+                ``collision_frequency_type`` AUTO, the rigid slot resolves to ``PRE_POST_INIT``
+                (detect before and right after initialization), matching the self-contact slot;
+                raise the detection frequency (``ITERATIONS``) to widen the per-step motion budget
+                for fast bodies. Kinematic bodies move outside the solver and are not truncated.
+            rigid_conservative_bound_relaxation: Relaxation factor in (0, 1) applied to rigid DAT
+                truncation scalars and the conservative motion budget. Only used when
+                ``rigid_enable_penetration_free`` is ``True``.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -519,7 +568,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ``ITERATIONS`` slots ("every k-th iteration").
             collision_frequency_type: ``[rigid, soft_self_contact]``
                 :class:`SolverBase.CollisionFrequencyType` entries naming the in-step detection point;
-                runtime-changeable via :meth:`SolverBase.set_collision_frequency`.
+                runtime-changeable via :meth:`SolverBase.set_collision_frequency`. An enabled rigid-soft or
+                soft-self DAT family requires its corresponding slot to resolve to an active mode rather than
+                ``NONE``. When both DAT families are enabled, their resolved schedules must be equivalent.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -682,10 +733,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                 "contact_matching='latest' (or 'sticky' for persistent friction anchors). "
                 "Alternatively, set rigid_contact_history=False."
             )
-        # Per-step schedule cache; refreshed at every step() so runtime
-        # set_collision_frequency() changes take effect at the next step.
-        self._sc_mode_this_step, self._sc_freq_this_step = self._resolve_self_contact_schedule()
-
         effective_deterministic = deterministic if deterministic is not None else wp.config.deterministic
         particle_deterministic_max_records = 0
         coupling_deterministic_max_records = 0
@@ -777,6 +824,13 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_joint_angular_k_start,
             rigid_joint_linear_kd,
             rigid_joint_angular_kd,
+        )
+
+        # Initialize rigid penetration-free (DAT) truncation state
+        self._init_rigid_penetration_free(
+            model,
+            rigid_enable_penetration_free,
+            rigid_conservative_bound_relaxation,
         )
 
         # Controls whether the next step() refreshes contact state derived from
@@ -1120,6 +1174,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_particle_contact_material_ke = wp.zeros(0, dtype=float, device=self.device)
         self.body_particle_contact_material_kd = wp.zeros(0, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(0, dtype=float, device=self.device)
+        # Dense BVH queries retain non-facing rows for DAT coverage; this mask
+        # excludes those rows from penalty and ALM force evaluation.
+        self.body_particle_contact_force_eligible = wp.zeros(0, dtype=wp.int32, device=self.device)
         # Zero-length body poses for static-shape contact kernels when State.body_q is absent.
         self._empty_body_q = wp.empty(0, dtype=wp.transform, device=self.device)
         if model.particle_count > 0 and model.shape_count > 0:
@@ -1329,6 +1386,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_particle_contact_material_kd,
                     self.body_particle_contact_material_mu,
                     contacts.soft_contact_count,
+                    self.body_particle_contact_force_eligible,
                     contacts.soft_contact_indices,
                     contacts.soft_contact_barycentric,
                     contacts.soft_contact_shape,
@@ -1401,6 +1459,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.friction_epsilon,
                     self.model.particle_radius,
                     contacts.soft_contact_count,
+                    self.body_particle_contact_force_eligible,
                     contacts.soft_contact_particle,
                     self.body_particle_contact_penalty_k,
                     self.body_particle_contact_material_kd,
@@ -1492,6 +1551,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_particle_contact_material_ke = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_kd = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(soft_contact_max, dtype=float, device=self.device)
+        self.body_particle_contact_force_eligible = wp.ones(soft_contact_max, dtype=wp.int32, device=self.device)
 
     def _init_rigid_contact_warmstart(self, rigid_contact_max: int) -> None:
         """Allocate fresh contact-history buffers."""
@@ -2200,44 +2260,58 @@ class SolverVBD(SolverBase, CouplingInterface):
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
-        _Frequency = SolverBase.CollisionFrequencyType
-        self._sc_mode_this_step, self._sc_freq_this_step = self._resolve_self_contact_schedule()
-        self._rigid_mode_this_step = _Frequency.NONE
-        self._rigid_freq_this_step = 1
+        rigid_collision_schedule = self._resolve_collision_schedule(SolverBase._COLLISION_SLOT_RIGID)
+        soft_self_collision_schedule = self._resolve_collision_schedule(SolverBase._COLLISION_SLOT_SOFT_SELF)
+        self._validate_dat_collision_schedules(rigid_collision_schedule, soft_self_collision_schedule)
+
         if self.pipeline is not None:
             contacts = self._resolve_step_contacts(contacts)
-            rigid_mode = self._resolved_collision_frequency_type(SolverBase._COLLISION_SLOT_RIGID)
-            self._rigid_mode_this_step = rigid_mode
-            self._rigid_freq_this_step = self._collision_frequency[SolverBase._COLLISION_SLOT_RIGID]
-            if rigid_mode in (_Frequency.PRE_INIT, _Frequency.ITERATIONS):
-                # ITERATIONS' baseline includes the pre-init pass; in-loop
-                # re-detections start at the first k-th iteration.
-                self._run_rigid_collision(state_in)
-                update_rigid = True
+
+        rigid_collision_due = self.pipeline is not None and rigid_collision_schedule.detects_before_initialization
+        soft_self_collision_due = (
+            self.particle_enable_self_contact and soft_self_collision_schedule.detects_before_initialization
+        )
+        if rigid_collision_due or soft_self_collision_due:
+            self._refresh_collision_sets(
+                state_in,
+                run_rigid_collision=rigid_collision_due,
+                run_soft_self_collision=soft_self_collision_due,
+            )
+        if rigid_collision_due:
+            update_rigid = True
 
         if control is None:
             control = self.model.control(clone_variables=False)
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
-        self._initialize_particles(state_in, state_out, dt)
+        self._initialize_particles(state_in, state_out, contacts, dt)
 
         for iter_num in range(self.iterations):
-            if (
-                self._rigid_mode_this_step == _Frequency.ITERATIONS
-                and iter_num > 0
-                and iter_num % self._rigid_freq_this_step == 0
-            ):
-                # Re-detect all pipeline contacts at the current iterate. This
-                # must also run without internally integrated bodies because
-                # the pipeline owns particle-shape contacts. In-flight rigid
-                # lambdas are snapshotted first so matching can carry them onto
-                # the refreshed contact set.
-                self._snapshot_rigid_contact_history(contacts)
-                self._run_rigid_collision(self._rigid_iterate_view(state_in, state_out))
-                self._refresh_rigid_contact_state(contacts, refresh=True)
-                self._refresh_body_particle_contact_state(contacts, refresh=True)
+            rigid_collision_due = self.pipeline is not None and rigid_collision_schedule.is_due(iter_num)
+            soft_self_collision_due = self.particle_enable_self_contact and soft_self_collision_schedule.is_due(
+                iter_num
+            )
+            if rigid_collision_due or soft_self_collision_due:
+                # Detect from the same mid-solve iterate. Before a rigid-pipeline
+                # refresh, preserve in-flight lambdas for contact matching.
+                collision_state = self._rigid_iterate_view(state_in, state_out)
+                if rigid_collision_due:
+                    self._snapshot_rigid_contact_history(contacts)
+                self._refresh_collision_sets(
+                    collision_state,
+                    run_rigid_collision=rigid_collision_due,
+                    run_soft_self_collision=soft_self_collision_due,
+                )
+                if rigid_collision_due:
+                    self._refresh_rigid_contact_state(contacts, refresh=True)
+                    self._refresh_body_particle_contact_state(
+                        contacts,
+                        refresh=True,
+                        particle_q=collision_state.particle_q,
+                        body_q=collision_state.body_q,
+                    )
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
-            self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+            self._solve_particle_iteration(state_in, state_out, contacts, dt)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
@@ -2467,32 +2541,253 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-    def _penetration_free_truncation(self, particle_q_out=None):
-        """
-        Modify displacements_in in-place, also modify particle_q if its not None
+    def _init_rigid_penetration_free(
+        self,
+        model: Model,
+        rigid_enable_penetration_free: bool,
+        rigid_conservative_bound_relaxation: float,
+    ):
+        """Initialize rigid-soft DAT state and motion budgets.
 
+        A particle-only model can still collide with static rigid shapes, so the
+        zero-body case retains the particle-side DAT state with empty body arrays.
         """
-        if not self.particle_enable_self_contact:
-            self.truncation_ts.fill_(1.0)
+        self.rigid_enable_penetration_free = rigid_enable_penetration_free
+        self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
+        # Threshold below which a displacement is treated as parallel to a division plane.
+        self.rigid_dat_parallel_epsilon = 1e-5
+
+        if not self.rigid_enable_penetration_free:
+            return
+
+        if self.pipeline is None:
+            raise ValueError(
+                "rigid_enable_penetration_free requires a solver-owned collision pipeline "
+                "(pass pipeline=CollisionPipeline(...) to SolverVBD): the DAT reference poses "
+                "must be snapshotted at the exact detection instants the solver drives."
+            )
+        has_rigid_soft_queries = (
+            self.pipeline.soft_contact_pair_count > 0
+            or len(self.pipeline.soft_edge_rigid_pairs) > 0
+            or len(self.pipeline.soft_face_rigid_pairs) > 0
+            or self.pipeline._full_surface_bvh_thread_count > 0
+        )
+        if has_rigid_soft_queries and self.pipeline.soft_contact_gap <= 0.0:
+            raise ValueError(
+                "rigid_enable_penetration_free requires soft_contact_gap > 0 when rigid-soft "
+                "queries are active: DAT's between-detection motion bound needs positive "
+                "query slack independent of particle radii and shape margins."
+            )
+        if self.integrate_with_external_rigid_solver:
+            raise ValueError("rigid_enable_penetration_free is not supported with an external rigid solver.")
+
+        self.body_truncation_ts = wp.zeros(model.body_count, dtype=float, device=self.device)
+        # Reference poses at the last rigid collision detection (mirror of
+        # pos_prev_collision_detection): rigid pose updates accumulate from here and the
+        # per-body motion budget below is measured from here.
+        self.body_q_prev_collision_detection = wp.clone(model.body_q, device=self.device)
+
+        self._init_rigid_dat_body_bounding_radius(model)
+
+        # Both sides of a rigid-soft pair receive half of the collision query slack.
+        soft_gap = float(self.pipeline.soft_contact_gap) if model.particle_count > 0 else np.inf
+        if model.particle_count > 0 and np.isfinite(soft_gap) and soft_gap > 0.0:
+            rigid_soft_max_displacement = 0.5 * rigid_conservative_bound_relaxation * soft_gap
+        else:
+            rigid_soft_max_displacement = wp.inf
+        self._rigid_dat_particle_max_displacement = rigid_soft_max_displacement
+        self._rigid_dat_body_max_displacement = wp.full(
+            model.body_count, rigid_soft_max_displacement, dtype=float, device=self.device
+        )
+
+    def _init_rigid_dat_body_bounding_radius(self, model: Model):
+        """Compute a conservative surface radius about each rigid body's COM.
+
+        The radius makes ``|translation| + |rotation angle| * radius`` bound the
+        displacement of every represented surface point between collision detections.
+        """
+        from ...geometry import GeoType  # noqa: PLC0415
+
+        shape_body = model.shape_body.numpy()
+        shape_type = model.shape_type.numpy()
+        shape_scale = model.shape_scale.numpy()
+        shape_transform = model.shape_transform.numpy()
+        shape_collision_radius = model.shape_collision_radius.numpy()
+        body_com = model.body_com.numpy()
+        bounding_radius = np.zeros(model.body_count, dtype=np.float32)
+
+        def shape_local_reach(shape_index: int, com_shape: wp.vec3) -> float:
+            """Return a conservative upper bound on the shape's distance about the body COM."""
+            geo = shape_type[shape_index]
+            scale = wp.vec3(*shape_scale[shape_index])
+            if geo == GeoType.SPHERE:
+                return wp.length(com_shape) + wp.abs(scale[0])
+            if geo == GeoType.CAPSULE:
+                h = scale[1]
+                p0 = wp.vec3(0.0, 0.0, -h)
+                p1 = wp.vec3(0.0, 0.0, h)
+                return wp.max(wp.length(p0 - com_shape), wp.length(p1 - com_shape)) + wp.abs(scale[0])
+            if geo == GeoType.BOX:
+                reach = 0.0
+                for sx in (-1.0, 1.0):
+                    for sy in (-1.0, 1.0):
+                        for sz in (-1.0, 1.0):
+                            corner = wp.vec3(sx * scale[0], sy * scale[1], sz * scale[2])
+                            reach = wp.max(reach, wp.length(corner - com_shape))
+                return reach
+            if geo == GeoType.ELLIPSOID:
+                # Conservative bounding sphere (over-approximates; only tightens truncation).
+                radius = wp.max(wp.abs(scale[0]), wp.max(wp.abs(scale[1]), wp.abs(scale[2])))
+                return wp.length(com_shape) + radius
+            if geo in (GeoType.CYLINDER, GeoType.CONE):
+                radius, h = scale[0], scale[1]
+                # A sphere about the shape origin avoids underestimating the continuous rim.
+                return wp.length(com_shape) + wp.length(wp.vec2(radius, h))
+            if geo in (GeoType.MESH, GeoType.CONVEX_MESH):
+                src_mesh = model.shape_source[shape_index]
+                verts = getattr(src_mesh, "vertices", None)
+                if verts is not None and len(verts) > 0:
+                    points_shape = np.asarray(verts, dtype=np.float64) * np.asarray(scale, dtype=np.float64)
+                    return float(
+                        np.max(np.linalg.norm(points_shape - np.asarray(com_shape, dtype=np.float64)[None, :], axis=1))
+                    )
+            # Preserve a conservative fallback for geometry without explicit support points.
+            return wp.length(com_shape) + shape_collision_radius[shape_index]
+
+        for shape_index in range(model.shape_count):
+            body_index = shape_body[shape_index]
+            # Collision flags are mutable, so cache every attached shape that could
+            # later be enabled for rigid-soft queries.
+            if body_index < 0:
+                continue
+            X_bs = wp.transform(*shape_transform[shape_index])
+            # com_shape is the body's Center of Mass in shape frame
+            com_shape = wp.transform_point(wp.transform_inverse(X_bs), wp.vec3(*body_com[body_index]))
+            reach = shape_local_reach(shape_index, com_shape)
+            bounding_radius[body_index] = max(bounding_radius[body_index], reach)
+
+        self._rigid_dat_body_bounding_radius = wp.array(bounding_radius, dtype=float, device=self.device)
+
+    def _reset_dat_references(self, state: State, *, reset_rigid_soft: bool, reset_particles: bool):
+        """Reset selected DAT trajectory references at a collision checkpoint."""
+        if reset_rigid_soft and self.model.body_count > 0:
+            self.body_q_prev_collision_detection.assign(state.body_q)
+        if reset_particles and self.model.particle_count > 0:
+            self.pos_prev_collision_detection.assign(state.particle_q)
+            self.particle_displacements.zero_()
+
+    def _refresh_collision_sets(
+        self,
+        state: State,
+        *,
+        run_rigid_collision: bool,
+        run_soft_self_collision: bool,
+    ):
+        """Run selected collision detectors, then reset their DAT references."""
+        if run_rigid_collision:
+            self._run_rigid_collision(state)
+        if run_soft_self_collision:
+            self._collision_detection_penetration_free(state, reset_reference=False)
+
+        reset_rigid_soft = run_rigid_collision and self.rigid_enable_penetration_free
+        reset_particles = reset_rigid_soft or (run_soft_self_collision and self.particle_enable_self_contact)
+        if reset_rigid_soft or reset_particles:
+            self._reset_dat_references(
+                state,
+                reset_rigid_soft=reset_rigid_soft,
+                reset_particles=reset_particles,
+            )
+
+    def _rigid_penetration_free_truncation(self, contacts: Contacts | None, body_q):
+        """Truncate accumulated rigid poses against rigid-soft division planes.
+
+        Applied after the rigid bodies move (forward step and each AVBD iteration).
+        Particle displacements are not modified here; the particle-phase joint pass
+        (:meth:`_penetration_free_truncation`) re-enforces the rigid-soft planes on both
+        sides.
+        """
+        if not self.rigid_enable_penetration_free or contacts is None or body_q is None:
+            return
+
+        self.body_truncation_ts.fill_(1.0)
+
+        if self.model.particle_count > 0 and contacts.soft_contact_max > 0:
+            # Also respect the rigid-soft planes; the write to truncation_ts is a
+            # harmless side effect (it is refilled before its next particle-phase use).
             wp.launch(
-                kernel=apply_truncation_ts,
-                dim=self.model.particle_count,
+                kernel=apply_rigid_soft_truncation,
+                dim=contacts.soft_contact_max,
                 inputs=[
-                    self.pos_prev_collision_detection,  # pos: wp.array[wp.vec3],
-                    self.particle_displacements,  # displacement_in: wp.array[wp.vec3],
-                    self.truncation_ts,  # truncation_ts: wp.array[float],
-                    wp.inf,  # max_displacement: float (input threshold)
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_indices,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_normal,
+                    contacts.soft_contact_barycentric,
+                    contacts.soft_contact_rigid_indices,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
+                    self.pos_prev_collision_detection,
+                    self.particle_displacements,
+                    self.body_q_prev_collision_detection,
+                    body_q,
+                    self.model.body_com,
+                    self.rigid_dat_parallel_epsilon,
+                    self.rigid_conservative_bound_relaxation,
                 ],
                 outputs=[
-                    self.particle_displacements,  # displacement_out: wp.array[wp.vec3],
-                    particle_q_out,  # pos_out: wp.array[wp.vec3],
+                    self.truncation_ts,
+                    self.body_truncation_ts,
                 ],
                 device=self.device,
             )
 
-        else:
+        wp.launch(
+            kernel=apply_body_truncation_ts,
+            dim=self.model.body_count,
+            inputs=[
+                self.body_q_prev_collision_detection,
+                self.model.body_com,
+                self.body_truncation_ts,
+                self._rigid_dat_body_bounding_radius,
+                self._rigid_dat_body_max_displacement,
+            ],
+            outputs=[
+                body_q,
+            ],
+            device=self.device,
+        )
+
+    def _penetration_free_truncation(self, state: State, contacts: Contacts | None):
+        """
+        Truncate the accumulated particle and rigid updates in ``state`` in place.
+
+        When rigid DAT is enabled and ``contacts`` are provided, additionally
+        truncates the accumulated rigid pose updates (``state.body_q`` relative to
+        ``self.body_q_prev_collision_detection``) against the rigid-soft division planes,
+        in the same pass that truncates the soft side.
+        """
+        # Rigid-soft DAT also applies to world-attached shapes, whose state has no
+        # body_q. Warp accepts that null array because static rows never index it;
+        # a model with actual bodies, however, must provide their current poses.
+        rigid_dat_active = self.rigid_enable_penetration_free and contacts is not None
+        if rigid_dat_active and self.model.body_count > 0 and state.body_q is None:
+            raise ValueError("Rigid-soft DAT requires body_q for a model with rigid bodies")
+
+        # Max displacement between collision detections (0.5 * gamma * detection slack
+        # per side); displacements beyond it degenerate to isotropic truncation.
+        max_displacement = wp.inf
+        if self.particle_enable_self_contact:
+            max_displacement = self._self_contact_query_radius * self.particle_conservative_bound_relaxation * 0.5
+        if rigid_dat_active:
+            max_displacement = min(max_displacement, self._rigid_dat_particle_max_displacement)
+
+        self.truncation_ts.fill_(1.0)
+
+        if self.particle_enable_self_contact:
             ##  parallel by collision and atomic operation
-            self.truncation_ts.fill_(1.0)
             wp.launch(
                 kernel=apply_planar_truncation_parallel_by_collision,
                 inputs=[
@@ -2511,25 +2806,74 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+        if rigid_dat_active:
+            # Joint rigid-soft pass: both sides of every contact are constrained against
+            # the same division plane within this launch.
+            self.body_truncation_ts.fill_(1.0)
             wp.launch(
-                kernel=apply_truncation_ts,
-                dim=self.model.particle_count,
+                kernel=apply_rigid_soft_truncation,
+                dim=contacts.soft_contact_max,
                 inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_indices,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_normal,
+                    contacts.soft_contact_barycentric,
+                    contacts.soft_contact_rigid_indices,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
-                    self.truncation_ts,
-                    self._self_contact_query_radius
-                    * self.particle_conservative_bound_relaxation
-                    * 0.5,  # max_displacement: degenerate to isotropic truncation
+                    self.body_q_prev_collision_detection,
+                    state.body_q,
+                    self.model.body_com,
+                    self.rigid_dat_parallel_epsilon,
+                    self.rigid_conservative_bound_relaxation,
                 ],
                 outputs=[
-                    self.particle_displacements,
-                    particle_q_out,
+                    self.truncation_ts,
+                    self.body_truncation_ts,
                 ],
                 device=self.device,
             )
 
-    def _initialize_particles(self, state_in: State, state_out: State, dt: float):
+        wp.launch(
+            kernel=apply_truncation_ts,
+            dim=self.model.particle_count,
+            inputs=[
+                self.pos_prev_collision_detection,
+                self.particle_displacements,
+                self.truncation_ts,
+                max_displacement,
+            ],
+            outputs=[
+                self.particle_displacements,
+                state.particle_q,
+            ],
+            device=self.device,
+        )
+
+        if rigid_dat_active and self.model.body_count > 0:
+            wp.launch(
+                kernel=apply_body_truncation_ts,
+                dim=self.model.body_count,
+                inputs=[
+                    self.body_q_prev_collision_detection,
+                    self.model.body_com,
+                    self.body_truncation_ts,
+                    self._rigid_dat_body_bounding_radius,
+                    self._rigid_dat_body_max_displacement,
+                ],
+                outputs=[
+                    state.body_q,
+                ],
+                device=self.device,
+            )
+
+    def _initialize_particles(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float):
         """Initialize particle positions for the VBD iteration."""
         model = self.model
 
@@ -2537,10 +2881,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         if model.particle_count == 0:
             return
 
-        # Collision detection before initialization to compute conservative bounds
-        if self.particle_enable_self_contact and self._sc_mode_this_step != SolverBase.CollisionFrequencyType.NONE:
-            self._collision_detection_penetration_free(state_in)
-        else:
+        # Without DAT, use the step-start particle positions as a fixed reference for
+        # all VBD iterations. particle_displacements accumulates the inertial displacement
+        # and VBD corrections, so the current iterate is reference + displacement.
+        # Active DAT schedules establish this reference at collision-detection checkpoints.
+        if not self.rigid_enable_penetration_free and not self.particle_enable_self_contact:
             self.pos_prev_collision_detection.assign(state_in.particle_q)
             self.particle_displacements.zero_()
 
@@ -2565,7 +2910,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-        self._penetration_free_truncation(state_in.particle_q)
+        self._penetration_free_truncation(state_in, contacts)
 
     def _refresh_rigid_contact_state(self, contacts: Contacts | None, refresh: bool) -> bool:
         """Rebuild rigid contact lists and AVBD contact state from ``contacts``.
@@ -2724,7 +3069,13 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         return refresh
 
-    def _refresh_body_particle_contact_state(self, contacts: Contacts | None, refresh: bool) -> None:
+    def _refresh_body_particle_contact_state(
+        self,
+        contacts: Contacts | None,
+        refresh: bool,
+        particle_q: wp.array[wp.vec3] | None,
+        body_q: wp.array[wp.transform] | None,
+    ) -> None:
         """Rebuild body-particle contact lists and material state when needed."""
         model = self.model
         if (
@@ -2739,6 +3090,37 @@ class SolverVBD(SolverBase, CouplingInterface):
         if model.particle_count == 0 or not refresh or contacts is None:
             return
 
+        soft_contact_launch_dim = contacts.soft_contact_max
+        if self.body_particle_contact_penalty_k.shape[0] < soft_contact_launch_dim:
+            self._raise_if_capturing_resize(
+                "body-particle contact state",
+                self.body_particle_contact_penalty_k.shape[0],
+                soft_contact_launch_dim,
+            )
+            self._init_body_particle_contact_state(soft_contact_launch_dim)
+
+        if particle_q is None:
+            raise ValueError("particle_q is required when refreshing body-particle contacts")
+        body_q_for_eligibility = body_q if body_q is not None else self._empty_body_q
+        wp.launch(
+            kernel=compute_body_particle_contact_force_eligibility,
+            dim=soft_contact_launch_dim,
+            inputs=[
+                contacts.soft_contact_count,
+                contacts.soft_contact_indices,
+                contacts.soft_contact_barycentric,
+                contacts.soft_contact_rigid_indices,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_normal,
+                particle_q,
+                model.shape_body,
+                body_q_for_eligibility,
+            ],
+            outputs=[self.body_particle_contact_force_eligible],
+            device=self.device,
+        )
+
         if not self.integrate_with_external_rigid_solver and model.body_count > 0:
             self.body_particle_contact_counts.zero_()
             self.body_particle_contact_overflow_max.zero_()
@@ -2748,6 +3130,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 inputs=[
                     contacts.soft_contact_count,
                     contacts.soft_contact_shape,
+                    self.body_particle_contact_force_eligible,
                     model.shape_body,
                     self.body_inv_mass_effective,
                     self.body_particle_contact_buffer_pre_alloc,
@@ -2766,14 +3149,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
-        soft_contact_launch_dim = contacts.soft_contact_max
-        if self.body_particle_contact_penalty_k.shape[0] < soft_contact_launch_dim:
-            self._raise_if_capturing_resize(
-                "body-particle contact state",
-                self.body_particle_contact_penalty_k.shape[0],
-                soft_contact_launch_dim,
-            )
-            self._init_body_particle_contact_state(soft_contact_launch_dim)
         wp.launch(
             kernel=init_body_particle_contacts,
             inputs=[
@@ -2846,6 +3221,16 @@ class SolverVBD(SolverBase, CouplingInterface):
         if self._integrates_rigid_bodies:
             refresh = self._refresh_rigid_contact_state(contacts, refresh)
 
+        # Eligibility is defined at the collision configuration. Refresh body-particle
+        # state before internal rigid prediction modifies state_in.body_q in place.
+        self._refresh_body_particle_contact_state(
+            contacts,
+            refresh,
+            particle_q=state_in.particle_q,
+            body_q=state_in.body_q,
+        )
+
+        if self._integrates_rigid_bodies:
             # Per-step penalty decay, lambda retention, C0, and ALM auto-rho
             # (body_q is still collide frame here).
             if contacts is not None and contacts.rigid_contact_max > 0:
@@ -2947,6 +3332,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+            # Truncate the forward step against the division planes before any
+            # solve iterations run on the predicted poses.
+            self._rigid_penetration_free_truncation(contacts, state_in.body_q)
+
             if model.joint_count > 0:
                 # Per-step joint setup: penalty-k decay, C0 snapshot, lambda retention,
                 # and automatic per-row rho refresh for compliant ALM.
@@ -3040,11 +3429,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             # The forward step and any enabled cable update have consumed the mask.
             self._rigid_pose_rebaseline_mask.zero_()
 
-        self._refresh_body_particle_contact_state(contacts, refresh)
-
-    def _solve_particle_iteration(
-        self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
-    ):
+    def _solve_particle_iteration(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float):
         """Solve one VBD iteration for particles."""
         model = self.model
 
@@ -3064,14 +3449,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Early exit if no particles
         if model.particle_count == 0:
             return
-
-        # Update collision detection if needed (penetration-free mode only)
-        if self.particle_enable_self_contact:
-            _Frequency = SolverBase.CollisionFrequencyType
-            if (self._sc_mode_this_step == _Frequency.PRE_POST_INIT and iter_num == 0) or (
-                self._sc_mode_this_step == _Frequency.ITERATIONS and iter_num % self._sc_freq_this_step == 0
-            ):
-                self._collision_detection_penetration_free(state_in)
 
         # Zero out forces and hessians
         self.particle_forces.zero_()
@@ -3095,6 +3472,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_indices,
                         contacts.soft_contact_count,
                         contacts.soft_contact_max,
+                        self.body_particle_contact_force_eligible,
                         self.body_particle_contact_penalty_k,
                         self.body_particle_contact_material_ke,
                         self.body_particle_contact_material_kd,
@@ -3228,7 +3606,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     ],
                     device=self.device,
                 )
-            self._penetration_free_truncation(state_in.particle_q)
+            self._penetration_free_truncation(state_in, contacts)
 
         wp.copy(state_out.particle_q, state_in.particle_q)
 
@@ -3261,6 +3639,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     inputs=[
                         contacts.soft_contact_count,
                         contacts.soft_contact_indices,
+                        self.body_particle_contact_force_eligible,
                         contacts.soft_contact_shape,
                         contacts.soft_contact_body_pos,
                         contacts.soft_contact_normal,
@@ -3449,6 +3828,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+        # Truncate the accumulated pose updates before the dual updates read them.
+        self._rigid_penetration_free_truncation(contacts, state_in.body_q)
+
         if contacts is not None and contacts.rigid_contact_max > 0:
             wp.launch(
                 kernel=update_duals_body_body_contacts,
@@ -3488,6 +3870,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 inputs=[
                     contacts.soft_contact_count,
                     contacts.soft_contact_indices,
+                    self.body_particle_contact_force_eligible,
                     contacts.soft_contact_shape,
                     contacts.soft_contact_body_pos,
                     contacts.soft_contact_normal,
@@ -3787,6 +4170,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             if interval < 0:
                 return Frequency.PRE_INIT
             return Frequency.ITERATIONS
+        if slot == SolverBase._COLLISION_SLOT_RIGID and self.rigid_enable_penetration_free:
+            # Symmetric to the self-contact slot: rigid DAT references reset at each
+            # detection, so AUTO detects before and right after initialization.
+            return Frequency.PRE_POST_INIT
         return super()._default_collision_frequency_type(slot)
 
     def _rigid_iterate_view(self, state_in: State, state_out: State) -> State:
@@ -3794,8 +4181,8 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         No arrays are copied: internal rigid iterations update
         ``state_in.body_q`` in place, externally integrated rigid bodies are
-        supplied through ``state_out``, and particle iterations update
-        ``state_out.particle_q``.
+        supplied through ``state_out``. Particle VBD updates ``state_in.particle_q``
+        in place; ``state_out`` is only synchronized at the end of each iteration.
         """
         view = State()
         if self.integrate_with_external_rigid_solver:
@@ -3804,31 +4191,56 @@ class SolverVBD(SolverBase, CouplingInterface):
         else:
             view.body_q = state_in.body_q
             view.body_qd = state_in.body_qd
-        view.particle_q = state_out.particle_q if state_out.particle_q is not None else state_in.particle_q
+        view.particle_q = state_in.particle_q
         view.particle_qd = state_in.particle_qd
         return view
 
-    def _resolve_self_contact_schedule(self):
-        """Resolve the self-contact slot to a concrete (mode, frequency) pair.
-
-        ``AUTO`` resolution lives in :meth:`_default_collision_frequency_type`,
-        so base-level queries agree with the schedule used here; the deprecated
-        interval also supplies the ITERATIONS frequency.
-        """
+    def _resolve_collision_schedule(self, slot: int) -> SolverVBD._CollisionSchedule:
+        """Resolve one collision slot to its effective mode and frequency."""
         Frequency = SolverBase.CollisionFrequencyType
-        slot = SolverBase._COLLISION_SLOT_SOFT_SELF
         mode = self._resolved_collision_frequency_type(slot)
         freq = self._collision_frequency[slot]
-        interval = self._deprecated_particle_interval
-        if self._collision_frequency_type[slot] == Frequency.AUTO and interval is not None and interval >= 1:
-            freq = interval
-        return mode, freq
+        if slot == SolverBase._COLLISION_SLOT_SOFT_SELF:
+            interval = self._deprecated_particle_interval
+            if self._collision_frequency_type[slot] == Frequency.AUTO and interval is not None and interval >= 1:
+                freq = interval
+        return self._CollisionSchedule(mode, freq)
 
-    def _collision_detection_penetration_free(self, current_state: State):
+    def _validate_dat_collision_schedules(
+        self,
+        rigid_collision_schedule: SolverVBD._CollisionSchedule,
+        soft_self_collision_schedule: SolverVBD._CollisionSchedule,
+    ) -> None:
+        """Require active DAT families to have usable, mutually consistent schedules."""
+        Frequency = SolverBase.CollisionFrequencyType
+        if self.rigid_enable_penetration_free and rigid_collision_schedule.mode == Frequency.NONE:
+            raise ValueError(
+                "rigid_enable_penetration_free requires an active rigid collision schedule; "
+                "collision_frequency_type NONE cannot maintain DAT's detection-centered "
+                "motion-bound and complete-pair invariants."
+            )
+        if self.particle_enable_self_contact and soft_self_collision_schedule.mode == Frequency.NONE:
+            raise ValueError(
+                "particle_enable_self_contact requires an active soft self-collision schedule; "
+                "collision_frequency_type NONE cannot maintain DAT's detection-centered "
+                "motion-bound and complete-pair invariants."
+            )
+        if (
+            self.rigid_enable_penetration_free
+            and self.particle_enable_self_contact
+            and not rigid_collision_schedule.is_equivalent_to(soft_self_collision_schedule)
+        ):
+            raise ValueError(
+                "rigid-soft DAT and soft-self DAT share a particle trajectory reference and "
+                "therefore require equivalent rigid and soft self-collision schedules"
+            )
+
+    def _collision_detection_penetration_free(self, current_state: State, *, reset_reference: bool = True):
         # particle_displacements is based on pos_prev_collision_detection
         # so reset them every time we do collision detection
-        self.pos_prev_collision_detection.assign(current_state.particle_q)
-        self.particle_displacements.zero_()
+        if reset_reference:
+            self.pos_prev_collision_detection.assign(current_state.particle_q)
+            self.particle_displacements.zero_()
 
         self.trimesh_collision_detector.refit(current_state.particle_q)
         self.trimesh_collision_detector.vertex_triangle_collision_detection(

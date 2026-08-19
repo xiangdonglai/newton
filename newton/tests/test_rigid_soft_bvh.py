@@ -2255,6 +2255,425 @@ def test_bvh_graph_capture(test, device):
     test.assertTrue(np.array_equal(idx_cap, idx_ref))
 
 
+def _run_bvh_dat_box_particle(device, enable_dat):
+    """Advance a dynamic rigid mesh box toward one fixed soft vertex."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.12), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia = wp.mat33(0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), mass=1.0, inertia=inertia, lock_inertia=True
+    )
+    builder.add_shape_mesh(body, mesh=newton.Mesh.create_box(0.1, 0.1, 0.1))
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 1.0e-6
+    model.soft_contact_kd = 0.0
+    model.shape_material_ke.fill_(1.0e-6)
+    model.shape_material_kd.zero_()
+
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.05,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        rigid_compliant_alm=False,
+        rigid_enable_penetration_free=enable_dat,
+        pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][:3] = [0.0, 0.0, 5.0]
+    state_in.body_qd.assign(qd)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+    return float(state_out.body_q.numpy()[body, 2] + 0.1), float(state_out.particle_q.numpy()[0, 2])
+
+
+def test_bvh_dat_mesh_triangle_stops_before_soft_vertex(test, device):
+    """Dense VT metadata lets DAT truncate the actual rigid triangle rather than a proxy table."""
+    box_top, particle_z = _run_bvh_dat_box_particle(device, enable_dat=True)
+    test.assertLessEqual(box_top, particle_z + 1.0e-4)
+
+    control_top, _ = _run_bvh_dat_box_particle(device, enable_dat=False)
+    test.assertGreater(control_top, particle_z + 1.0e-3, "control must cross the fixed vertex")
+
+
+def _run_bvh_dat_static_pair(device, family, enable_dat):
+    """Translate one soft primitive through a static mesh feature and return its plane gaps."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_mesh(-1, mesh=newton.Mesh.create_box(0.2, 0.2, 0.1))
+    if family == "vt":
+        builder.add_particle(pos=wp.vec3(0.05, 0.0, 0.105), vel=wp.vec3(0.0), mass=0.1, radius=0.0)
+    elif family == "tv":
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=[wp.vec3(*p) for p in [(0.05, 0.05, 0.115), (0.35, 0.2, 0.1), (0.2, 0.35, 0.1)]],
+            indices=[0, 1, 2],
+            density=1.0,
+            particle_radius=0.0,
+        )
+    elif family == "ee":
+        v0, v1 = np.array([0.0, 0.3, 0.05]), np.array([0.0, 0.1, 0.16])
+        side = np.array([0.3, 0.0, 0.0])
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=[wp.vec3(*v0), wp.vec3(*v1), wp.vec3(*(v0 + side)), wp.vec3(*(v1 + side))],
+            indices=[0, 1, 2, 2, 1, 3],
+            density=1.0,
+            particle_radius=0.0,
+        )
+    else:
+        raise ValueError(f"unknown pair family: {family}")
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 1.0e-6
+    model.soft_contact_kd = 0.0
+    model.shape_material_ke.fill_(1.0e-6)
+    model.shape_material_kd.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.01,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+
+    # Read the exact pair that will define the DAT plane, then drive the complete
+    # soft primitive through its rigid counterpart along the row normal.
+    contacts = pipeline.contacts()
+    probe = model.state()
+    if pipeline._full_surface_bvh_needs_detector:
+        pipeline.refit_soft_contact_bvh(probe)
+    pipeline.collide(probe, contacts)
+    count = int(contacts.soft_contact_count.numpy()[0])
+    indices_all = contacts.soft_contact_indices.numpy()[:count]
+    if family == "vt":
+        matches = np.flatnonzero((indices_all[:, 0] >= 0) & (indices_all[:, 1] < 0))
+    elif family == "ee":
+        matches = np.flatnonzero((indices_all[:, 1] >= 0) & (indices_all[:, 2] < 0))
+    else:
+        matches = np.flatnonzero(indices_all[:, 2] >= 0)
+    if len(matches) == 0:
+        raise AssertionError(f"test setup emitted no {family.upper()} pair")
+    row = int(matches[0])
+    indices = indices_all[row]
+    bary = contacts.soft_contact_barycentric.numpy()[row]
+    normal = contacts.soft_contact_normal.numpy()[row]
+    rigid_point = contacts.soft_contact_body_pos.numpy()[row]
+    q_reference = probe.particle_q.numpy().copy()
+    soft_point_reference = np.zeros(3)
+    for local in range(3):
+        if indices[local] >= 0:
+            soft_point_reference += bary[local] * q_reference[indices[local]]
+    # Dense DAT uses the closest-point direction, independent of the outward force normal.
+    dat_normal = soft_point_reference - rigid_point
+    pair_gap = np.linalg.norm(dat_normal)
+    dat_normal /= pair_gap
+    proposed_displacement = (-5.0 * normal) / 60.0
+    delta_soft = max(-float(np.dot(dat_normal, proposed_displacement)), 0.0)
+    plane_fraction = 0.0 if delta_soft > 0.0 else 0.5
+    plane_point = rigid_point + plane_fraction * pair_gap * dat_normal
+
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        rigid_compliant_alm=False,
+        rigid_enable_penetration_free=enable_dat,
+        pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.particle_qd.numpy()
+    qd[:] = -5.0 * normal
+    state_in.particle_qd.assign(qd)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    q_final = state_out.particle_q.numpy()
+    soft_point = np.zeros(3)
+    vertex_gaps = []
+    for local in range(3):
+        if indices[local] >= 0:
+            soft_point += bary[local] * q_final[indices[local]]
+            vertex_gaps.append(float(np.dot(dat_normal, q_final[indices[local]] - plane_point)))
+    return {
+        "closest_point_gap": float(np.dot(dat_normal, soft_point - plane_point)),
+        "vertex_gaps": vertex_gaps,
+    }
+
+
+def test_bvh_dat_static_mesh_pair_families(test, device):
+    """Dense VT, TV, and EE rows all truncate soft motion against a static rigid mesh."""
+    for family in ("vt", "tv", "ee"):
+        dat = _run_bvh_dat_static_pair(device, family, enable_dat=True)
+        control = _run_bvh_dat_static_pair(device, family, enable_dat=False)
+        test.assertGreaterEqual(dat["closest_point_gap"], -1.0e-4, f"DAT must preserve the {family.upper()} half-space")
+        test.assertTrue(
+            all(g >= -1.0e-4 for g in dat["vertex_gaps"]),
+            f"DAT must keep every soft {family.upper()} primitive vertex in its assigned half-space",
+        )
+        test.assertLess(control["closest_point_gap"], -1.0e-3, f"control must cross the {family.upper()} plane")
+
+
+def test_bvh_dat_plane_uses_complete_primitive_approach(test, device):
+    """Place the DAT plane from the fastest vertex, not the interpolated closest-point motion."""
+    from newton._src.solvers.vbd.rigid_vbd_kernels import apply_rigid_soft_truncation  # noqa: PLC0415
+
+    # A rigid triangle rotates about a stationary closest point at the origin;
+    # its x=1 vertex advances by 0.3 m along +z. Only soft-triangle vertex 0
+    # moves down (0.9 m), with closest-point weight 0.25. Planar-DAT therefore
+    # uses the two complete-primitive maxima, delta_rigid=0.3 and
+    # delta_soft=0.9, and places the plane at lambda=0.25.
+    mesh = newton.Mesh(
+        np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], np.float32),
+        np.array([0, 1, 2], np.int32),
+    )
+    mesh_id = mesh.finalize(device=device)
+    particle_q = wp.array([[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
+    particle_displacements = wp.array(
+        [[0.0, 0.0, -0.9], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=wp.vec3, device=device
+    )
+    body_q_ref = wp.array([wp.transform_identity()], dtype=wp.transform, device=device)
+    rotation_angle = np.arcsin(0.3)
+    rotation = wp.quat(0.0, -np.sin(0.5 * rotation_angle), 0.0, np.cos(0.5 * rotation_angle))
+    body_q = wp.array([wp.transform(wp.vec3(0.0), rotation)], dtype=wp.transform, device=device)
+    truncation_ts = wp.ones(3, dtype=float, device=device)
+    body_truncation_ts = wp.ones(1, dtype=float, device=device)
+
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([[0.25, 0.25, 0.5]], dtype=wp.vec3, device=device),
+            wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([mesh_id], dtype=wp.uint64, device=device),
+            particle_q,
+            particle_displacements,
+            body_q_ref,
+            body_q,
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            1.0e-6,
+            0.85,
+        ],
+        outputs=[truncation_ts, body_truncation_ts],
+        device=device,
+    )
+
+    expected_t = 0.85 * (0.75 / 0.9)
+    expected_body_t = 0.85 * np.arcsin(0.25) / rotation_angle
+    test.assertAlmostEqual(float(truncation_ts.numpy()[0]), expected_t, places=5)
+    test.assertTrue(np.allclose(truncation_ts.numpy()[1:], 1.0))
+    test.assertAlmostEqual(float(body_truncation_ts.numpy()[0]), expected_body_t, places=4)
+
+
+def test_bvh_solver_owned_pipeline_refits_soft_features(test, device):
+    """An owning VBD solver refits TV/EE BVHs at every rigid-contact detection."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_mesh(-1, mesh=newton.Mesh.create_box(0.2, 0.2, 0.1))
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(*p) for p in [(0.05, 0.05, 0.115), (0.35, 0.2, 0.1), (0.2, 0.35, 0.1)]],
+        indices=[0, 1, 2],
+        density=1.0,
+        particle_radius=0.0,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(
+        model,
+        soft_contact_gap=0.01,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
+
+    # Seed the detector with a triangle one metre away, then restore the near
+    # model state.  The second owned detection finds TV only if it refits first.
+    state_far, state_out = model.state(), model.state()
+    q_far = state_far.particle_q.numpy()
+    q_far[:, 2] += 1.0
+    state_far.particle_q.assign(q_far)
+    solver.step(state_far, state_out, None, None, 1.0 / 60.0)
+    test.assertEqual(int(solver.contacts.soft_contact_count.numpy()[0]), 0)
+
+    state_near, state_out = model.state(), model.state()
+    solver.step(state_near, state_out, None, None, 1.0 / 60.0)
+    count = int(solver.contacts.soft_contact_count.numpy()[0])
+    indices = solver.contacts.soft_contact_indices.numpy()[:count]
+    test.assertTrue(np.any(indices[:, 2] >= 0), "the refreshed pipeline must recover the TV row")
+
+
+def test_bvh_invalid_adjacent_face_row_does_not_push_particle_sideways(test, device):
+    """Dense DAT rows behind an adjacent face remain safety pairs, not penalty contacts."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_mesh(-1, mesh=newton.Mesh.create_box(0.2, 0.2, 0.1))
+    builder.add_particle(pos=wp.vec3(0.195, 0.0, 0.105), vel=wp.vec3(0.0), mass=0.1, radius=0.0)
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_kd = 0.0
+    model.shape_material_kd.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        soft_contact_gap=0.01,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
+    state_in, state_out = model.state(), model.state()
+    x0 = state_in.particle_q.numpy().copy()
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    count = min(int(solver.contacts.soft_contact_count.numpy()[0]), solver.contacts.soft_contact_max)
+    eligible = solver.body_particle_contact_force_eligible.numpy()[:count]
+    test.assertTrue(np.any(eligible == 0), "setup must contain a sign-failed adjacent-face row")
+    x1 = state_out.particle_q.numpy()
+    test.assertAlmostEqual(float(x1[0, 0]), float(x0[0, 0]), places=6)
+
+
+def test_analytic_sdf_penetration_remains_force_eligible(test, device):
+    """Solver-local BVH filtering must not disable recovery of a negative analytic SDF row."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_sphere(-1, radius=0.1)
+    builder.add_particle(pos=wp.vec3(0.05, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.1, radius=0.0)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(
+        model,
+        soft_contact_gap=0.01,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
+    state_in, state_out = model.state(), model.state()
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    count = min(int(solver.contacts.soft_contact_count.numpy()[0]), solver.contacts.soft_contact_max)
+    test.assertGreater(count, 0)
+    rigid_indices = solver.contacts.soft_contact_rigid_indices.numpy()[:count]
+    eligibility = solver.body_particle_contact_force_eligible.numpy()[:count]
+    analytic_rows = np.all(rigid_indices < 0, axis=1)
+    test.assertTrue(np.any(analytic_rows))
+    test.assertTrue(np.all(eligibility[analytic_rows] == 1))
+
+
+def _run_bvh_dat_rotating_mesh(device, enable_dat):
+    """Rotate a long rigid mesh bar through a fixed soft vertex and inspect the active VT plane."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    particle = np.array([0.7, 0.3, 0.0])
+    builder.add_particle(pos=wp.vec3(*particle), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), mass=1.0, inertia=inertia, lock_inertia=True
+    )
+    box_mesh = newton.Mesh.create_box(1.0, 0.05, 0.05)
+    builder.add_shape_mesh(body, mesh=box_mesh)
+    builder.color()
+    model = builder.finalize(device=device)
+    # Disable the physical contact response so this regression isolates DAT's
+    # curved-trajectory truncation from the penalty solver.
+    model.soft_contact_ke = 0.0
+    model.shape_material_ke.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.3,
+        soft_contact_max=32,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+    probe_contacts = pipeline.contacts()
+    probe_state = model.state()
+    pipeline.collide(probe_state, probe_contacts)
+    probe_count = min(int(probe_contacts.soft_contact_count.numpy()[0]), probe_contacts.soft_contact_max)
+    probe_soft_indices = probe_contacts.soft_contact_indices.numpy()[:probe_count]
+    probe_rigid_indices = probe_contacts.soft_contact_rigid_indices.numpy()[:probe_count]
+    probe_body_pos = probe_contacts.soft_contact_body_pos.numpy()[:probe_count]
+    vt_rows = np.flatnonzero((probe_soft_indices[:, 0] == 0) & (probe_soft_indices[:, 1] < 0))
+    if len(vt_rows) == 0:
+        raise AssertionError("rotation setup emitted no VT pair")
+    pair_normals = particle[None, :] - probe_body_pos[vt_rows]
+    pair_normals /= np.linalg.norm(pair_normals, axis=1)[:, None]
+    row = int(vt_rows[np.argmax(pair_normals[:, 1])])
+    dat_normal = particle - probe_body_pos[row]
+    pair_gap = np.linalg.norm(dat_normal)
+    dat_normal /= pair_gap
+    # The soft vertex is fixed and the rigid triangle approaches, so Eq. (11)
+    # gives lambda=1: the adaptive plane passes through the soft closest point.
+    plane_point = probe_body_pos[row] + pair_gap * dat_normal
+    rigid_slots = probe_rigid_indices[row]
+    mesh_indices = np.asarray(box_mesh.indices, dtype=np.int32).reshape(-1)
+    mesh_vertices = np.asarray(box_mesh.vertices, dtype=np.float64)
+    rigid_vertices_local = mesh_vertices[mesh_indices[rigid_slots]]
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=0,
+        rigid_compliant_alm=False,
+        rigid_enable_penetration_free=enable_dat,
+        pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][3:] = [0.0, 0.0, 30.0]
+    state_in.body_qd.assign(qd)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    pose = state_out.body_q.numpy()[body]
+    qx, qy, qz, qw = pose[3:]
+    yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    relative = particle - pose[:3]
+    particle_local_y = -np.sin(yaw) * relative[0] + np.cos(yaw) * relative[1]
+
+    q_vec = pose[3:6]
+    q_w = pose[6]
+    rotated_vertices = []
+    for vertex in rigid_vertices_local:
+        twice_cross = 2.0 * np.cross(q_vec, vertex)
+        rotated_vertices.append(vertex + q_w * twice_cross + np.cross(q_vec, twice_cross) + pose[:3])
+    rigid_plane_gaps = np.asarray(rotated_vertices) @ dat_normal - np.dot(plane_point, dat_normal)
+    return {
+        "particle_local_y": float(particle_local_y),
+        "rigid_vertex_plane_gaps": rigid_plane_gaps,
+        "soft_plane_gap": float(np.dot(dat_normal, particle - plane_point)),
+    }
+
+
+def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
+    """Exact rigid triangle vertices stop rotational crossing, not only translation."""
+    dat = _run_bvh_dat_rotating_mesh(device, enable_dat=True)
+    control = _run_bvh_dat_rotating_mesh(device, enable_dat=False)
+    test.assertGreaterEqual(dat["particle_local_y"], 0.05 - 1.0e-4, "DAT must keep the vertex above the rotating bar")
+    test.assertGreaterEqual(dat["soft_plane_gap"], -1.0e-6)
+    test.assertTrue(
+        np.all(dat["rigid_vertex_plane_gaps"] <= 1.0e-4),
+        "every vertex of the selected rigid triangle must remain in its assigned half-space",
+    )
+    test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
+
+
 add_function_test(
     TestBvhFullSurfaceSoftContact,
     "test_bvh_overflow",
@@ -2267,6 +2686,48 @@ add_function_test(
     "test_bvh_graph_capture",
     test_bvh_graph_capture,
     devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_bvh_dat_mesh_triangle_stops_before_soft_vertex",
+    test_bvh_dat_mesh_triangle_stops_before_soft_vertex,
+    devices=soft_devices,
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_bvh_dat_exact_rigid_triangle_truncates_rotation",
+    test_bvh_dat_exact_rigid_triangle_truncates_rotation,
+    devices=soft_devices,
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_bvh_solver_owned_pipeline_refits_soft_features",
+    test_bvh_solver_owned_pipeline_refits_soft_features,
+    devices=soft_devices,
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_bvh_invalid_adjacent_face_row_does_not_push_particle_sideways",
+    test_bvh_invalid_adjacent_face_row_does_not_push_particle_sideways,
+    devices=soft_devices,
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_analytic_sdf_penetration_remains_force_eligible",
+    test_analytic_sdf_penetration_remains_force_eligible,
+    devices=soft_devices,
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_bvh_dat_static_mesh_pair_families",
+    test_bvh_dat_static_mesh_pair_families,
+    devices=soft_devices,
+)
+add_function_test(
+    TestBvhFullSurfaceSoftContact,
+    "test_bvh_dat_plane_uses_complete_primitive_approach",
+    test_bvh_dat_plane_uses_complete_primitive_approach,
+    devices=soft_devices,
 )
 
 if __name__ == "__main__":

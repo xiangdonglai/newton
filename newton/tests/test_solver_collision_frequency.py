@@ -108,9 +108,9 @@ def test_frequency_validation_and_ownership(test, device):
     with test.assertRaises(ValueError):
         _NonOwning(model, collision_frequency_type=[Frequency.PRE_INIT, Frequency.NONE])
 
-    # PRE_POST_INIT is meaningless for the rigid slot.
-    with test.assertRaises(ValueError):
-        _StubSolver(model, pipeline=pipeline, collision_frequency_type=[Frequency.PRE_POST_INIT, Frequency.NONE])
+    # PRE_POST_INIT is valid for the rigid slot (SolverVBD re-detects after
+    # initialization for rigid DAT); construction must accept it.
+    _StubSolver(model, pipeline=pipeline, collision_frequency_type=[Frequency.PRE_POST_INIT, Frequency.NONE])
 
     # List shape and range validation.
     with test.assertRaises(ValueError):
@@ -151,26 +151,6 @@ def test_vbd_rigid_none_refreshes_external_contacts(test, device):
     solver.contacts.clear()
     solver.step(state_b, state_a, None, None, 1e-3)
     test.assertEqual(int(solver.body_body_contact_counts.numpy().sum()), 0)
-
-
-def test_vbd_self_contact_none_starts_empty(test, device):
-    """Keep first-step self-contact inactive when its schedule is NONE."""
-    model = _build_cloth_model(device)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    solver = SolverVBD(
-        model,
-        iterations=1,
-        pipeline=pipeline,
-        particle_enable_self_contact=True,
-        collision_frequency_type=[Frequency.NONE, Frequency.NONE],
-    )
-    data = solver.contacts.soft_self_contact_data
-    test.assertEqual(int(data.vertex_colliding_triangles_count.numpy().sum()), 0)
-    test.assertEqual(int(data.edge_colliding_edges_count.numpy().sum()), 0)
-
-    state_a, state_b = model.state(), model.state()
-    solver.step(state_a, state_b, None, None, 1e-3)
-    test.assertTrue(np.isfinite(state_b.particle_q.numpy()).all())
 
 
 def test_vbd_rigid_iterations_mode(test, device):
@@ -218,9 +198,9 @@ def test_vbd_rigid_iterations_refreshes_body_particle_contacts(test, device):
             self.body_particle_refreshes = 0
             super().__init__(*args, **kwargs)
 
-        def _refresh_body_particle_contact_state(self, contacts, refresh):
+        def _refresh_body_particle_contact_state(self, contacts, refresh, particle_q, body_q):
             self.body_particle_refreshes += 1
-            super()._refresh_body_particle_contact_state(contacts, refresh)
+            super()._refresh_body_particle_contact_state(contacts, refresh, particle_q, body_q)
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body(xform=wp.transform_identity())
@@ -292,6 +272,232 @@ def test_vbd_external_rigid_iterate_view(test, device):
 
     test.assertIs(view.body_q, state_out.body_q)
     test.assertIs(view.body_qd, state_out.body_qd)
+    test.assertIs(view.particle_q, state_in.particle_q)
+
+
+def test_vbd_dat_collision_schedule_coordination(test, device):
+    """Coordinate valid DAT schedules and reject incompatible checkpoints."""
+
+    class _TrackingSolver(SolverVBD):
+        def __init__(self, *args, **kwargs):
+            self.collision_refreshes = []
+            self.rigid_detection_positions = []
+            self.self_detection_positions = []
+            super().__init__(*args, **kwargs)
+
+        def _refresh_collision_sets(self, state, *, run_rigid_collision, run_soft_self_collision):
+            self.collision_refreshes.append((run_rigid_collision, run_soft_self_collision))
+            super()._refresh_collision_sets(
+                state,
+                run_rigid_collision=run_rigid_collision,
+                run_soft_self_collision=run_soft_self_collision,
+            )
+
+        def _run_rigid_collision(self, state):
+            self.rigid_detection_positions.append(state.particle_q.numpy().copy())
+            super()._run_rigid_collision(state)
+
+        def _collision_detection_penetration_free(self, state, *, reset_reference=True):
+            self.self_detection_positions.append(state.particle_q.numpy().copy())
+            super()._collision_detection_penetration_free(state, reset_reference=reset_reference)
+
+    def build_solver(rigid_dat, soft_self_dat, frequency_types, frequencies=(1, 1), iterations=3):
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.add_shape_box(-1, hx=0.2, hy=0.2, hz=0.1)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=1.0e2,
+            tri_ka=1.0e2,
+            tri_kd=1.0e-4,
+        )
+        builder.color()
+        model = builder.finalize(device=device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.02)
+        solver = _TrackingSolver(
+            model,
+            iterations=iterations,
+            pipeline=pipeline,
+            particle_enable_self_contact=soft_self_dat,
+            rigid_enable_penetration_free=rigid_dat,
+            collision_frequency=list(frequencies),
+            collision_frequency_type=frequency_types,
+        )
+        return model, solver
+
+    both = (True, True)
+    valid_cases = [
+        # DAT families, modes, frequencies, iterations, expected refreshes
+        (*both, [Frequency.PRE_INIT, Frequency.PRE_INIT], (1, 1), 3, [(True, True)]),
+        (*both, [Frequency.PRE_POST_INIT, Frequency.PRE_POST_INIT], (1, 1), 3, [(True, True)] * 2),
+        (*both, [Frequency.ITERATIONS, Frequency.ITERATIONS], (2, 2), 6, [(True, True)] * 3),
+        (*both, [Frequency.AUTO, Frequency.AUTO], (1, 1), 3, [(True, True)] * 2),
+        (True, False, [Frequency.PRE_POST_INIT, Frequency.NONE], (1, 1), 3, [(True, False)] * 2),
+        (False, True, [Frequency.NONE, Frequency.PRE_POST_INIT], (1, 1), 3, [(False, True)] * 2),
+    ]
+    for rigid_dat, soft_self_dat, modes, frequencies, iterations, expected in valid_cases:
+        model, solver = build_solver(rigid_dat, soft_self_dat, modes, frequencies, iterations)
+        solver.step(model.state(), model.state(), None, None, 1.0e-3)
+        test.assertEqual(solver.collision_refreshes, expected)
+        if rigid_dat and soft_self_dat:
+            test.assertEqual(len(solver.rigid_detection_positions), len(expected))
+            test.assertEqual(len(solver.self_detection_positions), len(expected))
+            for rigid_q, self_q in zip(
+                solver.rigid_detection_positions,
+                solver.self_detection_positions,
+                strict=True,
+            ):
+                np.testing.assert_array_equal(rigid_q, self_q)
+
+    mismatched_cases = [
+        ([2, 5], [Frequency.ITERATIONS, Frequency.ITERATIONS]),
+        ([1, 1], [Frequency.PRE_POST_INIT, Frequency.ITERATIONS]),
+    ]
+    for frequencies, frequency_types in mismatched_cases:
+        model, solver = build_solver(True, True, frequency_types, frequencies, iterations=2)
+        with test.assertRaisesRegex(ValueError, "require equivalent"):
+            solver.step(model.state(), model.state(), None, None, 1.0e-3)
+
+
+def test_vbd_collision_refresh_resets_only_active_dat_references(test, device):
+    """Reset rigid-soft and particle DAT references only for active DAT detectors."""
+
+    class _TrackingSolver(SolverVBD):
+        def __init__(self, *args, **kwargs):
+            self.collision_refreshes = []
+            self.dat_reference_resets = []
+            self.collision_events = []
+            super().__init__(*args, **kwargs)
+
+        def _run_rigid_collision(self, state):
+            self.collision_events.append("rigid_collision")
+            super()._run_rigid_collision(state)
+
+        def _collision_detection_penetration_free(self, state, *, reset_reference=True):
+            self.collision_events.append("soft_self_collision")
+            super()._collision_detection_penetration_free(state, reset_reference=reset_reference)
+
+        def _refresh_collision_sets(self, state, *, run_rigid_collision, run_soft_self_collision):
+            self.collision_refreshes.append((run_rigid_collision, run_soft_self_collision))
+            super()._refresh_collision_sets(
+                state,
+                run_rigid_collision=run_rigid_collision,
+                run_soft_self_collision=run_soft_self_collision,
+            )
+
+        def _reset_dat_references(self, state, *, reset_rigid_soft, reset_particles):
+            self.collision_events.append("dat_reference_reset")
+            self.dat_reference_resets.append((reset_rigid_soft, reset_particles))
+            super()._reset_dat_references(
+                state,
+                reset_rigid_soft=reset_rigid_soft,
+                reset_particles=reset_particles,
+            )
+
+    cases = [
+        # rigid DAT, soft-self DAT, schedule modes, detector calls, DAT resets, ordered events
+        (False, False, [Frequency.PRE_INIT, Frequency.NONE], (True, False), [], ["rigid_collision"]),
+        (
+            True,
+            False,
+            [Frequency.PRE_INIT, Frequency.NONE],
+            (True, False),
+            [(True, True)],
+            ["rigid_collision", "dat_reference_reset"],
+        ),
+        (
+            False,
+            True,
+            [Frequency.NONE, Frequency.PRE_INIT],
+            (False, True),
+            [(False, True)],
+            ["soft_self_collision", "dat_reference_reset"],
+        ),
+        (
+            True,
+            True,
+            [Frequency.PRE_INIT, Frequency.PRE_INIT],
+            (True, True),
+            [(True, True)],
+            ["rigid_collision", "soft_self_collision", "dat_reference_reset"],
+        ),
+    ]
+    for rigid_dat, soft_self_dat, frequency_types, expected_refresh, expected_resets, expected_events in cases:
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.add_shape_box(-1, hx=0.2, hy=0.2, hz=0.1)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=1.0e2,
+            tri_ka=1.0e2,
+            tri_kd=1.0e-4,
+        )
+        builder.color()
+        model = builder.finalize(device=device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.02)
+        solver = _TrackingSolver(
+            model,
+            iterations=0,
+            pipeline=pipeline,
+            particle_enable_self_contact=soft_self_dat,
+            rigid_enable_penetration_free=rigid_dat,
+            collision_frequency_type=frequency_types,
+        )
+
+        solver.step(model.state(), model.state(), None, None, 1.0e-3)
+
+        test.assertEqual(solver.collision_refreshes, [expected_refresh])
+        test.assertEqual(solver.dat_reference_resets, expected_resets)
+        test.assertEqual(solver.collision_events, expected_events)
+
+
+def test_vbd_dat_rejects_disabled_collision_schedules(test, device):
+    """Require an active collision schedule for each enabled DAT family."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_box(-1, hx=0.2, hy=0.2, hz=0.1)
+    builder.add_cloth_grid(
+        pos=wp.vec3(0.0, 0.0, 0.5),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=2,
+        dim_y=2,
+        cell_x=0.1,
+        cell_y=0.1,
+        mass=0.1,
+        tri_ke=1.0e2,
+        tri_ka=1.0e2,
+        tri_kd=1.0e-4,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.02)
+    cases = [
+        (True, False, "active rigid collision schedule"),
+        (False, True, "active soft self-collision schedule"),
+    ]
+    for rigid_dat, soft_self_dat, message in cases:
+        solver = SolverVBD(
+            model,
+            iterations=1,
+            pipeline=pipeline,
+            rigid_enable_penetration_free=rigid_dat,
+            particle_enable_self_contact=soft_self_dat,
+            collision_frequency_type=[Frequency.NONE, Frequency.NONE],
+        )
+        with test.assertRaisesRegex(ValueError, message):
+            solver.step(model.state(), model.state(), None, None, 1.0e-3)
 
 
 def _build_cloth_model(device):
@@ -414,12 +620,6 @@ add_function_test(
 )
 add_function_test(
     TestSolverCollisionFrequency,
-    "test_vbd_self_contact_none_starts_empty",
-    test_vbd_self_contact_none_starts_empty,
-    devices=devices,
-)
-add_function_test(
-    TestSolverCollisionFrequency,
     "test_vbd_rigid_iterations_mode",
     test_vbd_rigid_iterations_mode,
     devices=devices,
@@ -440,6 +640,24 @@ add_function_test(
     TestSolverCollisionFrequency,
     "test_vbd_external_rigid_iterate_view",
     test_vbd_external_rigid_iterate_view,
+    devices=devices,
+)
+add_function_test(
+    TestSolverCollisionFrequency,
+    "test_vbd_dat_collision_schedule_coordination",
+    test_vbd_dat_collision_schedule_coordination,
+    devices=devices,
+)
+add_function_test(
+    TestSolverCollisionFrequency,
+    "test_vbd_collision_refresh_resets_only_active_dat_references",
+    test_vbd_collision_refresh_resets_only_active_dat_references,
+    devices=devices,
+)
+add_function_test(
+    TestSolverCollisionFrequency,
+    "test_vbd_dat_rejects_disabled_collision_schedules",
+    test_vbd_dat_rejects_disabled_collision_schedules,
     devices=devices,
 )
 add_function_test(

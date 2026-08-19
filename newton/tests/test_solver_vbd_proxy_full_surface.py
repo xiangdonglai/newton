@@ -77,6 +77,7 @@ def _run_proxy_harvest(device, corners, bary):
             wp.zeros(smax, dtype=float, device=device),  # material_kd
             wp.zeros(smax, dtype=float, device=device),  # material_mu
             contacts.soft_contact_count,
+            wp.ones(smax, dtype=wp.int32, device=device),
             contacts.soft_contact_indices,
             contacts.soft_contact_barycentric,
             contacts.soft_contact_shape,

@@ -20,6 +20,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _eval_soft_ef_contact,
     _reset_world_selected,
     evaluate_body_particle_contact,
+    planar_truncation_t,
 )
 
 from ...geometry import ParticleFlags
@@ -2147,26 +2148,6 @@ def planar_truncation(
         return t * delta_v
 
 
-@wp.func
-def planar_truncation_t(
-    v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, eps: float, gamma_r: float, gamma_min: float = 1e-3
-):
-    denom = wp.dot(n, delta_v)
-
-    # Parallel (or nearly parallel) → no intersection
-    if wp.abs(denom) < eps:
-        return 1.0
-
-    # Solve: dot(n, v + t*delta_v - d) = 0
-    t = wp.dot(n, d - v) / denom
-
-    if t < 0:
-        return 1.0
-
-    t = wp.clamp(wp.min(t * gamma_r, t - gamma_min), 0.0, 1.0)
-    return t
-
-
 @wp.kernel
 def apply_planar_truncation_parallel_by_collision(
     # inputs
@@ -2339,6 +2320,7 @@ def accumulate_particle_body_contact_force_and_hessian(
     body_particle_contact_indices: wp.array[wp.vec3i],
     body_particle_contact_count: wp.array[int],
     body_particle_contact_max: int,
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
     body_particle_contact_penalty_k: wp.array[float],
     body_particle_contact_material_ke: wp.array[float],
@@ -2369,6 +2351,8 @@ def accumulate_particle_body_contact_force_and_hessian(
     # per launch, so only scatter to this record's corners of the active color.
     count = min(body_particle_contact_max, body_particle_contact_count[0])
     if t_id >= count:
+        return
+    if body_particle_contact_force_eligible[t_id] == 0:
         return
 
     corners = body_particle_contact_indices[t_id]
