@@ -36,6 +36,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_rigid_contact_from_collision,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
+    rigid_point_trajectory,
     rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
     step_body_body_contact_C0_lambda,
@@ -4612,12 +4613,53 @@ def _rigid_trajectory_truncation_probe(
     angle: float,
     offset0: wp.vec3,
     gamma_r: float,
+    use_interval_arithmetic: bool,
+    trajectory_samples: int,
     t_out: wp.array[float],
 ):
-    t_out[0] = rigid_trajectory_truncation_t(n, d, c0, dx, axis, angle, offset0, gamma_r)
+    t_out[0] = rigid_trajectory_truncation_t(
+        n, d, c0, dx, axis, angle, offset0, gamma_r, 1.0e-3, use_interval_arithmetic, trajectory_samples
+    )
 
 
-def _probe_trajectory_truncation(device, n, d, c0, dx, axis, angle, offset0, gamma_r):
+@wp.kernel
+def _rigid_point_trajectory_probe(
+    t: float,
+    c0: wp.vec3,
+    dx: wp.vec3,
+    axis: wp.vec3,
+    angle: float,
+    offset0: wp.vec3,
+    point_out: wp.array[wp.vec3],
+):
+    point_out[0] = rigid_point_trajectory(t, c0, dx, axis, angle, offset0)
+
+
+def _probe_rigid_point_trajectory(device, t, c0, dx, axis, angle, offset0):
+    point_out = wp.empty(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        _rigid_point_trajectory_probe,
+        dim=1,
+        inputs=[t, wp.vec3(*c0), wp.vec3(*dx), wp.vec3(*axis), angle, wp.vec3(*offset0)],
+        outputs=[point_out],
+        device=device,
+    )
+    return point_out.numpy()[0]
+
+
+def _probe_trajectory_truncation(
+    device,
+    n,
+    d,
+    c0,
+    dx,
+    axis,
+    angle,
+    offset0,
+    gamma_r,
+    use_interval_arithmetic=False,
+    trajectory_samples=8,
+):
     t_out = wp.zeros(1, dtype=float, device=device)
     wp.launch(
         _rigid_trajectory_truncation_probe,
@@ -4631,6 +4673,8 @@ def _probe_trajectory_truncation(device, n, d, c0, dx, axis, angle, offset0, gam
             angle,
             wp.vec3(*offset0),
             gamma_r,
+            use_interval_arithmetic,
+            trajectory_samples,
         ],
         outputs=[t_out],
         device=device,
@@ -4638,8 +4682,83 @@ def _probe_trajectory_truncation(device, n, d, c0, dx, axis, angle, offset0, gam
     return float(t_out.numpy()[0])
 
 
+def _probe_rigid_dat_returning_sdf_arc(
+    device,
+    use_interval_arithmetic,
+    *,
+    rigid_anchor=None,
+    plane_normal=(1.0, 0.0, 0.0),
+    plane_point=None,
+    rotation_angle=math.pi,
+    trajectory_samples=8,
+):
+    """Probe a rotating rigid SDF point that crosses and returns through a plane."""
+
+    if rigid_anchor is None:
+        phi = math.pi / 16.0
+        rigid_anchor = (math.cos(phi), -math.sin(phi), 0.0)
+    if plane_point is None:
+        plane_point = (0.5 * (0.99 + rigid_anchor[0]), 0.0, 0.0)
+    return _probe_trajectory_truncation(
+        device,
+        plane_normal,
+        plane_point,
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+        rotation_angle,
+        rigid_anchor,
+        1.0,
+        use_interval_arithmetic,
+        trajectory_samples,
+    )
+
+
 def test_rigid_dat_trajectory_truncation(test, device):
-    """Sampling + bisection finds the latest safe time of a curved trajectory vs a plane."""
+    """Compare Stage 1 sampling+bisection with optional Stage 2 interval verification."""
+    # The production trajectory uses Rodrigues directly for every angle; there
+    # is no separate first-order branch at small angles.
+    small_angle = 5.0e-8
+    small_angle_point = _probe_rigid_point_trajectory(
+        device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 1), small_angle, (1, 0, 0)
+    )
+    test.assertTrue(np.allclose(small_angle_point, (math.cos(small_angle), math.sin(small_angle), 0.0), atol=1e-12))
+    identity_point = _probe_rigid_point_trajectory(
+        device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 0), 0.0, (1, 2, 3)
+    )
+    test.assertTrue(np.array_equal(identity_point, (1.0, 2.0, 3.0)))
+
+    # A point already behind its assigned plane is outside Algorithm 1's
+    # precondition. Both modes use the same explicit recovery policy: strict
+    # endpoint improvement is accepted, while further violation is blocked.
+    for use_interval_arithmetic in (False, True):
+        recovery_t = _probe_trajectory_truncation(
+            device,
+            (0, 1, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+            (0, -0.2, 0),
+            (0, 0, 1),
+            0.0,
+            (0, 0.1, 0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        worsening_t = _probe_trajectory_truncation(
+            device,
+            (0, 1, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+            (0, 0.1, 0),
+            (0, 0, 1),
+            0.0,
+            (0, 0.1, 0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        test.assertEqual(recovery_t, 1.0)
+        test.assertEqual(worsening_t, 0.0)
+
     # Pure rotation: point at radius 1 rotating pi/2 about z crosses plane y=0.5 at t=1/3
     # (sin(t*pi/2) = 0.5). gamma_r=1 leaves only the fixed 1e-3 safety backoff.
     t = _probe_trajectory_truncation(
@@ -4659,26 +4778,10 @@ def test_rigid_dat_trajectory_truncation(test, device):
     )
     test.assertAlmostEqual(t, 0.425, delta=2e-3)
 
-    # A narrow rotational crossing that returns before the next one-of-eight
-    # sample endpoint. Endpoint-only sampling misses this arc entirely: the x
-    # coordinate rises above 0.99 at t=1/16 and is below it at t=0 and 1/8.
-    phi = math.pi / 16.0
-    t = _probe_trajectory_truncation(
-        device,
-        (1, 0, 0),
-        (0.99, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 1),
-        math.pi,
-        (math.cos(-phi), math.sin(-phi), 0),
-        1.0,
-    )
-    test.assertLess(t, 1.0 / 16.0, "interval verification must catch a between-sample arc")
-
     # The same cross-and-return arc starting exactly on the plane must stall;
     # checking only the end point would incorrectly release it.
-    t = _probe_trajectory_truncation(
+    phi = math.pi / 16.0
+    t_interval = _probe_trajectory_truncation(
         device,
         (1, 0, 0),
         (math.cos(phi), 0, 0),
@@ -4688,8 +4791,9 @@ def test_rigid_dat_trajectory_truncation(test, device):
         math.pi,
         (math.cos(-phi), math.sin(-phi), 0),
         1.0,
+        True,
     )
-    test.assertEqual(t, 0.0, "a pinched trajectory that initially approaches must stall")
+    test.assertEqual(t_interval, 0.0, "interval arithmetic must stall a boundary trajectory that returns")
 
     # Screw motion that stays on the safe side of the plane.
     t = _probe_trajectory_truncation(
@@ -4697,18 +4801,157 @@ def test_rigid_dat_trajectory_truncation(test, device):
     )
     test.assertEqual(t, 1.0)
 
-    # Pinched start (point on the plane): an approaching update is blocked outright
-    # (a squeezed contact must stall, not pass through)...
+    # A valid start exactly on the plane blocks an approaching update...
     t = _probe_trajectory_truncation(
         device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, 0.1, 0), (0, 0, 1), 0.0, (0, 0.5, 0), 0.85
     )
     test.assertEqual(t, 0.0)
 
-    # ...while a separating update from the same pinched start stays free.
+    # ...while a separating update from the same boundary point stays free.
     t = _probe_trajectory_truncation(
         device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, -0.1, 0), (0, 0, 1), 0.0, (0, 0.5, 0), 0.85
     )
     test.assertEqual(t, 1.0)
+
+
+def test_rigid_dat_interval_flag_catches_returning_sdf_arc(test, device):
+    """Stage 2 catches a crossing that returns between adjacent Stage-1 samples."""
+
+    stage1_t = _probe_rigid_dat_returning_sdf_arc(device, use_interval_arithmetic=False)
+    interval_t = _probe_rigid_dat_returning_sdf_arc(device, use_interval_arithmetic=True)
+    test.assertEqual(stage1_t, 1.0, "Stage 1 endpoint samples intentionally miss this returning arc")
+    test.assertLess(interval_t, 1.0 / 16.0, "Stage 2 must detect the between-sample crossing")
+
+
+def test_rigid_dat_interval_catches_quarter_circle_tangent_peak(test, device):
+    """Interval verification removes Stage-1's even/odd sampling coincidence."""
+
+    epsilon = 1.0e-4
+    plane_rhs = math.sqrt(2.0) - epsilon
+    inv_sqrt_two = 1.0 / math.sqrt(2.0)
+    probe_args = {
+        "rigid_anchor": (1.0, 0.0, 0.0),
+        "plane_normal": (inv_sqrt_two, inv_sqrt_two, 0.0),
+        "plane_point": (0.5 * plane_rhs, 0.5 * plane_rhs, 0.0),
+        "rotation_angle": math.pi / 2.0,
+    }
+
+    even_stage1_t = _probe_rigid_dat_returning_sdf_arc(
+        device, False, trajectory_samples=8, **probe_args
+    )
+    odd_stage1_t = _probe_rigid_dat_returning_sdf_arc(
+        device, False, trajectory_samples=9, **probe_args
+    )
+    odd_interval_t = _probe_rigid_dat_returning_sdf_arc(
+        device, True, trajectory_samples=9, **probe_args
+    )
+
+    first_crossing = (math.pi / 4.0 - math.acos(plane_rhs / math.sqrt(2.0))) / (math.pi / 2.0)
+    expected_t = first_crossing - 1.0e-3
+    test.assertAlmostEqual(even_stage1_t, expected_t, delta=5.0e-5)
+    test.assertEqual(odd_stage1_t, 1.0, "nine samples straddle and miss the narrow peak at t=1/2")
+    test.assertAlmostEqual(odd_interval_t, expected_t, delta=5.0e-5)
+    test.assertLess(odd_interval_t, 0.5)
+
+
+def _run_bvh_dat_rotating_mesh(device, enable_dat, use_interval_arithmetic=False):
+    """Rotate a long rigid mesh bar through a fixed soft vertex and inspect the active VT plane."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    particle = np.array([0.7, 0.3, 0.0])
+    builder.add_particle(pos=wp.vec3(*particle), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), mass=1.0, inertia=inertia, lock_inertia=True
+    )
+    box_mesh = newton.Mesh.create_box(1.0, 0.05, 0.05)
+    builder.add_shape_mesh(body, mesh=box_mesh)
+    builder.color()
+    model = builder.finalize(device=device)
+    # Disable the physical contact response so this regression isolates DAT's
+    # curved-trajectory truncation from the penalty solver.
+    model.soft_contact_ke = 0.0
+    model.shape_material_ke.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.3,
+        soft_contact_max=32,
+        enable_rigid_soft_full_surface_contact=True,
+        full_surface_mesh_backend="bvh",
+    )
+    probe_contacts = pipeline.contacts()
+    probe_state = model.state()
+    pipeline.collide(probe_state, probe_contacts)
+    probe_count = min(int(probe_contacts.soft_contact_count.numpy()[0]), probe_contacts.soft_contact_max)
+    probe_soft_indices = probe_contacts.soft_contact_indices.numpy()[:probe_count]
+    probe_rigid_indices = probe_contacts.soft_contact_rigid_indices.numpy()[:probe_count]
+    probe_body_pos = probe_contacts.soft_contact_body_pos.numpy()[:probe_count]
+    vt_rows = np.flatnonzero((probe_soft_indices[:, 0] == 0) & (probe_soft_indices[:, 1] < 0))
+    if len(vt_rows) == 0:
+        raise AssertionError("rotation setup emitted no VT pair")
+    pair_normals = particle[None, :] - probe_body_pos[vt_rows]
+    pair_normals /= np.linalg.norm(pair_normals, axis=1)[:, None]
+    row = int(vt_rows[np.argmax(pair_normals[:, 1])])
+    dat_normal = particle - probe_body_pos[row]
+    pair_gap = np.linalg.norm(dat_normal)
+    dat_normal /= pair_gap
+    # The soft vertex is fixed and the rigid triangle approaches, so Eq. (11)
+    # gives lambda=1: the adaptive plane passes through the soft closest point.
+    plane_point = probe_body_pos[row] + pair_gap * dat_normal
+    rigid_slots = probe_rigid_indices[row]
+    mesh_indices = np.asarray(box_mesh.indices, dtype=np.int32).reshape(-1)
+    mesh_vertices = np.asarray(box_mesh.vertices, dtype=np.float64)
+    rigid_vertices_local = mesh_vertices[mesh_indices[rigid_slots]]
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=0,
+        rigid_compliant_alm=False,
+        rigid_enable_penetration_free=enable_dat,
+        rigid_dat_use_interval_arithmetic=use_interval_arithmetic,
+        pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][3:] = [0.0, 0.0, 30.0]
+    state_in.body_qd.assign(qd)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    pose = state_out.body_q.numpy()[body]
+    qx, qy, qz, qw = pose[3:]
+    yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    relative = particle - pose[:3]
+    particle_local_y = -np.sin(yaw) * relative[0] + np.cos(yaw) * relative[1]
+
+    q_vec = pose[3:6]
+    q_w = pose[6]
+    rotated_vertices = []
+    for vertex in rigid_vertices_local:
+        twice_cross = 2.0 * np.cross(q_vec, vertex)
+        rotated_vertices.append(vertex + q_w * twice_cross + np.cross(q_vec, twice_cross) + pose[:3])
+    rigid_plane_gaps = np.asarray(rotated_vertices) @ dat_normal - np.dot(plane_point, dat_normal)
+    return {
+        "particle_local_y": float(particle_local_y),
+        "rigid_vertex_plane_gaps": rigid_plane_gaps,
+        "soft_plane_gap": float(np.dot(dat_normal, particle - plane_point)),
+    }
+
+
+def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
+    """Exact rigid triangle vertices stop rotational crossing, not only translation."""
+    dat = _run_bvh_dat_rotating_mesh(device, enable_dat=True)
+    dat_interval = _run_bvh_dat_rotating_mesh(device, enable_dat=True, use_interval_arithmetic=True)
+    control = _run_bvh_dat_rotating_mesh(device, enable_dat=False)
+    for result in (dat, dat_interval):
+        test.assertGreaterEqual(
+            result["particle_local_y"], 0.05 - 1.0e-4, "DAT must keep the vertex above the rotating bar"
+        )
+        test.assertGreaterEqual(result["soft_plane_gap"], -1.0e-6)
+        test.assertTrue(
+            np.all(result["rigid_vertex_plane_gaps"] <= 1.0e-4),
+            "every vertex of the selected rigid triangle must remain in its assigned half-space",
+        )
+    test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
 
 
 def _build_sphere_drop_on_cloth(device):
@@ -5127,6 +5370,24 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_interval_flag_catches_returning_sdf_arc",
+    test_rigid_dat_interval_flag_catches_returning_sdf_arc,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_interval_catches_quarter_circle_tangent_peak",
+    test_rigid_dat_interval_catches_quarter_circle_tangent_peak,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_exact_rigid_triangle_truncates_rotation",
+    test_bvh_dat_exact_rigid_triangle_truncates_rotation,
     devices=devices,
 )
 add_function_test(

@@ -352,6 +352,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Rigid body - penetration-free DAT truncation
         rigid_enable_penetration_free: bool = False,  # Truncate rigid pose updates against per-contact division planes
         rigid_conservative_bound_relaxation: float = 0.85,  # Relaxation factor for rigid DAT truncation
+        rigid_dat_use_interval_arithmetic: bool = False,  # Experimental interval verification of rigid trajectories
         deterministic: wp.DeterministicMode | None = None,
         pipeline: CollisionPipeline | None = None,
         collision_frequency: list[int] | None = None,
@@ -551,6 +552,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                 for fast bodies. Kinematic bodies move outside the solver and are not truncated.
             rigid_conservative_bound_relaxation: Relaxation factor in (0, 1) applied to rigid DAT
                 truncation scalars and the conservative motion budget. Only used when
+                ``rigid_enable_penetration_free`` is ``True``.
+            rigid_dat_use_interval_arithmetic: Temporary experimental selector for rigid DAT
+                trajectory truncation. ``False`` uses sampling and bisection; ``True`` uses
+                interval arithmetic to detect crossings between sample points. Only used when
                 ``rigid_enable_penetration_free`` is ``True``.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
@@ -831,6 +836,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             model,
             rigid_enable_penetration_free,
             rigid_conservative_bound_relaxation,
+            rigid_dat_use_interval_arithmetic,
         )
 
         # Controls whether the next step() refreshes contact state derived from
@@ -2546,6 +2552,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         model: Model,
         rigid_enable_penetration_free: bool,
         rigid_conservative_bound_relaxation: float,
+        rigid_dat_use_interval_arithmetic: bool,
     ):
         """Initialize rigid-soft DAT state and motion budgets.
 
@@ -2554,6 +2561,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
         self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
+        self.rigid_dat_use_interval_arithmetic = rigid_dat_use_interval_arithmetic
         # Threshold below which a displacement is treated as parallel to a division plane.
         self.rigid_dat_parallel_epsilon = 1e-5
 
@@ -2736,6 +2744,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.body_com,
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
+                    self.rigid_dat_use_interval_arithmetic,
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -2832,6 +2841,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.body_com,
                     self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
+                    self.rigid_dat_use_interval_arithmetic,
                 ],
                 outputs=[
                     self.truncation_ts,

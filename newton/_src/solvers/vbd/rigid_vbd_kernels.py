@@ -33,6 +33,10 @@ from newton._src.core.types import MAXVAL
 from newton._src.math import orthonormal_basis, quat_velocity
 from newton._src.sim import JointType
 from newton._src.sim.contacts import contact_surface_point, contact_surface_separation
+from newton._src.solvers.vbd.interval_arithmetic import (
+    rigid_point_plane_signed_distance_derivative_interval,
+    rigid_point_plane_signed_distance_interval,
+)
 from newton._src.solvers.solver import integrate_rigid_body
 
 wp.set_module_options({"enable_backward": False})
@@ -6830,9 +6834,8 @@ def update_cable_dahl_state(
 # Rigid-body Divide-and-Truncate (DAT) penetration-free truncation.
 #
 # Rigid bodies follow curved vertex trajectories under interpolated pose updates. Per-contact
-# division planes are enforced by sampling + bisection (paper Alg. 1, stage 1), followed by a
-# conservative Lipschitz interval check that catches crossings returning between sample points
-# (the role of paper Alg. 1, stage 2).
+# division planes are enforced by sampling + bisection (paper Alg. 1, Stage 1), optionally
+# followed by interval verification of the complete prefix arc (paper Alg. 1, Stage 2).
 #
 # The kernels consume only the abstract ``Contacts`` record fields (shape ids, points,
 # normals, margins, soft feature indices + barycentrics) plus reference/candidate poses,
@@ -6841,14 +6844,10 @@ def update_cable_dahl_state(
 
 # Uniform samples along the trajectory used to bracket the first plane crossing.
 DAT_TRAJECTORY_SAMPLES = wp.constant(8)
-# Subcells used only inside a coarse interval that cannot be certified safe. At the final
-# resolution an ambiguous cell truncates at its left endpoint, so this controls conservatism,
-# not correctness: a crossing cannot be silently skipped.
-DAT_TRAJECTORY_INTERVAL_REFINEMENTS = wp.constant(32)
 # Bisection refinements of the bracketed crossing time.
 DAT_BISECTION_ITERATIONS = wp.constant(16)
-# Reference points within this band of a division plane count as pinched: approach is
-# blocked outright instead of bisected, separation stays free.
+# Numerical band used only by the soft straight-ray wrong-side guard below;
+# rigid curved-trajectory truncation does not have a separate pinch category.
 DAT_PINCH_BAND = wp.constant(1.0e-6)
 
 
@@ -6894,14 +6893,46 @@ def rigid_pose_delta(q_ref: wp.transform, q_cur: wp.transform, com: wp.vec3):
 def rigid_point_trajectory(
     t: float, c0: wp.vec3, dx: wp.vec3, axis: wp.vec3, angle: float, offset0: wp.vec3
 ) -> wp.vec3:
-    """Position at interpolation parameter ``t`` of a body-fixed point whose COM offset at
-    the reference pose is ``offset0``, under linearly interpolated translation + rotation."""
+    """Position at ``t`` under linear translation and Rodrigues rotation.
+
+    ``axis`` must be a unit world-space axis when ``angle`` is nonzero. A zero
+    axis is permitted for the zero-angle identity trajectory.
+    """
     ta = t * angle
-    if wp.abs(ta) > _SMALL_ANGLE_EPS:
-        rotated = wp.quat_rotate(wp.quat_from_axis_angle(axis, ta), offset0)
-    else:
-        rotated = offset0 + wp.cross(axis * ta, offset0)
+    parallel = axis * wp.dot(axis, offset0)
+    perpendicular = offset0 - parallel
+    rotated = parallel + wp.cos(ta) * perpendicular + wp.sin(ta) * wp.cross(axis, offset0)
     return c0 + t * dx + rotated
+
+
+@wp.func
+def _rigid_trajectory_prefix_is_interval_safe(
+    t: float,
+    n: wp.vec3,
+    d: wp.vec3,
+    c0: wp.vec3,
+    dx: wp.vec3,
+    axis: wp.vec3,
+    angle: float,
+    offset0: wp.vec3,
+    s0: float,
+) -> bool:
+    """Certify that the complete prefix trajectory ``[0, t]`` stays safe."""
+
+    trajectory_range = rigid_point_plane_signed_distance_interval(0.0, t, n, d, c0, dx, axis, angle, offset0)
+    if trajectory_range.upper < 0.0:
+        return True
+
+    if s0 <= 0.0:
+        # A prefix starting exactly on the plane cannot have a strictly negative
+        # range. Monotone nonincreasing signed distance still certifies that the
+        # motion separates throughout the prefix.
+        derivative_range = rigid_point_plane_signed_distance_derivative_interval(
+            0.0, t, n, dx, axis, angle, offset0
+        )
+        return derivative_range.upper <= 0.0
+
+    return False
 
 
 @wp.func
@@ -6915,14 +6946,15 @@ def rigid_trajectory_truncation_t(
     offset0: wp.vec3,
     gamma_r: float,
     gamma_min: float = 1e-3,
+    use_interval_arithmetic: bool = False,
+    trajectory_samples: int = DAT_TRAJECTORY_SAMPLES,
 ):
-    """Return a safely backed-off interpolation parameter before a body-fixed point crosses a plane.
+    """Return a backed-off interpolation parameter before a rigid point crosses a plane.
 
-    The point must start on the negative side of the plane. Uniform sampling brackets ordinary
-    sign changes and bisection refines them. Each coarse interval is also bounded with a global
-    trajectory Lipschitz constant. Ambiguous intervals are subdivided; if the finest cell still
-    cannot be certified negative, truncation conservatively stops at that cell's left endpoint.
-    Thus a narrow rotational arc that crosses and returns between sample endpoints is not missed.
+    Stage 1 always uses the sampling and bisection implementation from
+    ``ankac/rigid-dat-persistent-planes``. The temporary interval-arithmetic
+    option additionally runs Algorithm 1, Stage 2: certify the complete prefix
+    arc ``[0, t*]`` and shorten it by prefix bisection when needed.
 
     Args:
         n: World-space plane normal away from the rigid side. The allowed rigid
@@ -6931,8 +6963,9 @@ def rigid_trajectory_truncation_t(
         c0: Body center of mass in world space at the reference pose (``t = 0``).
         dx: Proposed world-space COM displacement from the reference pose to the
             current pose. The trajectory translates the COM as ``c0 + t * dx``.
-        axis: World-space axis of the shortest-arc rotation from the reference
-            orientation to the current orientation.
+        axis: Unit world-space axis of the shortest-arc rotation from the
+            reference orientation to the current orientation. It may be zero
+            only when ``angle`` is zero.
         angle: Total shortest-arc rotation angle in radians. At parameter ``t``,
             the point has rotated by ``t * angle`` about ``axis``.
         offset0: World-space vector from ``c0`` to the body-fixed point at the
@@ -6942,83 +6975,71 @@ def rigid_trajectory_truncation_t(
         gamma_min: Additive parameter-space backoff from that parameter. The
             returned value uses the more conservative of ``gamma_r * t`` and
             ``t - gamma_min``.
+        use_interval_arithmetic: Run the experimental interval-arithmetic Stage
+            2 after the common sampling and bisection Stage 1.
+        trajectory_samples: Number of uniform Stage-1 endpoint samples. The
+            production default is ``DAT_TRAJECTORY_SAMPLES``; exposing it here
+            allows focused tests to demonstrate sampling-parity failures.
 
     Returns:
         A truncation parameter in ``[0, 1]``. ``1`` accepts the complete proposed
         rigid update, while ``0`` blocks it at the reference pose.
     """
+    # Algorithm 1, Stage 1: locate the first sampled sign change, then refine
+    # that pointwise root bracket by ordinary bisection.
     s0 = wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
-    pinched = s0 >= -DAT_PINCH_BAND
-
-    # The second derivative comes only from rotation and satisfies
-    # |s''(t)| <= angle^2 |n| |offset0|. Relative to the chord joining an
-    # interval's endpoints, this bounds its interior maximum by M*h^2/8.
-    # This is much tighter than a first-derivative Lipschitz bound while remaining
-    # conservative for the complete screw trajectory.
-    curvature_bound = angle * angle * wp.length(n) * wp.length(offset0)
-    derivative0 = wp.dot(n, dx + angle * wp.cross(axis, offset0))
-    if pinched and derivative0 >= 0.0:
-        # At/on the plane and initially approaching (including tangency): stall.
-        return 0.0
-
-    coarse_dt = 1.0 / float(DAT_TRAJECTORY_SAMPLES)
-    fine_dt = coarse_dt / float(DAT_TRAJECTORY_INTERVAL_REFINEMENTS)
-
-    t_lo = float(0.0)
-    t_hi = float(1.0)
+    candidate_t = float(1.0)
     crossed = bool(False)
-    conservative_stop = bool(False)
-    s_coarse_lo = s0
-    for k in range(DAT_TRAJECTORY_SAMPLES):
-        t_k = float(k + 1) / float(DAT_TRAJECTORY_SAMPLES)
-        s_k = wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d)
-        coarse_upper = wp.max(s_coarse_lo, s_k) + 0.125 * curvature_bound * coarse_dt * coarse_dt
-        if coarse_upper > 0.0:
-            # Search this ambiguous coarse interval from left to right. A positive
-            # endpoint provides a true root bracket; a finest interval whose upper
-            # bound remains nonnegative is conservatively treated as potentially crossing.
-            fine_s_lo = s_coarse_lo
-            for j in range(DAT_TRAJECTORY_INTERVAL_REFINEMENTS):
-                fine_t_lo = (float(k) + float(j) / float(DAT_TRAJECTORY_INTERVAL_REFINEMENTS)) * coarse_dt
-                fine_t_hi = fine_t_lo + fine_dt
-                fine_s_hi = wp.dot(n, rigid_point_trajectory(fine_t_hi, c0, dx, axis, angle, offset0) - d)
-                fine_upper = wp.max(fine_s_lo, fine_s_hi) + 0.125 * curvature_bound * fine_dt * fine_dt
-                # For a pinched start that initially separates, certify the first
-                # cell directly from the derivative Lipschitz bound. This preserves
-                # separating motion while still sending any possible early reversal
-                # through the conservative-stop path.
-                first_pinched_cell_safe = bool(False)
-                if k == 0 and j == 0 and pinched:
-                    first_pinched_cell_safe = derivative0 + curvature_bound * fine_dt <= 0.0
-                if fine_s_hi >= 0.0:
-                    t_lo = fine_t_lo
-                    t_hi = fine_t_hi
-                    crossed = True
-                    break
-                if fine_upper > 0.0 and not first_pinched_cell_safe:
-                    t_lo = fine_t_lo
-                    conservative_stop = True
-                    break
-                fine_s_lo = fine_s_hi
-            if crossed or conservative_stop:
+    if s0 > 0.0:
+        s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
+        # Algorithm 1 assumes a valid starting half-space. If a persistent
+        # plane is already violated, permit only strict endpoint recovery and
+        # skip Stage 2, whose safe-prefix test cannot certify t=0.
+        if s_end < s0:
+            return 1.0
+        return 0.0
+    else:
+        t_lo = float(0.0)
+        t_hi = float(1.0)
+        for k in range(trajectory_samples):
+            t_k = float(k + 1) / float(trajectory_samples)
+            s_k = wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d)
+            if s_k > 0.0:
+                t_lo = float(k) / float(trajectory_samples)
+                t_hi = t_k
+                crossed = True
                 break
-        s_coarse_lo = s_k
 
-    if conservative_stop:
-        return wp.clamp(wp.min(t_lo * gamma_r, t_lo - gamma_min), 0.0, 1.0)
+        if crossed:
+            for _j in range(DAT_BISECTION_ITERATIONS):
+                t_mid = 0.5 * (t_lo + t_hi)
+                s_mid = wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d)
+                if s_mid <= 0.0:
+                    t_lo = t_mid
+                else:
+                    t_hi = t_mid
+            candidate_t = t_lo
 
-    if not crossed:
-        return 1.0
+    if use_interval_arithmetic:
+        if not _rigid_trajectory_prefix_is_interval_safe(
+            candidate_t, n, d, c0, dx, axis, angle, offset0, s0
+        ):
+            # Algorithm 1, Stage 2: prefix safety is monotone. Search for the
+            # largest t whose complete trajectory prefix can be certified safe.
+            t_lo = float(0.0)
+            t_hi = candidate_t
+            for _j in range(DAT_BISECTION_ITERATIONS):
+                t_mid = 0.5 * (t_lo + t_hi)
+                if _rigid_trajectory_prefix_is_interval_safe(t_mid, n, d, c0, dx, axis, angle, offset0, s0):
+                    t_lo = t_mid
+                else:
+                    t_hi = t_mid
+            candidate_t = t_lo
+            crossed = True
 
-    for _j in range(DAT_BISECTION_ITERATIONS):
-        t_mid = 0.5 * (t_lo + t_hi)
-        s_mid = wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d)
-        if s_mid < 0.0:
-            t_lo = t_mid
-        else:
-            t_hi = t_mid
-
-    return wp.clamp(wp.min(t_lo * gamma_r, t_lo - gamma_min), 0.0, 1.0)
+    if crossed:
+        return wp.clamp(wp.min(candidate_t * gamma_r, candidate_t - gamma_min), 0.0, 1.0)
+    return 1.0
 
 
 @wp.kernel
@@ -7042,6 +7063,7 @@ def apply_rigid_soft_truncation(
     body_com: wp.array[wp.vec3],
     parallel_eps: float,
     gamma: float,
+    use_interval_arithmetic: bool,
     # outputs
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
@@ -7063,10 +7085,9 @@ def apply_rigid_soft_truncation(
     most three vertices, then locally reduces the rigid primitive's at most three curved
     vertex trajectories before one atomic body update.
 
-    A pinched contact (reference gap ~ 0, e.g. cloth squeezed between a driven gripper and
-    the ground) keeps its plane at the contact anchor: approach is blocked (stall),
-    separation stays free. Skipping such contacts instead would let the rigid side walk
-    through.
+    The soft straight-ray guard treats a vertex numerically on its plane as a
+    boundary case: approach is blocked and separation remains free. Rigid curved
+    trajectories instead distinguish only valid and wrong-side initial states.
     """
     contact_index = wp.tid()
 
@@ -7185,10 +7206,32 @@ def apply_rigid_soft_truncation(
                     x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
                     x_body = wp.transform_point(shape_transform[shape_index], x_shape)
                     x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
-                    t_v = rigid_trajectory_truncation_t(n, d, c0, dx_body, rot_axis, rot_angle, x_rigid_ref - c0, gamma)
+                    t_v = rigid_trajectory_truncation_t(
+                        n,
+                        d,
+                        c0,
+                        dx_body,
+                        rot_axis,
+                        rot_angle,
+                        x_rigid_ref - c0,
+                        gamma,
+                        1.0e-3,
+                        use_interval_arithmetic,
+                    )
                     t_b = wp.min(t_b, t_v)
         else:
-            t_b = rigid_trajectory_truncation_t(n, d, c0, dx_body, rot_axis, rot_angle, bx0 - c0, gamma)
+            t_b = rigid_trajectory_truncation_t(
+                n,
+                d,
+                c0,
+                dx_body,
+                rot_axis,
+                rot_angle,
+                bx0 - c0,
+                gamma,
+                1.0e-3,
+                use_interval_arithmetic,
+            )
         if t_b < 1.0:
             wp.atomic_min(body_truncation_ts, body_index, t_b)
 
