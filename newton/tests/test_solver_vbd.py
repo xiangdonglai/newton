@@ -27,6 +27,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _compliant_alm_coefficients,
     _contact_tangent_conditioning_scale,
     _joint_angular_rho_seed,
+    apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     compute_rigid_contact_forces,
@@ -34,8 +35,11 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_body_particle_contact,
     evaluate_linear_constraint_force_hessian,
     evaluate_rigid_contact_from_collision,
+    find_primitive_pair_separator,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
+    place_dat_division_plane,
+    planar_truncation_t,
     rigid_point_trajectory,
     rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
@@ -4604,6 +4608,399 @@ add_function_test(
 
 
 @wp.kernel
+def _planar_truncation_probe(
+    signed_distance: wp.array[float],
+    normal_displacement: wp.array[float],
+    gamma: float,
+    t_out: wp.array[float],
+):
+    i = wp.tid()
+    t_out[i] = planar_truncation_t(
+        wp.vec3(0.0, 0.0, signed_distance[i]),
+        wp.vec3(0.0, 0.0, normal_displacement[i]),
+        wp.vec3(0.0, 0.0, 1.0),
+        wp.vec3(0.0),
+        gamma,
+    )
+
+
+def test_planar_truncation_uses_endpoint_signs(test, device):
+    """Small normal motion still truncates when the proposed endpoint changes side."""
+    s0 = 3.797968e-6
+    normal_displacement = -9.053657e-6
+    signed_distances = wp.array([s0, s0, -1.0e-6, -1.0e-6], dtype=float, device=device)
+    normal_displacements = wp.array([normal_displacement, -1.0e-6, -1.0e-6, 1.0e-6], dtype=float, device=device)
+    t_out = wp.empty(4, dtype=float, device=device)
+    wp.launch(
+        _planar_truncation_probe,
+        dim=4,
+        inputs=[signed_distances, normal_displacements, 0.85],
+        outputs=[t_out],
+        device=device,
+    )
+    crossing_t = s0 / -normal_displacement
+    expected_crossing_t = min(0.85 * crossing_t, crossing_t - 1.0e-3)
+    np.testing.assert_allclose(
+        t_out.numpy(),
+        [expected_crossing_t, 1.0, 0.0, 1.0],
+        rtol=0.0,
+        atol=1.0e-6,
+    )
+
+
+@wp.kernel
+def _primitive_pair_separator_probe(
+    soft_indices: wp.vec3i,
+    soft: wp.array[wp.vec3],
+    rigid_indices: wp.vec3i,
+    rigid_mesh: wp.uint64,
+    closest_soft: wp.vec3,
+    closest_rigid: wp.vec3,
+    collision_normal: wp.vec3,
+    delta_soft: float,
+    delta_rigid: float,
+    valid_out: wp.array[wp.int32],
+    normal_out: wp.array[wp.vec3],
+    plane_out: wp.array[wp.vec3],
+    gap_out: wp.array[float],
+    lambda_out: wp.array[float],
+):
+    valid, n, soft_support, rigid_support, gap = find_primitive_pair_separator(
+        soft_indices,
+        rigid_indices,
+        soft,
+        rigid_mesh,
+        wp.vec3(1.0),
+        wp.transform_identity(),
+        closest_soft,
+        closest_rigid,
+        collision_normal,
+    )
+    d = wp.vec3(0.0)
+    lmbd = float(0.0)
+    if valid:
+        d, lmbd = place_dat_division_plane(n, rigid_support, gap, delta_soft, delta_rigid)
+    valid_out[0] = wp.int32(valid)
+    normal_out[0] = n
+    plane_out[0] = d
+    gap_out[0] = gap
+    lambda_out[0] = lmbd
+
+
+def _probe_primitive_pair_separator(
+    device,
+    soft,
+    rigid,
+    closest_soft,
+    closest_rigid,
+    collision_normal,
+    delta_soft=0.0,
+    delta_rigid=0.0,
+):
+    soft = np.asarray(soft, dtype=np.float32)
+    rigid = np.asarray(rigid, dtype=np.float32)
+    soft_padded = np.repeat(soft[:1], 3, axis=0)
+    rigid_padded = np.repeat(rigid[:1], 3, axis=0)
+    soft_padded[: len(soft)] = soft
+    rigid_padded[: len(rigid)] = rigid
+    soft_indices = [-1, -1, -1]
+    rigid_indices = [-1, -1, -1]
+    soft_indices[: len(soft)] = range(len(soft))
+    rigid_indices[: len(rigid)] = range(len(rigid))
+    rigid_points = wp.array(rigid_padded, dtype=wp.vec3, device=device)
+    rigid_mesh = wp.Mesh(
+        points=rigid_points,
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    valid_out = wp.empty(1, dtype=wp.int32, device=device)
+    normal_out = wp.empty(1, dtype=wp.vec3, device=device)
+    plane_out = wp.empty(1, dtype=wp.vec3, device=device)
+    gap_out = wp.empty(1, dtype=float, device=device)
+    lambda_out = wp.empty(1, dtype=float, device=device)
+    wp.launch(
+        _primitive_pair_separator_probe,
+        dim=1,
+        inputs=[
+            wp.vec3i(*soft_indices),
+            wp.array(soft_padded, dtype=wp.vec3, device=device),
+            wp.vec3i(*rigid_indices),
+            rigid_mesh.id,
+            wp.vec3(*closest_soft),
+            wp.vec3(*closest_rigid),
+            wp.vec3(*collision_normal),
+            delta_soft,
+            delta_rigid,
+        ],
+        outputs=[valid_out, normal_out, plane_out, gap_out, lambda_out],
+        device=device,
+    )
+    return {
+        "valid": bool(valid_out.numpy()[0]),
+        "normal": normal_out.numpy()[0],
+        "plane": plane_out.numpy()[0],
+        "gap": float(gap_out.numpy()[0]),
+        "lambda": float(lambda_out.numpy()[0]),
+    }
+
+
+def test_primitive_pair_separator_vt_tv_ee(test, device):
+    """The stored closest pair produces the maximum-gap separator for all dense families."""
+    cases = [
+        (
+            [[0.2, 0.2, 1.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [0.2, 0.2, 1.0],
+            [0.2, 0.2, 0.0],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]],
+            [[0.2, 0.2, 0.0]],
+            [0.2, 0.2, 1.0],
+            [0.2, 0.2, 0.0],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ),
+    ]
+    for soft, rigid, closest_soft, closest_rigid, expected_n in cases:
+        result = _probe_primitive_pair_separator(
+            device,
+            soft,
+            rigid,
+            closest_soft,
+            closest_rigid,
+            collision_normal=[1.0, 0.0, 0.0],
+            delta_soft=0.75,
+            delta_rigid=0.25,
+        )
+        test.assertTrue(result["valid"])
+        np.testing.assert_allclose(result["normal"], expected_n, atol=1.0e-6)
+        test.assertAlmostEqual(result["gap"], 1.0, places=6)
+        test.assertAlmostEqual(result["lambda"], 0.25, places=6)
+        soft_plane_values = (np.asarray(soft) - result["plane"]) @ result["normal"]
+        rigid_plane_values = (np.asarray(rigid) - result["plane"]) @ result["normal"]
+        test.assertGreaterEqual(float(np.min(soft_plane_values)), -1.0e-6)
+        test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-6)
+
+
+def test_primitive_pair_separator_vt_near_triangle_edge(test, device):
+    """VT separation remains valid as the point projection crosses a triangle edge."""
+    triangle = [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    height = 1.0e-6
+    lateral = 1.0e-7
+    cases = [
+        ("inside", [0.0, lateral, height], [0.0, lateral, 0.0], [0.0, 0.0, 1.0], height),
+        ("on edge", [0.0, 0.0, height], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], height),
+        (
+            "outside",
+            [0.0, -lateral, height],
+            [0.0, 0.0, 0.0],
+            np.array([0.0, -lateral, height]) / np.hypot(lateral, height),
+            np.hypot(lateral, height),
+        ),
+    ]
+    for label, point, closest_rigid, expected_n, expected_gap in cases:
+        result = _probe_primitive_pair_separator(
+            device,
+            [point],
+            triangle,
+            closest_soft=point,
+            closest_rigid=closest_rigid,
+            collision_normal=[0.0, 0.0, 1.0],
+        )
+        test.assertTrue(result["valid"], label)
+        np.testing.assert_allclose(result["normal"], expected_n, atol=1.0e-6, err_msg=label)
+        test.assertAlmostEqual(result["gap"], expected_gap, places=10, msg=label)
+        soft_plane_value = float(np.dot(np.asarray(point) - result["plane"], result["normal"]))
+        rigid_plane_values = (np.asarray(triangle) - result["plane"]) @ result["normal"]
+        test.assertGreaterEqual(soft_plane_value, -1.0e-8, label)
+        test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-8, label)
+
+
+def test_primitive_pair_separator_degenerate_fallbacks(test, device):
+    """A positive nanogap remains usable while every zero-gap pair fails closed."""
+    triangle = [[-0.01, -0.01, 0.0], [0.01, -0.01, 0.0], [0.0, 0.01, 0.0]]
+    stable = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 1.0e-7]],
+        triangle,
+        closest_soft=[1.0e-7, 0.0, 1.0e-7],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertTrue(stable["valid"])
+    np.testing.assert_allclose(stable["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+
+    face_fallback = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 1.0e-7]],
+        triangle,
+        closest_soft=[1.0e-7, 0.0, 1.0e-7],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(face_fallback["valid"])
+    np.testing.assert_allclose(face_fallback["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertGreater(face_fallback["gap"], 0.0)
+
+    short_face_fallback = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 1.0e-6]],
+        [[-5.0e-6, -5.0e-6, 0.0], [5.0e-6, -5.0e-6, 0.0], [0.0, 5.0e-6, 0.0]],
+        closest_soft=[4.0e-6, 0.0, 1.0e-6],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(short_face_fallback["valid"])
+    np.testing.assert_allclose(short_face_fallback["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertAlmostEqual(short_face_fallback["gap"], 1.0e-6, places=10)
+
+    touching_vt = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 0.0]],
+        triangle,
+        closest_soft=[0.0, 0.0, 0.0],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertFalse(touching_vt["valid"])
+    test.assertAlmostEqual(touching_vt["gap"], 0.0, places=7)
+
+    coincident_ee = _probe_primitive_pair_separator(
+        device,
+        [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]],
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        closest_soft=[0.0, 0.0, 0.0],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[0.0, 0.0, 0.0],
+    )
+    test.assertFalse(coincident_ee["valid"])
+    test.assertAlmostEqual(coincident_ee["gap"], 0.0, places=7)
+
+    intersecting_ee = _probe_primitive_pair_separator(
+        device,
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        [[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+        closest_soft=[0.0, 0.0, 0.0],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertFalse(intersecting_ee["valid"])
+
+    collapsed = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        closest_soft=[0.0, 0.0, 0.0],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[0.0, 0.0, 0.0],
+    )
+    test.assertFalse(collapsed["valid"])
+
+
+def test_primitive_pair_separator_ee_feature_fallbacks(test, device):
+    """EE feature normals recover separated skew and parallel pairs without accepting intersections."""
+    captured_soft = [
+        [0.362191170, -0.0216176156, 0.0115757957],
+        [0.349923998, -0.0210668258, 0.00879837759],
+    ]
+    captured_rigid = [
+        [0.344296515, -0.0221406277, 0.0326073393],
+        [0.356472254, -0.0213688165, 0.0102543645],
+    ]
+    expected_cross = np.cross(
+        np.asarray(captured_rigid[1]) - captured_rigid[0],
+        np.asarray(captured_soft[1]) - captured_soft[0],
+    )
+    expected_cross /= np.linalg.norm(expected_cross)
+    # A slight tangent perturbation of the feature normal also separates this
+    # captured pair. The exact feature direction must win because the closest
+    # candidate fails and feature candidates precede the collision normal.
+    collision_normal = expected_cross + np.array([5.0e-4, 0.0, 0.0])
+    collision_normal /= np.linalg.norm(collision_normal)
+    stable_gap = np.min(np.asarray(captured_soft) @ collision_normal) - np.max(
+        np.asarray(captured_rigid) @ collision_normal
+    )
+    test.assertGreater(stable_gap, 0.0)
+    captured = _probe_primitive_pair_separator(
+        device,
+        captured_soft,
+        captured_rigid,
+        closest_soft=[0.356459856, -0.0213602819, 0.0102781672],
+        closest_rigid=[0.356459558, -0.0213696212, 0.0102776773],
+        collision_normal=collision_normal,
+    )
+    test.assertTrue(captured["valid"])
+    np.testing.assert_allclose(captured["normal"], expected_cross, atol=1.0e-6)
+    test.assertAlmostEqual(captured["gap"], 9.3565102e-6, places=10)
+
+    short_skew = _probe_primitive_pair_separator(
+        device,
+        [[-5.0e-6, 0.0, 1.0e-6], [5.0e-6, 0.0, 1.0e-6]],
+        [[0.0, -5.0e-6, 0.0], [0.0, 5.0e-6, 0.0]],
+        closest_soft=[4.0e-6, 0.0, 1.0e-6],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(short_skew["valid"])
+    np.testing.assert_allclose(short_skew["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertAlmostEqual(short_skew["gap"], 1.0e-6, places=10)
+
+    parallel = _probe_primitive_pair_separator(
+        device,
+        [[-1.0, 1.0e-6, 0.0], [1.0, 1.0e-6, 0.0]],
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        closest_soft=[0.5, 1.0e-6, 0.0],
+        closest_rigid=[0.0, 0.0, 0.0],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(parallel["valid"])
+    np.testing.assert_allclose(parallel["normal"], [0.0, 1.0, 0.0], atol=1.0e-6)
+    test.assertAlmostEqual(parallel["gap"], 1.0e-6, places=10)
+
+
+def test_dat_division_plane_placement_extremes(test, device):
+    """Adaptive placement reaches either support endpoint and defaults to the midpoint."""
+    soft = [[0.0, 0.0, 1.0]]
+    rigid = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    expected = [(1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 1.0, 1.0), (0.0, 0.0, 0.5, 0.5)]
+    for delta_soft, delta_rigid, expected_lambda, expected_z in expected:
+        result = _probe_primitive_pair_separator(
+            device,
+            soft,
+            rigid,
+            closest_soft=[0.0, 0.0, 1.0],
+            closest_rigid=[0.0, 0.0, 0.0],
+            collision_normal=[0.0, 0.0, 1.0],
+            delta_soft=delta_soft,
+            delta_rigid=delta_rigid,
+        )
+        test.assertAlmostEqual(result["lambda"], expected_lambda, places=6)
+        test.assertAlmostEqual(float(result["plane"][2]), expected_z, places=6)
+
+
+def test_primitive_pair_separator_large_world_coordinates(test, device):
+    """Relative support projections preserve a millimeter gap far from the origin."""
+    origin = 1000.0
+    result = _probe_primitive_pair_separator(
+        device,
+        [[origin, origin, origin + 1.0e-3]],
+        [[origin - 0.1, origin - 0.1, origin], [origin + 0.1, origin - 0.1, origin], [origin, origin + 0.1, origin]],
+        closest_soft=[origin, origin, origin + 1.0e-3],
+        closest_rigid=[origin, origin, origin],
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertTrue(result["valid"])
+    test.assertGreater(result["gap"], 9.0e-4)
+
+
+@wp.kernel
 def _rigid_trajectory_truncation_probe(
     n: wp.vec3,
     d: wp.vec3,
@@ -4723,9 +5120,7 @@ def test_rigid_dat_trajectory_truncation(test, device):
         device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 1), small_angle, (1, 0, 0)
     )
     test.assertTrue(np.allclose(small_angle_point, (math.cos(small_angle), math.sin(small_angle), 0.0), atol=1e-12))
-    identity_point = _probe_rigid_point_trajectory(
-        device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 0), 0.0, (1, 2, 3)
-    )
+    identity_point = _probe_rigid_point_trajectory(device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 0), 0.0, (1, 2, 3))
     test.assertTrue(np.array_equal(identity_point, (1.0, 2.0, 3.0)))
 
     # A point already behind its assigned plane is outside Algorithm 1's
@@ -4836,15 +5231,9 @@ def test_rigid_dat_interval_catches_quarter_circle_tangent_peak(test, device):
         "rotation_angle": math.pi / 2.0,
     }
 
-    even_stage1_t = _probe_rigid_dat_returning_sdf_arc(
-        device, False, trajectory_samples=8, **probe_args
-    )
-    odd_stage1_t = _probe_rigid_dat_returning_sdf_arc(
-        device, False, trajectory_samples=9, **probe_args
-    )
-    odd_interval_t = _probe_rigid_dat_returning_sdf_arc(
-        device, True, trajectory_samples=9, **probe_args
-    )
+    even_stage1_t = _probe_rigid_dat_returning_sdf_arc(device, False, trajectory_samples=8, **probe_args)
+    odd_stage1_t = _probe_rigid_dat_returning_sdf_arc(device, False, trajectory_samples=9, **probe_args)
+    odd_interval_t = _probe_rigid_dat_returning_sdf_arc(device, True, trajectory_samples=9, **probe_args)
 
     first_crossing = (math.pi / 4.0 - math.acos(plane_rhs / math.sqrt(2.0))) / (math.pi / 2.0)
     expected_t = first_crossing - 1.0e-3
@@ -4952,6 +5341,158 @@ def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
             "every vertex of the selected rigid triangle must remain in its assigned half-space",
         )
     test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
+
+
+def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_body=False):
+    """Apply one dense VT DAT row and return its particle and body factors."""
+    rigid_mesh = wp.Mesh(
+        points=wp.array(
+            [[-0.01, -0.01, 0.0], [0.01, -0.01, 0.0], [0.0, 0.01, 0.0]],
+            dtype=wp.vec3,
+            device=device,
+        ),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    truncation_ts = wp.ones(1, dtype=float, device=device)
+    body_truncation_ts = (
+        wp.ones(1, dtype=float, device=device) if moving_body else wp.empty(0, dtype=float, device=device)
+    )
+    body_q_ref = (
+        wp.array([wp.transform_identity()], dtype=wp.transform, device=device)
+        if moving_body
+        else wp.empty(0, dtype=wp.transform, device=device)
+    )
+    body_q = (
+        wp.array(
+            [wp.transform(wp.vec3(0.0, 0.0, 1.0e-3), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        )
+        if moving_body
+        else wp.empty(0, dtype=wp.transform, device=device)
+    )
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([stored_normal], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+            wp.array([0 if moving_body else -1], dtype=wp.int32, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+            wp.array([[0.0, 0.0, particle_z]], dtype=wp.vec3, device=device),
+            wp.array([[0.0, 0.0, displacement_z]], dtype=wp.vec3, device=device),
+            body_q_ref,
+            body_q,
+            wp.zeros(1, dtype=wp.vec3, device=device) if moving_body else wp.empty(0, dtype=wp.vec3, device=device),
+            0.85,
+            False,
+        ],
+        outputs=[truncation_ts, body_truncation_ts],
+        device=device,
+    )
+    body_t = float(body_truncation_ts.numpy()[0]) if moving_body else 1.0
+    return float(truncation_ts.numpy()[0]), body_t
+
+
+def test_bvh_dat_nanometer_vt_gap_truncates(test, device):
+    """A nanometer-gap VT row truncates against its certified closest-pair separator."""
+    truncation_t, _body_t = _run_vt_dat_row(
+        device,
+        particle_z=1.0e-7,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-1.0e-4,
+    )
+    test.assertLess(truncation_t, 1.0, "the particle trajectory crosses the certified face plane")
+
+
+def test_bvh_dat_zero_gap_vt_fails_closed(test, device):
+    """A zero-gap VT row reports separator failure and freezes both sides."""
+    from newton.tests.unittest_utils import StdOutCapture  # noqa: PLC0415
+
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        truncation_t, body_t = _run_vt_dat_row(
+            device,
+            particle_z=0.0,
+            stored_normal=[1.0, 0.0, 0.0],
+            displacement_z=-1.0e-4,
+            moving_body=True,
+        )
+        wp.synchronize_device(wp.get_device(device))
+    finally:
+        output = capture.end()
+    test.assertIn("Rigid-soft DAT found no separating normal for BVH row 0", output)
+    test.assertEqual(truncation_t, 0.0)
+    test.assertEqual(body_t, 0.0)
+
+
+def test_bvh_dat_uses_geometric_separator_for_back_facing_ee(test, device):
+    """A separated back-facing EE row uses its valid geometric separator.
+
+    DAT requires assigned primitive sides, not agreement with the rigid surface
+    normal used by the force law. Motion away from the geometric plane remains
+    unconstrained even when that plane's normal is back-facing.
+    """
+    pair_delta = np.array([0.001338402, 0.014236988, -0.002109018], dtype=np.float32)
+    force_normal = np.array([-0.876487, 0.001508, -0.481423], dtype=np.float32)
+    force_normal /= np.linalg.norm(force_normal)
+    dat_normal = pair_delta / np.linalg.norm(pair_delta)
+    rigid_points = wp.array([[0.0, 0.0, 0.0], [0.0, 0.002, 0.0], [0.001, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    rigid_mesh = wp.Mesh(
+        points=rigid_points,
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+
+    test.assertLess(float(np.dot(pair_delta, force_normal)), 0.0)
+    def apply_with_displacement(displacement):
+        truncation_ts = wp.ones(2, dtype=float, device=device)
+        wp.launch(
+            apply_rigid_soft_truncation,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                wp.array([[0, 1, -1]], dtype=wp.vec3i, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+                wp.array([force_normal], dtype=wp.vec3, device=device),
+                wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+                wp.array([[0, 1, -1]], dtype=wp.vec3i, device=device),
+                wp.array([-1], dtype=wp.int32, device=device),
+                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
+                wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+                wp.array([pair_delta, pair_delta + np.array([0.0, 0.002, 0.0])], dtype=wp.vec3, device=device),
+                wp.array([displacement, displacement], dtype=wp.vec3, device=device),
+                wp.empty(0, dtype=wp.transform, device=device),
+                wp.empty(0, dtype=wp.transform, device=device),
+                wp.empty(0, dtype=wp.vec3, device=device),
+                0.85,
+                False,
+            ],
+            outputs=[truncation_ts, wp.empty(0, dtype=float, device=device)],
+            device=device,
+        )
+        return truncation_ts.numpy()
+
+    away_displacement = 1.0e-3 * dat_normal
+    test.assertLess(float(np.dot(force_normal, away_displacement)), 0.0)
+    test.assertTrue(
+        np.array_equal(apply_with_displacement(away_displacement), np.ones(2, dtype=np.float32)),
+        "motion away from the certified geometric separator must remain unconstrained",
+    )
+    toward_displacement = -2.0 * pair_delta
+    test.assertTrue(
+        np.all(apply_with_displacement(toward_displacement) < 1.0),
+        "motion crossing the back-facing geometric separator must be truncated",
+    )
 
 
 def _build_sphere_drop_on_cloth(device):
@@ -5368,6 +5909,48 @@ class TestVBDRigidDAT(unittest.TestCase):
 
 add_function_test(
     TestVBDRigidDAT,
+    "test_planar_truncation_uses_endpoint_signs",
+    test_planar_truncation_uses_endpoint_signs,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_primitive_pair_separator_vt_tv_ee",
+    test_primitive_pair_separator_vt_tv_ee,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_primitive_pair_separator_vt_near_triangle_edge",
+    test_primitive_pair_separator_vt_near_triangle_edge,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_primitive_pair_separator_degenerate_fallbacks",
+    test_primitive_pair_separator_degenerate_fallbacks,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_primitive_pair_separator_ee_feature_fallbacks",
+    test_primitive_pair_separator_ee_feature_fallbacks,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_dat_division_plane_placement_extremes",
+    test_dat_division_plane_placement_extremes,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_primitive_pair_separator_large_world_coordinates",
+    test_primitive_pair_separator_large_world_coordinates,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
     devices=devices,
@@ -5388,6 +5971,25 @@ add_function_test(
     TestVBDRigidDAT,
     "test_bvh_dat_exact_rigid_triangle_truncates_rotation",
     test_bvh_dat_exact_rigid_triangle_truncates_rotation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_nanometer_vt_gap_truncates",
+    test_bvh_dat_nanometer_vt_gap_truncates,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_zero_gap_vt_fails_closed",
+    test_bvh_dat_zero_gap_vt_fails_closed,
+    devices=devices,
+    check_output=False,  # the test captures the expected kernel warning itself
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_uses_geometric_separator_for_back_facing_ee",
+    test_bvh_dat_uses_geometric_separator_for_back_facing_ee,
     devices=devices,
 )
 add_function_test(

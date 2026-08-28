@@ -2562,8 +2562,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
         self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
         self.rigid_dat_use_interval_arithmetic = rigid_dat_use_interval_arithmetic
-        # Threshold below which a displacement is treated as parallel to a division plane.
-        self.rigid_dat_parallel_epsilon = 1e-5
 
         if not self.rigid_enable_penetration_free:
             return
@@ -2742,7 +2740,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_q_prev_collision_detection,
                     body_q,
                     self.model.body_com,
-                    self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_dat_use_interval_arithmetic,
                 ],
@@ -2805,7 +2802,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.tri_indices,
                     self.model.edge_indices,
                     self.trimesh_collision_info,
-                    self.trimesh_collision_detector.edge_edge_parallel_epsilon,
                     self.particle_conservative_bound_relaxation,
                 ],
                 outputs=[
@@ -2839,7 +2835,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_q_prev_collision_detection,
                     state.body_q,
                     self.model.body_com,
-                    self.rigid_dat_parallel_epsilon,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_dat_use_interval_arithmetic,
                 ],

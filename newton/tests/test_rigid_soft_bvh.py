@@ -2429,17 +2429,17 @@ def test_bvh_dat_plane_uses_complete_primitive_approach(test, device):
     """Place the DAT plane from the fastest vertex, not the interpolated closest-point motion."""
     from newton._src.solvers.vbd.rigid_vbd_kernels import apply_rigid_soft_truncation  # noqa: PLC0415
 
-    # A rigid triangle rotates about a stationary closest point at the origin;
-    # its x=1 vertex advances by 0.3 m along +z. Only soft-triangle vertex 0
-    # moves down (0.9 m), with closest-point weight 0.25. Planar-DAT therefore
-    # uses the two complete-primitive maxima, delta_rigid=0.3 and
+    # A TV row pairs a soft triangle with the rigid vertex at x=1. The rigid
+    # vertex advances by 0.3 m along +z while only soft-triangle vertex 0 moves
+    # down (0.9 m), despite carrying closest-point weight 0.25. Planar-DAT therefore
+    # uses the two primitive approach maxima, delta_rigid=0.3 and
     # delta_soft=0.9, and places the plane at lambda=0.25.
     mesh = newton.Mesh(
         np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], np.float32),
         np.array([0, 1, 2], np.int32),
     )
     mesh_id = mesh.finalize(device=device)
-    particle_q = wp.array([[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
+    particle_q = wp.array([[0.0, -1.0, 1.0], [2.0, -1.0, 1.0], [1.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
     particle_displacements = wp.array(
         [[0.0, 0.0, -0.9], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=wp.vec3, device=device
     )
@@ -2457,10 +2457,10 @@ def test_bvh_dat_plane_uses_complete_primitive_approach(test, device):
             wp.array([1], dtype=wp.int32, device=device),
             wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
             wp.array([0], dtype=wp.int32, device=device),
-            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
             wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
             wp.array([[0.25, 0.25, 0.5]], dtype=wp.vec3, device=device),
-            wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+            wp.array([[1, -1, -1]], dtype=wp.vec3i, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
             wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
@@ -2470,7 +2470,6 @@ def test_bvh_dat_plane_uses_complete_primitive_approach(test, device):
             body_q_ref,
             body_q,
             wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
-            1.0e-6,
             0.85,
             False,
         ],
