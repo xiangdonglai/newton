@@ -30,6 +30,7 @@ from typing import Any
 import warp as wp
 
 from newton._src.core.types import MAXVAL
+from newton._src.geometry.kernels import triangle_closest_point
 from newton._src.math import orthonormal_basis, quat_velocity
 from newton._src.sim import JointType
 from newton._src.sim.contacts import contact_surface_point, contact_surface_separation
@@ -6930,46 +6931,6 @@ def _normalized_feature_cross(first: wp.vec3, second: wp.vec3):
 
 
 @wp.func
-def _primitive_pair_feature_normal(
-    soft_vertices: wp.mat33,
-    soft_count: int,
-    rigid_vertices: wp.mat33,
-    rigid_count: int,
-    closest_delta: wp.vec3,
-):
-    """Construct the topology-derived VT, TV, or EE separator candidate."""
-    feature_n = wp.vec3(0.0)
-    if soft_count == 1 and rigid_count == 3:  # VT
-        feature_n = _normalized_feature_cross(
-            rigid_vertices[1] - rigid_vertices[0],
-            rigid_vertices[2] - rigid_vertices[0],
-        )
-    elif soft_count == 3 and rigid_count == 1:  # TV
-        feature_n = _normalized_feature_cross(
-            soft_vertices[1] - soft_vertices[0],
-            soft_vertices[2] - soft_vertices[0],
-        )
-    elif soft_count == 2 and rigid_count == 2:  # EE
-        soft_edge = soft_vertices[1] - soft_vertices[0]
-        rigid_edge = rigid_vertices[1] - rigid_vertices[0]
-        soft_length_sq = wp.length_sq(soft_edge)
-        rigid_length_sq = wp.length_sq(rigid_edge)
-        if (
-            soft_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS
-            and rigid_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS
-        ):
-            feature_n = _normalized_feature_cross(rigid_edge, soft_edge)
-            if wp.length_sq(feature_n) == 0.0:
-                common_edge = soft_edge
-                common_length_sq = soft_length_sq
-                if rigid_length_sq > soft_length_sq:
-                    common_edge = rigid_edge
-                    common_length_sq = rigid_length_sq
-                feature_n = closest_delta - wp.dot(closest_delta, common_edge) / common_length_sq * common_edge
-    return feature_n
-
-
-@wp.func
 def find_primitive_pair_separator(
     soft_indices: wp.vec3i,
     rigid_indices: wp.vec3i,
@@ -6977,22 +6938,21 @@ def find_primitive_pair_separator(
     rigid_mesh: wp.uint64,
     rigid_scale: wp.vec3,
     X_wr_ref: wp.transform,
-    closest_soft_ref: wp.vec3,
-    closest_rigid_ref: wp.vec3,
     collision_normal: wp.vec3,
 ):
     """Find and certify a DAT separator for one complete VT, TV, or EE pair.
 
-    The ``-1``-padded primitive indices identify VT, TV, or EE directly. Candidate
-    order is closest-pair direction, topology-derived feature direction, then the
-    collision pipeline's stored contact normal. VT/TV feature directions use the
-    triangle face normal; nonparallel EE uses the edge cross product; parallel EE projects
-    the stored closest displacement perpendicular to the common edge. Every
-    candidate is accepted only after all vertices pass a strict positive-gap
-    support test; exactly touching or intersecting pairs fail closed.
+    The ``-1``-padded primitive indices identify VT, TV, or EE directly.
+    For VT/TV, candidate families are the recomputed closest-point delta,
+    triangle support axes, and the collision-pipeline normal. For EE, they are
+    the recomputed closest-point delta, the edge cross product, the longer-edge
+    perpendicular projection, and the collision-pipeline normal. This function
+    certifies every candidate uniformly and keeps the widest strictly separating
+    option. Exactly touching or intersecting pairs fail closed.
 
-    Returns ``(valid, n, soft_support, rigid_support, gap)`` with ``n`` pointing
-    into the soft primitive's assigned half-space.
+    Returns ``(valid, n, soft_support, rigid_support, gap, candidate_index)``
+    with ``n`` pointing into the soft primitive's assigned half-space. The
+    candidate index records which enumerated axis produced the widest gap.
     """
     soft_count = int(0)
     rigid_count = int(0)
@@ -7047,41 +7007,131 @@ def find_primitive_pair_separator(
             rigid_indices[1],
             rigid_indices[2],
         )
-        return False, wp.vec3(0.0), soft_vertices[0], rigid_vertices[0], float(0.0)
+        return False, wp.vec3(0.0), soft_vertices[0], rigid_vertices[0], float(0.0), int(-1)
 
-    # In exact arithmetic, the closest-point delta separates two disjoint convex
-    # primitives. Numerically inaccurate closest points can tilt that delta enough
-    # to fail the complete-primitive support test. In that case, fall back to the
-    # topology-derived feature normal (both signs), then use the collision
-    # pipeline's normal as the final resort. The positive half-space is always
-    # assigned to the soft primitive.
-    feature_n = wp.vec3(0.0)
-    for candidate_index in range(4):
-        candidate_n = closest_soft_ref - closest_rigid_ref
-        if candidate_index == 1:
-            feature_n = _primitive_pair_feature_normal(
-                soft_vertices,
-                soft_count,
-                rigid_vertices,
-                rigid_count,
-                closest_soft_ref - closest_rigid_ref,
-            )
-            candidate_n = feature_n
-        elif candidate_index == 2:
-            candidate_n = -feature_n
-        elif candidate_index == 3:
-            candidate_n = collision_normal
-        valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
-            candidate_n,
-            soft_vertices,
-            soft_count,
-            rigid_vertices,
-            rigid_count,
+    best_valid = False
+    best_n = wp.vec3(0.0)
+    best_soft_support = soft_vertices[0]
+    best_rigid_support = rigid_vertices[0]
+    best_gap = float(0.0)
+    best_candidate_index = int(-1)
+
+    if is_vt or is_tv:
+        point = soft_vertices[0]
+        triangle = rigid_vertices
+        if is_tv:
+            point = rigid_vertices[0]
+            triangle = soft_vertices
+        closest, _bary, _feature = triangle_closest_point(
+            triangle[0], triangle[1], triangle[2], point
         )
-        if valid:
-            return valid, n, soft_support, rigid_support, gap
+        face_axis = _normalized_feature_cross(
+            triangle[1] - triangle[0],
+            triangle[2] - triangle[0],
+        )
 
-    return False, wp.vec3(0.0), soft_vertices[0], rigid_vertices[0], float(0.0)
+        # VT/TV: enumerate the recomputed closest-point, face, AB, AC, BC,
+        # and collision-pipeline axes.
+        for candidate_index in range(6):
+            candidate_axis = point - closest
+            if candidate_index == 1:
+                candidate_axis = face_axis
+            elif candidate_index >= 2 and candidate_index <= 4:
+                edge_start = int(0)
+                edge_end = candidate_index - 1
+                if candidate_index == 4:
+                    edge_start = int(1)
+                    edge_end = int(2)
+                edge = triangle[edge_end] - triangle[edge_start]
+                candidate_axis = wp.cross(face_axis, edge)
+            elif candidate_index == 5:
+                candidate_axis = collision_normal
+
+            for sign_index in range(2):
+                signed_axis = candidate_axis
+                if sign_index == 1:
+                    signed_axis = -signed_axis
+                valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
+                    signed_axis,
+                    soft_vertices,
+                    soft_count,
+                    rigid_vertices,
+                    rigid_count,
+                )
+                if valid and (not best_valid or gap > best_gap):
+                    best_valid = True
+                    best_n = n
+                    best_soft_support = soft_support
+                    best_rigid_support = rigid_support
+                    best_gap = gap
+                    best_candidate_index = candidate_index
+    else:  # EE
+        soft_edge = soft_vertices[1] - soft_vertices[0]
+        rigid_edge = rigid_vertices[1] - rigid_vertices[0]
+        # Warp compares its final argument against squared edge lengths.
+        closest_parameters = wp.closest_point_edge_edge(
+            soft_vertices[0],
+            soft_vertices[1],
+            rigid_vertices[0],
+            rigid_vertices[1],
+            _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS,
+        )
+        closest_soft = soft_vertices[0] + closest_parameters[0] * soft_edge
+        closest_rigid = rigid_vertices[0] + closest_parameters[1] * rigid_edge
+        recomputed_closest_axis = closest_soft - closest_rigid
+        soft_length_sq = wp.length_sq(soft_edge)
+        rigid_length_sq = wp.length_sq(rigid_edge)
+        edge_cross_axis = _normalized_feature_cross(rigid_edge, soft_edge)
+        parallel_edge_axis = wp.vec3(0.0)
+        if (
+            soft_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS
+            and rigid_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS
+        ):
+            # Remove the component of the recomputed closest-point axis parallel
+            # to the longer edge. This is useful for near-parallel edges because
+            # the orthogonality is improved.
+            longer_length_sq = soft_length_sq
+            longer_edge = soft_edge
+            if rigid_length_sq > soft_length_sq:
+                longer_length_sq = rigid_length_sq
+                longer_edge = rigid_edge
+            parallel_edge_axis = (
+                recomputed_closest_axis
+                - wp.dot(recomputed_closest_axis, longer_edge) / longer_length_sq * longer_edge
+            )
+
+        # EE: enumerate all possible separating axes:
+        # recomputed closest, edge cross product, longer-edge projection,
+        # and collision-pipeline axes.
+        for candidate_index in range(4):
+            candidate_axis = recomputed_closest_axis
+            if candidate_index == 1:
+                candidate_axis = edge_cross_axis
+            elif candidate_index == 2:
+                candidate_axis = parallel_edge_axis
+            elif candidate_index == 3:
+                candidate_axis = collision_normal
+
+            for sign_index in range(2):
+                signed_axis = candidate_axis
+                if sign_index == 1:
+                    signed_axis = -signed_axis
+                valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
+                    signed_axis,
+                    soft_vertices,
+                    soft_count,
+                    rigid_vertices,
+                    rigid_count,
+                )
+                if valid and (not best_valid or gap > best_gap):
+                    best_valid = True
+                    best_n = n
+                    best_soft_support = soft_support
+                    best_rigid_support = rigid_support
+                    best_gap = gap
+                    best_candidate_index = candidate_index
+
+    return best_valid, best_n, best_soft_support, best_rigid_support, best_gap, best_candidate_index
 
 
 @wp.func
@@ -7378,15 +7428,13 @@ def apply_rigid_soft_truncation(
         mesh = shape_source_ptr[shape_index]
         X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
 
-        valid_plane, n, x_ref, bx0, gap = find_primitive_pair_separator(
+        valid_plane, n, x_ref, bx0, gap, _candidate_index = find_primitive_pair_separator(
             indices,
             rigid_indices,
             pos_prev_collision_detection,
             mesh,
             shape_scale[shape_index],
             X_wr_ref,
-            x_ref,
-            bx0,
             soft_contact_normal[contact_index],
         )
         if not valid_plane:

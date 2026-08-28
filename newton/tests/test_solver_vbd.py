@@ -4674,8 +4674,6 @@ def _primitive_pair_separator_probe(
     soft: wp.array[wp.vec3],
     rigid_indices: wp.vec3i,
     rigid_mesh: wp.uint64,
-    closest_soft: wp.vec3,
-    closest_rigid: wp.vec3,
     collision_normal: wp.vec3,
     delta_soft: float,
     delta_rigid: float,
@@ -4684,16 +4682,15 @@ def _primitive_pair_separator_probe(
     plane_out: wp.array[wp.vec3],
     gap_out: wp.array[float],
     lambda_out: wp.array[float],
+    candidate_index_out: wp.array[wp.int32],
 ):
-    valid, n, soft_support, rigid_support, gap = find_primitive_pair_separator(
+    valid, n, soft_support, rigid_support, gap, candidate_index = find_primitive_pair_separator(
         soft_indices,
         rigid_indices,
         soft,
         rigid_mesh,
         wp.vec3(1.0),
         wp.transform_identity(),
-        closest_soft,
-        closest_rigid,
         collision_normal,
     )
     d = wp.vec3(0.0)
@@ -4705,14 +4702,13 @@ def _primitive_pair_separator_probe(
     plane_out[0] = d
     gap_out[0] = gap
     lambda_out[0] = lmbd
+    candidate_index_out[0] = candidate_index
 
 
 def _probe_primitive_pair_separator(
     device,
     soft,
     rigid,
-    closest_soft,
-    closest_rigid,
     collision_normal,
     delta_soft=0.0,
     delta_rigid=0.0,
@@ -4737,6 +4733,7 @@ def _probe_primitive_pair_separator(
     plane_out = wp.empty(1, dtype=wp.vec3, device=device)
     gap_out = wp.empty(1, dtype=float, device=device)
     lambda_out = wp.empty(1, dtype=float, device=device)
+    candidate_index_out = wp.empty(1, dtype=wp.int32, device=device)
     wp.launch(
         _primitive_pair_separator_probe,
         dim=1,
@@ -4745,13 +4742,11 @@ def _probe_primitive_pair_separator(
             wp.array(soft_padded, dtype=wp.vec3, device=device),
             wp.vec3i(*rigid_indices),
             rigid_mesh.id,
-            wp.vec3(*closest_soft),
-            wp.vec3(*closest_rigid),
             wp.vec3(*collision_normal),
             delta_soft,
             delta_rigid,
         ],
-        outputs=[valid_out, normal_out, plane_out, gap_out, lambda_out],
+        outputs=[valid_out, normal_out, plane_out, gap_out, lambda_out, candidate_index_out],
         device=device,
     )
     return {
@@ -4760,41 +4755,34 @@ def _probe_primitive_pair_separator(
         "plane": plane_out.numpy()[0],
         "gap": float(gap_out.numpy()[0]),
         "lambda": float(lambda_out.numpy()[0]),
+        "candidate_index": int(candidate_index_out.numpy()[0]),
     }
 
 
-def test_primitive_pair_separator_vt_tv_ee(test, device):
-    """The stored closest pair produces the maximum-gap separator for all dense families."""
+def _check_primitive_pair_separator_regular_cases(test, device):
+    """Recomputed closest points produce the maximum-gap separator for regular pairs."""
     cases = [
         (
             [[0.2, 0.2, 1.0]],
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            [0.2, 0.2, 1.0],
-            [0.2, 0.2, 0.0],
             [0.0, 0.0, 1.0],
         ),
         (
             [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]],
             [[0.2, 0.2, 0.0]],
-            [0.2, 0.2, 1.0],
-            [0.2, 0.2, 0.0],
             [0.0, 0.0, 1.0],
         ),
         (
             [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
             [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
             [0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
         ),
     ]
-    for soft, rigid, closest_soft, closest_rigid, expected_n in cases:
+    for soft, rigid, expected_n in cases:
         result = _probe_primitive_pair_separator(
             device,
             soft,
             rigid,
-            closest_soft,
-            closest_rigid,
             collision_normal=[1.0, 0.0, 0.0],
             delta_soft=0.75,
             delta_rigid=0.25,
@@ -4809,29 +4797,26 @@ def test_primitive_pair_separator_vt_tv_ee(test, device):
         test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-6)
 
 
-def test_primitive_pair_separator_vt_near_triangle_edge(test, device):
+def _check_primitive_pair_separator_near_triangle_edge(test, device):
     """VT separation remains valid as the point projection crosses a triangle edge."""
     triangle = [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
     height = 1.0e-6
     lateral = 1.0e-7
     cases = [
-        ("inside", [0.0, lateral, height], [0.0, lateral, 0.0], [0.0, 0.0, 1.0], height),
-        ("on edge", [0.0, 0.0, height], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], height),
+        ("inside", [0.0, lateral, height], [0.0, 0.0, 1.0], height),
+        ("on edge", [0.0, 0.0, height], [0.0, 0.0, 1.0], height),
         (
             "outside",
             [0.0, -lateral, height],
-            [0.0, 0.0, 0.0],
             np.array([0.0, -lateral, height]) / np.hypot(lateral, height),
             np.hypot(lateral, height),
         ),
     ]
-    for label, point, closest_rigid, expected_n, expected_gap in cases:
+    for label, point, expected_n, expected_gap in cases:
         result = _probe_primitive_pair_separator(
             device,
             [point],
             triangle,
-            closest_soft=point,
-            closest_rigid=closest_rigid,
             collision_normal=[0.0, 0.0, 1.0],
         )
         test.assertTrue(result["valid"], label)
@@ -4842,16 +4827,48 @@ def test_primitive_pair_separator_vt_near_triangle_edge(test, device):
         test.assertGreaterEqual(soft_plane_value, -1.0e-8, label)
         test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-8, label)
 
+    # Captured from the redetection regression. The point is 46 micrometers
+    # above the top edge of a vertical triangle. Recomputing the closest point
+    # from the indexed primitives must recover the complete-triangle separator.
+    captured_point = np.array([3.623332034408122e-08, 0.20000000298023224, 0.10004636645317078])
+    captured_triangle = np.array(
+        [[-0.2, 0.2, -0.1], [-0.2, 0.2, 0.1], [0.2, 0.2, 0.1]]
+    )
+    captured_rigid_closest = np.array(
+        [4.7683716530855236e-08, 0.20000000298023224, 0.10000000149011612]
+    )
+    captured_normal = captured_point - captured_rigid_closest
+    captured_normal /= np.linalg.norm(captured_normal)
+    captured_vt = _probe_primitive_pair_separator(
+        device,
+        [captured_point],
+        captured_triangle,
+        collision_normal=captured_normal,
+    )
+    test.assertTrue(captured_vt["valid"])
+    np.testing.assert_allclose(captured_vt["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertGreater(captured_vt["gap"], 4.6e-5)
 
-def test_primitive_pair_separator_degenerate_fallbacks(test, device):
-    """A positive nanogap remains usable while every zero-gap pair fails closed."""
+    # The transposed TV family must construct the same closest-feature
+    # direction with the opposite assigned half-space.
+    captured_tv = _probe_primitive_pair_separator(
+        device,
+        captured_triangle,
+        [captured_point],
+        collision_normal=-captured_normal,
+    )
+    test.assertTrue(captured_tv["valid"])
+    np.testing.assert_allclose(captured_tv["normal"], [0.0, 0.0, -1.0], atol=1.0e-6)
+    test.assertGreater(captured_tv["gap"], 4.6e-5)
+
+
+def _check_primitive_pair_separator_degenerate_cases(test, device):
+    """Positive nanogaps remain usable while zero-gap pairs fail closed."""
     triangle = [[-0.01, -0.01, 0.0], [0.01, -0.01, 0.0], [0.0, 0.01, 0.0]]
     stable = _probe_primitive_pair_separator(
         device,
         [[0.0, 0.0, 1.0e-7]],
         triangle,
-        closest_soft=[1.0e-7, 0.0, 1.0e-7],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[0.0, 0.0, 1.0],
     )
     test.assertTrue(stable["valid"])
@@ -4861,8 +4878,6 @@ def test_primitive_pair_separator_degenerate_fallbacks(test, device):
         device,
         [[0.0, 0.0, 1.0e-7]],
         triangle,
-        closest_soft=[1.0e-7, 0.0, 1.0e-7],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[1.0, 0.0, 0.0],
     )
     test.assertTrue(face_fallback["valid"])
@@ -4873,8 +4888,6 @@ def test_primitive_pair_separator_degenerate_fallbacks(test, device):
         device,
         [[0.0, 0.0, 1.0e-6]],
         [[-5.0e-6, -5.0e-6, 0.0], [5.0e-6, -5.0e-6, 0.0], [0.0, 5.0e-6, 0.0]],
-        closest_soft=[4.0e-6, 0.0, 1.0e-6],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[1.0, 0.0, 0.0],
     )
     test.assertTrue(short_face_fallback["valid"])
@@ -4885,8 +4898,6 @@ def test_primitive_pair_separator_degenerate_fallbacks(test, device):
         device,
         [[0.0, 0.0, 0.0]],
         triangle,
-        closest_soft=[0.0, 0.0, 0.0],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[1.0, 0.0, 0.0],
     )
     test.assertFalse(touching_vt["valid"])
@@ -4896,8 +4907,6 @@ def test_primitive_pair_separator_degenerate_fallbacks(test, device):
         device,
         [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]],
         [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        closest_soft=[0.0, 0.0, 0.0],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[0.0, 0.0, 0.0],
     )
     test.assertFalse(coincident_ee["valid"])
@@ -4907,8 +4916,6 @@ def test_primitive_pair_separator_degenerate_fallbacks(test, device):
         device,
         [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         [[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
-        closest_soft=[0.0, 0.0, 0.0],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[0.0, 0.0, 1.0],
     )
     test.assertFalse(intersecting_ee["valid"])
@@ -4917,14 +4924,12 @@ def test_primitive_pair_separator_degenerate_fallbacks(test, device):
         device,
         [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
         [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
-        closest_soft=[0.0, 0.0, 0.0],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[0.0, 0.0, 0.0],
     )
     test.assertFalse(collapsed["valid"])
 
 
-def test_primitive_pair_separator_ee_feature_fallbacks(test, device):
+def _check_primitive_pair_separator_ee_feature_cases(test, device):
     """EE feature normals recover separated skew and parallel pairs without accepting intersections."""
     captured_soft = [
         [0.362191170, -0.0216176156, 0.0115757957],
@@ -4952,8 +4957,6 @@ def test_primitive_pair_separator_ee_feature_fallbacks(test, device):
         device,
         captured_soft,
         captured_rigid,
-        closest_soft=[0.356459856, -0.0213602819, 0.0102781672],
-        closest_rigid=[0.356459558, -0.0213696212, 0.0102776773],
         collision_normal=collision_normal,
     )
     test.assertTrue(captured["valid"])
@@ -4964,8 +4967,6 @@ def test_primitive_pair_separator_ee_feature_fallbacks(test, device):
         device,
         [[-5.0e-6, 0.0, 1.0e-6], [5.0e-6, 0.0, 1.0e-6]],
         [[0.0, -5.0e-6, 0.0], [0.0, 5.0e-6, 0.0]],
-        closest_soft=[4.0e-6, 0.0, 1.0e-6],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[1.0, 0.0, 0.0],
     )
     test.assertTrue(short_skew["valid"])
@@ -4976,13 +4977,149 @@ def test_primitive_pair_separator_ee_feature_fallbacks(test, device):
         device,
         [[-1.0, 1.0e-6, 0.0], [1.0, 1.0e-6, 0.0]],
         [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        closest_soft=[0.5, 1.0e-6, 0.0],
-        closest_rigid=[0.0, 0.0, 0.0],
         collision_normal=[1.0, 0.0, 0.0],
     )
     test.assertTrue(parallel["valid"])
     np.testing.assert_allclose(parallel["normal"], [0.0, 1.0, 0.0], atol=1.0e-6)
     test.assertAlmostEqual(parallel["gap"], 1.0e-6, places=10)
+
+
+def _check_primitive_pair_separator_candidate_provenance(test, device):
+    """Record which candidate wins representative VT/TV and EE configurations."""
+    # Candidate indices for VT/TV are: recomputed closest, face, AB, AC, BC,
+    # and collision-pipeline normal. The large-coordinate fixtures deliberately
+    # expose float32 differences between the reconstructed closest-point and
+    # support-axis calculations.
+    vt_cases = [
+        (
+            0,
+            np.array([0.2, 0.2, 1.0]),
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            np.array([0.0, 0.0, 1.0]),
+        ),
+        (
+            1,
+            np.array([547.9113159179688, -122.23348236083984, 717.1705932617188]),
+            np.array(
+                [
+                    [547.8746337890625, -122.140380859375, 717.1693115234375],
+                    [547.933837890625, -122.26324462890625, 717.0872802734375],
+                    [547.9259033203125, -122.29670715332031, 717.2552490234375],
+                ]
+            ),
+            np.zeros(3),
+        ),
+    ]
+
+    # Permuting the captured near-edge triangle makes its same top edge occupy
+    # AB, AC, and BC, proving all three indexed edge candidates independently.
+    captured_point = np.array([3.623332034408122e-08, 0.20000000298023224, 0.10004636645317078])
+    captured_triangle = np.array(
+        [[-0.2, 0.2, -0.1], [-0.2, 0.2, 0.1], [0.2, 0.2, 0.1]]
+    )
+    captured_closest = np.array(
+        [4.7683716530855236e-08, 0.20000000298023224, 0.10000000149011612]
+    )
+    captured_normal = captured_point - captured_closest
+    captured_normal /= np.linalg.norm(captured_normal)
+    for candidate_index, permutation in ((2, (1, 2, 0)), (3, (1, 0, 2)), (4, (0, 1, 2))):
+        vt_cases.append(
+            (
+                candidate_index,
+                captured_point,
+                captured_triangle[list(permutation)],
+                captured_normal,
+            )
+        )
+
+    vt_cases.append(
+        (
+            5,
+            np.array([6859.2255859375, -2215.376953125, -564.0525512695312]),
+            np.array(
+                [
+                    [6859.068359375, -2215.279052734375, -564.6334228515625],
+                    [6859.1865234375, -2215.46484375, -563.5595703125],
+                    [6858.01318359375, -2215.479736328125, -564.3081665039062],
+                ]
+            ),
+            np.array([0.9937951304372967, 0.04554049558062646, -0.10147562259669696]),
+        )
+    )
+
+    observed_vt = set()
+    observed_tv = set()
+    for expected_index, point, triangle, collision_normal in vt_cases:
+        vt = _probe_primitive_pair_separator(
+            device,
+            [point],
+            triangle,
+            collision_normal=collision_normal,
+        )
+        test.assertTrue(vt["valid"])
+        test.assertEqual(vt["candidate_index"], expected_index)
+        observed_vt.add(vt["candidate_index"])
+
+        tv = _probe_primitive_pair_separator(
+            device,
+            triangle,
+            [point],
+            collision_normal=-collision_normal,
+        )
+        test.assertTrue(tv["valid"])
+        test.assertEqual(tv["candidate_index"], expected_index)
+        observed_tv.add(tv["candidate_index"])
+
+    test.assertEqual(observed_vt, set(range(6)))
+    test.assertEqual(observed_tv, set(range(6)))
+
+    # EE candidates are: recomputed closest, edge cross product, parallel-edge
+    # projection, and pipeline normal. Clean parallel geometry now selects the
+    # recomputed closest axis; the other axes remain numerical fallbacks.
+    ee_cases = [
+        (
+            0,
+            [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+        ),
+        (
+            1,
+            [
+                [0.362191170, -0.0216176156, 0.0115757957],
+                [0.349923998, -0.0210668258, 0.00879837759],
+            ],
+            [
+                [0.344296515, -0.0221406277, 0.0326073393],
+                [0.356472254, -0.0213688165, 0.0102543645],
+            ],
+            [0.03294748, 0.99808204, 0.05240873],
+        ),
+        (
+            0,
+            [[-1.0, 1.0e-6, 0.0], [1.0, 1.0e-6, 0.0]],
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [1.0, 0.0, 0.0],
+        ),
+        (
+            0,
+            [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+        ),
+    ]
+    observed_ee = set()
+    for expected_index, soft, rigid, collision_normal in ee_cases:
+        result = _probe_primitive_pair_separator(
+            device,
+            soft,
+            rigid,
+            collision_normal,
+        )
+        test.assertTrue(result["valid"])
+        test.assertEqual(result["candidate_index"], expected_index)
+        observed_ee.add(result["candidate_index"])
+    test.assertEqual(observed_ee, {0, 1})
 
 
 def test_dat_division_plane_placement_extremes(test, device):
@@ -4995,8 +5132,6 @@ def test_dat_division_plane_placement_extremes(test, device):
             device,
             soft,
             rigid,
-            closest_soft=[0.0, 0.0, 1.0],
-            closest_rigid=[0.0, 0.0, 0.0],
             collision_normal=[0.0, 0.0, 1.0],
             delta_soft=delta_soft,
             delta_rigid=delta_rigid,
@@ -5005,19 +5140,32 @@ def test_dat_division_plane_placement_extremes(test, device):
         test.assertAlmostEqual(float(result["plane"][2]), expected_z, places=6)
 
 
-def test_primitive_pair_separator_large_world_coordinates(test, device):
+def _check_primitive_pair_separator_large_world_coordinates(test, device):
     """Relative support projections preserve a millimeter gap far from the origin."""
     origin = 1000.0
     result = _probe_primitive_pair_separator(
         device,
         [[origin, origin, origin + 1.0e-3]],
         [[origin - 0.1, origin - 0.1, origin], [origin + 0.1, origin - 0.1, origin], [origin, origin + 0.1, origin]],
-        closest_soft=[origin, origin, origin + 1.0e-3],
-        closest_rigid=[origin, origin, origin],
         collision_normal=[0.0, 0.0, 1.0],
     )
     test.assertTrue(result["valid"])
     test.assertGreater(result["gap"], 9.0e-4)
+
+
+def test_primitive_pair_separator_cases(test, device):
+    """Validate separator geometry, fallbacks, degeneracy, and every winner index."""
+    sections = (
+        ("regular geometry", _check_primitive_pair_separator_regular_cases),
+        ("triangle-edge boundary", _check_primitive_pair_separator_near_triangle_edge),
+        ("degenerate and zero-gap", _check_primitive_pair_separator_degenerate_cases),
+        ("EE feature axes", _check_primitive_pair_separator_ee_feature_cases),
+        ("candidate provenance", _check_primitive_pair_separator_candidate_provenance),
+        ("large world coordinates", _check_primitive_pair_separator_large_world_coordinates),
+    )
+    for section, check in sections:
+        with test.subTest(section=section):
+            check(test, device)
 
 
 @wp.kernel
@@ -5941,38 +6089,14 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_primitive_pair_separator_vt_tv_ee",
-    test_primitive_pair_separator_vt_tv_ee,
-    devices=devices,
-)
-add_function_test(
-    TestVBDRigidDAT,
-    "test_primitive_pair_separator_vt_near_triangle_edge",
-    test_primitive_pair_separator_vt_near_triangle_edge,
-    devices=devices,
-)
-add_function_test(
-    TestVBDRigidDAT,
-    "test_primitive_pair_separator_degenerate_fallbacks",
-    test_primitive_pair_separator_degenerate_fallbacks,
-    devices=devices,
-)
-add_function_test(
-    TestVBDRigidDAT,
-    "test_primitive_pair_separator_ee_feature_fallbacks",
-    test_primitive_pair_separator_ee_feature_fallbacks,
+    "test_primitive_pair_separator_cases",
+    test_primitive_pair_separator_cases,
     devices=devices,
 )
 add_function_test(
     TestVBDRigidDAT,
     "test_dat_division_plane_placement_extremes",
     test_dat_division_plane_placement_extremes,
-    devices=devices,
-)
-add_function_test(
-    TestVBDRigidDAT,
-    "test_primitive_pair_separator_large_world_coordinates",
-    test_primitive_pair_separator_large_world_coordinates,
     devices=devices,
 )
 add_function_test(
