@@ -20,7 +20,6 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _eval_soft_ef_contact,
     _reset_world_selected,
     evaluate_body_particle_contact,
-    planar_truncation_t,
 )
 
 from ...geometry import ParticleFlags
@@ -1900,6 +1899,31 @@ def accumulate_contact_force_and_hessian_no_self_contact(
 
 
 @wp.func
+def segment_plane_intersects(
+    v: wp.vec3,
+    delta_v: wp.vec3,
+    n: wp.vec3,
+    d: wp.vec3,
+    eps_parallel: float,  # e.g., 1e-8
+    eps_intersect_near: float,  # e.g., 1e-8
+    eps_intersect_far: float,  # e.g., 1e-8
+    coplanar_counts: bool,  # True if you want a coplanar segment to count as "hit"
+) -> bool:
+    # Plane eq: n·(p - d) = 0
+    # Segment: p(t) = v + t * delta_v,  t in [0, 1]
+    nv = wp.dot(n, delta_v)
+    num = -wp.dot(n, v - d)
+
+    # Parallel (or nearly): either coplanar or no hit
+    if wp.abs(nv) < eps_parallel:
+        return coplanar_counts and (wp.abs(num) < eps_parallel)
+
+    t = num / nv
+    # consider tiny tolerance at ends
+    return (t >= eps_intersect_near) and (t <= 1.0 + eps_intersect_far)
+
+
+@wp.func
 def create_vertex_triangle_division_plane_closest_pt(
     v: wp.vec3,
     delta_v: wp.vec3,
@@ -1918,7 +1942,7 @@ def create_vertex_triangle_division_plane_closest_pt(
     n_hat = v - closest_p
 
     if wp.length(n_hat) < 1e-12:
-        return wp.vec3(0.0), v
+        return wp.vector(False, False, False, False, length=4, dtype=wp.bool), wp.vec3(0.0), v
 
     n = wp.normalize(n_hat)
 
@@ -1933,13 +1957,31 @@ def create_vertex_triangle_division_plane_closest_pt(
     )
 
     if delta_t_n + delta_v_n == 0.0:
-        lmbd = 0.5
+        d = closest_p + 0.5 * n_hat
     else:
         lmbd = delta_t_n / (delta_t_n + delta_v_n)
         lmbd = wp.clamp(lmbd, 0.05, 0.95)
-    d = closest_p + lmbd * n_hat
+        d = closest_p + lmbd * n_hat
 
-    return n, d
+    if delta_v_n == 0.0:
+        is_dummy_for_v = True
+    else:
+        is_dummy_for_v = not segment_plane_intersects(v, delta_v, n, d, 1e-6, -1e-8, 1e-8, False)
+
+    if delta_t_n == 0.0:
+        is_dummy_for_t_1 = True
+        is_dummy_for_t_2 = True
+        is_dummy_for_t_3 = True
+    else:
+        is_dummy_for_t_1 = not segment_plane_intersects(t1, delta_t1, n, d, 1e-6, -1e-8, 1e-8, False)
+        is_dummy_for_t_2 = not segment_plane_intersects(t2, delta_t2, n, d, 1e-6, -1e-8, 1e-8, False)
+        is_dummy_for_t_3 = not segment_plane_intersects(t3, delta_t3, n, d, 1e-6, -1e-8, 1e-8, False)
+
+    return (
+        wp.vector(is_dummy_for_v, is_dummy_for_t_1, is_dummy_for_t_2, is_dummy_for_t_3, length=4, dtype=wp.bool),
+        n,
+        d,
+    )
 
 
 @wp.func
@@ -2031,7 +2073,11 @@ def create_edge_edge_division_plane_closest_pt(
     n_hat = c1 - c2
 
     if wp.length(n_hat) < 1e-12:
-        return robust_edge_pair_normal(e0_v0_pos, e0_v1_pos, e1_v0_pos, e1_v1_pos), c1 * 0.5 + c2 * 0.5
+        return (
+            wp.vector(False, False, False, False, length=4, dtype=wp.bool),
+            robust_edge_pair_normal(e0_v0_pos, e0_v1_pos, e1_v0_pos, e1_v1_pos),
+            c1 * 0.5 + c2 * 0.5,
+        )
 
     n = wp.normalize(n_hat)
 
@@ -2051,13 +2097,74 @@ def create_edge_edge_division_plane_closest_pt(
     )
 
     if delta_e0 + delta_e1 == 0.0:
-        lmbd = 0.5
+        d = c2 + 0.5 * n_hat
     else:
         lmbd = delta_e1 / (delta_e1 + delta_e0)
-        lmbd = wp.clamp(lmbd, 0.05, 0.95)
-    d = c2 + lmbd * n_hat
 
-    return n, d
+        lmbd = wp.clamp(lmbd, 0.05, 0.95)
+        d = c2 + lmbd * n_hat
+
+    if delta_e0 == 0.0:
+        is_dummy_for_e0_v0 = True
+        is_dummy_for_e0_v1 = True
+    else:
+        is_dummy_for_e0_v0 = not segment_plane_intersects(e0_v0_pos, delta_e0_v0, n, d, 1e-6, -1e-8, 1e-6, False)
+        is_dummy_for_e0_v1 = not segment_plane_intersects(e0_v1_pos, delta_e0_v1, n, d, 1e-6, -1e-8, 1e-6, False)
+
+    if delta_e1 == 0.0:
+        is_dummy_for_e1_v0 = True
+        is_dummy_for_e1_v1 = True
+    else:
+        is_dummy_for_e1_v0 = not segment_plane_intersects(e1_v0_pos, delta_e1_v0, n, d, 1e-6, -1e-8, 1e-6, False)
+        is_dummy_for_e1_v1 = not segment_plane_intersects(e1_v1_pos, delta_e1_v1, n, d, 1e-6, -1e-8, 1e-6, False)
+
+    return (
+        wp.vector(
+            is_dummy_for_e0_v0, is_dummy_for_e0_v1, is_dummy_for_e1_v0, is_dummy_for_e1_v1, length=4, dtype=wp.bool
+        ),
+        n,
+        d,
+    )
+
+
+@wp.func
+def planar_truncation(
+    v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, eps: float, gamma_r: float, gamma_min: float = 1e-3
+):
+    nv = wp.dot(n, delta_v)
+    num = wp.dot(n, d - v)
+
+    # Parallel (or nearly): do not truncate
+    if wp.abs(nv) < eps:
+        return delta_v
+
+    t = num / nv
+
+    t = wp.max(wp.min(t * gamma_r, t - gamma_min), 0.0)
+    if t >= 1:
+        return delta_v
+    else:
+        return t * delta_v
+
+
+@wp.func
+def planar_truncation_t(
+    v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, eps: float, gamma_r: float, gamma_min: float = 1e-3
+):
+    denom = wp.dot(n, delta_v)
+
+    # Parallel (or nearly parallel) -> no intersection
+    if wp.abs(denom) < eps:
+        return 1.0
+
+    # Solve: dot(n, v + t*delta_v - d) = 0
+    t = wp.dot(n, d - v) / denom
+
+    if t < 0:
+        return 1.0
+
+    t = wp.clamp(wp.min(t * gamma_r, t - gamma_min), 0.0, 1.0)
+    return t
 
 
 @wp.kernel
@@ -2068,6 +2175,7 @@ def apply_planar_truncation_parallel_by_collision(
     tri_indices: wp.array2d[wp.int32],
     edge_indices: wp.array2d[wp.int32],
     collision_info_array: wp.array[TriMeshCollisionInfo],
+    parallel_eps: float,
     gamma: float,
     truncation_t_out: wp.array[float],
 ):
@@ -2107,7 +2215,7 @@ def apply_planar_truncation_parallel_by_collision(
                 delta_e2_v2 = displacement_in[e2_v2]
 
                 # n points to the edge 1 side
-                n, d = create_edge_edge_division_plane_closest_pt(
+                is_dummy, n, d = create_edge_edge_division_plane_closest_pt(
                     e1_v1_pos,
                     delta_e1_v1,
                     e1_v2_pos,
@@ -2118,18 +2226,18 @@ def apply_planar_truncation_parallel_by_collision(
                     delta_e2_v2,
                 )
 
-                # n points into edge 1's allowed half-space; edge 2 uses -n.
-                t = planar_truncation_t(e1_v1_pos, delta_e1_v1, n, d, gamma)
-                if t < 1.0:
+                # For each, check the corresponding is_dummy entry in the vec4 is_dummy
+                if not is_dummy[0]:
+                    t = planar_truncation_t(e1_v1_pos, delta_e1_v1, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e1_v1, t)
-                t = planar_truncation_t(e1_v2_pos, delta_e1_v2, n, d, gamma)
-                if t < 1.0:
+                if not is_dummy[1]:
+                    t = planar_truncation_t(e1_v2_pos, delta_e1_v2, n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e1_v2, t)
-                t = planar_truncation_t(e2_v1_pos, delta_e2_v1, -n, d, gamma)
-                if t < 1.0:
+                if not is_dummy[2]:
+                    t = planar_truncation_t(e2_v1_pos, delta_e2_v1, -n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e2_v1, t)
-                t = planar_truncation_t(e2_v2_pos, delta_e2_v2, -n, d, gamma)
-                if t < 1.0:
+                if not is_dummy[3]:
+                    t = planar_truncation_t(e2_v2_pos, delta_e2_v2, -n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, e2_v2, t)
 
                 # planar truncation for 2 sides
@@ -2162,7 +2270,7 @@ def apply_planar_truncation_parallel_by_collision(
                 delta_t2 = displacement_in[tri_b]
                 delta_t3 = displacement_in[tri_c]
 
-                n, d = create_vertex_triangle_division_plane_closest_pt(
+                is_dummy, n, d = create_vertex_triangle_division_plane_closest_pt(
                     colliding_particle_pos,
                     colliding_particle_displacement,
                     t1,
@@ -2173,18 +2281,20 @@ def apply_planar_truncation_parallel_by_collision(
                     delta_t3,
                 )
 
-                # n points into the vertex's allowed half-space; the triangle uses -n.
-                t = planar_truncation_t(colliding_particle_pos, colliding_particle_displacement, n, d, gamma)
-                if t < 1.0:
+                # planar truncation for 2 sides
+                if not is_dummy[0]:
+                    t = planar_truncation_t(
+                        colliding_particle_pos, colliding_particle_displacement, n, d, parallel_eps, gamma
+                    )
                     wp.atomic_min(truncation_t_out, particle_idx, t)
-                t = planar_truncation_t(t1, delta_t1, -n, d, gamma)
-                if t < 1.0:
+                if not is_dummy[1]:
+                    t = planar_truncation_t(t1, delta_t1, -n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, tri_a, t)
-                t = planar_truncation_t(t2, delta_t2, -n, d, gamma)
-                if t < 1.0:
+                if not is_dummy[2]:
+                    t = planar_truncation_t(t2, delta_t2, -n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, tri_b, t)
-                t = planar_truncation_t(t3, delta_t3, -n, d, gamma)
-                if t < 1.0:
+                if not is_dummy[3]:
+                    t = planar_truncation_t(t3, delta_t3, -n, d, parallel_eps, gamma)
                     wp.atomic_min(truncation_t_out, tri_c, t)
 
             collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE

@@ -2802,6 +2802,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.tri_indices,
                     self.model.edge_indices,
                     self.trimesh_collision_info,
+                    self.trimesh_collision_detector.edge_edge_parallel_epsilon,
                     self.particle_conservative_bound_relaxation,
                 ],
                 outputs=[

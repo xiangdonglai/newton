@@ -20,6 +20,7 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_spring_force_and_hessian_both_vertices,
     evaluate_vertex_triangle_collision_force_hessian_4_vertices,
     evaluate_volumetric_neo_hookean_force_and_hessian,
+    planar_truncation_t as particle_planar_truncation_t,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     RigidContactHistory,
@@ -4649,6 +4650,25 @@ def test_planar_truncation_uses_endpoint_signs(test, device):
 
 
 @wp.kernel
+def _particle_planar_truncation_probe(parallel_epsilon: float, t_out: wp.array[float]):
+    t_out[0] = particle_planar_truncation_t(
+        wp.vec3(0.0, 0.0, 3.797968e-6),
+        wp.vec3(0.0, 0.0, -9.053657e-6),
+        wp.vec3(0.0, 0.0, 1.0),
+        wp.vec3(0.0),
+        parallel_epsilon,
+        0.85,
+    )
+
+
+def test_particle_planar_truncation_preserves_parallel_epsilon(test, device):
+    """Soft-self DAT retains its legacy absolute parallel-motion threshold."""
+    t_out = wp.empty(1, dtype=float, device=device)
+    wp.launch(_particle_planar_truncation_probe, dim=1, inputs=[1.0e-5], outputs=[t_out], device=device)
+    test.assertEqual(float(t_out.numpy()[0]), 1.0)
+
+
+@wp.kernel
 def _primitive_pair_separator_probe(
     soft_indices: wp.vec3i,
     soft: wp.array[wp.vec3],
@@ -5911,6 +5931,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_planar_truncation_uses_endpoint_signs",
     test_planar_truncation_uses_endpoint_signs,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_particle_planar_truncation_preserves_parallel_epsilon",
+    test_particle_planar_truncation_preserves_parallel_epsilon,
     devices=devices,
 )
 add_function_test(
