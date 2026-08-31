@@ -28,6 +28,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _compliant_alm_coefficients,
     _contact_tangent_conditioning_scale,
     _joint_angular_rho_seed,
+    apply_body_truncation_ts,
     apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
@@ -39,7 +40,6 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     find_primitive_pair_separator,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
-    place_dat_division_plane,
     planar_truncation_t,
     rigid_point_trajectory,
     rigid_trajectory_truncation_t,
@@ -4625,16 +4625,52 @@ def _planar_truncation_probe(
     )
 
 
+@wp.kernel
+def _planar_truncation_float32_endpoint_probe(
+    t_out: wp.array[float],
+    signed_endpoint_out: wp.array[float],
+    unverified_signed_endpoint_out: wp.array[float],
+):
+    i = wp.tid()
+    # Exact coordinates captured from the cloth--box redetection regression.
+    v = wp.vec3(0.0, 0.0, 0.100000008941)
+    delta_v = wp.vec3(0.0, 0.0, -2.23517417908e-8)
+    if i == 1:
+        # This smaller displacement exposes the early-return failure where the
+        # algebraic endpoint remains positive but v + delta_v rounds onto d.
+        delta_v = wp.vec3(0.0, 0.0, -5.0e-9)
+    n = wp.vec3(0.0, 0.0, 1.0)
+    d = wp.vec3(0.0, 0.0, 0.10000000149011612)
+    gamma = float(0.85)
+
+    s0 = wp.dot(n, v - d)
+    s1 = wp.dot(n, v + delta_v - d)
+    t_unverified = wp.clamp(wp.min(gamma * s0 / (s0 - s1), s0 / (s0 - s1) - 1.0e-3), 0.0, 1.0)
+    unverified_signed_endpoint_out[i] = wp.dot(n, v + t_unverified * delta_v - d)
+
+    t = planar_truncation_t(v, delta_v, n, d, gamma)
+    t_out[i] = t
+    signed_endpoint_out[i] = wp.dot(n, v + t * delta_v - d)
+
+
 def test_planar_truncation_uses_endpoint_signs(test, device):
-    """Small normal motion still truncates when the proposed endpoint changes side."""
+    """Crossing and approaching endpoints back off; recovery motion remains free."""
     s0 = 3.797968e-6
     normal_displacement = -9.053657e-6
-    signed_distances = wp.array([s0, s0, -1.0e-6, -1.0e-6], dtype=float, device=device)
-    normal_displacements = wp.array([normal_displacement, -1.0e-6, -1.0e-6, 1.0e-6], dtype=float, device=device)
-    t_out = wp.empty(4, dtype=float, device=device)
+    signed_distances = wp.array(
+        [s0, s0, -1.0e-6, -1.0e-6, 1.0e-3, 1.0e-3, 1.0e-3, 0.0],
+        dtype=float,
+        device=device,
+    )
+    normal_displacements = wp.array(
+        [normal_displacement, -1.0e-6, -1.0e-6, 1.0e-6, -1.0e-3, -0.99995e-3, -0.998e-3, 0.0],
+        dtype=float,
+        device=device,
+    )
+    t_out = wp.empty(8, dtype=float, device=device)
     wp.launch(
         _planar_truncation_probe,
-        dim=4,
+        dim=8,
         inputs=[signed_distances, normal_displacements, 0.85],
         outputs=[t_out],
         device=device,
@@ -4643,10 +4679,58 @@ def test_planar_truncation_uses_endpoint_signs(test, device):
     expected_crossing_t = min(0.85 * crossing_t, crossing_t - 1.0e-3)
     np.testing.assert_allclose(
         t_out.numpy(),
-        [expected_crossing_t, 1.0, 0.0, 1.0],
+        [expected_crossing_t, 1.0, 0.0, 1.0, 0.85, 1.0, 1.0, 1.0],
         rtol=0.0,
         atol=1.0e-6,
     )
+
+
+def test_planar_truncation_keeps_float32_endpoint_strictly_safe(test, device):
+    """A DAT backoff that rounds onto the plane is reduced to a verified endpoint."""
+    t_out = wp.empty(2, dtype=float, device=device)
+    signed_endpoint = wp.empty(2, dtype=float, device=device)
+    unverified_signed_endpoint = wp.empty(2, dtype=float, device=device)
+    wp.launch(
+        _planar_truncation_float32_endpoint_probe,
+        dim=2,
+        outputs=[t_out, signed_endpoint, unverified_signed_endpoint],
+        device=device,
+    )
+    unverified_signed_endpoint = unverified_signed_endpoint.numpy()
+    signed_endpoint = signed_endpoint.numpy()
+    t_out = t_out.numpy()
+    np.testing.assert_array_equal(unverified_signed_endpoint, np.zeros(2, dtype=np.float32))
+    test.assertTrue(np.all(signed_endpoint > 0.0))
+    test.assertTrue(np.all(t_out > 0.1))
+    test.assertTrue(np.all(t_out < np.array([0.28333336, 0.85], dtype=np.float32)))
+
+
+def test_body_zero_truncation_preserves_reference_pose(test, device):
+    """A zero DAT factor copies the safe pose without quaternion roundoff drift."""
+    reference = np.asarray(
+        [[0.35995337, 0.02241303, 0.05281769, 0.02175077, -0.99139446, -0.00290286, 0.12905623]],
+        dtype=np.float32,
+    )
+    candidate = np.asarray(
+        [[0.35995337, 0.02241302, 0.05281769, 0.02175077, -0.9913946, -0.00290286, 0.12905625]],
+        dtype=np.float32,
+    )
+    body_q_ref = wp.array(reference, dtype=wp.transform, device=device)
+    body_q = wp.array(candidate, dtype=wp.transform, device=device)
+    wp.launch(
+        apply_body_truncation_ts,
+        dim=1,
+        inputs=[
+            body_q_ref,
+            wp.array([[0.01, -0.02, 0.03]], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=float, device=device),
+            wp.ones(1, dtype=float, device=device),
+            wp.ones(1, dtype=float, device=device),
+        ],
+        outputs=[body_q],
+        device=device,
+    )
+    np.testing.assert_array_equal(body_q.numpy(), reference)
 
 
 @wp.kernel
@@ -4696,7 +4780,10 @@ def _primitive_pair_separator_probe(
     d = wp.vec3(0.0)
     lmbd = float(0.0)
     if valid:
-        d, lmbd = place_dat_division_plane(n, rigid_support, gap, delta_soft, delta_rigid)
+        lmbd = float(0.5)
+        if delta_soft + delta_rigid > 0.0:
+            lmbd = delta_rigid / (delta_rigid + delta_soft)
+        d = (1.0 - lmbd) * rigid_support + lmbd * soft_support
     valid_out[0] = wp.int32(valid)
     normal_out[0] = n
     plane_out[0] = d
@@ -4746,7 +4833,14 @@ def _probe_primitive_pair_separator(
             delta_soft,
             delta_rigid,
         ],
-        outputs=[valid_out, normal_out, plane_out, gap_out, lambda_out, candidate_index_out],
+        outputs=[
+            valid_out,
+            normal_out,
+            plane_out,
+            gap_out,
+            lambda_out,
+            candidate_index_out,
+        ],
         device=device,
     )
     return {
@@ -5123,11 +5217,18 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
 
 
 def test_dat_division_plane_placement_extremes(test, device):
-    """Adaptive placement reaches either support endpoint and defaults to the midpoint."""
-    soft = [[0.0, 0.0, 1.0]]
-    rigid = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-    expected = [(1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 1.0, 1.0), (0.0, 0.0, 0.5, 0.5)]
-    for delta_soft, delta_rigid, expected_lambda, expected_z in expected:
+    """Adaptive placement reuses either represented support and otherwise bisects them."""
+    soft = np.array([[1000.02, -499.98, 1.0]], dtype=np.float32)
+    rigid = np.array(
+        [[1000.0, -500.0, 0.0], [1000.1, -500.0, 0.0], [1000.0, -499.9, 0.0]],
+        dtype=np.float32,
+    )
+    expected = (
+        (1.0, 0.0, 0.0, rigid[0]),
+        (0.0, 1.0, 1.0, soft[0]),
+        (0.0, 0.0, 0.5, 0.5 * (rigid[0] + soft[0])),
+    )
+    for delta_soft, delta_rigid, expected_lambda, expected_plane in expected:
         result = _probe_primitive_pair_separator(
             device,
             soft,
@@ -5137,7 +5238,10 @@ def test_dat_division_plane_placement_extremes(test, device):
             delta_rigid=delta_rigid,
         )
         test.assertAlmostEqual(result["lambda"], expected_lambda, places=6)
-        test.assertAlmostEqual(float(result["plane"][2]), expected_z, places=6)
+        if expected_lambda in (0.0, 1.0):
+            np.testing.assert_array_equal(result["plane"], expected_plane)
+        else:
+            np.testing.assert_allclose(result["plane"], expected_plane, rtol=0.0, atol=1.0e-6)
 
 
 def _check_primitive_pair_separator_large_world_coordinates(test, device):
@@ -6079,6 +6183,18 @@ add_function_test(
     TestVBDRigidDAT,
     "test_planar_truncation_uses_endpoint_signs",
     test_planar_truncation_uses_endpoint_signs,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_planar_truncation_keeps_float32_endpoint_strictly_safe",
+    test_planar_truncation_keeps_float32_endpoint_strictly_safe,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_body_zero_truncation_preserves_reference_pose",
+    test_body_zero_truncation_preserves_reference_pose,
     devices=devices,
 )
 add_function_test(

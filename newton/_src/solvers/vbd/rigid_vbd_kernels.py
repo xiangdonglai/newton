@@ -7135,21 +7135,6 @@ def find_primitive_pair_separator(
 
 
 @wp.func
-def place_dat_division_plane(
-    n: wp.vec3,
-    rigid_support: wp.vec3,
-    gap: float,
-    delta_soft: float,
-    delta_rigid: float,
-):
-    """Place the adaptive DAT plane at a normal-space fraction of the pair gap."""
-    lmbd = float(0.5)
-    if delta_soft + delta_rigid > 0.0:
-        lmbd = delta_rigid / (delta_rigid + delta_soft)
-    return rigid_support + (lmbd * gap) * n, lmbd
-
-
-@wp.func
 def planar_truncation_t(v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, gamma_r: float, gamma_min: float = 1e-3):
     """Keep a straight vertex trajectory in the positive plane half-space.
 
@@ -7160,20 +7145,47 @@ def planar_truncation_t(v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, ga
     """
     s0 = wp.dot(n, v - d)
     normal_displacement = wp.dot(n, delta_v)
-    s1 = s0 + normal_displacement
+    # Evaluate the endpoint exactly as it will be stored. At sub-ULP gaps,
+    # ``s0 + dot(n, delta_v)`` can remain positive even though ``v + delta_v``
+    # rounds onto the plane.
+    s1 = wp.dot(n, v + delta_v - d)
 
     if s0 < 0.0:
         if s1 >= s0:
             return 1.0
         return 0.0
 
-    if s1 >= 0.0:
+    # A proposal whose stored endpoint remains strictly on the allowed side
+    # does not reach the plane and needs no truncation.
+    if s1 > 0.0:
         return 1.0
 
-    # s0 >= 0 and s1 < 0 imply a unique crossing on the segment.
+    # No strictly positive float32 bracket exists when the reference is already
+    # on the plane. Permit non-approaching motion and reject inward motion.
+    if s0 == 0.0:
+        if normal_displacement >= 0.0:
+            return 1.0
+        return 0.0
+
+    # Here the reference is strictly safe but the stored endpoint is not. Start
+    # from DAT's analytic backoff using the endpoint signs evaluated above.
     t = s0 / (s0 - s1)
     t = wp.clamp(wp.min(t * gamma_r, t - gamma_min), 0.0, 1.0)
-    return t
+    if wp.dot(n, v + t * delta_v - d) > 0.0:
+        return t
+
+    # For sub-ULP clearances the backed-off endpoint may round onto the plane.
+    # Bisect between the safe reference and the failed candidate, retaining the
+    # last parameter whose endpoint is representably on the positive side.
+    t_safe = float(0.0)
+    t_unsafe = t
+    for _ in range(24):
+        t_mid = 0.5 * (t_safe + t_unsafe)
+        if wp.dot(n, v + t_mid * delta_v - d) > 0.0:
+            t_safe = t_mid
+        else:
+            t_unsafe = t_mid
+    return t_safe
 
 
 @wp.func
@@ -7491,23 +7503,33 @@ def apply_rigid_soft_truncation(
         if rigid_indices[0] >= 0:
             # BVH mesh query
             mesh = shape_source_ptr[shape_index]
+            X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
+            X_wr_end = wp.transform_multiply(body_q[body_index], shape_transform[shape_index])
             for i in range(3):
                 rigid_index = rigid_indices[i]
                 if rigid_index >= 0:
                     x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
-                    x_body = wp.transform_point(shape_transform[shape_index], x_shape)
-                    x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
-                    x_rigid_end = wp.transform_point(body_q[body_index], x_body)
+                    x_rigid_ref = wp.transform_point(X_wr_ref, x_shape)
+                    x_rigid_end = wp.transform_point(X_wr_end, x_shape)
                     delta_rigid = wp.max(delta_rigid, wp.dot(n, x_rigid_end - x_rigid_ref))
         else:
             # SDF query
             anchor_end = wp.transform_point(body_q[body_index], soft_contact_body_pos[contact_index])
             delta_rigid = wp.max(wp.dot(n, anchor_end - bx0), 0.0)
 
-    # BVH rows supply a certified complete-primitive support gap; SDF rows use
-    # their non-negative signed contact gap. Only the normal coordinate defines
-    # the plane, so the same placement formula applies to both representations.
-    d, _lmbd = place_dat_division_plane(n, bx0, gap, delta_soft, delta_rigid)
+    lmbd = float(0.5)
+    if delta_soft + delta_rigid > 0.0:
+        lmbd = delta_rigid / (delta_rigid + delta_soft)
+
+    if rigid_indices[0] >= 0:
+        # BVH: interpolate the certified support points, preserving either
+        # endpoint exactly when lambda reaches 0 or 1.
+        d = (1.0 - lmbd) * bx0 + lmbd * x_ref
+    else:
+        # SDF: place the plane along the contact normal from the rigid witness.
+        # Because gap is clamped to zero for existing penetration, the recovery
+        # plane remains at the rigid surface.
+        d = bx0 + (lmbd * gap) * n
 
     # Soft side: n points toward its allowed positive half-space. Dense BVH
     # rows constrain every vertex of the complete soft primitive.
@@ -7529,12 +7551,12 @@ def apply_rigid_soft_truncation(
         t_b = float(1.0)
         if rigid_indices[0] >= 0:
             mesh = shape_source_ptr[shape_index]
+            X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
             for i in range(3):
                 rigid_index = rigid_indices[i]
                 if rigid_index >= 0:
                     x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
-                    x_body = wp.transform_point(shape_transform[shape_index], x_shape)
-                    x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
+                    x_rigid_ref = wp.transform_point(X_wr_ref, x_shape)
                     t_v = rigid_trajectory_truncation_t(
                         n,
                         d,
@@ -7586,12 +7608,19 @@ def apply_body_truncation_ts(
     """
     b = wp.tid()
 
+    t = body_truncation_ts[b]
+    if t == 0.0:
+        # Zero means "remain at the certified reference pose". Reconstructing
+        # that pose through a zero-angle quaternion product and normalization
+        # changes float32 components by an ULP, which is enough to cross an
+        # exactly touching DAT plane.
+        body_q[b] = body_q_ref[b]
+        return
+
     q_cur = body_q[b]
     q_ref = body_q_ref[b]
     com = body_com[b]
     c0, dx, axis, angle = rigid_pose_delta(q_ref, q_cur, com)
-
-    t = body_truncation_ts[b]
 
     motion_bound = wp.length(dx) + wp.abs(angle) * rigid_dat_body_bounding_radius[b]
     max_point_displacement = rigid_dat_body_max_displacement[b]
