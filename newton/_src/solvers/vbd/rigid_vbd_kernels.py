@@ -6859,6 +6859,23 @@ DAT_BISECTION_ITERATIONS = wp.constant(16)
 # to normalize reliably in float32. EE then uses its parallel-edge fallback.
 DAT_FEATURE_CROSS_SIN_EPS = wp.constant(1.0e-4)
 
+# Empty half-width kept on each side of a rigid-soft DAT plane. This is large
+# relative to the nanometer-scale FP32 separator failures observed in the
+# meter-scale examples, while remaining visually negligible.
+RIGID_SOFT_DAT_SEPARATION_EPS = wp.constant(1.0e-6)
+
+_FLOAT32_EPS = wp.constant(1.1920929e-7)
+"""Distance from 1.0 to the next float32.
+
+For a normal float32 value ``S = m * 2**e``, where ``1 <= m < 2``, adjacent
+values are ``2**(e - 23)`` apart. Because ``_FLOAT32_EPS = 2**-23``, the
+product ``_FLOAT32_EPS * abs(S) = m * 2**(e - 23)`` is between one and two
+such spacings.
+"""
+_FLOAT32_MIN_NORMAL = wp.constant(1.1754944e-38)
+RIGID_SOFT_DAT_ULP_FACTOR = wp.constant(4.0)
+"""Keep the DAT separation band roughly four to eight float32 spacings wide when needed."""
+
 
 @wp.func
 def _certify_primitive_pair_separator(
@@ -6946,9 +6963,11 @@ def find_primitive_pair_separator(
     For VT/TV, candidate families are the recomputed closest-point delta,
     triangle support axes, and the collision-pipeline normal. For EE, they are
     the recomputed closest-point delta, the edge cross product, the longer-edge
-    perpendicular projection, and the collision-pipeline normal. This function
-    certifies every candidate uniformly and keeps the widest strictly separating
-    option. Exactly touching or intersecting pairs fail closed.
+    perpendicular projection, and the collision-pipeline normal. A recomputed
+    closest-point axis whose certified complete-primitive gap exceeds the DAT
+    band is returned directly. Otherwise, every candidate is certified and the
+    widest strictly separating option is kept. Exactly touching or intersecting
+    pairs fail closed.
 
     Returns ``(valid, n, soft_support, rigid_support, gap, candidate_index)``
     with ``n`` pointing into the soft primitive's assigned half-space. The
@@ -7025,15 +7044,34 @@ def find_primitive_pair_separator(
         closest, _bary, _feature = triangle_closest_point(
             triangle[0], triangle[1], triangle[2], point
         )
+        recomputed_closest_point_axis = point - closest
+        recomputed_closest_point_norm = wp.length(recomputed_closest_point_axis)
+
+        # The closest-point distance is only a cheap gate. Return this axis only
+        # when its certified complete-primitive support gap also spans the DAT
+        # band; tangential closest-point error can otherwise make the support
+        # gap much smaller than the point-to-point distance.
+        if recomputed_closest_point_norm > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+            valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
+                recomputed_closest_point_axis if is_vt else -recomputed_closest_point_axis,
+                soft_vertices,
+                soft_count,
+                rigid_vertices,
+                rigid_count,
+            )
+            if valid and gap > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+                return valid, n, soft_support, rigid_support, gap, 0
+
         face_axis = _normalized_feature_cross(
             triangle[1] - triangle[0],
             triangle[2] - triangle[0],
         )
 
-        # VT/TV: enumerate the recomputed closest-point, face, AB, AC, BC,
-        # and collision-pipeline axes.
+        # If the closest axis does not provide a full band, enumerate the
+        # recomputed closest-point, face, AB, AC, BC, and collision-pipeline
+        # axes for the widest certified gap.
         for candidate_index in range(6):
-            candidate_axis = point - closest
+            candidate_axis = recomputed_closest_point_axis
             if candidate_index == 1:
                 candidate_axis = face_axis
             elif candidate_index >= 2 and candidate_index <= 4:
@@ -7078,7 +7116,26 @@ def find_primitive_pair_separator(
         )
         closest_soft = soft_vertices[0] + closest_parameters[0] * soft_edge
         closest_rigid = rigid_vertices[0] + closest_parameters[1] * rigid_edge
-        recomputed_closest_axis = closest_soft - closest_rigid
+
+        # As above, distinguish point-to-point distance from the certified
+        # support gap of the complete edge pair.
+        recomputed_closest_point_axis = closest_soft - closest_rigid
+        recomputed_closest_point_norm = wp.length(recomputed_closest_point_axis)
+        if recomputed_closest_point_norm > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+            valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
+                recomputed_closest_point_axis,
+                soft_vertices,
+                soft_count,
+                rigid_vertices,
+                rigid_count,
+            )
+            if valid and gap > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+                return valid, n, soft_support, rigid_support, gap, 0
+
+        # EE: enumerate all possible separating axes:
+        # recomputed closest, edge cross product, longer-edge projection,
+        # and collision-pipeline axes.
+
         soft_length_sq = wp.length_sq(soft_edge)
         rigid_length_sq = wp.length_sq(rigid_edge)
         edge_cross_axis = _normalized_feature_cross(rigid_edge, soft_edge)
@@ -7096,15 +7153,12 @@ def find_primitive_pair_separator(
                 longer_length_sq = rigid_length_sq
                 longer_edge = rigid_edge
             parallel_edge_axis = (
-                recomputed_closest_axis
-                - wp.dot(recomputed_closest_axis, longer_edge) / longer_length_sq * longer_edge
+                recomputed_closest_point_axis
+                - wp.dot(recomputed_closest_point_axis, longer_edge) / longer_length_sq * longer_edge
             )
 
-        # EE: enumerate all possible separating axes:
-        # recomputed closest, edge cross product, longer-edge projection,
-        # and collision-pipeline axes.
         for candidate_index in range(4):
-            candidate_axis = recomputed_closest_axis
+            candidate_axis = recomputed_closest_point_axis
             if candidate_index == 1:
                 candidate_axis = edge_cross_axis
             elif candidate_index == 2:
@@ -7141,24 +7195,46 @@ def place_dat_division_plane(
     gap: float,
     delta_soft: float,
     delta_rigid: float,
+    separation_eps: float = RIGID_SOFT_DAT_SEPARATION_EPS,
 ):
-    """Place the adaptive DAT plane at a normal-space fraction of the pair gap."""
+    """Place the adaptive DAT plane while reserving clearance on both sides."""
     lmbd = float(0.5)
-    if delta_soft + delta_rigid > 0.0:
-        lmbd = delta_rigid / (delta_rigid + delta_soft)
-    return rigid_support + (lmbd * gap) * n, lmbd
+    if gap >= 2.0 * separation_eps:
+        total_approach = delta_soft + delta_rigid
+        if total_approach > 0.0:
+            lmbd = delta_rigid / total_approach
+
+        # Clamp the adaptive placement to preserve an (-eps, eps) band between
+        # the two primitive supports.
+        minimum_fraction = separation_eps / gap
+        lmbd = wp.clamp(lmbd, minimum_fraction, 1.0 - minimum_fraction)
+
+    # When the gap is smaller than 2*eps, lambda remains 0.5: the midpoint
+    # maximizes the available clearance even though the full band cannot fit.
+    plane_distance = lmbd * gap
+    plane_point = rigid_support + plane_distance * n
+    return plane_point, lmbd
 
 
 @wp.func
-def planar_truncation_t(v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, gamma_r: float, gamma_min: float = 1e-3):
+def planar_truncation_t(
+    v: wp.vec3,
+    delta_v: wp.vec3,
+    n: wp.vec3,
+    d: wp.vec3,
+    gamma_r: float,
+    gamma_min: float = 1e-3,
+    minimum_signed_distance: float = 0.0,
+):
     """Keep a straight vertex trajectory in the positive plane half-space.
 
-    The allowed side satisfies ``dot(n, x - d) >= 0``. Endpoint signs, rather
-    than an absolute displacement tolerance, determine whether the segment
-    crosses the plane. A wrong-side start may move toward the allowed side but
-    may not make its signed distance more negative.
+    The allowed side satisfies
+    ``dot(n, x - d) >= minimum_signed_distance``. Endpoint signs, rather than
+    an absolute displacement tolerance, determine whether the segment crosses
+    that boundary. A wrong-side start may move toward the allowed side but may
+    not make its signed distance more negative.
     """
-    s0 = wp.dot(n, v - d)
+    s0 = wp.dot(n, v - d) - minimum_signed_distance
     normal_displacement = wp.dot(n, delta_v)
     s1 = s0 + normal_displacement
 
@@ -7221,17 +7297,17 @@ def _rigid_trajectory_prefix_is_interval_safe(
     angle: float,
     offset0: wp.vec3,
     s0: float,
+    maximum_signed_distance: float,
 ) -> bool:
     """Certify that the complete prefix trajectory ``[0, t]`` stays safe."""
 
     trajectory_range = rigid_point_plane_signed_distance_interval(0.0, t, n, d, c0, dx, axis, angle, offset0)
-    if trajectory_range.upper < 0.0:
+    if trajectory_range.upper < maximum_signed_distance:
         return True
 
     if s0 <= 0.0:
-        # A prefix starting exactly on the plane cannot have a strictly negative
-        # range. Monotone nonincreasing signed distance still certifies that the
-        # motion separates throughout the prefix.
+        # If the trajectory starts on or behind its assigned rigid-side boundary
+        # and its signed plane distance is nonincreasing, the entire prefix is safe.
         derivative_range = rigid_point_plane_signed_distance_derivative_interval(
             0.0, t, n, dx, axis, angle, offset0
         )
@@ -7253,6 +7329,7 @@ def rigid_trajectory_truncation_t(
     gamma_min: float = 1e-3,
     use_interval_arithmetic: bool = False,
     trajectory_samples: int = DAT_TRAJECTORY_SAMPLES,
+    maximum_signed_distance: float = 0.0,
 ):
     """Return a backed-off interpolation parameter before a rigid point crosses a plane.
 
@@ -7263,7 +7340,8 @@ def rigid_trajectory_truncation_t(
 
     Args:
         n: World-space plane normal away from the rigid side. The allowed rigid
-            side satisfies ``dot(n, x - d) < 0``.
+            side satisfies
+            ``dot(n, x - d) <= maximum_signed_distance``.
         d: A world-space point on the division plane.
         c0: Body center of mass in world space at the reference pose (``t = 0``).
         dx: Proposed world-space COM displacement from the reference pose to the
@@ -7285,30 +7363,46 @@ def rigid_trajectory_truncation_t(
         trajectory_samples: Number of uniform Stage-1 endpoint samples. The
             production default is ``DAT_TRAJECTORY_SAMPLES``; exposing it here
             allows focused tests to demonstrate sampling-parity failures.
+        maximum_signed_distance: Signed boundary assigned to the rigid side.
+            Rigid-soft DAT passes ``-epsilon`` to keep the rigid primitive
+            outside the negative edge of the empty band.
 
     Returns:
         A truncation parameter in ``[0, 1]``. ``1`` accepts the complete proposed
         rigid update, while ``0`` blocks it at the reference pose.
     """
-    # Algorithm 1, Stage 1: locate the first sampled sign change, then refine
-    # that pointwise root bracket by ordinary bisection.
-    s0 = wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
+    s0 = (
+        wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
+        - maximum_signed_distance
+    )
     candidate_t = float(1.0)
     crossed = bool(False)
     if s0 > 0.0:
-        s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
-        # Algorithm 1 assumes a valid starting half-space. If a persistent
-        # plane is already violated, permit only strict endpoint recovery and
-        # skip Stage 2, whose safe-prefix test cannot certify t=0.
-        if s_end < s0:
+        # Algorithm 1 assumes a valid starting half-space. A point already
+        # inside the forbidden band may move only monotonically away from it.
+        s_end = (
+            wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
+            - maximum_signed_distance
+        )
+        # An endpoint-only test is insufficient for rotation: an arc can first
+        # worsen and then recover. Requiring the derivative to be nonpositive.
+        derivative_range = rigid_point_plane_signed_distance_derivative_interval(
+            0.0, 1.0, n, dx, axis, angle, offset0
+        )
+        if s_end <= s0 and derivative_range.upper <= _FLOAT32_MIN_NORMAL:
             return 1.0
         return 0.0
     else:
+        # DAT Paper Algorithm 1, Stage 1: locate the first sampled sign change, then refine
+        # that pointwise root bracket by ordinary bisection.
         t_lo = float(0.0)
         t_hi = float(1.0)
         for k in range(trajectory_samples):
             t_k = float(k + 1) / float(trajectory_samples)
-            s_k = wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d)
+            s_k = (
+                wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d)
+                - maximum_signed_distance
+            )
             if s_k > 0.0:
                 t_lo = float(k) / float(trajectory_samples)
                 t_hi = t_k
@@ -7318,7 +7412,10 @@ def rigid_trajectory_truncation_t(
         if crossed:
             for _j in range(DAT_BISECTION_ITERATIONS):
                 t_mid = 0.5 * (t_lo + t_hi)
-                s_mid = wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d)
+                s_mid = (
+                    wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d)
+                    - maximum_signed_distance
+                )
                 if s_mid <= 0.0:
                     t_lo = t_mid
                 else:
@@ -7327,15 +7424,17 @@ def rigid_trajectory_truncation_t(
 
     if use_interval_arithmetic:
         if not _rigid_trajectory_prefix_is_interval_safe(
-            candidate_t, n, d, c0, dx, axis, angle, offset0, s0
+            candidate_t, n, d, c0, dx, axis, angle, offset0, s0, maximum_signed_distance
         ):
-            # Algorithm 1, Stage 2: prefix safety is monotone. Search for the
+            # DAT Paper Algorithm 1, Stage 2: prefix safety is monotone. Search for the
             # largest t whose complete trajectory prefix can be certified safe.
             t_lo = float(0.0)
             t_hi = candidate_t
             for _j in range(DAT_BISECTION_ITERATIONS):
                 t_mid = 0.5 * (t_lo + t_hi)
-                if _rigid_trajectory_prefix_is_interval_safe(t_mid, n, d, c0, dx, axis, angle, offset0, s0):
+                if _rigid_trajectory_prefix_is_interval_safe(
+                    t_mid, n, d, c0, dx, axis, angle, offset0, s0, maximum_signed_distance
+                ):
                     t_lo = t_mid
                 else:
                     t_hi = t_mid
@@ -7467,6 +7566,39 @@ def apply_rigid_soft_truncation(
         pair_delta = x_ref - bx0
         gap = wp.max(wp.dot(n, pair_delta), 0.0)
 
+    # Use a one-micrometer band around meter-scale scenes. At larger
+    # world-coordinate magnitudes, increase it so the band remains several
+    # representable float32 steps wide. ``_FLOAT32_EPS * coordinate_scale``
+    # estimates one to two local float32 spacings, and
+    # ``RIGID_SOFT_DAT_ULP_FACTOR`` supplies the safety factor.
+    coordinate_scale = float(1.0)
+    for i in range(3):
+        vi = indices[i]
+        if vi >= 0:
+            x_v = pos_prev_collision_detection[vi]
+            coordinate_scale = wp.max(coordinate_scale, wp.abs(x_v[0]))
+            coordinate_scale = wp.max(coordinate_scale, wp.abs(x_v[1]))
+            coordinate_scale = wp.max(coordinate_scale, wp.abs(x_v[2]))
+    if rigid_indices[0] >= 0:
+        mesh = shape_source_ptr[shape_index]
+        for i in range(3):
+            rigid_index = rigid_indices[i]
+            if rigid_index >= 0:
+                x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
+                x_body = wp.transform_point(shape_transform[shape_index], x_shape)
+                x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
+                coordinate_scale = wp.max(coordinate_scale, wp.abs(x_rigid_ref[0]))
+                coordinate_scale = wp.max(coordinate_scale, wp.abs(x_rigid_ref[1]))
+                coordinate_scale = wp.max(coordinate_scale, wp.abs(x_rigid_ref[2]))
+    else:
+        coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[0]))
+        coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[1]))
+        coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[2]))
+    separation_eps = wp.max(
+        RIGID_SOFT_DAT_SEPARATION_EPS,
+        RIGID_SOFT_DAT_ULP_FACTOR * _FLOAT32_EPS * coordinate_scale,
+    )
+
     # Rigid-body update accumulated since the reference pose.
     c0 = wp.vec3(0.0)
     dx_body = wp.vec3(0.0)
@@ -7507,10 +7639,11 @@ def apply_rigid_soft_truncation(
     # BVH rows supply a certified complete-primitive support gap; SDF rows use
     # their non-negative signed contact gap. Only the normal coordinate defines
     # the plane, so the same placement formula applies to both representations.
-    d, _lmbd = place_dat_division_plane(n, bx0, gap, delta_soft, delta_rigid)
+    plane_point, _lmbd = place_dat_division_plane(n, bx0, gap, delta_soft, delta_rigid, separation_eps)
 
     # Soft side: n points toward its allowed positive half-space. Dense BVH
-    # rows constrain every vertex of the complete soft primitive.
+    # rows constrain every vertex of the complete soft primitive. The allowed
+    # side begins epsilon beyond the division plane.
     for i in range(3):
         vi = indices[i]
         # DAT constrains the complete primitive, not only vertices carrying a
@@ -7518,7 +7651,15 @@ def apply_rigid_soft_truncation(
         # require every vertex of the paired edge or triangle to stay on its side.
         if vi >= 0:
             x_v = pos_prev_collision_detection[vi]
-            t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, gamma)
+            t_v = planar_truncation_t(
+                x_v,
+                particle_displacements[vi],
+                n,
+                plane_point,
+                gamma,
+                1.0e-3,
+                separation_eps,
+            )
             if t_v < 1.0:
                 wp.atomic_min(truncation_ts, vi, t_v)
 
@@ -7537,7 +7678,7 @@ def apply_rigid_soft_truncation(
                     x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
                     t_v = rigid_trajectory_truncation_t(
                         n,
-                        d,
+                        plane_point,
                         c0,
                         dx_body,
                         rot_axis,
@@ -7546,12 +7687,14 @@ def apply_rigid_soft_truncation(
                         gamma,
                         1.0e-3,
                         use_interval_arithmetic,
+                        DAT_TRAJECTORY_SAMPLES,
+                        -separation_eps,
                     )
                     t_b = wp.min(t_b, t_v)
         else:
             t_b = rigid_trajectory_truncation_t(
                 n,
-                d,
+                plane_point,
                 c0,
                 dx_body,
                 rot_axis,
@@ -7560,6 +7703,8 @@ def apply_rigid_soft_truncation(
                 gamma,
                 1.0e-3,
                 use_interval_arithmetic,
+                DAT_TRAJECTORY_SAMPLES,
+                -separation_eps,
             )
         if t_b < 1.0:
             wp.atomic_min(body_truncation_ts, body_index, t_b)
@@ -7596,6 +7741,11 @@ def apply_body_truncation_ts(
     motion_bound = wp.length(dx) + wp.abs(angle) * rigid_dat_body_bounding_radius[b]
     max_point_displacement = rigid_dat_body_max_displacement[b]
     if motion_bound > max_point_displacement:
+        # For any represented collision point,
+        # ||x(t) - x(0)|| <= t * (||dx|| + |angle| * bounding_radius)
+        #                  = t * motion_bound.
+        # Therefore, t <= max_point_displacement / motion_bound guarantees
+        # ||x(t) - x(0)|| <= max_point_displacement.
         t = wp.min(t, max_point_displacement / motion_bound)
 
     if t < 1.0:

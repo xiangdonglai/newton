@@ -20,6 +20,8 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_spring_force_and_hessian_both_vertices,
     evaluate_vertex_triangle_collision_force_hessian_4_vertices,
     evaluate_volumetric_neo_hookean_force_and_hessian,
+)
+from newton._src.solvers.vbd.particle_vbd_kernels import (
     planar_truncation_t as particle_planar_truncation_t,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
@@ -4607,12 +4609,15 @@ add_function_test(
 # Rigid-body DAT (Divide and Truncate) penetration-free truncation
 # =====================================================================================
 
+_RIGID_SOFT_DAT_TEST_EPS = 1.0e-6
+
 
 @wp.kernel
 def _planar_truncation_probe(
     signed_distance: wp.array[float],
     normal_displacement: wp.array[float],
     gamma: float,
+    minimum_signed_distance: float,
     t_out: wp.array[float],
 ):
     i = wp.tid()
@@ -4622,7 +4627,79 @@ def _planar_truncation_probe(
         wp.vec3(0.0, 0.0, 1.0),
         wp.vec3(0.0),
         gamma,
+        1.0e-3,
+        minimum_signed_distance,
     )
+
+
+@wp.kernel
+def _large_coordinate_epsilon_ablation_probe(
+    origin: float,
+    initial_gap: float,
+    normal_displacement: float,
+    separation_eps: wp.array[float],
+    t_out: wp.array[float],
+    accepted_gap_out: wp.array[float],
+):
+    """Apply the production plane-placement/truncation math at a large origin."""
+    i = wp.tid()
+    n = wp.vec3(0.0, 0.0, 1.0)
+    rigid_support = wp.vec3(origin, origin, origin)
+    soft_start = wp.vec3(origin, origin, origin + initial_gap)
+    soft_displacement = wp.vec3(0.0, 0.0, normal_displacement)
+    plane_point, _lmbd = place_dat_division_plane(
+        n,
+        rigid_support,
+        initial_gap,
+        wp.max(-normal_displacement, 0.0),
+        0.0,
+        separation_eps[i],
+    )
+    t = planar_truncation_t(
+        soft_start,
+        soft_displacement,
+        n,
+        plane_point,
+        0.85,
+        1.0e-3,
+        separation_eps[i],
+    )
+    accepted = soft_start + t * soft_displacement
+    t_out[i] = t
+    # This subtraction happens after ``accepted`` has been stored as a vec3 of
+    # FP32 values, exposing whether its intended positive gap is representable.
+    accepted_gap_out[i] = accepted[2] - origin
+
+
+def test_rigid_soft_dat_scale_aware_epsilon_prevents_fp32_gap_collapse(test, device):
+    """A fixed micrometer band can round a truncated endpoint onto distant geometry."""
+    origin = np.float32(1000.0)
+    adjacent = np.nextafter(origin, np.float32(np.inf))
+    initial_gap = float(adjacent - origin)
+    base_eps = _RIGID_SOFT_DAT_TEST_EPS
+    scale_eps = max(base_eps, 4.0 * np.finfo(np.float32).eps * float(origin))
+
+    t_out = wp.empty(2, dtype=float, device=device)
+    accepted_gap_out = wp.empty(2, dtype=float, device=device)
+    wp.launch(
+        _large_coordinate_epsilon_ablation_probe,
+        dim=2,
+        inputs=[
+            float(origin),
+            initial_gap,
+            -initial_gap,
+            wp.array([base_eps, scale_eps], dtype=float, device=device),
+        ],
+        outputs=[t_out, accepted_gap_out],
+        device=device,
+    )
+
+    fixed_t, scaled_t = t_out.numpy()
+    fixed_gap, scaled_gap = accepted_gap_out.numpy()
+    test.assertGreater(fixed_t, 0.0, "the fixed epsilon control must attempt a partial advance")
+    test.assertEqual(fixed_gap, 0.0, "that partial endpoint must collapse onto the rigid support in FP32")
+    test.assertEqual(scaled_t, 0.0, "a worsening move from inside the representable band must be halted")
+    test.assertEqual(scaled_gap, initial_gap, "halting must retain the original one-ULP separation")
 
 
 def test_planar_truncation_uses_endpoint_signs(test, device):
@@ -4635,7 +4712,7 @@ def test_planar_truncation_uses_endpoint_signs(test, device):
     wp.launch(
         _planar_truncation_probe,
         dim=4,
-        inputs=[signed_distances, normal_displacements, 0.85],
+        inputs=[signed_distances, normal_displacements, 0.85, 0.0],
         outputs=[t_out],
         device=device,
     )
@@ -4677,6 +4754,7 @@ def _primitive_pair_separator_probe(
     collision_normal: wp.vec3,
     delta_soft: float,
     delta_rigid: float,
+    separation_eps: float,
     valid_out: wp.array[wp.int32],
     normal_out: wp.array[wp.vec3],
     plane_out: wp.array[wp.vec3],
@@ -4684,7 +4762,7 @@ def _primitive_pair_separator_probe(
     lambda_out: wp.array[float],
     candidate_index_out: wp.array[wp.int32],
 ):
-    valid, n, soft_support, rigid_support, gap, candidate_index = find_primitive_pair_separator(
+    valid, n, _soft_support, rigid_support, gap, candidate_index = find_primitive_pair_separator(
         soft_indices,
         rigid_indices,
         soft,
@@ -4696,7 +4774,7 @@ def _primitive_pair_separator_probe(
     d = wp.vec3(0.0)
     lmbd = float(0.0)
     if valid:
-        d, lmbd = place_dat_division_plane(n, rigid_support, gap, delta_soft, delta_rigid)
+        d, lmbd = place_dat_division_plane(n, rigid_support, gap, delta_soft, delta_rigid, separation_eps)
     valid_out[0] = wp.int32(valid)
     normal_out[0] = n
     plane_out[0] = d
@@ -4712,6 +4790,7 @@ def _probe_primitive_pair_separator(
     collision_normal,
     delta_soft=0.0,
     delta_rigid=0.0,
+    separation_eps=_RIGID_SOFT_DAT_TEST_EPS,
 ):
     soft = np.asarray(soft, dtype=np.float32)
     rigid = np.asarray(rigid, dtype=np.float32)
@@ -4745,6 +4824,7 @@ def _probe_primitive_pair_separator(
             wp.vec3(*collision_normal),
             delta_soft,
             delta_rigid,
+            separation_eps,
         ],
         outputs=[valid_out, normal_out, plane_out, gap_out, lambda_out, candidate_index_out],
         device=device,
@@ -4846,8 +4926,8 @@ def _check_primitive_pair_separator_near_triangle_edge(test, device):
         collision_normal=captured_normal,
     )
     test.assertTrue(captured_vt["valid"])
-    np.testing.assert_allclose(captured_vt["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
-    test.assertGreater(captured_vt["gap"], 4.6e-5)
+    test.assertGreater(float(np.dot(captured_vt["normal"], [0.0, 0.0, 1.0])), 0.999999)
+    test.assertGreater(captured_vt["gap"], 2.0 * _RIGID_SOFT_DAT_TEST_EPS)
 
     # The transposed TV family must construct the same closest-feature
     # direction with the opposite assigned half-space.
@@ -4858,8 +4938,25 @@ def _check_primitive_pair_separator_near_triangle_edge(test, device):
         collision_normal=-captured_normal,
     )
     test.assertTrue(captured_tv["valid"])
-    np.testing.assert_allclose(captured_tv["normal"], [0.0, 0.0, -1.0], atol=1.0e-6)
-    test.assertGreater(captured_tv["gap"], 4.6e-5)
+    test.assertGreater(float(np.dot(captured_tv["normal"], [0.0, 0.0, -1.0])), 0.999999)
+    test.assertGreater(captured_tv["gap"], 2.0 * _RIGID_SOFT_DAT_TEST_EPS)
+
+    # The raw closest-point distance here is about 41.5 micrometers, but a
+    # small tangential error in that direction leaves only 0.685 micrometers
+    # between the complete point and triangle supports. The direct-return test
+    # must use the certified support gap, then fall back to a feature axis.
+    narrow_support_point = captured_point.copy()
+    narrow_support_point[2] = 0.1 + 41.5e-6
+    narrow_support = _probe_primitive_pair_separator(
+        device,
+        [narrow_support_point],
+        captured_triangle,
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertTrue(narrow_support["valid"])
+    test.assertNotEqual(narrow_support["candidate_index"], 0)
+    np.testing.assert_allclose(narrow_support["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertGreater(narrow_support["gap"], 40.0e-6)
 
 
 def _check_primitive_pair_separator_degenerate_cases(test, device):
@@ -4987,9 +5084,11 @@ def _check_primitive_pair_separator_ee_feature_cases(test, device):
 def _check_primitive_pair_separator_candidate_provenance(test, device):
     """Record which candidate wins representative VT/TV and EE configurations."""
     # Candidate indices for VT/TV are: recomputed closest, face, AB, AC, BC,
-    # and collision-pipeline normal. The large-coordinate fixtures deliberately
-    # expose float32 differences between the reconstructed closest-point and
-    # support-axis calculations.
+    # and collision-pipeline normal. Candidate zero is exercised at a large
+    # clear gap. The numerical fallback fixtures are scaled by exact powers of
+    # two so their geometry and FP32 rounding pattern are preserved while their
+    # gaps remain below the two-epsilon direct-return threshold.
+    face_fallback_scale = 1.0 / 128.0
     vt_cases = [
         (
             0,
@@ -4999,8 +5098,10 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
         ),
         (
             1,
-            np.array([547.9113159179688, -122.23348236083984, 717.1705932617188]),
-            np.array(
+            face_fallback_scale
+            * np.array([547.9113159179688, -122.23348236083984, 717.1705932617188]),
+            face_fallback_scale
+            * np.array(
                 [
                     [547.8746337890625, -122.140380859375, 717.1693115234375],
                     [547.933837890625, -122.26324462890625, 717.0872802734375],
@@ -5022,21 +5123,25 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
     )
     captured_normal = captured_point - captured_closest
     captured_normal /= np.linalg.norm(captured_normal)
+    edge_fallback_scale = 1.0 / 64.0
     for candidate_index, permutation in ((2, (1, 2, 0)), (3, (1, 0, 2)), (4, (0, 1, 2))):
         vt_cases.append(
             (
                 candidate_index,
-                captured_point,
-                captured_triangle[list(permutation)],
+                edge_fallback_scale * captured_point,
+                edge_fallback_scale * captured_triangle[list(permutation)],
                 captured_normal,
             )
         )
 
+    pipeline_fallback_scale = 1.0 / 65536.0
     vt_cases.append(
         (
             5,
-            np.array([6859.2255859375, -2215.376953125, -564.0525512695312]),
-            np.array(
+            pipeline_fallback_scale
+            * np.array([6859.2255859375, -2215.376953125, -564.0525512695312]),
+            pipeline_fallback_scale
+            * np.array(
                 [
                     [6859.068359375, -2215.279052734375, -564.6334228515625],
                     [6859.1865234375, -2215.46484375, -563.5595703125],
@@ -5073,9 +5178,10 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
     test.assertEqual(observed_vt, set(range(6)))
     test.assertEqual(observed_tv, set(range(6)))
 
-    # EE candidates are: recomputed closest, edge cross product, parallel-edge
-    # projection, and pipeline normal. Clean parallel geometry now selects the
-    # recomputed closest axis; the other axes remain numerical fallbacks.
+    # EE candidates are: recomputed closest, edge cross product, longer-edge
+    # perpendicular projection, and pipeline normal. The last three are
+    # numerical fallbacks, so their fixtures use nearly parallel edges where
+    # float32 calculations make each fallback the widest certified separator.
     ee_cases = [
         (
             0,
@@ -5096,16 +5202,28 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
             [0.03294748, 0.99808204, 0.05240873],
         ),
         (
-            0,
-            [[-1.0, 1.0e-6, 0.0], [1.0, 1.0e-6, 0.0]],
-            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            [1.0, 0.0, 0.0],
+            2,
+            [
+                [0.07511226832866669, 0.6257380843162537, 0.23137839138507843],
+                [0.024136168882250786, 0.6058070659637451, 0.2765265703201294],
+            ],
+            [
+                [0.08582332730293274, 0.6299260854721069, 0.22189216315746307],
+                [0.03484739735722542, 0.609994649887085, 0.26704031229019165],
+            ],
+            [-0.691932201385498, 0.19522728025913239, -0.6950655579566956],
         ),
         (
-            0,
-            [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
-            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            [0.0, 1.0, 0.0],
+            3,
+            [
+                [-0.06112665310502052, -0.07107410579919815, -0.025363503023982048],
+                [-0.03286260738968849, 0.006155697163194418, -0.17437146604061127],
+            ],
+            [
+                [-0.06335166096687317, -0.07715090364217758, -0.01363344956189394],
+                [-0.03508760780096054, 7.889624976087362e-05, -0.16264140605926514],
+            ],
+            [0.0962277352809906, -0.8910560607910156, -0.4435756206512451],
         ),
     ]
     observed_ee = set()
@@ -5119,14 +5237,18 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
         test.assertTrue(result["valid"])
         test.assertEqual(result["candidate_index"], expected_index)
         observed_ee.add(result["candidate_index"])
-    test.assertEqual(observed_ee, {0, 1})
+    test.assertEqual(observed_ee, set(range(4)))
 
 
-def test_dat_division_plane_placement_extremes(test, device):
-    """Adaptive placement reaches either support endpoint and defaults to the midpoint."""
+def test_dat_division_plane_reserves_epsilon_band(test, device):
+    """Adaptive placement reserves epsilon per side, or half of a smaller gap."""
     soft = [[0.0, 0.0, 1.0]]
     rigid = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-    expected = [(1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 1.0, 1.0), (0.0, 0.0, 0.5, 0.5)]
+    expected = [
+        (1.0, 0.0, _RIGID_SOFT_DAT_TEST_EPS, _RIGID_SOFT_DAT_TEST_EPS),
+        (0.0, 1.0, 1.0 - _RIGID_SOFT_DAT_TEST_EPS, 1.0 - _RIGID_SOFT_DAT_TEST_EPS),
+        (0.0, 0.0, 0.5, 0.5),
+    ]
     for delta_soft, delta_rigid, expected_lambda, expected_z in expected:
         result = _probe_primitive_pair_separator(
             device,
@@ -5136,8 +5258,83 @@ def test_dat_division_plane_placement_extremes(test, device):
             delta_soft=delta_soft,
             delta_rigid=delta_rigid,
         )
-        test.assertAlmostEqual(result["lambda"], expected_lambda, places=6)
-        test.assertAlmostEqual(float(result["plane"][2]), expected_z, places=6)
+        test.assertAlmostEqual(result["lambda"], expected_lambda, delta=5.0e-8)
+        test.assertAlmostEqual(float(result["plane"][2]), expected_z, delta=5.0e-8)
+
+    short_gap = 1.5 * _RIGID_SOFT_DAT_TEST_EPS
+    result = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, short_gap]],
+        rigid,
+        collision_normal=[0.0, 0.0, 1.0],
+        delta_soft=1.0,
+        delta_rigid=0.0,
+    )
+    test.assertAlmostEqual(result["lambda"], 0.5, delta=1.0e-6)
+    test.assertAlmostEqual(float(result["plane"][2]), 0.5 * short_gap, delta=1.0e-9)
+
+    # At this coordinate, one float32 ULP is much larger than one micrometer.
+    # The scale-aware epsilon clamp must produce a representable interior
+    # point instead of rounding the plane onto the rigid support.
+    origin = 1000.0
+    large_world_gap = 1.0e-3
+    large_world_eps = max(
+        _RIGID_SOFT_DAT_TEST_EPS,
+        4.0 * np.finfo(np.float32).eps * origin,
+    )
+    result = _probe_primitive_pair_separator(
+        device,
+        [[origin, origin, origin + large_world_gap]],
+        [
+            [origin - 0.1, origin - 0.1, origin],
+            [origin + 0.1, origin - 0.1, origin],
+            [origin, origin + 0.1, origin],
+        ],
+        collision_normal=[0.0, 0.0, 1.0],
+        delta_soft=1.0,
+        delta_rigid=0.0,
+        separation_eps=large_world_eps,
+    )
+    represented_rigid_margin = float(result["plane"][2]) - origin
+    represented_soft_margin = float(np.float32(origin + large_world_gap)) - float(result["plane"][2])
+    test.assertGreaterEqual(represented_rigid_margin, 0.95 * large_world_eps)
+    test.assertGreaterEqual(represented_soft_margin, 0.95 * large_world_eps)
+
+    adjacent_soft = float(np.nextafter(np.float32(origin), np.float32(np.inf)))
+    adjacent_gap = adjacent_soft - origin
+    result = _probe_primitive_pair_separator(
+        device,
+        [[origin, origin, adjacent_soft]],
+        [
+            [origin - 0.1, origin - 0.1, origin],
+            [origin + 0.1, origin - 0.1, origin],
+            [origin, origin + 0.1, origin],
+        ],
+        collision_normal=[0.0, 0.0, 1.0],
+        delta_soft=1.0,
+        delta_rigid=0.0,
+        separation_eps=large_world_eps,
+    )
+    test.assertLess(adjacent_gap, 2.0 * large_world_eps)
+    test.assertAlmostEqual(result["lambda"], 0.5, delta=1.0e-6)
+
+    # This is the smallest positive representable gap at x=1000. It lies well
+    # inside the effective two-sided band, so motion toward the rigid support
+    # must be halted rather than consuming the remaining adjacent-float gap.
+    t_out = wp.empty(1, dtype=float, device=device)
+    wp.launch(
+        _planar_truncation_probe,
+        dim=1,
+        inputs=[
+            wp.array([adjacent_gap], dtype=float, device=device),
+            wp.array([-adjacent_gap], dtype=float, device=device),
+            0.85,
+            result["lambda"] * result["gap"] + large_world_eps,
+        ],
+        outputs=[t_out],
+        device=device,
+    )
+    test.assertEqual(float(t_out.numpy()[0]), 0.0)
 
 
 def _check_primitive_pair_separator_large_world_coordinates(test, device):
@@ -5322,6 +5519,42 @@ def test_rigid_dat_trajectory_truncation(test, device):
         test.assertEqual(recovery_t, 1.0)
         test.assertEqual(worsening_t, 0.0)
 
+        # Endpoint recovery is insufficient for a curved rigid trajectory. The
+        # point starts behind its negative-side boundary, first moves farther
+        # into the forbidden band, and only then ends on the safe side. Any
+        # penetration-directed portion must halt the complete rigid update.
+        returning_recovery_t = _probe_trajectory_truncation(
+            device,
+            (1.0, 0.0, 0.0),
+            (0.8, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            2.0 * math.pi / 3.0,
+            (math.cos(-math.pi / 6.0), math.sin(-math.pi / 6.0), 0.0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        test.assertEqual(returning_recovery_t, 0.0)
+
+        # The true normal derivative of this quarter-circle recovery is zero
+        # at t=0 and strictly negative afterward. Directed interval rounding
+        # may return a positive subnormal upper bound for that exact zero; it
+        # must not freeze an otherwise monotone separating trajectory.
+        monotone_recovery_t = _probe_trajectory_truncation(
+            device,
+            (1.0, 0.0, 0.0),
+            (0.8, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            math.pi / 2.0,
+            (1.0, 0.0, 0.0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        test.assertEqual(monotone_recovery_t, 1.0)
+
     # Pure rotation: point at radius 1 rotating pi/2 about z crosses plane y=0.5 at t=1/3
     # (sin(t*pi/2) = 0.5). gamma_r=1 leaves only the fixed 1e-3 safety backoff.
     t = _probe_trajectory_truncation(
@@ -5452,9 +5685,10 @@ def _run_bvh_dat_rotating_mesh(device, enable_dat, use_interval_arithmetic=False
     dat_normal = particle - probe_body_pos[row]
     pair_gap = np.linalg.norm(dat_normal)
     dat_normal /= pair_gap
-    # The soft vertex is fixed and the rigid triangle approaches, so Eq. (11)
-    # gives lambda=1: the adaptive plane passes through the soft closest point.
-    plane_point = probe_body_pos[row] + pair_gap * dat_normal
+    # The soft vertex is fixed and the rigid triangle approaches, so the raw
+    # adaptive fraction is one. Epsilon-aware placement backs the plane away
+    # from the soft support by one clearance width.
+    plane_point = probe_body_pos[row] + (pair_gap - _RIGID_SOFT_DAT_TEST_EPS) * dat_normal
     rigid_slots = probe_rigid_indices[row]
     mesh_indices = np.asarray(box_mesh.indices, dtype=np.int32).reshape(-1)
     mesh_vertices = np.asarray(box_mesh.vertices, dtype=np.float64)
@@ -5503,15 +5737,23 @@ def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
         test.assertGreaterEqual(
             result["particle_local_y"], 0.05 - 1.0e-4, "DAT must keep the vertex above the rotating bar"
         )
-        test.assertGreaterEqual(result["soft_plane_gap"], -1.0e-6)
+        test.assertGreaterEqual(result["soft_plane_gap"], 0.75 * _RIGID_SOFT_DAT_TEST_EPS)
         test.assertTrue(
-            np.all(result["rigid_vertex_plane_gaps"] <= 1.0e-4),
-            "every vertex of the selected rigid triangle must remain in its assigned half-space",
+            np.all(result["rigid_vertex_plane_gaps"] <= -0.75 * _RIGID_SOFT_DAT_TEST_EPS),
+            "every selected rigid-triangle vertex must remain beyond the negative epsilon boundary",
         )
     test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
 
 
-def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_body=False):
+def _run_vt_dat_row(
+    device,
+    particle_z,
+    stored_normal,
+    displacement_z,
+    moving_body=False,
+    body_displacement_z=1.0e-3,
+    world_origin=0.0,
+):
     """Apply one dense VT DAT row and return its particle and body factors."""
     rigid_mesh = wp.Mesh(
         points=wp.array(
@@ -5525,14 +5767,15 @@ def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_bo
     body_truncation_ts = (
         wp.ones(1, dtype=float, device=device) if moving_body else wp.empty(0, dtype=float, device=device)
     )
+    origin_transform = wp.transform(wp.vec3(world_origin), wp.quat_identity())
     body_q_ref = (
-        wp.array([wp.transform_identity()], dtype=wp.transform, device=device)
+        wp.array([origin_transform], dtype=wp.transform, device=device)
         if moving_body
         else wp.empty(0, dtype=wp.transform, device=device)
     )
     body_q = (
         wp.array(
-            [wp.transform(wp.vec3(0.0, 0.0, 1.0e-3), wp.quat_identity())],
+            [wp.transform(wp.vec3(world_origin, world_origin, world_origin + body_displacement_z), wp.quat_identity())],
             dtype=wp.transform,
             device=device,
         )
@@ -5551,10 +5794,18 @@ def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_bo
             wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
             wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
             wp.array([0 if moving_body else -1], dtype=wp.int32, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array(
+                [wp.transform_identity() if moving_body else origin_transform],
+                dtype=wp.transform,
+                device=device,
+            ),
             wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
             wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
-            wp.array([[0.0, 0.0, particle_z]], dtype=wp.vec3, device=device),
+            wp.array(
+                [[world_origin, world_origin, world_origin + particle_z]],
+                dtype=wp.vec3,
+                device=device,
+            ),
             wp.array([[0.0, 0.0, displacement_z]], dtype=wp.vec3, device=device),
             body_q_ref,
             body_q,
@@ -5567,6 +5818,217 @@ def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_bo
     )
     body_t = float(body_truncation_ts.numpy()[0]) if moving_body else 1.0
     return float(truncation_ts.numpy()[0]), body_t
+
+
+@wp.kernel
+def _complete_pair_epsilon_endpoint_probe(
+    soft: wp.array[wp.vec3],
+    soft_count: int,
+    rigid: wp.array[wp.vec3],
+    rigid_count: int,
+    soft_displacement: wp.vec3,
+    rigid_displacement: wp.vec3,
+    n: wp.vec3,
+    d: wp.vec3,
+    eps: float,
+    soft_t: wp.array[float],
+    rigid_t: wp.array[float],
+):
+    i = wp.tid()
+    if i < soft_count:
+        soft_t[i] = planar_truncation_t(
+            soft[i],
+            soft_displacement,
+            n,
+            d,
+            0.85,
+            1.0e-3,
+            eps,
+        )
+    if i < rigid_count:
+        rigid_t[i] = rigid_trajectory_truncation_t(
+            n,
+            d,
+            wp.vec3(0.0),
+            rigid_displacement,
+            wp.vec3(0.0),
+            0.0,
+            rigid[i],
+            0.85,
+            1.0e-3,
+            True,
+            8,
+            -eps,
+        )
+
+
+def _probe_complete_pair_epsilon_endpoints(
+    device,
+    soft,
+    rigid,
+    collision_normal,
+    soft_displacement,
+    rigid_displacement,
+):
+    soft = np.asarray(soft, dtype=np.float32)
+    rigid = np.asarray(rigid, dtype=np.float32)
+    soft_displacement = np.asarray(soft_displacement, dtype=np.float32)
+    rigid_displacement = np.asarray(rigid_displacement, dtype=np.float32)
+    result = _probe_primitive_pair_separator(
+        device,
+        soft,
+        rigid,
+        collision_normal,
+        delta_soft=float(np.linalg.norm(soft_displacement)),
+        delta_rigid=float(np.linalg.norm(rigid_displacement)),
+    )
+    test_count = max(len(soft), len(rigid))
+    soft_t = wp.ones(len(soft), dtype=float, device=device)
+    rigid_t = wp.ones(len(rigid), dtype=float, device=device)
+    wp.launch(
+        _complete_pair_epsilon_endpoint_probe,
+        dim=test_count,
+        inputs=[
+            wp.array(soft, dtype=wp.vec3, device=device),
+            len(soft),
+            wp.array(rigid, dtype=wp.vec3, device=device),
+            len(rigid),
+            wp.vec3(*soft_displacement),
+            wp.vec3(*rigid_displacement),
+            wp.vec3(*result["normal"]),
+            wp.vec3(*result["plane"]),
+            _RIGID_SOFT_DAT_TEST_EPS,
+        ],
+        outputs=[soft_t, rigid_t],
+        device=device,
+    )
+    soft_factors = soft_t.numpy()
+    rigid_factor = float(np.min(rigid_t.numpy()))
+    soft_end = soft + soft_factors[:, None] * soft_displacement
+    rigid_end = rigid + rigid_factor * rigid_displacement
+    normal = np.asarray(result["normal"], dtype=np.float64)
+    plane = np.asarray(result["plane"], dtype=np.float64)
+    soft_margin = float(np.min((soft_end - plane) @ normal))
+    rigid_margin = float(-np.max((rigid_end - plane) @ normal))
+    return soft_margin, rigid_margin
+
+
+def test_bvh_dat_truncation_maintains_epsilon_band(test, device):
+    """Truncation preserves two epsilon of pair gap and never worsens a short-gap start."""
+    eps = _RIGID_SOFT_DAT_TEST_EPS
+
+    soft_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=10.0 * eps,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-20.0 * eps,
+    )
+    soft_pair_gap = 10.0 * eps + soft_t * (-20.0 * eps)
+    test.assertGreaterEqual(soft_pair_gap, 1.8 * eps)
+
+    _, body_t = _run_vt_dat_row(
+        device,
+        particle_z=10.0 * eps,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=20.0 * eps,
+    )
+    rigid_pair_gap = 10.0 * eps - body_t * (20.0 * eps)
+    test.assertGreaterEqual(rigid_pair_gap, 1.8 * eps)
+
+    short_gap = 1.5 * eps
+    soft_worsening_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-eps,
+    )
+    soft_recovery_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=eps,
+    )
+    test.assertEqual(soft_worsening_t, 0.0)
+    test.assertEqual(soft_recovery_t, 1.0)
+
+    _, rigid_worsening_t = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=eps,
+    )
+    _, rigid_recovery_t = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=-eps,
+    )
+    test.assertEqual(rigid_worsening_t, 0.0)
+    test.assertEqual(rigid_recovery_t, 1.0)
+
+    # Exercise the production kernel's coordinate-scale accumulation and
+    # anchor-plus-scalar thresholds, rather than only the placement helper.
+    large_origin = 1000.0
+    large_eps = max(eps, 4.0 * np.finfo(np.float32).eps * large_origin)
+    adjacent_gap = float(np.nextafter(np.float32(large_origin), np.float32(np.inf))) - large_origin
+    adjacent_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=adjacent_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-adjacent_gap,
+        world_origin=large_origin,
+    )
+    test.assertLess(adjacent_gap, 2.0 * large_eps)
+    test.assertEqual(adjacent_t, 0.0)
+
+    represented_gap = float(np.float32(large_origin + 1.0e-3)) - large_origin
+    large_displacement = -2.0e-3
+    large_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=represented_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=large_displacement,
+        world_origin=large_origin,
+    )
+    accepted_gap = represented_gap + large_t * large_displacement
+    test.assertGreaterEqual(accepted_gap, 1.95 * large_eps)
+
+    complete_pair_cases = [
+        (
+            "TV",
+            [[-0.01, -0.01, 10.0 * eps], [0.01, -0.01, 10.0 * eps], [0.0, 0.01, 10.0 * eps]],
+            [[0.0, 0.0, 0.0]],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -20.0 * eps],
+            [0.0, 0.0, 0.0],
+        ),
+        (
+            "EE",
+            [[-0.01, 10.0 * eps, 0.0], [0.01, 10.0 * eps, 0.0]],
+            [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+            [0.0, -20.0 * eps, 0.0],
+            [0.0, 0.0, 0.0],
+        ),
+    ]
+    for pair_type, soft, rigid, collision_normal, soft_displacement, rigid_displacement in complete_pair_cases:
+        with test.subTest(pair_type=pair_type):
+            soft_margin, rigid_margin = _probe_complete_pair_epsilon_endpoints(
+                device,
+                soft,
+                rigid,
+                collision_normal,
+                soft_displacement,
+                rigid_displacement,
+            )
+            test.assertGreaterEqual(soft_margin, 0.95 * eps)
+            test.assertGreaterEqual(rigid_margin, 0.95 * eps)
 
 
 def test_bvh_dat_nanometer_vt_gap_truncates(test, device):
@@ -5582,7 +6044,7 @@ def test_bvh_dat_nanometer_vt_gap_truncates(test, device):
 
 def test_bvh_dat_zero_gap_vt_fails_closed(test, device):
     """A zero-gap VT row reports separator failure and freezes both sides."""
-    from newton.tests.unittest_utils import StdOutCapture  # noqa: PLC0415
+    from newton.tests.unittest_utils import StdOutCapture
 
     capture = StdOutCapture()
     capture.begin()
@@ -6083,6 +6545,12 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
+    "test_rigid_soft_dat_scale_aware_epsilon_prevents_fp32_gap_collapse",
+    test_rigid_soft_dat_scale_aware_epsilon_prevents_fp32_gap_collapse,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_particle_planar_truncation_preserves_parallel_epsilon",
     test_particle_planar_truncation_preserves_parallel_epsilon,
     devices=devices,
@@ -6095,8 +6563,8 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_dat_division_plane_placement_extremes",
-    test_dat_division_plane_placement_extremes,
+    "test_dat_division_plane_reserves_epsilon_band",
+    test_dat_division_plane_reserves_epsilon_band,
     devices=devices,
 )
 add_function_test(
@@ -6127,6 +6595,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_bvh_dat_nanometer_vt_gap_truncates",
     test_bvh_dat_nanometer_vt_gap_truncates,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_truncation_maintains_epsilon_band",
+    test_bvh_dat_truncation_maintains_epsilon_band,
     devices=devices,
 )
 add_function_test(
