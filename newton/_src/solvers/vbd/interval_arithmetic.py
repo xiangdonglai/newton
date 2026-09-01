@@ -236,7 +236,8 @@ def rigid_point_plane_signed_distance_interval(
     t_lower: float,
     t_upper: float,
     n: wp.vec3,
-    d: wp.vec3,
+    plane_anchor: wp.vec3,
+    plane_offset: float,
     c0: wp.vec3,
     dx: wp.vec3,
     axis: wp.vec3,
@@ -260,13 +261,17 @@ def rigid_point_plane_signed_distance_interval(
     perpendicular = offset0 - parallel
     cross = wp.cross(axis, offset0)
 
-    constant = wp.dot(n, c0 - d + parallel)
+    # Evaluate the plane as dot(n, x - anchor) - offset. Keeping the usually
+    # tiny offset separate avoids losing it while constructing a world-space
+    # point on the plane.
+    constant = wp.dot(n, c0 - plane_anchor + parallel)
     linear = wp.dot(n, dx)
     cos_coeff = wp.dot(n, perpendicular)
     sin_coeff = wp.dot(n, cross)
 
     result = interval_add(point_interval(constant), interval_mul(time, point_interval(linear)))
-    return interval_add(result, _linear_sinusoid_interval(angle_interval, cos_coeff, sin_coeff))
+    result = interval_add(result, _linear_sinusoid_interval(angle_interval, cos_coeff, sin_coeff))
+    return interval_sub(result, point_interval(plane_offset))
 
 
 @wp.func

@@ -20,6 +20,8 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_spring_force_and_hessian_both_vertices,
     evaluate_vertex_triangle_collision_force_hessian_4_vertices,
     evaluate_volumetric_neo_hookean_force_and_hessian,
+)
+from newton._src.solvers.vbd.particle_vbd_kernels import (
     planar_truncation_t as particle_planar_truncation_t,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
@@ -38,15 +40,24 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_linear_constraint_force_hessian,
     evaluate_rigid_contact_from_collision,
     find_primitive_pair_separator,
+    fit_primitive_pair_plane_offset,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
     planar_truncation_t,
+    resolve_body_truncation_ts,
+    restore_invalid_rigid_soft_dat_particle_endpoints,
     rigid_point_trajectory,
+    rigid_pose_delta,
+    rigid_shape_point_at_t,
+    rigid_shape_point_transform_truncation_t,
     rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
+    snapshot_rigid_soft_dat_planes,
     step_body_body_contact_C0_lambda,
     update_duals_body_body_contacts,
     update_duals_joint,
+    validate_rigid_soft_dat_body_endpoints,
+    validate_rigid_soft_dat_particle_endpoints,
 )
 from newton.solvers.experimental.coupled import SolverCoupledProxy
 from newton.tests.unittest_utils import (
@@ -4621,6 +4632,7 @@ def _planar_truncation_probe(
         wp.vec3(0.0, 0.0, normal_displacement[i]),
         wp.vec3(0.0, 0.0, 1.0),
         wp.vec3(0.0),
+        0.0,
         gamma,
     )
 
@@ -4648,7 +4660,7 @@ def _planar_truncation_float32_endpoint_probe(
     t_unverified = wp.clamp(wp.min(gamma * s0 / (s0 - s1), s0 / (s0 - s1) - 1.0e-3), 0.0, 1.0)
     unverified_signed_endpoint_out[i] = wp.dot(n, v + t_unverified * delta_v - d)
 
-    t = planar_truncation_t(v, delta_v, n, d, gamma)
+    t = planar_truncation_t(v, delta_v, n, d, 0.0, gamma)
     t_out[i] = t
     signed_endpoint_out[i] = wp.dot(n, v + t * delta_v - d)
 
@@ -4722,10 +4734,8 @@ def test_body_zero_truncation_preserves_reference_pose(test, device):
         dim=1,
         inputs=[
             body_q_ref,
-            wp.array([[0.01, -0.02, 0.03]], dtype=wp.vec3, device=device),
+            body_q,
             wp.zeros(1, dtype=float, device=device),
-            wp.ones(1, dtype=float, device=device),
-            wp.ones(1, dtype=float, device=device),
         ],
         outputs=[body_q],
         device=device,
@@ -4763,12 +4773,13 @@ def _primitive_pair_separator_probe(
     delta_rigid: float,
     valid_out: wp.array[wp.int32],
     normal_out: wp.array[wp.vec3],
-    plane_out: wp.array[wp.vec3],
+    plane_anchor_out: wp.array[wp.vec3],
+    plane_offset_out: wp.array[float],
     gap_out: wp.array[float],
     lambda_out: wp.array[float],
     candidate_index_out: wp.array[wp.int32],
 ):
-    valid, n, soft_support, rigid_support, gap, candidate_index = find_primitive_pair_separator(
+    valid, n, _soft_support, rigid_support, gap, candidate_index = find_primitive_pair_separator(
         soft_indices,
         rigid_indices,
         soft,
@@ -4777,16 +4788,19 @@ def _primitive_pair_separator_probe(
         wp.transform_identity(),
         collision_normal,
     )
-    d = wp.vec3(0.0)
+    plane_anchor = wp.vec3(0.0)
+    plane_offset = float(0.0)
     lmbd = float(0.0)
     if valid:
         lmbd = float(0.5)
         if delta_soft + delta_rigid > 0.0:
             lmbd = delta_rigid / (delta_rigid + delta_soft)
-        d = (1.0 - lmbd) * rigid_support + lmbd * soft_support
+        plane_anchor = rigid_support
+        plane_offset = lmbd * gap
     valid_out[0] = wp.int32(valid)
     normal_out[0] = n
-    plane_out[0] = d
+    plane_anchor_out[0] = plane_anchor
+    plane_offset_out[0] = plane_offset
     gap_out[0] = gap
     lambda_out[0] = lmbd
     candidate_index_out[0] = candidate_index
@@ -4817,7 +4831,8 @@ def _probe_primitive_pair_separator(
     )
     valid_out = wp.empty(1, dtype=wp.int32, device=device)
     normal_out = wp.empty(1, dtype=wp.vec3, device=device)
-    plane_out = wp.empty(1, dtype=wp.vec3, device=device)
+    plane_anchor_out = wp.empty(1, dtype=wp.vec3, device=device)
+    plane_offset_out = wp.empty(1, dtype=float, device=device)
     gap_out = wp.empty(1, dtype=float, device=device)
     lambda_out = wp.empty(1, dtype=float, device=device)
     candidate_index_out = wp.empty(1, dtype=wp.int32, device=device)
@@ -4836,7 +4851,8 @@ def _probe_primitive_pair_separator(
         outputs=[
             valid_out,
             normal_out,
-            plane_out,
+            plane_anchor_out,
+            plane_offset_out,
             gap_out,
             lambda_out,
             candidate_index_out,
@@ -4846,7 +4862,8 @@ def _probe_primitive_pair_separator(
     return {
         "valid": bool(valid_out.numpy()[0]),
         "normal": normal_out.numpy()[0],
-        "plane": plane_out.numpy()[0],
+        "plane_anchor": plane_anchor_out.numpy()[0],
+        "plane_offset": float(plane_offset_out.numpy()[0]),
         "gap": float(gap_out.numpy()[0]),
         "lambda": float(lambda_out.numpy()[0]),
         "candidate_index": int(candidate_index_out.numpy()[0]),
@@ -4885,8 +4902,12 @@ def _check_primitive_pair_separator_regular_cases(test, device):
         np.testing.assert_allclose(result["normal"], expected_n, atol=1.0e-6)
         test.assertAlmostEqual(result["gap"], 1.0, places=6)
         test.assertAlmostEqual(result["lambda"], 0.25, places=6)
-        soft_plane_values = (np.asarray(soft) - result["plane"]) @ result["normal"]
-        rigid_plane_values = (np.asarray(rigid) - result["plane"]) @ result["normal"]
+        soft_plane_values = (
+            (np.asarray(soft) - result["plane_anchor"]) @ result["normal"] - result["plane_offset"]
+        )
+        rigid_plane_values = (
+            (np.asarray(rigid) - result["plane_anchor"]) @ result["normal"] - result["plane_offset"]
+        )
         test.assertGreaterEqual(float(np.min(soft_plane_values)), -1.0e-6)
         test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-6)
 
@@ -4916,8 +4937,12 @@ def _check_primitive_pair_separator_near_triangle_edge(test, device):
         test.assertTrue(result["valid"], label)
         np.testing.assert_allclose(result["normal"], expected_n, atol=1.0e-6, err_msg=label)
         test.assertAlmostEqual(result["gap"], expected_gap, places=10, msg=label)
-        soft_plane_value = float(np.dot(np.asarray(point) - result["plane"], result["normal"]))
-        rigid_plane_values = (np.asarray(triangle) - result["plane"]) @ result["normal"]
+        soft_plane_value = float(
+            np.dot(np.asarray(point) - result["plane_anchor"], result["normal"]) - result["plane_offset"]
+        )
+        rigid_plane_values = (
+            (np.asarray(triangle) - result["plane_anchor"]) @ result["normal"] - result["plane_offset"]
+        )
         test.assertGreaterEqual(soft_plane_value, -1.0e-8, label)
         test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-8, label)
 
@@ -5217,18 +5242,19 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
 
 
 def test_dat_division_plane_placement_extremes(test, device):
-    """Adaptive placement reuses either represented support and otherwise bisects them."""
-    soft = np.array([[1000.02, -499.98, 1.0]], dtype=np.float32)
+    """Adaptive placement retains a local support anchor and scalar offset."""
+    soft = np.array([[1000.02, -499.98, 1000.001]], dtype=np.float32)
     rigid = np.array(
-        [[1000.0, -500.0, 0.0], [1000.1, -500.0, 0.0], [1000.0, -499.9, 0.0]],
+        [[1000.0, -500.0, 1000.0], [1000.1, -500.0, 1000.0], [1000.0, -499.9, 1000.0]],
         dtype=np.float32,
     )
     expected = (
-        (1.0, 0.0, 0.0, rigid[0]),
-        (0.0, 1.0, 1.0, soft[0]),
-        (0.0, 0.0, 0.5, 0.5 * (rigid[0] + soft[0])),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 1.0),
+        (0.0, 0.0, 0.5),
+        (1.0, 0.01, 0.01 / 1.01),
     )
-    for delta_soft, delta_rigid, expected_lambda, expected_plane in expected:
+    for delta_soft, delta_rigid, expected_lambda in expected:
         result = _probe_primitive_pair_separator(
             device,
             soft,
@@ -5238,10 +5264,129 @@ def test_dat_division_plane_placement_extremes(test, device):
             delta_rigid=delta_rigid,
         )
         test.assertAlmostEqual(result["lambda"], expected_lambda, places=6)
-        if expected_lambda in (0.0, 1.0):
-            np.testing.assert_array_equal(result["plane"], expected_plane)
-        else:
-            np.testing.assert_allclose(result["plane"], expected_plane, rtol=0.0, atol=1.0e-6)
+        np.testing.assert_array_equal(result["plane_anchor"], rigid[0])
+        test.assertAlmostEqual(result["plane_offset"], expected_lambda * result["gap"], places=6)
+
+        if delta_rigid == 0.01:
+            test.assertGreater(result["plane_offset"], 0.0)
+            rounded_point = np.asarray(
+                result["plane_anchor"] + np.float32(result["plane_offset"]) * result["normal"],
+                dtype=np.float32,
+            )
+            np.testing.assert_array_equal(
+                rounded_point,
+                result["plane_anchor"],
+                "the scalar offset must survive even when no float32 world-space point can represent it",
+            )
+
+
+@wp.kernel
+def _primitive_pair_plane_certification_probe(
+    soft: wp.array[wp.vec3],
+    rigid_mesh: wp.uint64,
+    soft_indices: wp.array[wp.vec3i],
+    plane_anchor: wp.vec3,
+    plane_offsets: wp.array[float],
+    valid_out: wp.array[wp.int32],
+    fitted_offsets_out: wp.array[float],
+):
+    i = wp.tid()
+    valid, fitted_offset = fit_primitive_pair_plane_offset(
+        soft_indices[i],
+        wp.vec3i(0, 1, 2),
+        soft,
+        rigid_mesh,
+        wp.vec3(1.0),
+        wp.transform_identity(),
+        wp.vec3(0.0, 0.0, 1.0),
+        plane_anchor,
+        plane_offsets[i],
+    )
+    valid_out[i] = wp.int32(valid)
+    fitted_offsets_out[i] = fitted_offset
+
+
+def test_bvh_dat_certifies_final_plane_representation(test, device):
+    """Fit offsets using all support vertices and reject collapsed, inverted, or NaN inputs."""
+    rigid_mesh = wp.Mesh(
+        points=wp.array(
+            [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.2], [0.0, 1.0, -0.1]],
+            dtype=wp.vec3,
+            device=device,
+        ),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    valid_out = wp.empty(7, dtype=wp.int32, device=device)
+    fitted_offsets_out = wp.empty(7, dtype=float, device=device)
+    wp.launch(
+        _primitive_pair_plane_certification_probe,
+        dim=7,
+        inputs=[
+            wp.array(
+                [
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.2],
+                    [0.0, 0.0, 0.1],
+                    [-0.5, 0.0, 1.2],
+                    [0.5, 0.0, 0.8],
+                    [0.0, 0.5, 1.1],
+                ],
+                dtype=wp.vec3,
+                device=device,
+            ),
+            rigid_mesh.id,
+            wp.array(
+                [
+                    [0, -1, -1],
+                    [0, -1, -1],
+                    [0, -1, -1],
+                    [1, -1, -1],
+                    [2, -1, -1],
+                    [3, 4, 5],
+                    [0, -1, -1],
+                ],
+                dtype=wp.vec3i,
+                device=device,
+            ),
+            wp.vec3(0.0),
+            wp.array([0.5, -0.1, 1.1, 0.0, 0.0, 0.9, np.nan], dtype=float, device=device),
+        ],
+        outputs=[valid_out, fitted_offsets_out],
+        device=device,
+    )
+    np.testing.assert_array_equal(valid_out.numpy(), [1, 1, 1, 0, 0, 1, 0])
+    np.testing.assert_allclose(fitted_offsets_out.numpy()[:6], [0.5, 0.2, 1.0, 0.0, 0.0, 0.8], atol=1.0e-7)
+    test.assertTrue(np.isnan(fitted_offsets_out.numpy()[6]))
+
+    # At meter-scale coordinates, the requested decimal millimeter offset is
+    # not the same as the gap represented by float32 endpoints. Fit against the
+    # actual local projection rather than reconstructing a world-space point.
+    large_rigid_mesh = wp.Mesh(
+        points=wp.array(
+            [[1000.0, -500.0, 1000.0], [1000.1, -500.0, 1000.0], [1000.0, -499.9, 1000.0]],
+            dtype=wp.vec3,
+            device=device,
+        ),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    large_valid = wp.empty(1, dtype=wp.int32, device=device)
+    large_fitted_offset = wp.empty(1, dtype=float, device=device)
+    wp.launch(
+        _primitive_pair_plane_certification_probe,
+        dim=1,
+        inputs=[
+            wp.array([[1000.02, -499.98, 1000.001]], dtype=wp.vec3, device=device),
+            large_rigid_mesh.id,
+            wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.vec3(1000.0, -500.0, 1000.0),
+            wp.array([1.0e-3], dtype=float, device=device),
+        ],
+        outputs=[large_valid, large_fitted_offset],
+        device=device,
+    )
+    np.testing.assert_array_equal(large_valid.numpy(), [1])
+    expected_float32_gap = np.float32(1000.001) - np.float32(1000.0)
+    test.assertEqual(large_fitted_offset.numpy()[0], expected_float32_gap)
 
 
 def _check_primitive_pair_separator_large_world_coordinates(test, device):
@@ -5287,7 +5432,18 @@ def _rigid_trajectory_truncation_probe(
     t_out: wp.array[float],
 ):
     t_out[0] = rigid_trajectory_truncation_t(
-        n, d, c0, dx, axis, angle, offset0, gamma_r, 1.0e-3, use_interval_arithmetic, trajectory_samples
+        n,
+        d,
+        0.0,
+        c0,
+        dx,
+        axis,
+        angle,
+        offset0,
+        gamma_r,
+        1.0e-3,
+        use_interval_arithmetic,
+        trajectory_samples,
     )
 
 
@@ -5349,6 +5505,538 @@ def _probe_trajectory_truncation(
         device=device,
     )
     return float(t_out.numpy()[0])
+
+
+@wp.kernel
+def _rigid_transform_space_endpoint_probe(
+    soft: wp.array[wp.vec3],
+    rigid_mesh: wp.uint64,
+    q_ref: wp.transform,
+    q_cur: wp.transform,
+    com: wp.vec3,
+    shape_pose: wp.transform,
+    x_shape: wp.vec3,
+    collision_normal: wp.vec3,
+    t_out: wp.array[float],
+    signed_out: wp.array[wp.vec3],
+    plane_out: wp.array[wp.vec3],
+):
+    """Replay the frame-115 right-finger TV endpoint mismatch."""
+    _valid, n, soft_support, _rigid_support, _gap, _candidate = find_primitive_pair_separator(
+        wp.vec3i(0, 1, 2),
+        wp.vec3i(6, -1, -1),
+        soft,
+        rigid_mesh,
+        wp.vec3(1.0),
+        wp.transform_multiply(q_ref, shape_pose),
+        collision_normal,
+    )
+
+    x_ref = rigid_shape_point_at_t(q_ref, q_cur, com, shape_pose, x_shape, 0.0)
+    # The captured soft proposal moves away from the plane, hence
+    # delta_soft=0 and the adaptive plane lies at the soft support.
+    d = soft_support
+    c0, dx, axis, angle = rigid_pose_delta(q_ref, q_cur, com)
+    analytic_t = rigid_trajectory_truncation_t(
+        n,
+        d,
+        0.0,
+        c0,
+        dx,
+        axis,
+        angle,
+        x_ref - c0,
+        0.85,
+        1.0e-3,
+        True,
+    )
+    corrected_t = rigid_shape_point_transform_truncation_t(
+        n,
+        d,
+        0.0,
+        q_ref,
+        q_cur,
+        com,
+        shape_pose,
+        x_shape,
+        analytic_t,
+    )
+
+    x_analytic = rigid_point_trajectory(analytic_t, c0, dx, axis, angle, x_ref - c0)
+    x_realized = rigid_shape_point_at_t(q_ref, q_cur, com, shape_pose, x_shape, analytic_t)
+    x_corrected = rigid_shape_point_at_t(q_ref, q_cur, com, shape_pose, x_shape, corrected_t)
+    t_out[0] = analytic_t
+    t_out[1] = corrected_t
+    signed_out[0] = wp.vec3(
+        wp.dot(n, x_ref - d),
+        wp.dot(n, x_analytic - d),
+        wp.dot(n, x_realized - d),
+    )
+    signed_out[1] = wp.vec3(
+        wp.dot(n, x_corrected - d),
+        0.0,
+        0.0,
+    )
+    plane_out[0] = n
+    plane_out[1] = d
+
+
+@wp.kernel
+def _stored_rigid_shape_point_signed_distance_probe(
+    body_q: wp.array[wp.transform],
+    shape_pose: wp.transform,
+    x_shape: wp.vec3,
+    n: wp.vec3,
+    d: wp.vec3,
+    signed_out: wp.array[float],
+):
+    X_wr = wp.transform_multiply(body_q[0], shape_pose)
+    signed_out[0] = wp.dot(n, wp.transform_point(X_wr, x_shape) - d)
+
+
+@wp.kernel
+def _resolved_rigid_shape_point_signed_distance_probe(
+    body_q_ref: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_truncation_ts: wp.array[float],
+    shape_pose: wp.transform,
+    x_shape: wp.vec3,
+    plane_normals: wp.array[wp.vec3],
+    plane_points: wp.array[wp.vec3],
+    signed_out: wp.array[float],
+):
+    x_end = rigid_shape_point_at_t(
+        body_q_ref[0], body_q[0], body_com[0], shape_pose, x_shape, body_truncation_ts[0]
+    )
+    signed_out[0] = wp.dot(plane_normals[0], x_end - plane_points[0])
+
+
+def test_rigid_transform_space_bisection_keeps_float32_endpoint_safe(test, device):
+    """Rigid DAT tightens an analytically safe t when the realized SE(3) endpoint crosses."""
+    soft = wp.array(
+        [
+            [0.347914, 0.023066958, 0.013982422],
+            [0.3495404, 0.018965283, 0.04562197],
+            [0.3608888, 0.025238425, 0.027774924],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    rigid_points = wp.array(
+        [
+            [-0.00875, -0.0076, -0.00925],
+            [0.00875, -0.0076, -0.00925],
+            [0.00875, 0.0076, -0.00925],
+            [-0.00875, 0.0076, -0.00925],
+            [-0.00875, -0.0076, 0.00925],
+            [0.00875, -0.0076, 0.00925],
+            [0.00875, 0.0076, 0.00925],
+            [-0.00875, 0.0076, 0.00925],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    rigid_mesh = wp.Mesh(
+        points=rigid_points,
+        indices=wp.array(
+            [
+                0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+                0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6,
+                0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+            ],
+            dtype=wp.int32,
+            device=device,
+        ),
+    )
+    t_out = wp.empty(2, dtype=float, device=device)
+    signed_out = wp.empty(2, dtype=wp.vec3, device=device)
+    plane_out = wp.empty(2, dtype=wp.vec3, device=device)
+    q_ref_np = np.asarray(
+        [[
+            0.36061879992485046,
+            0.021399000659584999,
+            0.092580884695053101,
+            0.020824205130338669,
+            -0.99075442552566528,
+            -0.0027921756263822317,
+            0.13403064012527466,
+        ]],
+        dtype=np.float32,
+    )
+    q_cur_np = np.asarray(
+        [[
+            0.36061879992485046,
+            0.021398993209004402,
+            0.09258076548576355,
+            0.020824206992983818,
+            -0.99075454473495483,
+            -0.0027921758592128754,
+            0.13403065502643585,
+        ]],
+        dtype=np.float32,
+    )
+    q_ref = wp.transform(*q_ref_np[0])
+    q_cur = wp.transform(*q_cur_np[0])
+    com = wp.vec3(0.0, 0.015285000205039978, 0.021967500448226929)
+    shape_pose = wp.transform(0.0, 0.0075799999758601189, 0.045249998569488525, 0.0, 0.0, 0.0, 1.0)
+    x_shape = wp.vec3(-0.008750000037252903, -0.0076000001281499863, 0.00925000011920929)
+    wp.launch(
+        _rigid_transform_space_endpoint_probe,
+        dim=1,
+        inputs=[
+            soft,
+            rigid_mesh.id,
+            q_ref,
+            q_cur,
+            com,
+            shape_pose,
+            x_shape,
+            wp.vec3(0.42609602212905884, -0.55261355638504028, -0.71628248691558838),
+        ],
+        outputs=[t_out, signed_out, plane_out],
+        device=device,
+    )
+    t_out = t_out.numpy()
+    signed_out = signed_out.numpy()
+    if device.is_cuda:
+        # This is the exact scene failure: analytic DAT accepts the full body
+        # update while the realized transform lands on the wrong side.
+        test.assertEqual(float(t_out[0]), 1.0)
+        test.assertGreater(float(signed_out[0, 2]), 0.0)
+    else:
+        # CPU arithmetic detects the idealized crossing earlier, but its
+        # backed-off transform-space endpoint still rounds onto the plane.
+        test.assertGreaterEqual(float(signed_out[0, 2]), 0.0)
+    test.assertLess(float(t_out[1]), float(t_out[0]))
+    test.assertGreater(float(t_out[1]), 0.0)
+    test.assertLess(float(signed_out[1, 0]), 0.0)
+
+    # Apply the returned factor through the production pose kernel, then check
+    # the stored body's mesh point independently of the bisection helper.
+    body_q_ref = wp.array(q_ref_np, dtype=wp.transform, device=device)
+    body_q = wp.array(q_cur_np, dtype=wp.transform, device=device)
+    body_t = wp.array([t_out[1]], dtype=float, device=device)
+    resolved_body_q = wp.empty(1, dtype=wp.transform, device=device)
+    wp.launch(
+        resolve_body_truncation_ts,
+        dim=1,
+        inputs=[
+            body_q_ref,
+            body_q,
+            wp.array([[0.0, 0.015285000205039978, 0.021967500448226929]], dtype=wp.vec3, device=device),
+            wp.ones(1, dtype=float, device=device),
+            wp.full(1, wp.inf, dtype=float, device=device),
+        ],
+        outputs=[body_t, resolved_body_q],
+        device=device,
+    )
+    wp.launch(
+        apply_body_truncation_ts,
+        dim=1,
+        inputs=[body_q_ref, resolved_body_q, body_t],
+        outputs=[body_q],
+        device=device,
+    )
+    plane = plane_out.numpy()
+    stored_signed = wp.empty(1, dtype=float, device=device)
+    wp.launch(
+        _stored_rigid_shape_point_signed_distance_probe,
+        dim=1,
+        inputs=[body_q, shape_pose, x_shape, wp.vec3(*plane[0]), wp.vec3(*plane[1])],
+        outputs=[stored_signed],
+        device=device,
+    )
+    test.assertLess(float(stored_signed.numpy()[0]), 0.0)
+
+
+def test_rigid_dat_final_body_endpoint_audit_fails_closed(test, device):
+    """The body-wide scalar is rechecked against every cached plane before commit.
+
+    This is the captured shape-57 quaternion-normalization case. The reference
+    pose is separated by 1.76 nm, while the captured realized pose contains
+    the adjacent normalized quaternion and puts the selected box vertex on the
+    wrong side. Treating that realized pose as the final candidate, the audit
+    must replace its body scalar by exactly zero so applying it copies the
+    certified reference pose bit-for-bit.
+    """
+    q_ref_np = np.asarray(
+        [[
+            0.36189752817153931,
+            -0.021495357155799866,
+            0.057428888976573944,
+            0.99125164747238159,
+            0.021743502467870712,
+            -0.13013924658298492,
+            -0.0033328994177281857,
+        ]],
+        dtype=np.float32,
+    )
+    q_cur_np = np.asarray(
+        [[
+            0.36189752817153931,
+            -0.021495357155799866,
+            0.057428888976573944,
+            0.99125176668167114,
+            0.021743504330515862,
+            -0.13013926148414612,
+            -0.003332899883389473,
+        ]],
+        dtype=np.float32,
+    )
+    rigid_points = wp.array(
+        [
+            [-0.00875, -0.0076, -0.00925],
+            [0.00875, -0.0076, -0.00925],
+            [0.00875, 0.0076, -0.00925],
+            [-0.00875, 0.0076, -0.00925],
+            [-0.00875, -0.0076, 0.00925],
+            [0.00875, -0.0076, 0.00925],
+            [0.00875, 0.0076, 0.00925],
+            [-0.00875, 0.0076, 0.00925],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    rigid_mesh = wp.Mesh(
+        points=rigid_points,
+        indices=wp.array(
+            [
+                0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+                0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6,
+                0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+            ],
+            dtype=wp.int32,
+            device=device,
+        ),
+    )
+    body_q_ref = wp.array(q_ref_np, dtype=wp.transform, device=device)
+    body_q = wp.array(q_cur_np, dtype=wp.transform, device=device)
+    body_com = wp.array([[0.0, 0.015285, 0.0219675]], dtype=wp.vec3, device=device)
+    body_t = wp.ones(1, dtype=float, device=device)
+    plane_n = wp.array([[0.13261054, 0.9613476, 0.24129908]], dtype=wp.vec3, device=device)
+    plane_d = wp.array(
+        [[0.35021060705184937, -0.019895052537322044, 0.02172226645052433]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    plane_valid = wp.ones(1, dtype=wp.int32, device=device)
+    shape_pose = wp.transform(0.0, 0.00758, 0.04525, 0.0, 0.0, 0.0, 1.0)
+
+    signed_before = wp.empty(1, dtype=float, device=device)
+    wp.launch(
+        _resolved_rigid_shape_point_signed_distance_probe,
+        dim=1,
+        inputs=[
+            body_q_ref,
+            body_q,
+            body_com,
+            body_t,
+            shape_pose,
+            # Rigid slot 2 indexes the box triangle's third corner, whose
+            # underlying mesh point is vertex 1 (index buffer [0, 2, 1]).
+            wp.vec3(0.00875, -0.0076, -0.00925),
+            plane_n,
+            plane_d,
+        ],
+        outputs=[signed_before],
+        device=device,
+    )
+    test.assertGreater(float(signed_before.numpy()[0]), 0.0)
+
+    wp.launch(
+        validate_rigid_soft_dat_body_endpoints,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.array([[2, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([shape_pose], dtype=wp.transform, device=device),
+            wp.ones(1, dtype=wp.vec3, device=device),
+            wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+            body_q_ref,
+            body_q,
+            plane_n,
+            plane_d,
+            wp.zeros(1, dtype=float, device=device),
+            plane_valid,
+        ],
+        outputs=[body_t],
+        device=device,
+    )
+    test.assertEqual(float(body_t.numpy()[0]), 0.0)
+
+    wp.launch(
+        apply_body_truncation_ts,
+        dim=1,
+        inputs=[body_q_ref, body_q, body_t],
+        outputs=[body_q],
+        device=device,
+    )
+    np.testing.assert_array_equal(body_q.numpy(), q_ref_np)
+
+
+def test_rigid_dat_final_body_endpoint_audit_paths(test, device):
+    """Exercise final-scalar resolution and the BVH/SDF audit boundary policies."""
+    rigid_mesh = wp.Mesh(
+        points=wp.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=wp.vec3, device=device),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+
+    def run_dynamic(*, end_x, plane_x, rigid_indices, valid=1, max_displacement=wp.inf, ref_x=0.0):
+        body_q_ref = wp.array(
+            [wp.transform(wp.vec3(ref_x, 0.0, 0.0), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        )
+        body_q = wp.array(
+            [wp.transform(wp.vec3(end_x, 0.0, 0.0), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        )
+        body_t = wp.ones(1, dtype=float, device=device)
+        resolved_body_q = wp.empty(1, dtype=wp.transform, device=device)
+        wp.launch(
+            resolve_body_truncation_ts,
+            dim=1,
+            inputs=[
+                body_q_ref,
+                body_q,
+                wp.zeros(1, dtype=wp.vec3, device=device),
+                wp.zeros(1, dtype=float, device=device),
+                wp.array([max_displacement], dtype=float, device=device),
+            ],
+            outputs=[body_t, resolved_body_q],
+            device=device,
+        )
+        resolved_t = float(body_t.numpy()[0])
+        wp.launch(
+            validate_rigid_soft_dat_body_endpoints,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.vec3, device=device),
+                wp.array([rigid_indices], dtype=wp.vec3i, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                wp.ones(1, dtype=wp.vec3, device=device),
+                wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+                body_q_ref,
+                resolved_body_q,
+                wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+                wp.array([[plane_x, 0.0, 0.0]], dtype=wp.vec3, device=device),
+                wp.zeros(1, dtype=float, device=device),
+                wp.array([valid], dtype=wp.int32, device=device),
+            ],
+            outputs=[body_t],
+            device=device,
+        )
+        return resolved_t, float(body_t.numpy()[0])
+
+    # Safe BVH and analytic-SDF endpoints preserve the resolved scalar.
+    test.assertEqual(run_dynamic(end_x=0.25, plane_x=0.5, rigid_indices=[0, -1, -1]), (1.0, 1.0))
+    test.assertEqual(run_dynamic(end_x=0.25, plane_x=0.5, rigid_indices=[-1, -1, -1]), (1.0, 1.0))
+
+    # Crossed and exactly-on-plane SDF endpoints both fail closed. The latter
+    # makes the strict boundary rule explicit for a positive body update.
+    test.assertEqual(run_dynamic(end_x=1.0, plane_x=0.5, rigid_indices=[-1, -1, -1]), (1.0, 0.0))
+    test.assertEqual(run_dynamic(end_x=0.5, plane_x=0.5, rigid_indices=[-1, -1, -1]), (1.0, 0.0))
+
+    # A motion cap can choose the final scalar after row-local truncation; the
+    # audit checks that exact capped pose. An invalid plane-cache slot is ignored.
+    capped_t, audited_t = run_dynamic(
+        end_x=1.0,
+        plane_x=0.5,
+        rigid_indices=[-1, -1, -1],
+        max_displacement=0.75,
+    )
+    test.assertAlmostEqual(capped_t, 0.75)
+    test.assertEqual(audited_t, 0.0)
+    test.assertEqual(
+        run_dynamic(end_x=1.0, plane_x=0.5, rigid_indices=[-1, -1, -1], valid=0),
+        (1.0, 1.0),
+    )
+
+    # Existing wrong-side states may continue a strictly improving recovery.
+    test.assertEqual(
+        run_dynamic(end_x=0.75, plane_x=0.0, rigid_indices=[-1, -1, -1], ref_x=1.0),
+        (1.0, 1.0),
+    )
+
+    # Static-world rows return before touching the empty body arrays.
+    wp.launch(
+        validate_rigid_soft_dat_body_endpoints,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.array([[-1, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
+            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.ones(1, dtype=wp.vec3, device=device),
+            wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+            wp.empty(0, dtype=wp.transform, device=device),
+            wp.empty(0, dtype=wp.transform, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=float, device=device),
+            wp.ones(1, dtype=wp.int32, device=device),
+        ],
+        outputs=[wp.empty(0, dtype=float, device=device)],
+        device=device,
+    )
+
+
+def test_rigid_dat_final_particle_endpoint_audit(test, device):
+    """Restore only soft vertices whose exact stored endpoints violate a DAT plane."""
+    particle_q_ref = wp.array(
+        [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    particle_q = wp.array(
+        [[0.0, 0.0, 0.0], [0.5, 1.0, 0.0]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    particle_displacements = wp.array(
+        [[-1.0, 0.0, 0.0], [-0.5, 0.0, 0.0]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    truncation_ts = wp.ones(2, dtype=float, device=device)
+    wp.launch(
+        validate_rigid_soft_dat_particle_endpoints,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, 1, -1]], dtype=wp.vec3i, device=device),
+            particle_q_ref,
+            particle_q,
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=float, device=device),
+            wp.ones(1, dtype=wp.int32, device=device),
+        ],
+        outputs=[truncation_ts],
+        device=device,
+    )
+    np.testing.assert_array_equal(truncation_ts.numpy(), [0.0, 1.0])
+
+    wp.launch(
+        restore_invalid_rigid_soft_dat_particle_endpoints,
+        dim=2,
+        inputs=[particle_q_ref],
+        outputs=[truncation_ts, particle_displacements, particle_q],
+        device=device,
+    )
+    np.testing.assert_array_equal(particle_q.numpy(), [[1.0, 0.0, 0.0], [0.5, 1.0, 0.0]])
+    np.testing.assert_array_equal(particle_displacements.numpy(), [[0.0, 0.0, 0.0], [-0.5, 0.0, 0.0]])
+    np.testing.assert_array_equal(truncation_ts.numpy(), [0.0, 1.0])
 
 
 def _probe_rigid_dat_returning_sdf_arc(
@@ -5615,7 +6303,28 @@ def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
     test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
 
 
-def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_body=False):
+def _empty_previous_rigid_soft_dat_planes(device):
+    """Empty prior-checkpoint inputs for direct rigid-soft DAT kernel probes."""
+    return [
+        wp.zeros(1, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=wp.vec3i, device=device),
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=wp.vec3i, device=device),
+        wp.empty(0, dtype=wp.vec3, device=device),
+        wp.empty(0, dtype=wp.vec3, device=device),
+        wp.empty(0, dtype=float, device=device),
+        wp.empty(0, dtype=wp.int32, device=device),
+    ]
+
+
+def _run_vt_dat_row(
+    device,
+    particle_z,
+    stored_normal,
+    displacement_z,
+    moving_body=False,
+    previous_plane_normal=None,
+):
     """Apply one dense VT DAT row and return its particle and body factors."""
     rigid_mesh = wp.Mesh(
         points=wp.array(
@@ -5643,6 +6352,18 @@ def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_bo
         if moving_body
         else wp.empty(0, dtype=wp.transform, device=device)
     )
+    previous_inputs = _empty_previous_rigid_soft_dat_planes(device)
+    if previous_plane_normal is not None:
+        previous_inputs = [
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+            wp.array([previous_plane_normal], dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=float, device=device),
+            wp.ones(1, dtype=wp.int32, device=device),
+        ]
     wp.launch(
         apply_rigid_soft_truncation,
         dim=1,
@@ -5663,10 +6384,18 @@ def _run_vt_dat_row(device, particle_z, stored_normal, displacement_z, moving_bo
             body_q_ref,
             body_q,
             wp.zeros(1, dtype=wp.vec3, device=device) if moving_body else wp.empty(0, dtype=wp.vec3, device=device),
+            *previous_inputs,
             0.85,
             False,
         ],
-        outputs=[truncation_ts, body_truncation_ts],
+        outputs=[
+            truncation_ts,
+            body_truncation_ts,
+            wp.empty(1, dtype=wp.vec3, device=device),
+            wp.empty(1, dtype=wp.vec3, device=device),
+            wp.empty(1, dtype=float, device=device),
+            wp.empty(1, dtype=wp.int32, device=device),
+        ],
         device=device,
     )
     body_t = float(body_truncation_ts.numpy()[0]) if moving_body else 1.0
@@ -5684,6 +6413,157 @@ def test_bvh_dat_nanometer_vt_gap_truncates(test, device):
     test.assertLess(truncation_t, 1.0, "the particle trajectory crosses the certified face plane")
 
 
+def test_bvh_dat_recovers_exact_pairs_previous_plane(test, device):
+    """A redetected exact TV pair recovers its still-valid preceding plane.
+
+    These are exact float32 pick-cube captures for both numerical failure sites:
+    fresh separator construction and final plane-offset fitting. In each case
+    the preceding plane still separates all current vertices. Distractor rows
+    precede the exact match to exercise identity matching after BVH reordering.
+    """
+    cases = [
+        {
+            "name": "separator rebuild",
+            "soft": [
+                [0.4049401581287384, 0.030376249924302101, 0.0018670982681214809],
+                [0.34936729073524475, 0.016396841034293175, 0.025302374735474586],
+                [0.36161580681800842, 0.020333731546998024, 0.040753252804279327],
+            ],
+            "rigid": [0.35897275805473328, 0.019471097737550735, 0.037103250622749329],
+            "collision_normal": [0.7317919135093689, -0.5521971583366394, 0.3994484543800354],
+            "barycentric": [0.0033776164054870605, 0.2277320921421051, 0.76889032125473022],
+            "previous_normal": [0.25960731506347656, -0.96488338708877563, 0.040051780641078949],
+            "previous_anchor": [0.35897275805473328, 0.019471097737550735, 0.03710329532623291],
+        },
+        {
+            "name": "offset fitting",
+            "soft": [
+                [0.33686581254005432, -0.024143211543560028, 0.028041742742061615],
+                [0.3371431827545166, -0.023991044610738754, 0.010139824822545052],
+                [0.34898179769515991, -0.02109169214963913, 0.030553875491023064],
+            ],
+            "rigid": [0.3385918140411377, -0.023690516129136086, 0.024475008249282837],
+            "collision_normal": [-0.73330432176589966, 0.55234241485595703, -0.39646318554878235],
+            "barycentric": [0.64402002096176147, 0.21852612495422363, 0.13745385408401489],
+            "previous_normal": [-0.24509567022323608, 0.96948873996734619, 0.0044432054273784161],
+            "previous_anchor": [0.3385918140411377, -0.023690516129136086, 0.024475008249282837],
+        },
+    ]
+
+    for case in cases:
+        previous_normal = np.asarray(case["previous_normal"], dtype=np.float32)
+        previous_anchor = np.asarray(case["previous_anchor"], dtype=np.float32)
+        rigid_mesh = wp.Mesh(
+            points=wp.array([case["rigid"], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+        )
+        plane_normal = wp.zeros(1, dtype=wp.vec3, device=device)
+        plane_anchor = wp.zeros(1, dtype=wp.vec3, device=device)
+        plane_offset = wp.zeros(1, dtype=float, device=device)
+        plane_valid = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch(
+            apply_rigid_soft_truncation,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([case["rigid"]], dtype=wp.vec3, device=device),
+                wp.array([case["collision_normal"]], dtype=wp.vec3, device=device),
+                wp.array([case["barycentric"]], dtype=wp.vec3, device=device),
+                wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+                wp.array([-1], dtype=wp.int32, device=device),
+                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                wp.ones(1, dtype=wp.vec3, device=device),
+                wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+                wp.array(case["soft"], dtype=wp.vec3, device=device),
+                wp.zeros(3, dtype=wp.vec3, device=device),
+                wp.empty(0, dtype=wp.transform, device=device),
+                wp.empty(0, dtype=wp.transform, device=device),
+                wp.empty(0, dtype=wp.vec3, device=device),
+                wp.array([3], dtype=wp.int32, device=device),
+                wp.array([[-1, -1, -1], [2, -1, -1], [0, 1, 2]], dtype=wp.vec3i, device=device),
+                wp.array([-1, 1, 0], dtype=wp.int32, device=device),
+                wp.array([[-1, -1, -1], [1, 2, 3], [0, -1, -1]], dtype=wp.vec3i, device=device),
+                wp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], previous_normal], dtype=wp.vec3, device=device),
+                wp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], previous_anchor], dtype=wp.vec3, device=device),
+                wp.zeros(3, dtype=float, device=device),
+                wp.array([0, 0, 1], dtype=wp.int32, device=device),
+                0.85,
+                False,
+            ],
+            outputs=[
+                wp.ones(3, dtype=float, device=device),
+                wp.empty(0, dtype=float, device=device),
+                plane_normal,
+                plane_anchor,
+                plane_offset,
+                plane_valid,
+            ],
+            device=device,
+        )
+        test.assertEqual(int(plane_valid.numpy()[0]), 1, case["name"])
+        np.testing.assert_array_equal(plane_normal.numpy()[0], previous_normal, err_msg=case["name"])
+        np.testing.assert_array_equal(plane_anchor.numpy()[0], previous_anchor, err_msg=case["name"])
+        test.assertEqual(float(plane_offset.numpy()[0]), 0.0, case["name"])
+
+
+def test_bvh_dat_previous_plane_snapshot_clamps_overflow(test, device):
+    """The cached-row count never exceeds the fixed contact-buffer capacity."""
+    capacity = 2
+    contact_indices = wp.array([[0, -1, -1], [1, 2, -1]], dtype=wp.vec3i, device=device)
+    contact_shape = wp.array([3, 4], dtype=wp.int32, device=device)
+    rigid_indices = wp.array([[5, 6, 7], [8, 9, -1]], dtype=wp.vec3i, device=device)
+    plane_normals = wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=wp.vec3, device=device)
+    plane_anchors = wp.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=wp.vec3, device=device)
+    plane_offsets = wp.array([0.01, 0.02], dtype=float, device=device)
+    plane_valid = wp.ones(capacity, dtype=wp.int32, device=device)
+    previous_count = wp.zeros(1, dtype=wp.int32, device=device)
+    previous_indices = wp.empty_like(contact_indices)
+    previous_shape = wp.empty_like(contact_shape)
+    previous_rigid_indices = wp.empty_like(rigid_indices)
+    previous_normals = wp.empty_like(plane_normals)
+    previous_anchors = wp.empty_like(plane_anchors)
+    previous_offsets = wp.empty_like(plane_offsets)
+    previous_valid = wp.empty_like(plane_valid)
+
+    wp.launch(
+        snapshot_rigid_soft_dat_planes,
+        dim=capacity,
+        inputs=[
+            # Emitters may report five attempted contacts despite capacity two.
+            wp.array([5], dtype=wp.int32, device=device),
+            contact_indices,
+            contact_shape,
+            rigid_indices,
+            plane_normals,
+            plane_anchors,
+            plane_offsets,
+            plane_valid,
+        ],
+        outputs=[
+            previous_count,
+            previous_indices,
+            previous_shape,
+            previous_rigid_indices,
+            previous_normals,
+            previous_anchors,
+            previous_offsets,
+            previous_valid,
+        ],
+        device=device,
+    )
+    test.assertEqual(int(previous_count.numpy()[0]), capacity)
+    np.testing.assert_array_equal(previous_indices.numpy(), contact_indices.numpy())
+    np.testing.assert_array_equal(previous_shape.numpy(), contact_shape.numpy())
+    np.testing.assert_array_equal(previous_rigid_indices.numpy(), rigid_indices.numpy())
+    np.testing.assert_array_equal(previous_normals.numpy(), plane_normals.numpy())
+    np.testing.assert_array_equal(previous_anchors.numpy(), plane_anchors.numpy())
+    np.testing.assert_array_equal(previous_offsets.numpy(), plane_offsets.numpy())
+    np.testing.assert_array_equal(previous_valid.numpy(), [1, 1])
+    np.testing.assert_array_equal(plane_valid.numpy(), [0, 0])
+
+
 def test_bvh_dat_zero_gap_vt_fails_closed(test, device):
     """A zero-gap VT row reports separator failure and freezes both sides."""
     from newton.tests.unittest_utils import StdOutCapture  # noqa: PLC0415
@@ -5697,6 +6577,7 @@ def test_bvh_dat_zero_gap_vt_fails_closed(test, device):
             stored_normal=[1.0, 0.0, 0.0],
             displacement_z=-1.0e-4,
             moving_body=True,
+            previous_plane_normal=[0.0, 0.0, 1.0],
         )
         wp.synchronize_device(wp.get_device(device))
     finally:
@@ -5746,10 +6627,18 @@ def test_bvh_dat_uses_geometric_separator_for_back_facing_ee(test, device):
                 wp.empty(0, dtype=wp.transform, device=device),
                 wp.empty(0, dtype=wp.transform, device=device),
                 wp.empty(0, dtype=wp.vec3, device=device),
+                *_empty_previous_rigid_soft_dat_planes(device),
                 0.85,
                 False,
             ],
-            outputs=[truncation_ts, wp.empty(0, dtype=float, device=device)],
+            outputs=[
+                truncation_ts,
+                wp.empty(0, dtype=float, device=device),
+                wp.empty(1, dtype=wp.vec3, device=device),
+                wp.empty(1, dtype=wp.vec3, device=device),
+                wp.empty(1, dtype=float, device=device),
+                wp.empty(1, dtype=wp.int32, device=device),
+            ],
             device=device,
         )
         return truncation_ts.numpy()
@@ -6217,8 +7106,38 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
+    "test_bvh_dat_certifies_final_plane_representation",
+    test_bvh_dat_certifies_final_plane_representation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_transform_space_bisection_keeps_float32_endpoint_safe",
+    test_rigid_transform_space_bisection_keeps_float32_endpoint_safe,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_final_body_endpoint_audit_fails_closed",
+    test_rigid_dat_final_body_endpoint_audit_fails_closed,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_final_body_endpoint_audit_paths",
+    test_rigid_dat_final_body_endpoint_audit_paths,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_final_particle_endpoint_audit",
+    test_rigid_dat_final_particle_endpoint_audit,
     devices=devices,
 )
 add_function_test(
@@ -6243,6 +7162,18 @@ add_function_test(
     TestVBDRigidDAT,
     "test_bvh_dat_nanometer_vt_gap_truncates",
     test_bvh_dat_nanometer_vt_gap_truncates,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_recovers_exact_pairs_previous_plane",
+    test_bvh_dat_recovers_exact_pairs_previous_plane,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_previous_plane_snapshot_clamps_overflow",
+    test_bvh_dat_previous_plane_snapshot_clamps_overflow,
     devices=devices,
 )
 add_function_test(

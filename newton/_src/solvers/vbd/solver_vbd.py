@@ -75,7 +75,10 @@ from .rigid_vbd_kernels import (
     init_cable_rest_bend_twist,
     refresh_body_structural_k,
     reset_rigid_state,
+    resolve_body_truncation_ts,
+    restore_invalid_rigid_soft_dat_particle_endpoints,
     snapshot_body_body_contact_history,
+    snapshot_rigid_soft_dat_planes,
     solve_rigid_body,
     step_body_body_contact_C0_lambda,
     step_joint_C0_lambda_rho,
@@ -84,6 +87,8 @@ from .rigid_vbd_kernels import (
     update_duals_body_body_contacts,
     update_duals_body_particle_contacts,
     update_duals_joint,
+    validate_rigid_soft_dat_body_endpoints,
+    validate_rigid_soft_dat_particle_endpoints,
 )
 from .vbd_coupling_kernels import (
     _harvest_vbd_body_particle_contact_forces_on_proxy_bodies_kernel,
@@ -2414,6 +2419,12 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         flags_value = int(StateFlags.ALL if flags is None else flags)
 
+        if self.rigid_enable_penetration_free:
+            # A reset starts a new trajectory; no pre-reset world-space plane
+            # may be recovered for the first post-reset contact set.
+            self._previous_rigid_soft_dat_contact_count.zero_()
+            self._rigid_soft_dat_plane_valid.zero_()
+
         # Only requested BODY flags reach the launch as actionable arrays; everything
         # else stays None so an unrequested (possibly wrong-device) State array never
         # binds, and a supplied array is itself the kernel's reset signal.
@@ -2588,6 +2599,44 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise ValueError("rigid_enable_penetration_free is not supported with an external rigid solver.")
 
         self.body_truncation_ts = wp.zeros(model.body_count, dtype=float, device=self.device)
+        self._rigid_dat_resolved_body_q = wp.clone(model.body_q, device=self.device)
+        self._rigid_soft_dat_plane_normals = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.vec3, device=self.device
+        )
+        self._rigid_soft_dat_plane_anchors = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.vec3, device=self.device
+        )
+        self._rigid_soft_dat_plane_offsets = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=float, device=self.device
+        )
+        self._rigid_soft_dat_plane_valid = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.int32, device=self.device
+        )
+        # Detection reuses and reorders the contact buffer. Preserve the prior
+        # dense primitive identities and certified planes so an exact pair can
+        # recover its plane if a nanometer-scale float32 rebuild fails.
+        self._previous_rigid_soft_dat_contact_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._previous_rigid_soft_dat_contact_indices = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.vec3i, device=self.device
+        )
+        self._previous_rigid_soft_dat_contact_shape = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.int32, device=self.device
+        )
+        self._previous_rigid_soft_dat_contact_rigid_indices = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.vec3i, device=self.device
+        )
+        self._previous_rigid_soft_dat_plane_normals = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.vec3, device=self.device
+        )
+        self._previous_rigid_soft_dat_plane_anchors = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.vec3, device=self.device
+        )
+        self._previous_rigid_soft_dat_plane_offsets = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=float, device=self.device
+        )
+        self._previous_rigid_soft_dat_plane_valid = wp.zeros(
+            self.pipeline.soft_contact_max, dtype=wp.int32, device=self.device
+        )
         # Reference poses at the last rigid collision detection (mirror of
         # pos_prev_collision_detection): rigid pose updates accumulate from here and the
         # per-body motion budget below is measured from here.
@@ -2605,6 +2654,45 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._rigid_dat_body_max_displacement = wp.full(
             model.body_count, rigid_soft_max_displacement, dtype=float, device=self.device
         )
+
+    def _resolve_rigid_soft_dat_body_truncation(self, contacts: Contacts, body_q: wp.array[wp.transform]):
+        """Resolve the final body scalar, then audit that exact endpoint against every row."""
+        wp.launch(
+            kernel=resolve_body_truncation_ts,
+            dim=self.model.body_count,
+            inputs=[
+                self.body_q_prev_collision_detection,
+                body_q,
+                self.model.body_com,
+                self._rigid_dat_body_bounding_radius,
+                self._rigid_dat_body_max_displacement,
+            ],
+            outputs=[self.body_truncation_ts, self._rigid_dat_resolved_body_q],
+            device=self.device,
+        )
+        if contacts.soft_contact_max > 0:
+            wp.launch(
+                kernel=validate_rigid_soft_dat_body_endpoints,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_rigid_indices,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
+                    self.body_q_prev_collision_detection,
+                    self._rigid_dat_resolved_body_q,
+                    self._rigid_soft_dat_plane_normals,
+                    self._rigid_soft_dat_plane_anchors,
+                    self._rigid_soft_dat_plane_offsets,
+                    self._rigid_soft_dat_plane_valid,
+                ],
+                outputs=[self.body_truncation_ts],
+                device=self.device,
+            )
 
     def _init_rigid_dat_body_bounding_radius(self, model: Model):
         """Compute a conservative surface radius about each rigid body's COM.
@@ -2691,6 +2779,33 @@ class SolverVBD(SolverBase, CouplingInterface):
     ):
         """Run selected collision detectors, then reset their DAT references."""
         if run_rigid_collision:
+            if self.rigid_enable_penetration_free:
+                contacts = self._pipeline_contacts
+                wp.launch(
+                    kernel=snapshot_rigid_soft_dat_planes,
+                    dim=max(contacts.soft_contact_max, 1),
+                    inputs=[
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_indices,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_rigid_indices,
+                        self._rigid_soft_dat_plane_normals,
+                        self._rigid_soft_dat_plane_anchors,
+                        self._rigid_soft_dat_plane_offsets,
+                        self._rigid_soft_dat_plane_valid,
+                    ],
+                    outputs=[
+                        self._previous_rigid_soft_dat_contact_count,
+                        self._previous_rigid_soft_dat_contact_indices,
+                        self._previous_rigid_soft_dat_contact_shape,
+                        self._previous_rigid_soft_dat_contact_rigid_indices,
+                        self._previous_rigid_soft_dat_plane_normals,
+                        self._previous_rigid_soft_dat_plane_anchors,
+                        self._previous_rigid_soft_dat_plane_offsets,
+                        self._previous_rigid_soft_dat_plane_valid,
+                    ],
+                    device=self.device,
+                )
             self._run_rigid_collision(state)
         if run_soft_self_collision:
             self._collision_detection_penetration_free(state, reset_reference=False)
@@ -2740,25 +2855,37 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_q_prev_collision_detection,
                     body_q,
                     self.model.body_com,
+                    self._previous_rigid_soft_dat_contact_count,
+                    self._previous_rigid_soft_dat_contact_indices,
+                    self._previous_rigid_soft_dat_contact_shape,
+                    self._previous_rigid_soft_dat_contact_rigid_indices,
+                    self._previous_rigid_soft_dat_plane_normals,
+                    self._previous_rigid_soft_dat_plane_anchors,
+                    self._previous_rigid_soft_dat_plane_offsets,
+                    self._previous_rigid_soft_dat_plane_valid,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_dat_use_interval_arithmetic,
                 ],
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
+                    self._rigid_soft_dat_plane_normals,
+                    self._rigid_soft_dat_plane_anchors,
+                    self._rigid_soft_dat_plane_offsets,
+                    self._rigid_soft_dat_plane_valid,
                 ],
                 device=self.device,
             )
+
+        self._resolve_rigid_soft_dat_body_truncation(contacts, body_q)
 
         wp.launch(
             kernel=apply_body_truncation_ts,
             dim=self.model.body_count,
             inputs=[
                 self.body_q_prev_collision_detection,
-                self.model.body_com,
+                self._rigid_dat_resolved_body_q,
                 self.body_truncation_ts,
-                self._rigid_dat_body_bounding_radius,
-                self._rigid_dat_body_max_displacement,
             ],
             outputs=[
                 body_q,
@@ -2836,15 +2963,33 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_q_prev_collision_detection,
                     state.body_q,
                     self.model.body_com,
+                    self._previous_rigid_soft_dat_contact_count,
+                    self._previous_rigid_soft_dat_contact_indices,
+                    self._previous_rigid_soft_dat_contact_shape,
+                    self._previous_rigid_soft_dat_contact_rigid_indices,
+                    self._previous_rigid_soft_dat_plane_normals,
+                    self._previous_rigid_soft_dat_plane_anchors,
+                    self._previous_rigid_soft_dat_plane_offsets,
+                    self._previous_rigid_soft_dat_plane_valid,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_dat_use_interval_arithmetic,
                 ],
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
+                    self._rigid_soft_dat_plane_normals,
+                    self._rigid_soft_dat_plane_anchors,
+                    self._rigid_soft_dat_plane_offsets,
+                    self._rigid_soft_dat_plane_valid,
                 ],
                 device=self.device,
             )
+
+            # The row kernels compute per-contact factors. Resolve their
+            # body-wide minimum and motion cap, then validate the exact float32
+            # endpoint before either side's proposal is committed.
+            if self.model.body_count > 0:
+                self._resolve_rigid_soft_dat_body_truncation(contacts, state.body_q)
 
         wp.launch(
             kernel=apply_truncation_ts,
@@ -2862,16 +3007,46 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
+        if rigid_dat_active and contacts.soft_contact_max > 0:
+            # Audit the exact stored particle endpoints after all row minima and
+            # the isotropic displacement cap have been applied. A failed row
+            # restores only its affected vertices to the common reference.
+            wp.launch(
+                kernel=validate_rigid_soft_dat_particle_endpoints,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_indices,
+                    self.pos_prev_collision_detection,
+                    state.particle_q,
+                    self._rigid_soft_dat_plane_normals,
+                    self._rigid_soft_dat_plane_anchors,
+                    self._rigid_soft_dat_plane_offsets,
+                    self._rigid_soft_dat_plane_valid,
+                ],
+                outputs=[self.truncation_ts],
+                device=self.device,
+            )
+            wp.launch(
+                kernel=restore_invalid_rigid_soft_dat_particle_endpoints,
+                dim=self.model.particle_count,
+                inputs=[self.pos_prev_collision_detection],
+                outputs=[
+                    self.truncation_ts,
+                    self.particle_displacements,
+                    state.particle_q,
+                ],
+                device=self.device,
+            )
+
         if rigid_dat_active and self.model.body_count > 0:
             wp.launch(
                 kernel=apply_body_truncation_ts,
                 dim=self.model.body_count,
                 inputs=[
                     self.body_q_prev_collision_detection,
-                    self.model.body_com,
+                    self._rigid_dat_resolved_body_q,
                     self.body_truncation_ts,
-                    self._rigid_dat_body_bounding_radius,
-                    self._rigid_dat_body_max_displacement,
                 ],
                 outputs=[
                     state.body_q,

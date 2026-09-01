@@ -6861,6 +6861,12 @@ DAT_FEATURE_CROSS_SIN_EPS = wp.constant(1.0e-4)
 
 
 @wp.func
+def _dat_plane_value(x: wp.vec3, n: wp.vec3, plane_anchor: wp.vec3, plane_offset: float):
+    """Evaluate ``dot(n, x - anchor) - offset`` without forming a distant plane point."""
+    return wp.dot(n, x - plane_anchor) - plane_offset
+
+
+@wp.func
 def _certify_primitive_pair_separator(
     raw_n: wp.vec3,
     soft_vertices: wp.mat33,
@@ -6896,11 +6902,14 @@ def _certify_primitive_pair_separator(
             rigid_projection = projection
             rigid_support = vertex
 
-    gap = soft_projection - rigid_projection
+    # Re-evaluate the final support pair directly. The support search uses a
+    # nearby projection origin, but subtracting those two scalar projections
+    # can still discard a sub-ULP gap.
+    gap = wp.dot(n, soft_support - rigid_support)
     # Closed half-spaces at zero gap do not preserve strict material-primitive
     # separation: VT/TV can intersect tangentially in a face plane just as EE
-    # can cross inside a shared plane. DAT's backoff should keep a safe reference
-    # strictly separated, so every zero-gap row fails closed.
+    # can cross inside a shared plane. A newly built primitive separator must be
+    # strict, so every zero-gap row fails closed.
     valid = gap > 0.0
     return valid, n, soft_support, rigid_support, gap
 
@@ -7135,20 +7144,197 @@ def find_primitive_pair_separator(
 
 
 @wp.func
-def planar_truncation_t(v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, gamma_r: float, gamma_min: float = 1e-3):
+def fit_primitive_pair_plane_offset(
+    soft_indices: wp.vec3i,
+    rigid_indices: wp.vec3i,
+    particle_q_ref: wp.array[wp.vec3],
+    rigid_mesh: wp.uint64,
+    rigid_scale: wp.vec3,
+    X_wr_ref: wp.transform,
+    n: wp.vec3,
+    plane_anchor: wp.vec3,
+    requested_offset: float,
+):
+    """Fit a requested plane offset to the pair's representable separating interval.
+
+    With ``plane_anchor`` fixed, every rigid vertex requires
+    ``offset >= dot(n, x_rigid - anchor)`` and every soft vertex requires
+    ``offset <= dot(n, x_soft - anchor)``. Computing those bounds with the exact
+    float32 expression used downstream avoids rejecting a mathematically valid
+    plane merely because its adaptively interpolated endpoint rounded outward.
+    """
+    rigid_offset_lower = _dat_plane_value(
+        wp.transform_point(
+            X_wr_ref,
+            wp.cw_mul(wp.mesh_get_point(rigid_mesh, rigid_indices[0]), rigid_scale),
+        ),
+        n,
+        plane_anchor,
+        0.0,
+    )
+    soft_offset_upper = _dat_plane_value(
+        particle_q_ref[soft_indices[0]],
+        n,
+        plane_anchor,
+        0.0,
+    )
+
+    for i in range(1, 3):
+        soft_index = soft_indices[i]
+        if soft_index >= 0:
+            soft_offset_upper = wp.min(
+                soft_offset_upper,
+                _dat_plane_value(particle_q_ref[soft_index], n, plane_anchor, 0.0),
+            )
+
+        rigid_index = rigid_indices[i]
+        if rigid_index >= 0:
+            x_rigid = wp.transform_point(
+                X_wr_ref,
+                wp.cw_mul(wp.mesh_get_point(rigid_mesh, rigid_index), rigid_scale),
+            )
+            rigid_offset_lower = wp.max(
+                rigid_offset_lower,
+                _dat_plane_value(x_rigid, n, plane_anchor, 0.0),
+            )
+
+    if (
+        not wp.isfinite(rigid_offset_lower)
+        or not wp.isfinite(soft_offset_upper)
+        or not wp.isfinite(requested_offset)
+        or rigid_offset_lower >= soft_offset_upper
+    ):
+        return False, requested_offset
+    return True, wp.clamp(requested_offset, rigid_offset_lower, soft_offset_upper)
+
+
+@wp.func
+def recover_previous_primitive_pair_plane(
+    shape_index: int,
+    soft_indices: wp.vec3i,
+    rigid_indices: wp.vec3i,
+    particle_q_ref: wp.array[wp.vec3],
+    rigid_mesh: wp.uint64,
+    rigid_scale: wp.vec3,
+    X_wr_ref: wp.transform,
+    previous_contact_count: wp.array[wp.int32],
+    previous_contact_indices: wp.array[wp.vec3i],
+    previous_contact_shape: wp.array[wp.int32],
+    previous_contact_rigid_indices: wp.array[wp.vec3i],
+    previous_plane_normals: wp.array[wp.vec3],
+    previous_plane_anchors: wp.array[wp.vec3],
+    previous_plane_offsets: wp.array[float],
+    previous_plane_valid: wp.array[wp.int32],
+):
+    """Recover an exact pair's preceding plane if it still separates the pair.
+
+    Dense BVH append order is not stable between detections, so a failed
+    separator rebuild scans the preceding contact set by primitive identity
+    rather than assuming row indices persist. This path is invoked only after
+    fresh separator construction fails. The cached plane is never trusted on
+    identity alone: it is recertified against the complete current primitives.
+    """
+    previous_index = int(0)
+    while previous_index < previous_contact_count[0]:
+        previous_soft = previous_contact_indices[previous_index]
+        previous_rigid = previous_contact_rigid_indices[previous_index]
+        exact_pair = (
+            previous_plane_valid[previous_index] != 0
+            and previous_contact_shape[previous_index] == shape_index
+            and previous_soft[0] == soft_indices[0]
+            and previous_soft[1] == soft_indices[1]
+            and previous_soft[2] == soft_indices[2]
+            and previous_rigid[0] == rigid_indices[0]
+            and previous_rigid[1] == rigid_indices[1]
+            and previous_rigid[2] == rigid_indices[2]
+        )
+        if exact_pair:
+            previous_n = previous_plane_normals[previous_index]
+            previous_anchor = previous_plane_anchors[previous_index]
+            valid, fitted_offset = fit_primitive_pair_plane_offset(
+                soft_indices,
+                rigid_indices,
+                particle_q_ref,
+                rigid_mesh,
+                rigid_scale,
+                X_wr_ref,
+                previous_n,
+                previous_anchor,
+                previous_plane_offsets[previous_index],
+            )
+            if valid:
+                return True, previous_n, previous_anchor, fitted_offset, previous_index
+        previous_index += 1
+
+    return False, wp.vec3(0.0), wp.vec3(0.0), float(0.0), int(-1)
+
+
+@wp.kernel
+def snapshot_rigid_soft_dat_planes(
+    contact_count: wp.array[wp.int32],
+    contact_indices: wp.array[wp.vec3i],
+    contact_shape: wp.array[wp.int32],
+    contact_rigid_indices: wp.array[wp.vec3i],
+    plane_normals: wp.array[wp.vec3],
+    plane_anchors: wp.array[wp.vec3],
+    plane_offsets: wp.array[float],
+    plane_valid: wp.array[wp.int32],
+    previous_contact_count: wp.array[wp.int32],
+    previous_contact_indices: wp.array[wp.vec3i],
+    previous_contact_shape: wp.array[wp.int32],
+    previous_contact_rigid_indices: wp.array[wp.vec3i],
+    previous_plane_normals: wp.array[wp.vec3],
+    previous_plane_anchors: wp.array[wp.vec3],
+    previous_plane_offsets: wp.array[float],
+    previous_plane_valid: wp.array[wp.int32],
+):
+    """Snapshot active primitive identities and planes before detection reuses the rows."""
+    contact_index = wp.tid()
+    stored_count = wp.min(contact_count[0], previous_contact_indices.shape[0])
+    if contact_index == 0:
+        # Contact emitters keep incrementing the attempted count after the
+        # fixed buffer overflows. Never expose that unbounded counter to the
+        # later previous-row scan.
+        previous_contact_count[0] = stored_count
+    if contact_index >= stored_count:
+        return
+
+    previous_contact_indices[contact_index] = contact_indices[contact_index]
+    previous_contact_shape[contact_index] = contact_shape[contact_index]
+    previous_contact_rigid_indices[contact_index] = contact_rigid_indices[contact_index]
+    previous_plane_normals[contact_index] = plane_normals[contact_index]
+    previous_plane_anchors[contact_index] = plane_anchors[contact_index]
+    previous_plane_offsets[contact_index] = plane_offsets[contact_index]
+    previous_plane_valid[contact_index] = plane_valid[contact_index]
+
+    # Detection may append the new contacts in a different row order. No
+    # current row owns a plane until the next DAT pass rebuilds or recovers it.
+    plane_valid[contact_index] = 0
+
+
+@wp.func
+def planar_truncation_t(
+    v: wp.vec3,
+    delta_v: wp.vec3,
+    n: wp.vec3,
+    plane_anchor: wp.vec3,
+    plane_offset: float,
+    gamma_r: float,
+    gamma_min: float = 1e-3,
+):
     """Keep a straight vertex trajectory in the positive plane half-space.
 
-    The allowed side satisfies ``dot(n, x - d) >= 0``. Endpoint signs, rather
-    than an absolute displacement tolerance, determine whether the segment
-    crosses the plane. A wrong-side start may move toward the allowed side but
-    may not make its signed distance more negative.
+    The allowed side satisfies ``dot(n, x - plane_anchor) - plane_offset >= 0``.
+    Endpoint signs, rather than an absolute displacement tolerance, determine
+    whether the segment crosses the plane. A wrong-side start may move toward
+    the allowed side but may not make its signed distance more negative.
     """
-    s0 = wp.dot(n, v - d)
+    s0 = _dat_plane_value(v, n, plane_anchor, plane_offset)
     normal_displacement = wp.dot(n, delta_v)
     # Evaluate the endpoint exactly as it will be stored. At sub-ULP gaps,
     # ``s0 + dot(n, delta_v)`` can remain positive even though ``v + delta_v``
     # rounds onto the plane.
-    s1 = wp.dot(n, v + delta_v - d)
+    s1 = _dat_plane_value(v + delta_v, n, plane_anchor, plane_offset)
 
     if s0 < 0.0:
         if s1 >= s0:
@@ -7171,7 +7357,7 @@ def planar_truncation_t(v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, ga
     # from DAT's analytic backoff using the endpoint signs evaluated above.
     t = s0 / (s0 - s1)
     t = wp.clamp(wp.min(t * gamma_r, t - gamma_min), 0.0, 1.0)
-    if wp.dot(n, v + t * delta_v - d) > 0.0:
+    if _dat_plane_value(v + t * delta_v, n, plane_anchor, plane_offset) > 0.0:
         return t
 
     # For sub-ULP clearances the backed-off endpoint may round onto the plane.
@@ -7181,7 +7367,7 @@ def planar_truncation_t(v: wp.vec3, delta_v: wp.vec3, n: wp.vec3, d: wp.vec3, ga
     t_unsafe = t
     for _ in range(24):
         t_mid = 0.5 * (t_safe + t_unsafe)
-        if wp.dot(n, v + t_mid * delta_v - d) > 0.0:
+        if _dat_plane_value(v + t_mid * delta_v, n, plane_anchor, plane_offset) > 0.0:
             t_safe = t_mid
         else:
             t_unsafe = t_mid
@@ -7207,6 +7393,45 @@ def rigid_pose_delta(q_ref: wp.transform, q_cur: wp.transform, com: wp.vec3):
 
 
 @wp.func
+def _rigid_body_pose_from_delta_at_t(
+    q_ref: wp.transform,
+    q_cur: wp.transform,
+    com: wp.vec3,
+    c0: wp.vec3,
+    dx: wp.vec3,
+    axis: wp.vec3,
+    angle: float,
+    t: float,
+):
+    """Construct the realized pose from a precomputed rigid pose delta."""
+    if t <= 0.0:
+        return q_ref
+    if t >= 1.0:
+        return q_cur
+
+    c_new = c0 + t * dx
+    q_rot = wp.transform_get_rotation(q_ref)
+    ta = t * angle
+    if wp.abs(ta) > _SMALL_ANGLE_EPS:
+        q_new = wp.normalize(wp.quat_from_axis_angle(axis, ta) * q_rot)
+    else:
+        half_w = axis * (ta * 0.5)
+        q_new = wp.normalize(wp.quat(half_w[0], half_w[1], half_w[2], 1.0) * q_rot)
+    return wp.transform(c_new - wp.quat_rotate(q_new, com), q_new)
+
+
+@wp.func
+def rigid_body_pose_at_t(q_ref: wp.transform, q_cur: wp.transform, com: wp.vec3, t: float):
+    """Construct the body pose realized by ``apply_body_truncation_ts`` at ``t``.
+
+    The endpoint branches preserve the exact stored reference/proposal poses.
+    Intermediate poses interpolate COM translation and shortest-arc rotation.
+    """
+    c0, dx, axis, angle = rigid_pose_delta(q_ref, q_cur, com)
+    return _rigid_body_pose_from_delta_at_t(q_ref, q_cur, com, c0, dx, axis, angle, t)
+
+
+@wp.func
 def rigid_point_trajectory(
     t: float, c0: wp.vec3, dx: wp.vec3, axis: wp.vec3, angle: float, offset0: wp.vec3
 ) -> wp.vec3:
@@ -7223,10 +7448,98 @@ def rigid_point_trajectory(
 
 
 @wp.func
+def rigid_shape_point_at_t(
+    q_ref: wp.transform,
+    q_cur: wp.transform,
+    com: wp.vec3,
+    shape_pose: wp.transform,
+    x_shape: wp.vec3,
+    t: float,
+):
+    """Transform a shape-local point through the exact body pose realized at ``t``."""
+    q_t = rigid_body_pose_at_t(q_ref, q_cur, com, t)
+    return wp.transform_point(wp.transform_multiply(q_t, shape_pose), x_shape)
+
+
+@wp.func
+def _rigid_shape_point_from_delta_at_t(
+    q_ref: wp.transform,
+    q_cur: wp.transform,
+    com: wp.vec3,
+    c0: wp.vec3,
+    dx: wp.vec3,
+    axis: wp.vec3,
+    angle: float,
+    shape_pose: wp.transform,
+    x_shape: wp.vec3,
+    t: float,
+):
+    q_t = _rigid_body_pose_from_delta_at_t(q_ref, q_cur, com, c0, dx, axis, angle, t)
+    return wp.transform_point(wp.transform_multiply(q_t, shape_pose), x_shape)
+
+
+@wp.func
+def rigid_shape_point_transform_truncation_t(
+    n: wp.vec3,
+    plane_anchor: wp.vec3,
+    plane_offset: float,
+    q_ref: wp.transform,
+    q_cur: wp.transform,
+    com: wp.vec3,
+    shape_pose: wp.transform,
+    x_shape: wp.vec3,
+    candidate_t: float,
+):
+    """Tighten ``candidate_t`` until the realized float32 rigid point is safe.
+
+    ``rigid_trajectory_truncation_t`` certifies the continuous analytic path.
+    This second check accounts for float32 differences between that trajectory
+    and the body/shape transform sequence used by collision geometry.
+    """
+    c0, dx, axis, angle = rigid_pose_delta(q_ref, q_cur, com)
+    x0 = _rigid_shape_point_from_delta_at_t(
+        q_ref, q_cur, com, c0, dx, axis, angle, shape_pose, x_shape, 0.0
+    )
+    s0 = _dat_plane_value(x0, n, plane_anchor, plane_offset)
+    x_candidate = _rigid_shape_point_from_delta_at_t(
+        q_ref, q_cur, com, c0, dx, axis, angle, shape_pose, x_shape, candidate_t
+    )
+    s_candidate = _dat_plane_value(x_candidate, n, plane_anchor, plane_offset)
+
+    # Preserve the existing wrong-side policy: permit strict recovery, but do
+    # not claim a safe-side bracket that does not exist at t=0.
+    if s0 > 0.0:
+        if s_candidate < s0:
+            return candidate_t
+        return 0.0
+
+    # The rigid primitive owns the negative half-space. Require a strictly
+    # negative realized endpoint so rounding onto the plane also backs off.
+    if s_candidate < 0.0:
+        return candidate_t
+    if s0 == 0.0 or candidate_t <= 0.0:
+        return 0.0
+
+    t_safe = float(0.0)
+    t_unsafe = candidate_t
+    for _iteration in range(24):
+        t_mid = 0.5 * (t_safe + t_unsafe)
+        x_mid = _rigid_shape_point_from_delta_at_t(
+            q_ref, q_cur, com, c0, dx, axis, angle, shape_pose, x_shape, t_mid
+        )
+        if _dat_plane_value(x_mid, n, plane_anchor, plane_offset) < 0.0:
+            t_safe = t_mid
+        else:
+            t_unsafe = t_mid
+    return t_safe
+
+
+@wp.func
 def _rigid_trajectory_prefix_is_interval_safe(
     t: float,
     n: wp.vec3,
-    d: wp.vec3,
+    plane_anchor: wp.vec3,
+    plane_offset: float,
     c0: wp.vec3,
     dx: wp.vec3,
     axis: wp.vec3,
@@ -7236,7 +7549,9 @@ def _rigid_trajectory_prefix_is_interval_safe(
 ) -> bool:
     """Certify that the complete prefix trajectory ``[0, t]`` stays safe."""
 
-    trajectory_range = rigid_point_plane_signed_distance_interval(0.0, t, n, d, c0, dx, axis, angle, offset0)
+    trajectory_range = rigid_point_plane_signed_distance_interval(
+        0.0, t, n, plane_anchor, plane_offset, c0, dx, axis, angle, offset0
+    )
     if trajectory_range.upper < 0.0:
         return True
 
@@ -7255,7 +7570,8 @@ def _rigid_trajectory_prefix_is_interval_safe(
 @wp.func
 def rigid_trajectory_truncation_t(
     n: wp.vec3,
-    d: wp.vec3,
+    plane_anchor: wp.vec3,
+    plane_offset: float,
     c0: wp.vec3,
     dx: wp.vec3,
     axis: wp.vec3,
@@ -7275,8 +7591,9 @@ def rigid_trajectory_truncation_t(
 
     Args:
         n: World-space plane normal away from the rigid side. The allowed rigid
-            side satisfies ``dot(n, x - d) < 0``.
-        d: A world-space point on the division plane.
+            side satisfies ``dot(n, x - plane_anchor) - plane_offset < 0``.
+        plane_anchor: World-space support point used as the projection origin.
+        plane_offset: Signed plane offset from ``plane_anchor`` along ``n`` [m].
         c0: Body center of mass in world space at the reference pose (``t = 0``).
         dx: Proposed world-space COM displacement from the reference pose to the
             current pose. The trajectory translates the COM as ``c0 + t * dx``.
@@ -7304,11 +7621,15 @@ def rigid_trajectory_truncation_t(
     """
     # Algorithm 1, Stage 1: locate the first sampled sign change, then refine
     # that pointwise root bracket by ordinary bisection.
-    s0 = wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
+    s0 = _dat_plane_value(
+        rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0), n, plane_anchor, plane_offset
+    )
     candidate_t = float(1.0)
     crossed = bool(False)
     if s0 > 0.0:
-        s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
+        s_end = _dat_plane_value(
+            rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0), n, plane_anchor, plane_offset
+        )
         # Algorithm 1 assumes a valid starting half-space. If a persistent
         # plane is already violated, permit only strict endpoint recovery and
         # skip Stage 2, whose safe-prefix test cannot certify t=0.
@@ -7320,7 +7641,9 @@ def rigid_trajectory_truncation_t(
         t_hi = float(1.0)
         for k in range(trajectory_samples):
             t_k = float(k + 1) / float(trajectory_samples)
-            s_k = wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d)
+            s_k = _dat_plane_value(
+                rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0), n, plane_anchor, plane_offset
+            )
             if s_k > 0.0:
                 t_lo = float(k) / float(trajectory_samples)
                 t_hi = t_k
@@ -7330,7 +7653,12 @@ def rigid_trajectory_truncation_t(
         if crossed:
             for _j in range(DAT_BISECTION_ITERATIONS):
                 t_mid = 0.5 * (t_lo + t_hi)
-                s_mid = wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d)
+                s_mid = _dat_plane_value(
+                    rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0),
+                    n,
+                    plane_anchor,
+                    plane_offset,
+                )
                 if s_mid <= 0.0:
                     t_lo = t_mid
                 else:
@@ -7339,7 +7667,7 @@ def rigid_trajectory_truncation_t(
 
     if use_interval_arithmetic:
         if not _rigid_trajectory_prefix_is_interval_safe(
-            candidate_t, n, d, c0, dx, axis, angle, offset0, s0
+            candidate_t, n, plane_anchor, plane_offset, c0, dx, axis, angle, offset0, s0
         ):
             # Algorithm 1, Stage 2: prefix safety is monotone. Search for the
             # largest t whose complete trajectory prefix can be certified safe.
@@ -7347,7 +7675,9 @@ def rigid_trajectory_truncation_t(
             t_hi = candidate_t
             for _j in range(DAT_BISECTION_ITERATIONS):
                 t_mid = 0.5 * (t_lo + t_hi)
-                if _rigid_trajectory_prefix_is_interval_safe(t_mid, n, d, c0, dx, axis, angle, offset0, s0):
+                if _rigid_trajectory_prefix_is_interval_safe(
+                    t_mid, n, plane_anchor, plane_offset, c0, dx, axis, angle, offset0, s0
+                ):
                     t_lo = t_mid
                 else:
                     t_hi = t_mid
@@ -7378,11 +7708,23 @@ def apply_rigid_soft_truncation(
     body_q_ref: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
+    previous_contact_count: wp.array[wp.int32],
+    previous_contact_indices: wp.array[wp.vec3i],
+    previous_contact_shape: wp.array[wp.int32],
+    previous_contact_rigid_indices: wp.array[wp.vec3i],
+    previous_plane_normals: wp.array[wp.vec3],
+    previous_plane_anchors: wp.array[wp.vec3],
+    previous_plane_offsets: wp.array[float],
+    previous_plane_valid: wp.array[wp.int32],
     gamma: float,
     use_interval_arithmetic: bool,
     # outputs
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
+    dat_plane_normals: wp.array[wp.vec3],
+    dat_plane_anchors: wp.array[wp.vec3],
+    dat_plane_offsets: wp.array[float],
+    dat_plane_valid: wp.array[wp.int32],
 ):
     """Joint DAT truncation for one rigid-soft contact: build the division plane from the
     reference configuration and atomically min-reduce the truncation scalars of the soft
@@ -7410,6 +7752,10 @@ def apply_rigid_soft_truncation(
     if contact_index >= soft_contact_count[0]:
         return
 
+    # The collision buffer is reused. Explicitly invalidate every active slot
+    # until this invocation has constructed its exact division plane.
+    dat_plane_valid[contact_index] = 0
+
     indices = soft_contact_indices[contact_index]
     if indices[0] < 0:
         return
@@ -7434,6 +7780,9 @@ def apply_rigid_soft_truncation(
     # contact position on body, transformed to world frame
     bx0 = wp.transform_point(X_wb_ref, soft_contact_body_pos[contact_index])
 
+    recovered_previous_plane = bool(False)
+    previous_plane_anchor = wp.vec3(0.0)
+    previous_plane_offset = float(0.0)
     if rigid_indices[0] >= 0:
         # Dense BVH rows load the complete primitive vertices at this reference
         # state and certify the plane before accepting it.
@@ -7449,6 +7798,31 @@ def apply_rigid_soft_truncation(
             X_wr_ref,
             soft_contact_normal[contact_index],
         )
+        if not valid_plane:
+            (
+                valid_plane,
+                n,
+                previous_plane_anchor,
+                previous_plane_offset,
+                _previous_contact_index,
+            ) = recover_previous_primitive_pair_plane(
+                shape_index,
+                indices,
+                rigid_indices,
+                pos_prev_collision_detection,
+                mesh,
+                shape_scale[shape_index],
+                X_wr_ref,
+                previous_contact_count,
+                previous_contact_indices,
+                previous_contact_shape,
+                previous_contact_rigid_indices,
+                previous_plane_normals,
+                previous_plane_anchors,
+                previous_plane_offsets,
+                previous_plane_valid,
+            )
+            recovered_previous_plane = valid_plane
         if not valid_plane:
             wp.printf(
                 "Rigid-soft DAT found no separating normal for BVH row %d: "
@@ -7489,47 +7863,123 @@ def apply_rigid_soft_truncation(
         c0, dx_body, rot_axis, rot_angle = rigid_pose_delta(X_wb_ref, body_q[body_index], body_com[body_index])
         body_is_moving = wp.length_sq(dx_body) > 0.0 or rot_angle != 0.0
 
-    # Adaptive plane placement follows Planar-DAT Eq. (10)/(12): each side's
-    # approach is the maximum normal displacement of the complete paired
-    # primitive, not the displacement interpolated at its closest point.
-    # Here n points from the rigid primitive toward the soft primitive.
-    delta_soft = float(0.0)
-    for i in range(3):
-        vi = indices[i]
-        if vi >= 0:
-            delta_soft = wp.max(delta_soft, -wp.dot(n, particle_displacements[vi]))
-    delta_rigid = float(0.0)
-    if body_is_moving:
-        if rigid_indices[0] >= 0:
-            # BVH mesh query
-            mesh = shape_source_ptr[shape_index]
-            X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
-            X_wr_end = wp.transform_multiply(body_q[body_index], shape_transform[shape_index])
-            for i in range(3):
-                rigid_index = rigid_indices[i]
-                if rigid_index >= 0:
-                    x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
-                    x_rigid_ref = wp.transform_point(X_wr_ref, x_shape)
-                    x_rigid_end = wp.transform_point(X_wr_end, x_shape)
-                    delta_rigid = wp.max(delta_rigid, wp.dot(n, x_rigid_end - x_rigid_ref))
-        else:
-            # SDF query
-            anchor_end = wp.transform_point(body_q[body_index], soft_contact_body_pos[contact_index])
-            delta_rigid = wp.max(wp.dot(n, anchor_end - bx0), 0.0)
-
-    lmbd = float(0.5)
-    if delta_soft + delta_rigid > 0.0:
-        lmbd = delta_rigid / (delta_rigid + delta_soft)
-
-    if rigid_indices[0] >= 0:
-        # BVH: interpolate the certified support points, preserving either
-        # endpoint exactly when lambda reaches 0 or 1.
-        d = (1.0 - lmbd) * bx0 + lmbd * x_ref
+    if recovered_previous_plane:
+        # This exact pair's preceding plane still certifies the complete current
+        # primitives. Keep its world-space representation instead of rebuilding
+        # a different plane from a nanometer-scale float32 closest-point gap.
+        plane_anchor = previous_plane_anchor
+        plane_offset = previous_plane_offset
     else:
-        # SDF: place the plane along the contact normal from the rigid witness.
-        # Because gap is clamped to zero for existing penetration, the recovery
-        # plane remains at the rigid surface.
-        d = bx0 + (lmbd * gap) * n
+        # Adaptive plane placement follows Planar-DAT Eq. (10)/(12): each side's
+        # approach is the maximum normal displacement of the complete paired
+        # primitive, not the displacement interpolated at its closest point.
+        # Here n points from the rigid primitive toward the soft primitive.
+        delta_soft = float(0.0)
+        for i in range(3):
+            vi = indices[i]
+            if vi >= 0:
+                delta_soft = wp.max(delta_soft, -wp.dot(n, particle_displacements[vi]))
+        delta_rigid = float(0.0)
+        if body_is_moving:
+            if rigid_indices[0] >= 0:
+                # BVH mesh query
+                mesh = shape_source_ptr[shape_index]
+                X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
+                X_wr_end = wp.transform_multiply(body_q[body_index], shape_transform[shape_index])
+                for i in range(3):
+                    rigid_index = rigid_indices[i]
+                    if rigid_index >= 0:
+                        x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
+                        x_rigid_ref = wp.transform_point(X_wr_ref, x_shape)
+                        x_rigid_end = wp.transform_point(X_wr_end, x_shape)
+                        delta_rigid = wp.max(delta_rigid, wp.dot(n, x_rigid_end - x_rigid_ref))
+            else:
+                # SDF query
+                anchor_end = wp.transform_point(body_q[body_index], soft_contact_body_pos[contact_index])
+                delta_rigid = wp.max(wp.dot(n, anchor_end - bx0), 0.0)
+
+        lmbd = float(0.5)
+        if delta_soft + delta_rigid > 0.0:
+            lmbd = delta_rigid / (delta_rigid + delta_soft)
+
+        # Represent the plane relative to the rigid support instead of adding a
+        # potentially sub-ULP offset to a meter-scale world coordinate.
+        plane_anchor = bx0
+        plane_offset = lmbd * gap
+
+    if rigid_indices[0] >= 0 and not recovered_previous_plane:
+        # Certification of the separator normal precedes adaptive placement.
+        # Fit the requested offset to the actual float32 interval that keeps all
+        # vertices on their assigned sides before exposing the plane downstream.
+        valid_plane, plane_offset = fit_primitive_pair_plane_offset(
+            indices,
+            rigid_indices,
+            pos_prev_collision_detection,
+            mesh,
+            shape_scale[shape_index],
+            X_wr_ref,
+            n,
+            plane_anchor,
+            plane_offset,
+        )
+        if not valid_plane:
+            # Fresh normal construction can retain a tiny positive support gap
+            # while the separately compiled placement expression collapses its
+            # representable offset interval. The same exact-pair recovery used
+            # above is also the safe fallback for this second construction
+            # failure, and still recertifies all current primitive vertices.
+            (
+                valid_plane,
+                n,
+                plane_anchor,
+                plane_offset,
+                _previous_contact_index,
+            ) = recover_previous_primitive_pair_plane(
+                shape_index,
+                indices,
+                rigid_indices,
+                pos_prev_collision_detection,
+                mesh,
+                shape_scale[shape_index],
+                X_wr_ref,
+                previous_contact_count,
+                previous_contact_indices,
+                previous_contact_shape,
+                previous_contact_rigid_indices,
+                previous_plane_normals,
+                previous_plane_anchors,
+                previous_plane_offsets,
+                previous_plane_valid,
+            )
+            recovered_previous_plane = valid_plane
+        if not valid_plane:
+            wp.printf(
+                "Rigid-soft DAT could not represent a separating plane for BVH row %d: "
+                "shape=%d, soft=(%d, %d, %d), rigid=(%d, %d, %d)\n",
+                contact_index,
+                shape_index,
+                indices[0],
+                indices[1],
+                indices[2],
+                rigid_indices[0],
+                rigid_indices[1],
+                rigid_indices[2],
+            )
+            for i in range(3):
+                vi = indices[i]
+                if vi >= 0:
+                    wp.atomic_min(truncation_ts, vi, 0.0)
+            if body_index >= 0:
+                wp.atomic_min(body_truncation_ts, body_index, 0.0)
+            return
+
+    # Retain the exact float32 representation used by this row. The body-wide
+    # reduction can select a different scalar than this row computed, so later
+    # passes validate the actually realized endpoints against this same plane.
+    dat_plane_normals[contact_index] = n
+    dat_plane_anchors[contact_index] = plane_anchor
+    dat_plane_offsets[contact_index] = plane_offset
+    dat_plane_valid[contact_index] = 1
 
     # Soft side: n points toward its allowed positive half-space. Dense BVH
     # rows constrain every vertex of the complete soft primitive.
@@ -7540,7 +7990,14 @@ def apply_rigid_soft_truncation(
         # require every vertex of the paired edge or triangle to stay on its side.
         if vi >= 0:
             x_v = pos_prev_collision_detection[vi]
-            t_v = planar_truncation_t(x_v, particle_displacements[vi], n, d, gamma)
+            t_v = planar_truncation_t(
+                x_v,
+                particle_displacements[vi],
+                n,
+                plane_anchor,
+                plane_offset,
+                gamma,
+            )
             if t_v < 1.0:
                 wp.atomic_min(truncation_ts, vi, t_v)
 
@@ -7559,7 +8016,8 @@ def apply_rigid_soft_truncation(
                     x_rigid_ref = wp.transform_point(X_wr_ref, x_shape)
                     t_v = rigid_trajectory_truncation_t(
                         n,
-                        d,
+                        plane_anchor,
+                        plane_offset,
                         c0,
                         dx_body,
                         rot_axis,
@@ -7569,11 +8027,26 @@ def apply_rigid_soft_truncation(
                         1.0e-3,
                         use_interval_arithmetic,
                     )
+                    t_v = rigid_shape_point_transform_truncation_t(
+                        n,
+                        plane_anchor,
+                        plane_offset,
+                        X_wb_ref,
+                        body_q[body_index],
+                        body_com[body_index],
+                        shape_transform[shape_index],
+                        x_shape,
+                        t_v,
+                    )
+                    # This certifies this row's selected transform-space
+                    # endpoint. The body-wide audit below rechecks the exact
+                    # pose selected after the atomic minimum and motion cap.
                     t_b = wp.min(t_b, t_v)
         else:
             t_b = rigid_trajectory_truncation_t(
                 n,
-                d,
+                plane_anchor,
+                plane_offset,
                 c0,
                 dx_body,
                 rot_axis,
@@ -7588,52 +8061,205 @@ def apply_rigid_soft_truncation(
 
 
 @wp.kernel
-def apply_body_truncation_ts(
+def resolve_body_truncation_ts(
     # inputs
     body_q_ref: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
-    body_truncation_ts: wp.array[float],
     rigid_dat_body_bounding_radius: wp.array[float],
     rigid_dat_body_max_displacement: wp.array[float],
     # input/output
-    body_q: wp.array[wp.transform],
+    body_truncation_ts: wp.array[float],
+    # outputs
+    resolved_body_q: wp.array[wp.transform],
 ):
-    """Scale each body's accumulated pose update (reference -> candidate) by its truncation
-    scalar, interpolating translation and rotation about the COM.
-
-    Also applies the conservative isotropic bound: no point of the body may move farther
-    than its rigid-soft budget (0.5 * gamma * soft-contact query gap) since the
-    last collision detection, using
-    |dx| + |angle| * bounding_radius as an upper bound of the largest point motion.
-    """
+    """Resolve each body scalar and cache the exact pose that scalar realizes."""
     b = wp.tid()
 
     t = body_truncation_ts[b]
-    if t == 0.0:
+    q_ref = body_q_ref[b]
+    q_cur = body_q[b]
+    if t <= 0.0:
+        resolved_body_q[b] = q_ref
+        return
+
+    com = body_com[b]
+    _c0, dx, _axis, angle = rigid_pose_delta(q_ref, q_cur, com)
+
+    motion_bound = wp.length(dx) + wp.abs(angle) * rigid_dat_body_bounding_radius[b]
+    max_point_displacement = rigid_dat_body_max_displacement[b]
+    if motion_bound > max_point_displacement:
+        t = wp.min(t, max_point_displacement / motion_bound)
+        body_truncation_ts[b] = t
+
+    resolved_body_q[b] = rigid_body_pose_at_t(q_ref, q_cur, com, t)
+
+
+@wp.func
+def _rigid_dat_endpoint_is_unsafe(s_ref: float, s_end: float):
+    """Match rigid DAT's wrong-side recovery policy at a realized endpoint."""
+    if s_ref > 0.0:
+        return s_end >= s_ref
+    # A positive body update must finish strictly inside its assigned half-space.
+    # The t=0 case is skipped by the caller and preserves an exactly touching
+    # reference pose without repeatedly normalizing its quaternion.
+    return s_end >= 0.0
+
+
+@wp.func
+def _soft_dat_endpoint_is_unsafe(s_ref: float, s_end: float):
+    """Match the soft straight-ray boundary and wrong-side recovery policies."""
+    if s_ref < 0.0:
+        return s_end < s_ref
+    if s_ref > 0.0:
+        return s_end <= 0.0
+    return s_end < 0.0
+
+
+@wp.kernel
+def validate_rigid_soft_dat_particle_endpoints(
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_indices: wp.array[wp.vec3i],
+    particle_q_ref: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    dat_plane_normals: wp.array[wp.vec3],
+    dat_plane_anchors: wp.array[wp.vec3],
+    dat_plane_offsets: wp.array[float],
+    dat_plane_valid: wp.array[wp.int32],
+    # input/output
+    truncation_ts: wp.array[float],
+):
+    """Set a particle's truncation factor to zero when its stored endpoint is unsafe."""
+    contact_index = wp.tid()
+    if contact_index >= soft_contact_count[0] or dat_plane_valid[contact_index] == 0:
+        return
+
+    n = dat_plane_normals[contact_index]
+    plane_anchor = dat_plane_anchors[contact_index]
+    plane_offset = dat_plane_offsets[contact_index]
+    indices = soft_contact_indices[contact_index]
+    for i in range(3):
+        particle_index = indices[i]
+        if particle_index >= 0:
+            s_ref = _dat_plane_value(particle_q_ref[particle_index], n, plane_anchor, plane_offset)
+            s_end = _dat_plane_value(particle_q[particle_index], n, plane_anchor, plane_offset)
+            if _soft_dat_endpoint_is_unsafe(s_ref, s_end):
+                wp.atomic_min(truncation_ts, particle_index, 0.0)
+
+
+@wp.kernel
+def restore_invalid_rigid_soft_dat_particle_endpoints(
+    particle_q_ref: wp.array[wp.vec3],
+    # input/output
+    truncation_ts: wp.array[float],
+    particle_displacements: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+):
+    """Restore invalid soft endpoints to their exact collision reference."""
+    particle_index = wp.tid()
+    if truncation_ts[particle_index] == 0.0:
+        particle_displacements[particle_index] = wp.vec3(0.0)
+        particle_q[particle_index] = particle_q_ref[particle_index]
+
+
+@wp.kernel
+def validate_rigid_soft_dat_body_endpoints(
+    # contact inputs
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_shape: wp.array[wp.int32],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    shape_body: wp.array[wp.int32],
+    shape_transform: wp.array[wp.transform],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    # candidate body motion and cached row planes
+    body_q_ref: wp.array[wp.transform],
+    resolved_body_q: wp.array[wp.transform],
+    dat_plane_normals: wp.array[wp.vec3],
+    dat_plane_anchors: wp.array[wp.vec3],
+    dat_plane_offsets: wp.array[float],
+    dat_plane_valid: wp.array[wp.int32],
+    # input/output
+    body_truncation_ts: wp.array[float],
+):
+    """Reject a body-wide DAT scalar whose exact float32 endpoint crosses any row plane.
+
+    A contact row first certifies its own scalar, but all rows on one body are
+    subsequently reduced by an atomic minimum and by the isotropic motion cap.
+    Quaternion normalization means that evaluating the realized transform at a
+    smaller scalar is not bitwise guaranteed to preserve row-local safety. This
+    final pass checks the scalar that will actually be applied. If one row is on
+    the wrong side, the affected body returns to its exact common reference pose
+    (``t=0``). This restores a certified row exactly and prevents an already
+    wrong-side row from worsening.
+    """
+    contact_index = wp.tid()
+    if contact_index >= soft_contact_count[0] or dat_plane_valid[contact_index] == 0:
+        return
+
+    shape_index = soft_contact_shape[contact_index]
+    body_index = shape_body[shape_index]
+    if body_index < 0:
+        return
+
+    t = body_truncation_ts[body_index]
+    if t <= 0.0:
+        return
+
+    q_end = resolved_body_q[body_index]
+    n = dat_plane_normals[contact_index]
+    plane_anchor = dat_plane_anchors[contact_index]
+    plane_offset = dat_plane_offsets[contact_index]
+    rigid_indices = soft_contact_rigid_indices[contact_index]
+
+    crossed = bool(False)
+    if rigid_indices[0] >= 0:
+        mesh = shape_source_ptr[shape_index]
+        X_wr_ref = wp.transform_multiply(body_q_ref[body_index], shape_transform[shape_index])
+        X_wr_end = wp.transform_multiply(q_end, shape_transform[shape_index])
+        for i in range(3):
+            rigid_index = rigid_indices[i]
+            if rigid_index >= 0:
+                x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
+                x_ref = wp.transform_point(X_wr_ref, x_shape)
+                x_end = wp.transform_point(X_wr_end, x_shape)
+                if _rigid_dat_endpoint_is_unsafe(
+                    _dat_plane_value(x_ref, n, plane_anchor, plane_offset),
+                    _dat_plane_value(x_end, n, plane_anchor, plane_offset),
+                ):
+                    crossed = True
+    else:
+        # Analytic SDF rows identify only their stored surface point.
+        x_ref = wp.transform_point(body_q_ref[body_index], soft_contact_body_pos[contact_index])
+        x_end = wp.transform_point(q_end, soft_contact_body_pos[contact_index])
+        crossed = _rigid_dat_endpoint_is_unsafe(
+            _dat_plane_value(x_ref, n, plane_anchor, plane_offset),
+            _dat_plane_value(x_end, n, plane_anchor, plane_offset),
+        )
+
+    if crossed:
+        wp.atomic_min(body_truncation_ts, body_index, 0.0)
+
+
+@wp.kernel
+def apply_body_truncation_ts(
+    # inputs
+    body_q_ref: wp.array[wp.transform],
+    resolved_body_q: wp.array[wp.transform],
+    body_truncation_ts: wp.array[float],
+    # input/output
+    body_q: wp.array[wp.transform],
+):
+    """Apply each body's already-resolved DAT scalar about its center of mass."""
+    b = wp.tid()
+
+    t = body_truncation_ts[b]
+    if t <= 0.0:
         # Zero means "remain at the certified reference pose". Reconstructing
         # that pose through a zero-angle quaternion product and normalization
         # changes float32 components by an ULP, which is enough to cross an
         # exactly touching DAT plane.
         body_q[b] = body_q_ref[b]
         return
-
-    q_cur = body_q[b]
-    q_ref = body_q_ref[b]
-    com = body_com[b]
-    c0, dx, axis, angle = rigid_pose_delta(q_ref, q_cur, com)
-
-    motion_bound = wp.length(dx) + wp.abs(angle) * rigid_dat_body_bounding_radius[b]
-    max_point_displacement = rigid_dat_body_max_displacement[b]
-    if motion_bound > max_point_displacement:
-        t = wp.min(t, max_point_displacement / motion_bound)
-
-    if t < 1.0:
-        c_new = c0 + t * dx
-        q_rot = wp.transform_get_rotation(q_ref)
-        ta = t * angle
-        if wp.abs(ta) > _SMALL_ANGLE_EPS:
-            q_new = wp.normalize(wp.quat_from_axis_angle(axis, ta) * q_rot)
-        else:
-            half_w = axis * (ta * 0.5)
-            q_new = wp.normalize(wp.quat(half_w[0], half_w[1], half_w[2], 1.0) * q_rot)
-        body_q[b] = wp.transform(c_new - wp.quat_rotate(q_new, com), q_new)
+    body_q[b] = resolved_body_q[b]
