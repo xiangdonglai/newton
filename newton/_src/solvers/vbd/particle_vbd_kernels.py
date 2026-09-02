@@ -1888,6 +1888,7 @@ def accumulate_contact_force_and_hessian_no_self_contact(
                 contact_normal,
                 shape_margin,
                 dt,
+                False,
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -2335,6 +2336,7 @@ def accumulate_particle_body_contact_force_and_hessian(
     particle_colors: wp.array[int],
     # body-particle contact
     friction_epsilon: float,
+    rigid_body_particle_contact_use_log_barrier: bool,
     particle_radius: wp.array[float],
     body_particle_contact_indices: wp.array[wp.vec3i],
     body_particle_contact_count: wp.array[int],
@@ -2405,6 +2407,7 @@ def accumulate_particle_body_contact_force_and_hessian(
                 contact_normal,
                 shape_margin,
                 dt,
+                rigid_body_particle_contact_use_log_barrier,
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -2433,6 +2436,7 @@ def accumulate_particle_body_contact_force_and_hessian(
             contact_normal,
             shape_margin,
             dt,
+            rigid_body_particle_contact_use_log_barrier,
         )
         for i in range(3):
             ci = corners[i]

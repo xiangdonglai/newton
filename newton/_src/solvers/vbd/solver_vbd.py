@@ -342,6 +342,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_contact_k_start: float = 1.0e2,  # Legacy AVBD contact penalty ramp seed
         rigid_body_contact_buffer_size: int = 64,  # Per-body body-body contact list capacity
         rigid_body_particle_contact_buffer_size: int = 256,  # Per-body soft-contact list capacity (particle + edge/face)
+        rigid_body_particle_contact_use_log_barrier: bool = False,  # Use particle-style normal log barrier
         # Rigid body - joints
         rigid_joint_linear_ke: float = 1.0e5,  # Structural linear joint stiffness
         rigid_joint_angular_ke: float = 1.0e5,  # Structural angular joint stiffness
@@ -517,6 +518,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_body_contact_buffer_size: Max body-body contacts per rigid body for per-body contact lists.
             rigid_body_particle_contact_buffer_size: Max body-particle soft contacts tracked per rigid
                 body, covering both particle-vs-surface and full-surface edge/face contacts.
+            rigid_body_particle_contact_use_log_barrier: Whether body-particle normal contacts use the same C2
+                log-barrier law as particle self-contact. When ``False`` (default), they use the legacy quadratic
+                penalty law.
             rigid_joint_linear_ke: Material stiffness for non-cable structural linear joint slots [N/m].
             rigid_joint_angular_ke: Material stiffness for non-cable structural angular joint slots [N·m/rad].
             rigid_joint_linear_k_start: Linear penalty seed for legacy AVBD ramping [N/m]. Used when
@@ -550,6 +554,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                 (detect before and right after initialization), matching the self-contact slot;
                 raise the detection frequency (``ITERATIONS``) to widen the per-step motion budget
                 for fast bodies. Kinematic bodies move outside the solver and are not truncated.
+
+                The complete-primitive penetration-free argument applies to initially nonintersecting
+                rigid-soft mesh configurations queried through the dense full-surface BVH back-end, with
+                solver-controlled dynamic rigid motion, active consistent collision schedules, and no
+                BVH-candidate or soft-contact buffer overflow. Analytic SDF rows truncate the stored surface
+                point but do not provide equivalent dense primitive-pair coverage for general nonconvex
+                geometry. If either soft-contact overflow warning is reported, primitive pairs were dropped
+                and the penetration-free guarantee does not apply to that collision pass. Sampling and
+                bisection alone can miss a rigid trajectory that crosses and returns between samples; the
+                optional interval path detects such cases but remains experimental.
             rigid_conservative_bound_relaxation: Relaxation factor in (0, 1) applied to rigid DAT
                 truncation scalars and the conservative motion budget. Only used when
                 ``rigid_enable_penetration_free`` is ``True``.
@@ -782,6 +796,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Common parameters
         self.iterations = iterations
         self.friction_epsilon = friction_epsilon
+        self.rigid_body_particle_contact_use_log_barrier = bool(rigid_body_particle_contact_use_log_barrier)
         self._joint_mode_deprecation_warned = False
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -1388,6 +1403,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     state_out.body_qd,
                     self.model.body_com,
                     float(self.friction_epsilon),
+                    self.rigid_body_particle_contact_use_log_barrier,
                     self.body_particle_contact_penalty_k,
                     self.body_particle_contact_material_kd,
                     self.body_particle_contact_material_mu,
@@ -1463,6 +1479,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     int(ParticleFlags.ACTIVE),
                     int(ParticleFlags.PROXY),
                     self.friction_epsilon,
+                    self.rigid_body_particle_contact_use_log_barrier,
                     self.model.particle_radius,
                     contacts.soft_contact_count,
                     self.body_particle_contact_force_eligible,
@@ -2559,6 +2576,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         A particle-only model can still collide with static rigid shapes, so the
         zero-body case retains the particle-side DAT state with empty body arrays.
         """
+        if not (0.0 < rigid_conservative_bound_relaxation < 1.0):
+            raise ValueError(
+                "rigid_conservative_bound_relaxation must be in (0, 1), "
+                f"got {rigid_conservative_bound_relaxation}"
+            )
+
         self.rigid_enable_penetration_free = rigid_enable_penetration_free
         self.rigid_conservative_bound_relaxation = rigid_conservative_bound_relaxation
         self.rigid_dat_use_interval_arithmetic = rigid_dat_use_interval_arithmetic
@@ -3474,6 +3497,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         model.particle_colors,
                         # body-particle contact
                         self.friction_epsilon,
+                        self.rigid_body_particle_contact_use_log_barrier,
                         model.particle_radius,
                         contacts.soft_contact_indices,
                         contacts.soft_contact_count,
@@ -3694,6 +3718,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_inv_mass_effective,
                         model.shape_body,
                         self.friction_epsilon,
+                        self.rigid_body_particle_contact_use_log_barrier,
                         self.body_particle_contact_penalty_k,
                         self.body_particle_contact_material_ke,
                         self.body_particle_contact_material_kd,

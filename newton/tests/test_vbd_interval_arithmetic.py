@@ -11,10 +11,7 @@ import warp as wp
 from newton._src.solvers.vbd.interval_arithmetic import (
     interval,
     interval_add,
-    interval_cos_shortest_arc,
     interval_mul,
-    interval_sin_shortest_arc,
-    interval_sub,
     next_float_down,
     next_float_up,
     rigid_point_plane_signed_distance_derivative_interval,
@@ -42,8 +39,6 @@ def _basic_interval_kernel(
     b_upper: wp.array[float],
     add_lower: wp.array[float],
     add_upper: wp.array[float],
-    sub_lower: wp.array[float],
-    sub_upper: wp.array[float],
     mul_lower: wp.array[float],
     mul_upper: wp.array[float],
 ):
@@ -51,33 +46,11 @@ def _basic_interval_kernel(
     a = interval(a_lower[tid], a_upper[tid])
     b = interval(b_lower[tid], b_upper[tid])
     add_result = interval_add(a, b)
-    sub_result = interval_sub(a, b)
     mul_result = interval_mul(a, b)
     add_lower[tid] = add_result.lower
     add_upper[tid] = add_result.upper
-    sub_lower[tid] = sub_result.lower
-    sub_upper[tid] = sub_result.upper
     mul_lower[tid] = mul_result.lower
     mul_upper[tid] = mul_result.upper
-
-
-@wp.kernel(enable_backward=False)
-def _trig_interval_kernel(
-    angle_lower: wp.array[float],
-    angle_upper: wp.array[float],
-    sin_lower: wp.array[float],
-    sin_upper: wp.array[float],
-    cos_lower: wp.array[float],
-    cos_upper: wp.array[float],
-):
-    tid = wp.tid()
-    angle = interval(angle_lower[tid], angle_upper[tid])
-    sin_result = interval_sin_shortest_arc(angle)
-    cos_result = interval_cos_shortest_arc(angle)
-    sin_lower[tid] = sin_result.lower
-    sin_upper[tid] = sin_result.upper
-    cos_lower[tid] = cos_result.lower
-    cos_upper[tid] = cos_result.upper
 
 
 @wp.kernel(enable_backward=False)
@@ -186,7 +159,7 @@ def test_basic_interval_operations_contain_exact_results(test, device):
     a_upper = np.maximum(endpoints[:, 0], endpoints[:, 1])
     b_lower = np.minimum(endpoints[:, 2], endpoints[:, 3])
     b_upper = np.maximum(endpoints[:, 2], endpoints[:, 3])
-    outputs = _empty_outputs(len(endpoints), device, 6)
+    outputs = _empty_outputs(len(endpoints), device, 4)
     wp.launch(
         _basic_interval_kernel,
         dim=len(endpoints),
@@ -199,14 +172,12 @@ def test_basic_interval_operations_contain_exact_results(test, device):
         outputs=outputs,
         device=device,
     )
-    add_lower, add_upper, sub_lower, sub_upper, mul_lower, mul_upper = [output.numpy() for output in outputs]
+    add_lower, add_upper, mul_lower, mul_upper = [output.numpy() for output in outputs]
 
     a_lower64, a_upper64 = a_lower.astype(np.float64), a_upper.astype(np.float64)
     b_lower64, b_upper64 = b_lower.astype(np.float64), b_upper.astype(np.float64)
     exact_add_lower = a_lower64 + b_lower64
     exact_add_upper = a_upper64 + b_upper64
-    exact_sub_lower = a_lower64 - b_upper64
-    exact_sub_upper = a_upper64 - b_lower64
     products = np.stack(
         [
             a_lower64 * b_lower64,
@@ -220,50 +191,8 @@ def test_basic_interval_operations_contain_exact_results(test, device):
 
     test.assertTrue(np.all(add_lower.astype(np.float64) <= exact_add_lower))
     test.assertTrue(np.all(add_upper.astype(np.float64) >= exact_add_upper))
-    test.assertTrue(np.all(sub_lower.astype(np.float64) <= exact_sub_lower))
-    test.assertTrue(np.all(sub_upper.astype(np.float64) >= exact_sub_upper))
     test.assertTrue(np.all(mul_lower.astype(np.float64) <= exact_mul_lower))
     test.assertTrue(np.all(mul_upper.astype(np.float64) >= exact_mul_upper))
-
-
-def test_shortest_arc_trig_intervals_contain_samples(test, device):
-    half_pi = np.float32(np.pi / 2.0)
-    pi = np.float32(np.pi)
-    angle_ranges = np.array(
-        [
-            [0.0, 0.0],
-            [0.0, np.nextafter(np.float32(0.0), np.float32(np.inf))],
-            [0.0, 0.1],
-            [0.2, 1.0],
-            [1.0, 2.0],
-            [np.nextafter(half_pi, np.float32(-np.inf)), np.nextafter(half_pi, np.float32(np.inf))],
-            [2.0, np.pi],
-            [np.nextafter(pi, np.float32(-np.inf)), pi],
-            [0.0, np.pi],
-        ],
-        dtype=np.float32,
-    )
-    outputs = _empty_outputs(len(angle_ranges), device, 4)
-    wp.launch(
-        _trig_interval_kernel,
-        dim=len(angle_ranges),
-        inputs=[
-            wp.array(angle_ranges[:, 0], dtype=float, device=device),
-            wp.array(angle_ranges[:, 1], dtype=float, device=device),
-        ],
-        outputs=outputs,
-        device=device,
-    )
-    sin_lower, sin_upper, cos_lower, cos_upper = [output.numpy().astype(np.float64) for output in outputs]
-
-    for i, (lower, upper) in enumerate(angle_ranges.astype(np.float64)):
-        samples = np.linspace(lower, upper, 20001, dtype=np.float64)
-        sin_samples = np.sin(samples)
-        cos_samples = np.cos(samples)
-        test.assertLessEqual(sin_lower[i], sin_samples.min())
-        test.assertGreaterEqual(sin_upper[i], sin_samples.max())
-        test.assertLessEqual(cos_lower[i], cos_samples.min())
-        test.assertGreaterEqual(cos_upper[i], cos_samples.max())
 
 
 def _sample_rigid_signed_distance(t, n, d, c0, dx, axis, angle, offset0):
@@ -399,12 +328,6 @@ add_function_test(
     TestVBDIntervalArithmetic,
     "test_basic_interval_operations_contain_exact_results",
     test_basic_interval_operations_contain_exact_results,
-    devices=devices,
-)
-add_function_test(
-    TestVBDIntervalArithmetic,
-    "test_shortest_arc_trig_intervals_contain_samples",
-    test_shortest_arc_trig_intervals_contain_samples,
     devices=devices,
 )
 add_function_test(

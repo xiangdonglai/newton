@@ -1960,8 +1960,40 @@ def evaluate_rigid_contact_from_collision(
 
 
 @wp.func
+def _evaluate_rigid_soft_contact_force_norm(
+    distance: float,
+    collision_radius: float,
+    k: float,
+    use_log_barrier: bool,
+):
+    """Return ``dE/dd`` and ``d2E/dd2`` for rigid-soft normal contact.
+
+    The log-barrier branch intentionally matches
+    ``particle_vbd_kernels.evaluate_self_contact_force_norm``.  A zero contact
+    radius cannot define its positive-distance barrier interval, so it retains
+    the quadratic penalty law.
+    """
+    penetration_depth = collision_radius - distance
+    if not use_log_barrier or collision_radius <= 0.0:
+        return -k * penetration_depth, k
+
+    tau = collision_radius * 0.5
+    d_min = 1.0e-5
+    if tau > distance > d_min:
+        k2 = tau * tau * k
+        return -k2 / distance, k2 / (distance * distance)
+    elif distance <= d_min:
+        k2 = tau * tau * k
+        d_min_sq = d_min * d_min
+        return k2 * (distance - 2.0 * d_min) / d_min_sq, k2 / d_min_sq
+    else:
+        return -k * penetration_depth, k
+
+
+@wp.func
 def _compute_body_particle_contact_force(
-    penetration_depth: float,
+    distance: float,
+    collision_radius: float,
     n: wp.vec3,
     relative_translation: wp.vec3,
     ke: float,
@@ -1969,16 +2001,18 @@ def _compute_body_particle_contact_force(
     mu: float,
     friction_epsilon: float,
     dt: float,
+    use_log_barrier: bool,
 ):
-    """Pure force law for body-particle contacts: normal penalty + damping + friction.
+    """Pure force law for body-particle contacts: normal elasticity + damping + friction.
 
-    All geometry and kinematics (penetration, normal, relative displacement) are
+    All geometry and kinematics (distance, contact radius, normal, relative displacement) are
     resolved by the caller.  This function only computes the contact force and
     Hessian from those scalar/vector inputs.
     """
-    f_n = penetration_depth * ke
+    dE_dD, d2E_dDdD = _evaluate_rigid_soft_contact_force_norm(distance, collision_radius, ke, use_log_barrier)
+    f_n = -dE_dD
     force = n * f_n
-    hessian = ke * wp.outer(n, n)
+    hessian = d2E_dDdD * wp.outer(n, n)
 
     if wp.dot(n, relative_translation) < 0.0:
         damping_hessian = (kd / dt) * wp.outer(n, n)
@@ -2015,6 +2049,7 @@ def _eval_body_particle_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    use_log_barrier: bool,
 ):
     """Particle-rigid contact force/Hessian - resolves geometry from arrays then
     delegates to ``_compute_body_particle_contact_force``.
@@ -2035,7 +2070,9 @@ def _eval_body_particle_contact(
     n = contact_normal[contact_index]
 
     margin = shape_margin[shape_index] if shape_margin.shape[0] > 0 else 0.0
-    penetration_depth = -(wp.dot(n, particle_pos - bx) - particle_radius[particle_index] - margin)
+    distance = wp.dot(n, particle_pos - bx)
+    collision_radius = particle_radius[particle_index] + margin
+    penetration_depth = collision_radius - distance
     if penetration_depth > 0.0:
         dx = particle_pos - particle_prev_pos
 
@@ -2057,7 +2094,8 @@ def _eval_body_particle_contact(
         relative_translation = dx - bv * dt
 
         return _compute_body_particle_contact_force(
-            penetration_depth,
+            distance,
+            collision_radius,
             n,
             relative_translation,
             body_particle_contact_ke,
@@ -2065,6 +2103,7 @@ def _eval_body_particle_contact(
             friction_mu,
             friction_epsilon,
             dt,
+            use_log_barrier,
         )
     else:
         return wp.vec3(0.0), wp.mat33(0.0)
@@ -2093,6 +2132,7 @@ def _eval_soft_ef_contact(
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
     dt: float,
+    use_log_barrier: bool,
 ):
     """Soft-contact force/Hessian at a barycentric contact point over a record's soft particles.
 
@@ -2138,7 +2178,9 @@ def _eval_soft_ef_contact(
     force = wp.vec3(0.0)
     hessian = wp.mat33(0.0)
 
-    penetration_depth = -(wp.dot(n, x - bx) - radius - margin)
+    distance = wp.dot(n, x - bx)
+    collision_radius = radius + margin
+    penetration_depth = collision_radius - distance
     if penetration_depth > 0.0:
         dx = x - x_prev
 
@@ -2162,7 +2204,8 @@ def _eval_soft_ef_contact(
         # contact_ke/kd/mu are the per-contact AVBD values (ramped penalty + pre-mixed material,
         # cached by init_body_particle_contacts) -- the same source the particle path uses.
         force, hessian = _compute_body_particle_contact_force(
-            penetration_depth,
+            distance,
+            collision_radius,
             n,
             relative_translation,
             contact_ke,
@@ -2170,6 +2213,7 @@ def _eval_soft_ef_contact(
             contact_mu,
             friction_epsilon,
             dt,
+            use_log_barrier,
         )
 
     return force, hessian, bx
@@ -2228,6 +2272,7 @@ def evaluate_body_particle_contact(
         contact_normal,
         shape_margin,
         dt,
+        False,
     )
 
 
@@ -5436,6 +5481,7 @@ def accumulate_body_particle_contacts_per_body(
     shape_body: wp.array[int],
     # AVBD body-particle soft contact penalties and material properties
     friction_epsilon: float,
+    rigid_body_particle_contact_use_log_barrier: bool,
     body_particle_contact_penalty_k: wp.array[float],
     body_particle_contact_material_ke: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
@@ -5529,7 +5575,9 @@ def accumulate_body_particle_contacts_per_body(
             radius = particle_radius[particle_idx]
             s_idx = body_particle_contact_shape[contact_idx]
             margin = shape_margin[s_idx] if s_idx >= 0 and shape_margin.shape[0] > 0 else 0.0
-            penetration_depth = -(wp.dot(n, particle_pos - cp_world) - radius - margin)
+            distance = wp.dot(n, particle_pos - cp_world)
+            collision_radius = radius + margin
+            penetration_depth = collision_radius - distance
             if penetration_depth <= 0.0:
                 continue
 
@@ -5539,7 +5587,8 @@ def accumulate_body_particle_contacts_per_body(
             relative_translation = dx - bv * dt
 
             f_soft, h_soft = _compute_body_particle_contact_force(
-                penetration_depth,
+                distance,
+                collision_radius,
                 n,
                 relative_translation,
                 body_particle_contact_penalty_k[contact_idx],
@@ -5547,6 +5596,7 @@ def accumulate_body_particle_contacts_per_body(
                 body_particle_contact_material_mu[contact_idx],
                 friction_epsilon,
                 dt,
+                rigid_body_particle_contact_use_log_barrier,
             )
         else:
             # Edge/face: barycentric contact point over the record's 2-3 soft particles. Uses the
@@ -5574,6 +5624,7 @@ def accumulate_body_particle_contacts_per_body(
                 body_particle_contact_normal,
                 shape_margin,
                 dt,
+                rigid_body_particle_contact_use_log_barrier,
             )
 
         # Equal-and-opposite reaction on the body at the rigid contact point (shared by both kinds).
@@ -7217,7 +7268,7 @@ def place_dat_division_plane(
 
 
 @wp.func
-def planar_truncation_t(
+def rigid_soft_planar_truncation_t(
     v: wp.vec3,
     delta_v: wp.vec3,
     n: wp.vec3,
@@ -7651,7 +7702,7 @@ def apply_rigid_soft_truncation(
         # require every vertex of the paired edge or triangle to stay on its side.
         if vi >= 0:
             x_v = pos_prev_collision_detection[vi]
-            t_v = planar_truncation_t(
+            t_v = rigid_soft_planar_truncation_t(
                 x_v,
                 particle_displacements[vi],
                 n,

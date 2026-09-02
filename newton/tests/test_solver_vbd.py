@@ -29,6 +29,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _alm_relaxed_ascent,
     _compliant_alm_coefficients,
     _contact_tangent_conditioning_scale,
+    _evaluate_rigid_soft_contact_force_norm,
     _joint_angular_rho_seed,
     apply_rigid_soft_truncation,
     build_body_body_contact_lists,
@@ -42,8 +43,8 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     init_body_body_contacts_alm,
     init_body_particle_contacts,
     place_dat_division_plane,
-    planar_truncation_t,
     rigid_point_trajectory,
+    rigid_soft_planar_truncation_t,
     rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
     step_body_body_contact_C0_lambda,
@@ -271,6 +272,21 @@ def _eval_self_contact_norm_kernel(
 ):
     i = wp.tid()
     dEdD, d2E = evaluate_self_contact_force_norm(distances[i], collision_radius, k)
+    dEdD_out[i] = dEdD
+    d2E_out[i] = d2E
+
+
+@wp.kernel
+def _eval_rigid_soft_contact_norm_kernel(
+    distances: wp.array[float],
+    collision_radius: float,
+    k: float,
+    use_log_barrier: bool,
+    dEdD_out: wp.array[float],
+    d2E_out: wp.array[float],
+):
+    i = wp.tid()
+    dEdD, d2E = _evaluate_rigid_soft_contact_force_norm(distances[i], collision_radius, k, use_log_barrier)
     dEdD_out[i] = dEdD
     d2E_out[i] = d2E
 
@@ -928,6 +944,46 @@ def test_self_contact_barrier_c2_at_d_min(test, device):
         rtol=1e-3,
         err_msg="Self-contact barrier Hessian is not C2-continuous at d = d_min",
     )
+
+
+def test_rigid_soft_contact_log_barrier_matches_particle(test, device):
+    """The optional rigid-soft law must match self-contact; disabled mode stays quadratic."""
+    collision_radius = 0.02
+    k = 1.0e3
+    distances_np = np.array([0.75, 0.25, 0.0, -0.5], dtype=np.float32) * collision_radius
+    distances = wp.array(distances_np, dtype=float, device=device)
+
+    particle_dEdD = wp.zeros(len(distances_np), dtype=float, device=device)
+    particle_d2E = wp.zeros(len(distances_np), dtype=float, device=device)
+    rigid_dEdD = wp.zeros(len(distances_np), dtype=float, device=device)
+    rigid_d2E = wp.zeros(len(distances_np), dtype=float, device=device)
+    penalty_dEdD = wp.zeros(len(distances_np), dtype=float, device=device)
+    penalty_d2E = wp.zeros(len(distances_np), dtype=float, device=device)
+
+    wp.launch(
+        _eval_self_contact_norm_kernel,
+        dim=len(distances_np),
+        inputs=[distances, collision_radius, k, particle_dEdD, particle_d2E],
+        device=device,
+    )
+    wp.launch(
+        _eval_rigid_soft_contact_norm_kernel,
+        dim=len(distances_np),
+        inputs=[distances, collision_radius, k, True, rigid_dEdD, rigid_d2E],
+        device=device,
+    )
+    wp.launch(
+        _eval_rigid_soft_contact_norm_kernel,
+        dim=len(distances_np),
+        inputs=[distances, collision_radius, k, False, penalty_dEdD, penalty_d2E],
+        device=device,
+    )
+
+    np.testing.assert_allclose(rigid_dEdD.numpy(), particle_dEdD.numpy(), rtol=1.0e-6)
+    np.testing.assert_allclose(rigid_d2E.numpy(), particle_d2E.numpy(), rtol=1.0e-6)
+    np.testing.assert_allclose(penalty_dEdD.numpy(), -k * (collision_radius - distances_np), rtol=1.0e-6)
+    np.testing.assert_allclose(penalty_d2E.numpy(), k, rtol=1.0e-6)
+    test.assertGreater(-rigid_dEdD.numpy()[1], -penalty_dEdD.numpy()[1])
 
 
 def _rigid_joint_angular_rho_seed_uses_mean_mobility(test, device):
@@ -1826,6 +1882,7 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 particle_q,
                 particle_colors,
                 0.01,
+                False,
                 particle_radius,
                 contact_indices,
                 contact_count,
@@ -3770,6 +3827,12 @@ add_function_test(
 )
 add_function_test(
     TestSolverVBD,
+    "test_rigid_soft_contact_log_barrier_matches_particle",
+    test_rigid_soft_contact_log_barrier_matches_particle,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
     "test_rigid_contact_history_restore_from_match_index",
     _rigid_contact_history_restore_from_match_index,
     devices=devices,
@@ -4337,6 +4400,7 @@ def _run_face_section2(device, shape_margin):
             state.particle_q,
             model.particle_colors,
             1.0,  # friction_epsilon
+            False,  # legacy quadratic rigid-soft normal law
             model.particle_radius,
             contacts.soft_contact_indices,
             contacts.soft_contact_count,
@@ -4621,7 +4685,7 @@ def _planar_truncation_probe(
     t_out: wp.array[float],
 ):
     i = wp.tid()
-    t_out[i] = planar_truncation_t(
+    t_out[i] = rigid_soft_planar_truncation_t(
         wp.vec3(0.0, 0.0, signed_distance[i]),
         wp.vec3(0.0, 0.0, normal_displacement[i]),
         wp.vec3(0.0, 0.0, 1.0),
@@ -4655,7 +4719,7 @@ def _large_coordinate_epsilon_ablation_probe(
         0.0,
         separation_eps[i],
     )
-    t = planar_truncation_t(
+    t = rigid_soft_planar_truncation_t(
         soft_start,
         soft_displacement,
         n,
@@ -5836,7 +5900,7 @@ def _complete_pair_epsilon_endpoint_probe(
 ):
     i = wp.tid()
     if i < soft_count:
-        soft_t[i] = planar_truncation_t(
+        soft_t[i] = rigid_soft_planar_truncation_t(
             soft[i],
             soft_displacement,
             n,
@@ -6232,6 +6296,28 @@ def test_rigid_dat_requires_positive_rigid_soft_query_gap(test, device):
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.0)
     with test.assertRaisesRegex(ValueError, "soft_contact_gap > 0"):
         newton.solvers.SolverVBD(model, rigid_enable_penetration_free=True, pipeline=pipeline)
+
+
+def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
+    """Rigid DAT requires the strict relaxation interval used by its motion bound."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    model = builder.finalize(device=device)
+
+    for relaxation in (-0.1, 0.0, 1.0, 1.1, np.nan, np.inf):
+        with test.subTest(relaxation=relaxation):
+            with test.assertRaisesRegex(ValueError, r"must be in \(0, 1\)"):
+                newton.solvers.SolverVBD(
+                    model,
+                    rigid_conservative_bound_relaxation=relaxation,
+                )
+
+    for relaxation in (1.0e-6, 0.5, 1.0 - 1.0e-6):
+        with test.subTest(relaxation=relaxation):
+            solver = newton.solvers.SolverVBD(
+                model,
+                rigid_conservative_bound_relaxation=relaxation,
+            )
+            test.assertEqual(solver.rigid_conservative_bound_relaxation, relaxation)
 
 
 def test_rigid_dat_rejects_missing_body_pose(test, device):
@@ -6632,6 +6718,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_requires_positive_rigid_soft_query_gap",
     test_rigid_dat_requires_positive_rigid_soft_query_gap,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_validates_conservative_bound_relaxation",
+    test_rigid_dat_validates_conservative_bound_relaxation,
     devices=devices,
 )
 add_function_test(

@@ -18,7 +18,6 @@ import warp as wp
 
 wp.set_module_options({"enable_backward": False})
 
-_HALF_PI = wp.constant(1.5707963267948966)
 _PI = wp.constant(3.141592653589793)
 _TRIG_ULP_PADDING = wp.constant(4)
 
@@ -102,13 +101,6 @@ def interval_add(a: FloatInterval, b: FloatInterval) -> FloatInterval:
 
 
 @wp.func
-def interval_sub(a: FloatInterval, b: FloatInterval) -> FloatInterval:
-    """Outward-rounded interval subtraction."""
-
-    return interval(next_float_down(a.lower - b.upper), next_float_up(a.upper - b.lower))
-
-
-@wp.func
 def interval_mul(a: FloatInterval, b: FloatInterval) -> FloatInterval:
     """Outward-rounded multiplication of finite intervals."""
 
@@ -119,95 +111,6 @@ def interval_mul(a: FloatInterval, b: FloatInterval) -> FloatInterval:
     lower = wp.min(wp.min(p00, p01), wp.min(p10, p11))
     upper = wp.max(wp.max(p00, p01), wp.max(p10, p11))
     return interval(next_float_down(lower), next_float_up(upper))
-
-
-@wp.func
-def interval_sin_shortest_arc(angle: FloatInterval) -> FloatInterval:
-    """Enclose sine for an angle interval within the shortest-arc domain.
-
-    The intended domain is a small outward expansion of [0, pi]. The only
-    possible interior maximum is at pi/2; the minimum is at an endpoint.
-    """
-
-    # TODO: replace the empirical endpoint padding with a proven backend error
-    # bound before this module is allowed to certify solver trajectories.
-    sin_lower = wp.sin(angle.lower)
-    sin_upper = wp.sin(angle.upper)
-    lower = _expand_down(wp.min(sin_lower, sin_upper), _TRIG_ULP_PADDING)
-    upper = _expand_up(wp.max(sin_lower, sin_upper), _TRIG_ULP_PADDING)
-    if angle.lower <= _HALF_PI and angle.upper >= _HALF_PI:
-        upper = 1.0
-    return interval(lower, upper)
-
-
-@wp.func
-def interval_cos_shortest_arc(angle: FloatInterval) -> FloatInterval:
-    """Enclose cosine for an angle interval within the shortest-arc domain."""
-
-    cos_lower = wp.cos(angle.lower)
-    cos_upper = wp.cos(angle.upper)
-    lower = _expand_down(wp.min(cos_lower, cos_upper), _TRIG_ULP_PADDING)
-    upper = _expand_up(wp.max(cos_lower, cos_upper), _TRIG_ULP_PADDING)
-    if angle.lower <= 0.0 and angle.upper >= 0.0:
-        upper = 1.0
-    if angle.lower <= _PI and angle.upper >= _PI:
-        lower = -1.0
-    return interval(lower, upper)
-
-
-@wp.func
-def _interval_dot_exact(a: wp.vec3, b: wp.vec3) -> FloatInterval:
-    """Enclose a three-term dot product, treating float32 inputs as exact."""
-
-    result = interval_mul(point_interval(a[0]), point_interval(b[0]))
-    result = interval_add(result, interval_mul(point_interval(a[1]), point_interval(b[1])))
-    return interval_add(result, interval_mul(point_interval(a[2]), point_interval(b[2])))
-
-
-@wp.func
-def _interval_cross_component(a: wp.vec3, b: wp.vec3, component: int) -> FloatInterval:
-    """Enclose one component of the cross product of a and b."""
-
-    if component == 0:
-        return interval_sub(
-            interval_mul(point_interval(a[1]), point_interval(b[2])),
-            interval_mul(point_interval(a[2]), point_interval(b[1])),
-        )
-    if component == 1:
-        return interval_sub(
-            interval_mul(point_interval(a[2]), point_interval(b[0])),
-            interval_mul(point_interval(a[0]), point_interval(b[2])),
-        )
-    return interval_sub(
-        interval_mul(point_interval(a[0]), point_interval(b[1])),
-        interval_mul(point_interval(a[1]), point_interval(b[0])),
-    )
-
-
-@wp.func
-def _rigid_point_minus_plane_component_interval(
-    component: int,
-    time: FloatInterval,
-    sin_angle: FloatInterval,
-    cos_angle: FloatInterval,
-    c0: wp.vec3,
-    dx: wp.vec3,
-    axis: wp.vec3,
-    offset0: wp.vec3,
-    d: wp.vec3,
-    axis_dot_offset: FloatInterval,
-) -> FloatInterval:
-    """Enclose one coordinate of the rigid point minus the plane point."""
-
-    parallel = interval_mul(point_interval(axis[component]), axis_dot_offset)
-    perpendicular = interval_sub(point_interval(offset0[component]), parallel)
-    cross_component = _interval_cross_component(axis, offset0, component)
-
-    result = interval_sub(point_interval(c0[component]), point_interval(d[component]))
-    result = interval_add(result, interval_mul(time, point_interval(dx[component])))
-    result = interval_add(result, parallel)
-    result = interval_add(result, interval_mul(perpendicular, cos_angle))
-    return interval_add(result, interval_mul(cross_component, sin_angle))
 
 
 @wp.func
