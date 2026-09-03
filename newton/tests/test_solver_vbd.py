@@ -13,6 +13,8 @@ import warp as wp
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     accumulate_particle_body_contact_force_and_hessian,
+    create_edge_edge_division_plane_closest_pt,
+    create_vertex_triangle_division_plane_closest_pt,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
     evaluate_self_contact_force_norm,
@@ -20,9 +22,6 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_spring_force_and_hessian_both_vertices,
     evaluate_vertex_triangle_collision_force_hessian_4_vertices,
     evaluate_volumetric_neo_hookean_force_and_hessian,
-)
-from newton._src.solvers.vbd.particle_vbd_kernels import (
-    planar_truncation_t as particle_planar_truncation_t,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     RigidContactHistory,
@@ -43,8 +42,8 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     init_body_body_contacts_alm,
     init_body_particle_contacts,
     place_dat_division_plane,
+    planar_truncation_t,
     rigid_point_trajectory,
-    rigid_soft_planar_truncation_t,
     rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
     step_body_body_contact_C0_lambda,
@@ -4670,7 +4669,7 @@ add_function_test(
 
 
 # =====================================================================================
-# Rigid-body DAT (Divide and Truncate) penetration-free truncation
+# DAT (Divide and Truncate) planar and rigid-body truncation
 # =====================================================================================
 
 _RIGID_SOFT_DAT_TEST_EPS = 1.0e-6
@@ -4685,13 +4684,12 @@ def _planar_truncation_probe(
     t_out: wp.array[float],
 ):
     i = wp.tid()
-    t_out[i] = rigid_soft_planar_truncation_t(
+    t_out[i] = planar_truncation_t(
         wp.vec3(0.0, 0.0, signed_distance[i]),
         wp.vec3(0.0, 0.0, normal_displacement[i]),
         wp.vec3(0.0, 0.0, 1.0),
         wp.vec3(0.0),
         gamma,
-        1.0e-3,
         minimum_signed_distance,
     )
 
@@ -4719,13 +4717,12 @@ def _large_coordinate_epsilon_ablation_probe(
         0.0,
         separation_eps[i],
     )
-    t = rigid_soft_planar_truncation_t(
+    t = planar_truncation_t(
         soft_start,
         soft_displacement,
         n,
         plane_point,
         0.85,
-        1.0e-3,
         separation_eps[i],
     )
     accepted = soft_start + t * soft_displacement
@@ -4781,7 +4778,7 @@ def test_planar_truncation_uses_endpoint_signs(test, device):
         device=device,
     )
     crossing_t = s0 / -normal_displacement
-    expected_crossing_t = min(0.85 * crossing_t, crossing_t - 1.0e-3)
+    expected_crossing_t = 0.85 * crossing_t
     np.testing.assert_allclose(
         t_out.numpy(),
         [expected_crossing_t, 1.0, 0.0, 1.0],
@@ -4791,22 +4788,81 @@ def test_planar_truncation_uses_endpoint_signs(test, device):
 
 
 @wp.kernel
-def _particle_planar_truncation_probe(parallel_epsilon: float, t_out: wp.array[float]):
-    t_out[0] = particle_planar_truncation_t(
-        wp.vec3(0.0, 0.0, 3.797968e-6),
-        wp.vec3(0.0, 0.0, -9.053657e-6),
-        wp.vec3(0.0, 0.0, 1.0),
-        wp.vec3(0.0),
-        parallel_epsilon,
-        0.85,
+def _soft_self_dat_epsilon_probe(result: wp.array[float]):
+    zero = wp.vec3(0.0)
+
+    vertex = wp.vec3(0.0, 0.0, 8.0e-6)
+    triangle_0 = wp.vec3(-1.0, -1.0, 0.0)
+    triangle_1 = wp.vec3(1.0, -1.0, 0.0)
+    triangle_2 = wp.vec3(0.0, 1.0, 0.0)
+    vertex_displacement = wp.vec3(0.0, 0.0, -10.0e-6)
+    vt_n, vt_d, vt_eps = create_vertex_triangle_division_plane_closest_pt(
+        vertex,
+        vertex_displacement,
+        triangle_0,
+        zero,
+        triangle_1,
+        zero,
+        triangle_2,
+        zero,
     )
+    vt_t = planar_truncation_t(vertex, vertex_displacement, vt_n, vt_d, 0.85, vt_eps)
+    result[0] = wp.dot(vt_n, vertex - vt_d)
+    result[1] = wp.dot(-vt_n, triangle_0 - vt_d)
+    result[2] = wp.dot(vt_n, vertex + vt_t * vertex_displacement - triangle_0)
+    result[3] = vt_t
+    result[4] = vt_eps
+
+    # A point already inside the positive-side half-band may recover freely,
+    # but it may not move farther into the band.
+    point_inside_band = vt_d + 0.5 * vt_eps * vt_n
+    result[5] = planar_truncation_t(point_inside_band, -0.25 * vt_eps * vt_n, vt_n, vt_d, 0.85, vt_eps)
+    result[6] = planar_truncation_t(point_inside_band, 0.25 * vt_eps * vt_n, vt_n, vt_d, 0.85, vt_eps)
+
+    edge_0_a = wp.vec3(-1.0, 8.0e-6, 0.0)
+    edge_0_b = wp.vec3(1.0, 8.0e-6, 0.0)
+    edge_1_a = wp.vec3(-1.0, 0.0, 0.0)
+    edge_1_b = wp.vec3(1.0, 0.0, 0.0)
+    edge_0_displacement = wp.vec3(0.0, -10.0e-6, 0.0)
+    ee_n, ee_d, ee_eps = create_edge_edge_division_plane_closest_pt(
+        edge_0_a,
+        edge_0_displacement,
+        edge_0_b,
+        edge_0_displacement,
+        edge_1_a,
+        zero,
+        edge_1_b,
+        zero,
+    )
+    ee_t = planar_truncation_t(edge_0_a, edge_0_displacement, ee_n, ee_d, 0.85, ee_eps)
+    result[7] = wp.dot(ee_n, edge_0_a - ee_d)
+    result[8] = wp.dot(-ee_n, edge_1_a - ee_d)
+    result[9] = wp.dot(ee_n, edge_0_a + ee_t * edge_0_displacement - edge_1_a)
+    result[10] = ee_t
+    result[11] = ee_eps
 
 
-def test_particle_planar_truncation_preserves_parallel_epsilon(test, device):
-    """Soft-self DAT retains its legacy absolute parallel-motion threshold."""
-    t_out = wp.empty(1, dtype=float, device=device)
-    wp.launch(_particle_planar_truncation_probe, dim=1, inputs=[1.0e-5], outputs=[t_out], device=device)
-    test.assertEqual(float(t_out.numpy()[0]), 1.0)
+def test_soft_self_dat_uses_epsilon_separation(test, device):
+    """VT and EE planes reserve epsilon, and inside-band motion cannot worsen separation."""
+    result = wp.empty(12, dtype=float, device=device)
+    wp.launch(_soft_self_dat_epsilon_probe, dim=1, outputs=[result], device=device)
+    result = result.numpy()
+
+    vt_positive_margin, vt_negative_margin, vt_accepted_gap, vt_t, vt_eps = result[:5]
+    test.assertGreaterEqual(vt_positive_margin, 0.99 * vt_eps)
+    test.assertGreaterEqual(vt_negative_margin, 0.99 * vt_eps)
+    test.assertGreaterEqual(vt_accepted_gap, 2.0 * vt_eps)
+    test.assertGreater(vt_t, 0.0)
+    test.assertLess(vt_t, 1.0)
+    test.assertEqual(result[5], 0.0)
+    test.assertEqual(result[6], 1.0)
+
+    ee_positive_margin, ee_negative_margin, ee_accepted_gap, ee_t, ee_eps = result[7:]
+    test.assertGreaterEqual(ee_positive_margin, 0.99 * ee_eps)
+    test.assertGreaterEqual(ee_negative_margin, 0.99 * ee_eps)
+    test.assertGreaterEqual(ee_accepted_gap, 2.0 * ee_eps)
+    test.assertGreater(ee_t, 0.0)
+    test.assertLess(ee_t, 1.0)
 
 
 @wp.kernel
@@ -5900,13 +5956,12 @@ def _complete_pair_epsilon_endpoint_probe(
 ):
     i = wp.tid()
     if i < soft_count:
-        soft_t[i] = rigid_soft_planar_truncation_t(
+        soft_t[i] = planar_truncation_t(
             soft[i],
             soft_displacement,
             n,
             d,
             0.85,
-            1.0e-3,
             eps,
         )
     if i < rigid_count:
@@ -6637,8 +6692,8 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_particle_planar_truncation_preserves_parallel_epsilon",
-    test_particle_planar_truncation_preserves_parallel_epsilon,
+    "test_soft_self_dat_uses_epsilon_separation",
+    test_soft_self_dat_uses_epsilon_separation,
     devices=devices,
 )
 add_function_test(

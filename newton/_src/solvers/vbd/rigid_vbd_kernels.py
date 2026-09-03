@@ -6910,10 +6910,10 @@ DAT_BISECTION_ITERATIONS = wp.constant(16)
 # to normalize reliably in float32. EE then uses its parallel-edge fallback.
 DAT_FEATURE_CROSS_SIN_EPS = wp.constant(1.0e-4)
 
-# Empty half-width kept on each side of a rigid-soft DAT plane. This is large
-# relative to the nanometer-scale FP32 separator failures observed in the
-# meter-scale examples, while remaining visually negligible.
-RIGID_SOFT_DAT_SEPARATION_EPS = wp.constant(1.0e-6)
+# Empty half-width kept on each side of a DAT plane. This is large relative to
+# the nanometer-scale FP32 separator failures observed in the meter-scale
+# examples, while remaining visually negligible.
+DAT_SEPARATION_EPS = wp.constant(1.0e-6)
 
 _FLOAT32_EPS = wp.constant(1.1920929e-7)
 """Distance from 1.0 to the next float32.
@@ -6924,8 +6924,14 @@ product ``_FLOAT32_EPS * abs(S) = m * 2**(e - 23)`` is between one and two
 such spacings.
 """
 _FLOAT32_MIN_NORMAL = wp.constant(1.1754944e-38)
-RIGID_SOFT_DAT_ULP_FACTOR = wp.constant(4.0)
+DAT_ULP_FACTOR = wp.constant(4.0)
 """Keep the DAT separation band roughly four to eight float32 spacings wide when needed."""
+
+
+@wp.func
+def dat_separation_epsilon(coordinate_scale: float):
+    """Return a representable DAT half-band at the given coordinate scale."""
+    return wp.max(DAT_SEPARATION_EPS, DAT_ULP_FACTOR * _FLOAT32_EPS * coordinate_scale)
 
 
 @wp.func
@@ -7102,7 +7108,7 @@ def find_primitive_pair_separator(
         # when its certified complete-primitive support gap also spans the DAT
         # band; tangential closest-point error can otherwise make the support
         # gap much smaller than the point-to-point distance.
-        if recomputed_closest_point_norm > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+        if recomputed_closest_point_norm > 2.0 * DAT_SEPARATION_EPS:
             valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
                 recomputed_closest_point_axis if is_vt else -recomputed_closest_point_axis,
                 soft_vertices,
@@ -7110,7 +7116,7 @@ def find_primitive_pair_separator(
                 rigid_vertices,
                 rigid_count,
             )
-            if valid and gap > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+            if valid and gap > 2.0 * DAT_SEPARATION_EPS:
                 return valid, n, soft_support, rigid_support, gap, 0
 
         face_axis = _normalized_feature_cross(
@@ -7172,7 +7178,7 @@ def find_primitive_pair_separator(
         # support gap of the complete edge pair.
         recomputed_closest_point_axis = closest_soft - closest_rigid
         recomputed_closest_point_norm = wp.length(recomputed_closest_point_axis)
-        if recomputed_closest_point_norm > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+        if recomputed_closest_point_norm > 2.0 * DAT_SEPARATION_EPS:
             valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
                 recomputed_closest_point_axis,
                 soft_vertices,
@@ -7180,7 +7186,7 @@ def find_primitive_pair_separator(
                 rigid_vertices,
                 rigid_count,
             )
-            if valid and gap > 2.0 * RIGID_SOFT_DAT_SEPARATION_EPS:
+            if valid and gap > 2.0 * DAT_SEPARATION_EPS:
                 return valid, n, soft_support, rigid_support, gap, 0
 
         # EE: enumerate all possible separating axes:
@@ -7242,18 +7248,23 @@ def find_primitive_pair_separator(
 @wp.func
 def place_dat_division_plane(
     n: wp.vec3,
-    rigid_support: wp.vec3,
+    negative_support: wp.vec3,
     gap: float,
-    delta_soft: float,
-    delta_rigid: float,
-    separation_eps: float = RIGID_SOFT_DAT_SEPARATION_EPS,
+    positive_approach: float,
+    negative_approach: float,
+    separation_eps: float = DAT_SEPARATION_EPS,
 ):
-    """Place the adaptive DAT plane while reserving clearance on both sides."""
+    """Place a DAT plane between the supports while reserving clearance on both sides.
+
+    ``n`` points from ``negative_support`` toward the positive-side primitive.
+    The approach values are the largest motions of the corresponding primitive
+    toward the other side.
+    """
     lmbd = float(0.5)
     if gap >= 2.0 * separation_eps:
-        total_approach = delta_soft + delta_rigid
+        total_approach = positive_approach + negative_approach
         if total_approach > 0.0:
-            lmbd = delta_rigid / total_approach
+            lmbd = negative_approach / total_approach
 
         # Clamp the adaptive placement to preserve an (-eps, eps) band between
         # the two primitive supports.
@@ -7263,18 +7274,17 @@ def place_dat_division_plane(
     # When the gap is smaller than 2*eps, lambda remains 0.5: the midpoint
     # maximizes the available clearance even though the full band cannot fit.
     plane_distance = lmbd * gap
-    plane_point = rigid_support + plane_distance * n
+    plane_point = negative_support + plane_distance * n
     return plane_point, lmbd
 
 
 @wp.func
-def rigid_soft_planar_truncation_t(
+def planar_truncation_t(
     v: wp.vec3,
     delta_v: wp.vec3,
     n: wp.vec3,
     d: wp.vec3,
     gamma_r: float,
-    gamma_min: float = 1e-3,
     minimum_signed_distance: float = 0.0,
 ):
     """Keep a straight vertex trajectory in the positive plane half-space.
@@ -7299,7 +7309,7 @@ def rigid_soft_planar_truncation_t(
 
     # s0 >= 0 and s1 < 0 imply a unique crossing on the segment.
     t = s0 / (s0 - s1)
-    t = wp.clamp(wp.min(t * gamma_r, t - gamma_min), 0.0, 1.0)
+    t = wp.clamp(t * gamma_r, 0.0, 1.0)
     return t
 
 
@@ -7621,7 +7631,7 @@ def apply_rigid_soft_truncation(
     # world-coordinate magnitudes, increase it so the band remains several
     # representable float32 steps wide. ``_FLOAT32_EPS * coordinate_scale``
     # estimates one to two local float32 spacings, and
-    # ``RIGID_SOFT_DAT_ULP_FACTOR`` supplies the safety factor.
+    # ``DAT_ULP_FACTOR`` supplies the safety factor.
     coordinate_scale = float(1.0)
     for i in range(3):
         vi = indices[i]
@@ -7645,10 +7655,7 @@ def apply_rigid_soft_truncation(
         coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[0]))
         coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[1]))
         coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[2]))
-    separation_eps = wp.max(
-        RIGID_SOFT_DAT_SEPARATION_EPS,
-        RIGID_SOFT_DAT_ULP_FACTOR * _FLOAT32_EPS * coordinate_scale,
-    )
+    separation_eps = dat_separation_epsilon(coordinate_scale)
 
     # Rigid-body update accumulated since the reference pose.
     c0 = wp.vec3(0.0)
@@ -7702,13 +7709,12 @@ def apply_rigid_soft_truncation(
         # require every vertex of the paired edge or triangle to stay on its side.
         if vi >= 0:
             x_v = pos_prev_collision_detection[vi]
-            t_v = rigid_soft_planar_truncation_t(
+            t_v = planar_truncation_t(
                 x_v,
                 particle_displacements[vi],
                 n,
                 plane_point,
                 gamma,
-                1.0e-3,
                 separation_eps,
             )
             if t_v < 1.0:
