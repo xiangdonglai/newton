@@ -114,7 +114,7 @@ class Experiment:
         if cam is not None and isinstance(self.viewer, newton.viewer.ViewerGL):
             pos, pitch, yaw, look_at = cam
             self.viewer.set_camera(pos=pos, pitch=pitch, yaw=yaw)
-            if hasattr(self.viewer.camera, "look_at"):
+            if look_at is not None and hasattr(self.viewer.camera, "look_at"):
                 self.viewer.camera.look_at(look_at)
 
         # Optional MP4 recording of the GL viewer (opt-in via --record).

@@ -196,6 +196,12 @@ class ShirtPickScene(Scene):
 
     # -- presentation -----------------------------------------------------
     def camera(self):
+        if (
+            getattr(self.args, "control", None) == "state_machine"
+            and getattr(self.args, "sequence", None) == "press"
+        ):
+            # Keep look_at unset so the runner preserves these explicit angles.
+            return (wp.vec3(2.0, -0.75, -0.05), 10.8, 153.9, None)
         return (wp.vec3(1.6, -1.2, 1.0), -25.0, 125.0, wp.vec3(0.5, 0.0, 0.15))
 
     @classmethod

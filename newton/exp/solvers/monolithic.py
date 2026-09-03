@@ -134,15 +134,16 @@ class MonolithicAvbdStrategy(SolverStrategy):
             ],
             "rigid_contact_k_start": 1.0e2,
             "rigid_compliant_alm": False,
+            "rigid_body_particle_contact_use_log_barrier": bool(args.rigid_soft_contact_use_log_barrier),
             "rigid_dat_use_interval_arithmetic": bool(args.rigid_dat_interval_arithmetic),
             "rigid_avbd_beta": 1.0e5,
             "rigid_avbd_gamma": 0.99,
-            "rigid_joint_linear_k_start": 1.0e4,
-            "rigid_joint_angular_k_start": 1.0e1,
+            "rigid_joint_linear_k_start": 1.0e5,
+            "rigid_joint_angular_k_start": 1.0e5,
             "rigid_joint_linear_ke": 1.0e9,
             "rigid_joint_angular_ke": 1.0e9,
-            "rigid_joint_linear_kd": 1.0e-2,
-            "rigid_joint_angular_kd": 0.0,
+            "rigid_joint_linear_kd": 1e4,
+            "rigid_joint_angular_kd": 1e4,
             "rigid_contact_history": False,
         }
         if getattr(args, "full_surface", False):
@@ -194,6 +195,13 @@ class MonolithicAvbdStrategy(SolverStrategy):
             dest="dat",
             default=False,
             help="Enable rigid Divide-and-Truncate (DAT) penetration-free truncation in SolverVBD.",
+        )
+        parser.add_argument(
+            "--rigid-soft-contact-use-log-barrier",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Use the particle self-contact C2 log-barrier law for rigid-soft normal contact instead of the "
+            "legacy quadratic penalty law.",
         )
         parser.add_argument(
             "--rigid-dat-interval-arithmetic",

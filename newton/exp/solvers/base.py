@@ -81,7 +81,7 @@ class SolverStrategy:
             model,
             broad_phase="explicit",
             enable_rigid_soft_full_surface_contact=full_surface,
-            full_surface_mesh_backend="bvh",
+            rigid_soft_mesh_backend="bvh",
         )
 
     def pre_substeps(self, solver, state):
