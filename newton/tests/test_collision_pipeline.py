@@ -15,7 +15,6 @@ from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
-    create_soft_contacts,
     mesh_sdf,
     resolve_mesh_sign_method,
 )
@@ -26,6 +25,7 @@ from newton._src.geometry.soft_contacts_sdf import (
     SDF_LS_ITERS,
     _is_analytic,
     _shape_frames,
+    create_soft_contacts,
     eval_shape_sdf,
     launch_soft_ef_contacts,
     optimize_edge_sdf,
@@ -914,6 +914,8 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             # Tagged watertight so the sign method resolves to parity.
             wp.array([int(MeshProperties.WATERTIGHT)], dtype=wp.int32, device=device),
             wp.array([-1], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=TextureSDFData, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
             0.0,
             wp.array([0.0], dtype=wp.float32, device=device),
             1,
@@ -921,6 +923,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             wp.array([0], dtype=wp.int32, device=device),
             wp.empty(0, dtype=HeightfieldData, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
+            False,
         ],
         outputs=[
             soft_contact_count,
@@ -1112,6 +1115,8 @@ def _launch_open_box_soft_contact(test, device, mesh_id, points, mesh_properties
             wp.array([mesh_id], dtype=wp.uint64, device=device),
             wp.array([mesh_properties], dtype=wp.int32, device=device),
             wp.array([-1], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=TextureSDFData, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
             0.0,
             wp.array([0.0], dtype=wp.float32, device=device),
             1,
@@ -1119,6 +1124,7 @@ def _launch_open_box_soft_contact(test, device, mesh_id, points, mesh_properties
             wp.array([0], dtype=wp.int32, device=device),
             wp.empty(0, dtype=HeightfieldData, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
+            False,
         ],
         outputs=[
             count,
@@ -3581,7 +3587,11 @@ def test_mesh_sdf_provisioned_and_emits(test, device):
     test.assertGreaterEqual(int(model._shape_sdf_index.numpy()[mesh_shape]), 0)
 
     pipeline = newton.CollisionPipeline(
-        model, broad_phase="nxn", soft_contact_gap=0.1, enable_rigid_soft_full_surface_contact=True
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.1,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="sdf",
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -3590,6 +3600,57 @@ def test_mesh_sdf_provisioned_and_emits(test, device):
     idx = contacts.soft_contact_indices.numpy()[:total]
     # The mesh's volume SDF feeds the edge/face passes -> edge/face records emitted.
     test.assertGreater(int(np.sum(idx[:, 1] >= 0)), 0)
+
+
+def test_sdf_backend_particle_mesh_uses_texture_sdf(test, device):
+    """The default SDF back-end's particle-mesh row samples the provisioned texture, not the mesh BVH.
+
+    After finalization, move only the live Warp mesh far from the baked texture SDF. This deliberate
+    test-only mismatch makes the two query paths distinguishable: a triangle-BVH query misses the
+    particle, while the texture SDF still reports the original box surface.
+    """
+    box_mesh = newton.Mesh.create_box(0.5, 0.5, 0.5)
+    builder = newton.ModelBuilder()
+    shape = builder.add_shape_mesh(body=-1, mesh=box_mesh)
+    particle = builder.add_particle(wp.vec3(0.0, 0.0, 0.55), wp.vec3(0.0), 1.0, radius=0.0)
+    configure_sdf_for_collision_shapes(builder)
+    model = builder.finalize(device=device)
+    test.assertGreaterEqual(int(model._shape_sdf_index.numpy()[shape]), 0)
+
+    # The volume SDF is already baked. Move and refit only the triangle mesh queried by the legacy
+    # particle path; model.shape_source_ptr continues to reference this same Warp mesh.
+    moved_points = box_mesh.mesh.points.numpy() + np.array([10.0, 0.0, 0.0], dtype=np.float32)
+    box_mesh.mesh.points.assign(moved_points)
+    box_mesh.mesh.refit()
+
+    state = model.state()
+    legacy_pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.1,
+        enable_rigid_soft_full_surface_contact=False,
+        rigid_soft_mesh_backend="bvh",
+    )
+    legacy_contacts = legacy_pipeline.contacts()
+    legacy_pipeline.collide(state, legacy_contacts)
+    test.assertEqual(int(legacy_contacts.soft_contact_count.numpy()[0]), 0)
+
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.1,
+        enable_rigid_soft_full_surface_contact=False,
+    )
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+
+    count = int(contacts.soft_contact_count.numpy()[0])
+    test.assertEqual(count, 1)
+    test.assertEqual(int(contacts.soft_contact_particle.numpy()[0]), particle)
+    test.assertEqual(int(contacts.soft_contact_shape.numpy()[0]), shape)
+    # The sampled SDF still represents the original box, whose upper surface is z = 0.5.
+    body_pos = contacts.soft_contact_body_pos.numpy()[0]
+    np.testing.assert_allclose(body_pos, (0.0, 0.0, 0.5), atol=0.03)
 
 
 def test_force_sdf_provisions_collision_meshes(test, device):
@@ -3688,6 +3749,7 @@ def test_optimize_against_mesh_texture_sdf(test, device):
 
 for _name, _fn in (
     ("test_mesh_sdf_provisioned_and_emits", test_mesh_sdf_provisioned_and_emits),
+    ("test_sdf_backend_particle_mesh_uses_texture_sdf", test_sdf_backend_particle_mesh_uses_texture_sdf),
     ("test_optimize_against_mesh_texture_sdf", test_optimize_against_mesh_texture_sdf),
 ):
     add_function_test(TestFullSurfaceSoftContact, _name, _fn, devices=get_cuda_test_devices())
@@ -3708,10 +3770,12 @@ def _eval_shape_sdf_kernel(
     out_grad[0] = grad
 
 
-def _make_box_mesh_sdf_model(device):
+def _make_box_mesh_sdf_model(device, *, add_particle=False):
     """A single box MESH with a provisioned (unscaled) volume SDF, for eval_shape_sdf tests."""
     builder = newton.ModelBuilder()
     builder.add_shape_mesh(body=-1, mesh=newton.Mesh.create_box(0.5, 0.5, 0.5))
+    if add_particle:
+        builder.add_particle(wp.vec3(0.0, 0.0, 0.55), wp.vec3(0.0), 1.0, radius=0.0)
     configure_sdf_for_collision_shapes(builder)
     model = builder.finalize(device=device)
     return model, int(model._shape_sdf_index.numpy()[0])
@@ -3779,13 +3843,13 @@ def test_full_surface_empty_sdf_descriptor_rejected(test, device):
     """A participating mesh whose shape_sdf_index points at an empty placeholder descriptor (coarse
     texture None, e.g. a mesh-mesh BVH fallback) is rejected by the full-surface guard rather than
     sampled -- sampling one reproduced CUDA error 700 (E1)."""
-    model, sdf_idx = _make_box_mesh_sdf_model(device)
+    model, sdf_idx = _make_box_mesh_sdf_model(device, add_particle=True)
     test.assertGreaterEqual(sdf_idx, 0)
     # Simulate an empty placeholder descriptor at that slot: a nonnegative index whose descriptor
     # carries no texture (coarse texture None), exactly what a BVH fallback appends.
     model._texture_sdf_coarse_textures[sdf_idx] = None
     with test.assertRaises(ValueError):
-        newton.CollisionPipeline(model, broad_phase="nxn", enable_rigid_soft_full_surface_contact=True)
+        newton.CollisionPipeline(model, broad_phase="nxn", rigid_soft_mesh_backend="sdf")
 
 
 def _add_soft_triangle(builder, z=1.0):
@@ -3921,7 +3985,11 @@ def test_full_surface_nonuniform_mesh_accurate_distance(test, device):
     # 0.08 m gap, 0.06 m margin -> outside -> no contact. min_scale would under-report 0.04 < 0.06.
     model_out = _nonuniform_box_mesh_gap_model(device, tri_x=1.08)
     pipe_out = newton.CollisionPipeline(
-        model_out, broad_phase="nxn", soft_contact_gap=0.06, enable_rigid_soft_full_surface_contact=True
+        model_out,
+        broad_phase="nxn",
+        soft_contact_gap=0.06,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="sdf",
     )
     contacts_out = pipe_out.contacts()
     pipe_out.collide(model_out.state(), contacts_out)
@@ -3932,7 +4000,11 @@ def test_full_surface_nonuniform_mesh_accurate_distance(test, device):
     # 0.03 m gap -> inside the margin -> contact, projected onto the true +x surface at x = 1.0.
     model_in = _nonuniform_box_mesh_gap_model(device, tri_x=1.03)
     pipe_in = newton.CollisionPipeline(
-        model_in, broad_phase="nxn", soft_contact_gap=0.06, enable_rigid_soft_full_surface_contact=True
+        model_in,
+        broad_phase="nxn",
+        soft_contact_gap=0.06,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="sdf",
     )
     contacts_in = pipe_in.contacts()
     pipe_in.collide(model_in.state(), contacts_in)
@@ -3967,12 +4039,12 @@ for _name, _fn in (
 
 
 def test_unprovisioned_mesh_raises(test, device):
-    """A participating mesh with no SDF makes CollisionPipeline raise when the flag is enabled.
+    """A participating mesh with no SDF makes the explicit SDF back-end raise.
 
     Mirrors SolverVBD raising on an uncolored model: provisioning an SDF (e.g. via
     ShapeConfig.configure_sdf(force_sdf=True)) is a required build step, and skipping it is an error
-    rather than a silent degrade to the per-particle path. The opt-in 'bvh' back-end needs no SDF
-    and must construct cleanly on the same model.
+    rather than silently degrading to a different mesh query. The explicitly selected ``"bvh"``
+    back-end needs no SDF and must construct cleanly on the same model.
     """
     box_mesh = newton.Mesh.create_box(0.5, 0.5, 0.5)
     builder = newton.ModelBuilder()
@@ -3991,7 +4063,11 @@ def test_unprovisioned_mesh_raises(test, device):
     model = builder.finalize(device=device)
     with test.assertRaises(ValueError):
         newton.CollisionPipeline(
-            model, broad_phase="nxn", soft_contact_gap=0.1, enable_rigid_soft_full_surface_contact=True
+            model,
+            broad_phase="nxn",
+            soft_contact_gap=0.1,
+            enable_rigid_soft_full_surface_contact=True,
+            rigid_soft_mesh_backend="sdf",
         )
     # The BVH back-end (opt-in) handles the SDF-less mesh instead of raising -- and actually
     # produces full-surface records for it at runtime (the mesh is excluded from the legacy
@@ -4001,7 +4077,7 @@ def test_unprovisioned_mesh_raises(test, device):
         broad_phase="nxn",
         soft_contact_gap=0.1,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     contacts = pipeline.contacts()
     state = model.state()

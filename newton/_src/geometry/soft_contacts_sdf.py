@@ -1,22 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""SDF local-optimization primitives for full-surface rigid-soft contact.
+"""Rigid-soft particle contacts and SDF-based full-surface contact queries.
 
-Implements the Macklin et al. (2020) "Local Optimization for Robust Signed Distance Field
-Collision" face (barycentric simplex) and edge (1-D golden-section) optimizers over a rigid
-shape's signed-distance field, plus the shape-agnostic ``eval_shape_sdf`` dispatch.
+The particle-shape kernel handles analytic primitives, heightfields, and mesh/convex shapes using
+the selected SDF or nearest-triangle back-end. This module also implements the Macklin et al. (2020)
+"Local Optimization for Robust Signed Distance Field Collision" face (barycentric simplex) and
+edge (1-D golden-section) optimizers over a rigid shape's signed-distance field.
 
-This lives in its own module (not ``kernels.py``) because it needs the volume-SDF sampler from
-``sdf_texture``, and ``sdf_texture -> sdf_utils -> kernels`` would make a ``kernels`` import cyclic.
-Nothing imports this module except the collision launcher, so it is cycle-free.
+These kernels live here rather than in ``kernels.py`` because the volume-SDF sampler depends on
+``sdf_texture -> sdf_utils -> kernels``; importing that sampler back into ``kernels.py`` would form
+a cycle.
 """
 
 import warp as wp
 
-from .flags import ShapeFlags
+from ..utils.heightfield import HeightfieldData, sample_sdf_grad_heightfield
+from .flags import ParticleFlags, ShapeFlags
 from .kernels import (
     counter_increment,
+    mesh_query_point_sign,
+    resolve_mesh_sign_method,
     sdf_box,
     sdf_box_grad,
     sdf_capsule,
@@ -132,6 +136,151 @@ def eval_shape_sdf(
     else:
         scaled_grad = grad
     return dist * min_scale, dist * stretch, scaled_grad
+
+
+@wp.kernel
+def create_soft_contacts(
+    soft_rigid_contact_pairs: wp.array[wp.vec2i],
+    particle_q: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_world: wp.array[int],  # World indices for particles
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[wp.int32],
+    shape_sdf_index: wp.array[wp.int32],
+    texture_sdf_table: wp.array[TextureSDFData],
+    shape_world: wp.array[int],  # World indices for shapes
+    margin: float,
+    shape_margin: wp.array[float],
+    soft_contact_max: int,
+    shape_flags: wp.array[wp.int32],
+    shape_heightfield_index: wp.array[wp.int32],
+    heightfield_data: wp.array[HeightfieldData],
+    heightfield_elevations: wp.array[wp.float32],
+    mesh_contacts_use_sdf: bool,
+    # outputs
+    soft_contact_count: wp.array[int],
+    soft_contact_particle: wp.array[int],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    soft_contact_shape: wp.array[int],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_body_vel: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_tids: wp.array[int],
+):
+    tid = wp.tid()
+    pair = soft_rigid_contact_pairs[tid]
+    particle_index = pair[0]
+    shape_index = pair[1]
+    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+        return
+    if (shape_flags[shape_index] & ShapeFlags.COLLIDE_PARTICLES) == 0:
+        return
+
+    # Skip collision between different worlds unless either object is global.
+    particle_world_id = particle_world[particle_index]
+    shape_world_id = shape_world[shape_index]
+    if particle_world_id != -1 and shape_world_id != -1 and particle_world_id != shape_world_id:
+        return
+
+    X_bs, X_ws, X_sw = _shape_frames(shape_body, body_q, shape_transform, shape_index)
+    x_local = wp.transform_point(X_sw, particle_q[particle_index])
+
+    geo_type = shape_type[shape_index]
+    geo_scale = shape_scale[shape_index]
+    s_margin = shape_margin[shape_index] if shape_margin.shape[0] > 0 else 0.0
+    radius = particle_radius[particle_index]
+
+    d = 1.0e6
+    n = wp.vec3()
+    v = wp.vec3()
+
+    if geo_type == GeoType.SPHERE:
+        d = sdf_sphere(x_local, geo_scale[0])
+        n = sdf_sphere_grad(x_local, geo_scale[0])
+
+    if geo_type == GeoType.BOX:
+        d = sdf_box(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
+        n = sdf_box_grad(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
+
+    if geo_type == GeoType.CAPSULE:
+        d = sdf_capsule(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_capsule_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.CYLINDER:
+        d = sdf_cylinder(x_local, geo_scale[0], geo_scale[1], int(Axis.Z), -1.0, geo_scale[2])
+        n = sdf_cylinder_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z), -1.0, geo_scale[2])
+
+    if geo_type == GeoType.CONE:
+        d = sdf_cone(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_cone_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.ELLIPSOID:
+        d = sdf_ellipsoid(x_local, geo_scale)
+        n = sdf_ellipsoid_grad(x_local, geo_scale)
+
+    if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
+        if mesh_contacts_use_sdf:
+            sdf_idx = shape_sdf_index[shape_index]
+            if sdf_idx < 0:
+                # CollisionPipeline rejects active mesh shapes without an SDF when this backend is
+                # selected. Retain the guard so an invalid descriptor can never index the table.
+                return
+            _phi_lower, d, n = eval_shape_sdf(geo_type, geo_scale, x_local, sdf_idx, texture_sdf_table)
+        else:
+            mesh = shape_source_ptr[shape_index]
+            min_scale = wp.min(wp.min(wp.abs(geo_scale[0]), wp.abs(geo_scale[1])), wp.abs(geo_scale[2]))
+            query = mesh_query_point_sign(
+                mesh,
+                wp.cw_div(x_local, geo_scale),
+                margin + s_margin / min_scale + radius / min_scale,
+                resolve_mesh_sign_method(shape_mesh_properties[shape_index]),
+            )
+            if query.result:
+                shape_p = wp.cw_mul(wp.mesh_eval_position(mesh, query.face, query.u, query.v), geo_scale)
+                v = wp.cw_mul(wp.mesh_eval_velocity(mesh, query.face, query.u, query.v), geo_scale)
+                delta = x_local - shape_p
+                d = wp.length(delta) * query.sign
+                n = wp.normalize(delta) * query.sign
+
+    if geo_type == GeoType.PLANE:
+        d = sdf_plane(x_local, geo_scale[0] * 0.5, geo_scale[1] * 0.5)
+        n = wp.vec3(0.0, 0.0, 1.0)
+
+    if geo_type == GeoType.HFIELD:
+        hfd = heightfield_data[shape_heightfield_index[shape_index]]
+        d, n = sample_sdf_grad_heightfield(hfd, heightfield_elevations, x_local)
+
+    if d < margin + s_margin + radius:
+        # counter_increment must remain directly in the kernel body for Warp's replay substitution.
+        index = counter_increment(soft_contact_count, 0, soft_contact_tids, tid)
+        if index < soft_contact_max:
+            _write_soft_contact(
+                index,
+                soft_contact_particle,
+                soft_contact_indices,
+                soft_contact_barycentric,
+                soft_contact_shape,
+                soft_contact_rigid_indices,
+                soft_contact_body_pos,
+                soft_contact_body_vel,
+                soft_contact_normal,
+                particle_index,
+                wp.vec3i(particle_index, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                shape_index,
+                wp.vec3i(-1, -1, -1),
+                wp.transform_point(X_bs, x_local - n * d),
+                wp.transform_vector(X_bs, v),
+                wp.transform_vector(X_ws, n),
+            )
 
 
 @wp.func
@@ -445,7 +594,7 @@ def create_soft_edge_contacts(
 
 
 def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, edge_pairs, face_pairs, n_particle_pairs):
-    """Launch the soft EDGE and FACE passes (the soft-particle pass is the legacy kernel).
+    """Launch the soft EDGE and FACE passes; the particle pass is launched separately.
 
     ``edge_pairs`` / ``face_pairs`` are precomputed world-compatible (soft feature, shape) index
     pairs (``wp.vec2i``), analogous to :func:`_build_soft_particle_rigid_contact_pairs` for the

@@ -24,11 +24,10 @@ from ..geometry.contact_match import ContactMatcher
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
-from ..geometry.kernels import create_soft_contacts
 from ..geometry.narrow_phase import NarrowPhase
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.soft_contacts_bvh import build_full_surface_bvh_rigid_features, launch_soft_bvh_contacts
-from ..geometry.soft_contacts_sdf import launch_soft_ef_contacts
+from ..geometry.soft_contacts_sdf import create_soft_contacts, launch_soft_ef_contacts
 from ..geometry.support_function import (
     GenericShapeData,
     SupportMapDataProvider,
@@ -723,8 +722,8 @@ def _build_soft_particle_rigid_contact_pairs(model: Model, shape_mask: np.ndarra
 
     Emits every particle-shape pair whose worlds are compatible (see :func:`_world_compatible_pairs`).
     :attr:`~newton.ParticleFlags.ACTIVE` and :attr:`~newton.ShapeFlags.COLLIDE_PARTICLES` are applied
-    per-thread in :func:`~newton._src.geometry.kernels.create_soft_contacts`, not here, so the
-    candidate set stays valid when those flags change after the pipeline is constructed.
+    per-thread in the contact-emission kernels, not here, so the candidate set stays valid when
+    those flags change after the pipeline is constructed.
     ``shape_mask`` (optional boolean mask over shapes) drops pairs whose shape is handled elsewhere --
     the BVH full-surface back-end's VT query *replaces* the legacy closest-point record for its
     shapes, so they must not also appear here.
@@ -841,30 +840,29 @@ def _full_surface_capable_shape_mask(model: Model) -> np.ndarray:
     return analytic | infinite_plane | (is_mesh & has_real_sdf)
 
 
-def _raise_on_unprovisioned_full_surface_meshes(model: Model, capable: np.ndarray) -> None:
+def _raise_on_unprovisioned_rigid_soft_sdf_meshes(model: Model, full_surface_capable: np.ndarray) -> None:
     """A participating mesh/convex without a real SDF is a provisioning *mistake*, not an inherent
-    limitation, so fail loudly (the edge/face passes would otherwise sample an empty descriptor and a
-    soft body could pass straight through). Distinct from the unsupported shape *types*, which warn
-    and fall back -- see :func:`_warn_full_surface_fallbacks`."""
+    limitation, so fail loudly (particle and full-surface passes would otherwise sample an empty
+    descriptor and a soft body could pass straight through)."""
     stype = model.shape_type.numpy()
     is_mesh = np.isin(stype, (int(GeoType.MESH), int(GeoType.CONVEX_MESH)))
     collide_particles = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_PARTICLES)) != 0
-    unprovisioned = np.where(is_mesh & collide_particles & ~capable)[0]
+    unprovisioned = np.where(is_mesh & collide_particles & ~full_surface_capable)[0]
     if unprovisioned.size == 0:
         return
     labels = getattr(model, "shape_key", None)
     missing = [(labels[i] if labels is not None and i < len(labels) else f"shape {int(i)}") for i in unprovisioned]
     raise ValueError(
-        f"enable_rigid_soft_full_surface_contact=True, but these participating rigid shapes have no "
-        f"signed-distance field: {missing}. The edge and face contact passes sample each rigid "
-        f"mesh/convex shape's SDF, so a shape without one is skipped and a soft body can pass straight "
-        f"through it. Provision an SDF before ModelBuilder.finalize(), any one of these ways:\n"
+        f"rigid_soft_mesh_backend='sdf', but these participating rigid shapes have no signed-distance "
+        f"field: {missing}. Particle, edge, and face contacts sample each rigid mesh/convex shape's "
+        f"SDF, so a shape without one would be skipped. Provision an SDF before "
+        f"ModelBuilder.finalize(), any one of these ways:\n"
         f"  - For shapes that use the builder's default config (including importer-added shapes): "
         f"set builder.default_shape_cfg.configure_sdf(force_sdf=True) before you add or import them.\n"
         f"  - For a shape you gave an explicit config: call configure_sdf() on that config, e.g. "
         f"cfg.configure_sdf(force_sdf=True) (optionally max_resolution=... or target_voxel_size=...).\n"
         f"  - Manually: build one with mesh.build_sdf() and attach it to the shape.\n"
-        f"Or set enable_rigid_soft_full_surface_contact=False to use per-vertex (particle) contacts only."
+        f"Or select rigid_soft_mesh_backend='bvh' to query the exact mesh geometry."
     )
 
 
@@ -872,7 +870,7 @@ def _warn_full_surface_fallbacks(model: Model, capable: np.ndarray) -> None:
     """Warn about participating shapes whose *type* cannot do edge/face -- heightfields, finite planes,
     Gaussian splats, the NONE placeholder -- which fall back to per-particle soft contact. Mesh/convex
     without an SDF is handled separately (it raises; see
-    :func:`_raise_on_unprovisioned_full_surface_meshes`), so it is excluded here."""
+    :func:`_raise_on_unprovisioned_rigid_soft_sdf_meshes`), so it is excluded here."""
     stype = model.shape_type.numpy()
     is_mesh = np.isin(stype, (int(GeoType.MESH), int(GeoType.CONVEX_MESH)))
     collide_particles = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_PARTICLES)) != 0
@@ -960,7 +958,7 @@ class CollisionPipeline:
         soft_contact_gap: float | None = None,
         soft_contact_margin: float | None = None,
         enable_rigid_soft_full_surface_contact: bool = False,
-        full_surface_mesh_backend: Literal["sdf", "bvh"] = "sdf",
+        rigid_soft_mesh_backend: Literal["sdf", "bvh"] = "sdf",
         full_surface_bvh_contact_headroom: int = 4,
         requires_grad: bool | None = None,
         broad_phase: Literal["nxn", "sap", "explicit"]
@@ -1015,17 +1013,18 @@ class CollisionPipeline:
                 surface -- the edges and triangle interiors -- in addition to the per-vertex
                 (particle) contacts. Catches rigid features that pass between soft vertices
                 (e.g. a thin box edge through a coarse cloth cell), which the per-particle path misses.
-                Analytic rigid primitives use SDF local optimization; rigid mesh/convex shapes use the
-                back-end selected by ``full_surface_mesh_backend``. Consumed only by
+                Analytic rigid primitives use SDF local optimization; rigid mesh/convex shapes use
+                the back-end selected independently by ``rigid_soft_mesh_backend``. Consumed only by
                 :class:`~newton.solvers.SolverVBD`; other solvers raise on such contacts. Records are
                 emitted into :attr:`Contacts.soft_contact_indices`. Defaults to False. Fixed at
                 construction because it sizes the soft-contact buffer headroom.
-            full_surface_mesh_backend: Full-surface back-end for rigid **mesh/convex** shapes.
-                ``"sdf"`` (default) minimizes the shape's provisioned volume SDF and raises for a
-                participating mesh without one. ``"bvh"`` runs discrete vertex/edge/face queries
-                against exact mesh geometry instead -- no SDF required; keep its BVHs fresh via
-                :meth:`refit_soft_contact_bvh`. Ignored unless
-                ``enable_rigid_soft_full_surface_contact`` is set.
+            rigid_soft_mesh_backend: Contact-query back-end for rigid **mesh/convex** shapes.
+                ``"sdf"`` (default) samples the shape's provisioned volume SDF for particle rows
+                and, when full-surface contact is enabled, minimizes it over soft edges and faces.
+                It raises for a participating mesh without a provisioned SDF. ``"bvh"`` queries
+                exact mesh geometry. Without full-surface contact this is the nearest-triangle
+                particle query; with full-surface contact it runs dense vertex/edge/face queries,
+                whose BVHs must be kept fresh via :meth:`refit_soft_contact_bvh`.
 
                 .. experimental::
 
@@ -1446,28 +1445,35 @@ class CollisionPipeline:
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
         self.enable_rigid_soft_full_surface_contact = enable_rigid_soft_full_surface_contact
-        if full_surface_mesh_backend not in ("bvh", "sdf"):
-            raise ValueError(f"full_surface_mesh_backend must be 'bvh' or 'sdf', got {full_surface_mesh_backend!r}")
+        if rigid_soft_mesh_backend not in ("bvh", "sdf"):
+            raise ValueError(f"rigid_soft_mesh_backend must be 'bvh' or 'sdf', got {rigid_soft_mesh_backend!r}")
         if full_surface_bvh_contact_headroom < 0:
             raise ValueError(f"full_surface_bvh_contact_headroom must be >= 0, got {full_surface_bvh_contact_headroom}")
-        self.full_surface_mesh_backend = full_surface_mesh_backend
+        self.rigid_soft_mesh_backend = rigid_soft_mesh_backend
         self.full_surface_bvh_contact_headroom = full_surface_bvh_contact_headroom
+
+        _full_surface_capable_mask = _full_surface_capable_shape_mask(model) if model.shape_count > 0 else None
+        if rigid_soft_mesh_backend == "sdf" and model.particle_count > 0 and _full_surface_capable_mask is not None:
+            _raise_on_unprovisioned_rigid_soft_sdf_meshes(model, _full_surface_capable_mask)
 
         # Shapes handled by the BVH full-surface back-end. None when the feature is off, the SDF
         # back-end is selected, or no mesh/convex shape participates -- every other path below then
         # stays bit-for-bit identical to the pre-BVH pipeline.
-        _bvh_shape_mask: np.ndarray | None = None
-        if enable_rigid_soft_full_surface_contact and full_surface_mesh_backend == "bvh" and model.shape_count > 0:
+        _full_surface_bvh_shape_mask: np.ndarray | None = None
+        if enable_rigid_soft_full_surface_contact and rigid_soft_mesh_backend == "bvh" and model.shape_count > 0:
             # Deliberately NOT gated on COLLIDE_PARTICLES: the flag is mutable and checked
             # per-thread in the kernels (the candidate-pair contract), so a mesh disabled at
             # construction can still join the back-end when the flag is enabled at runtime.
             _stype = model.shape_type.numpy()
             _mask = np.isin(_stype, (int(GeoType.MESH), int(GeoType.CONVEX_MESH)))
             if _mask.any():
-                _bvh_shape_mask = _mask
+                _full_surface_bvh_shape_mask = _mask
 
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(
-            model, shape_mask=(~_bvh_shape_mask if _bvh_shape_mask is not None else None)
+            model,
+            shape_mask=(
+                ~_full_surface_bvh_shape_mask if _full_surface_bvh_shape_mask is not None else None
+            ),
         )
         self._soft_contact_pair_count = len(self.soft_rigid_contact_pairs)
         # Full-surface edge/face candidate pairs (world-compatible, like the particle pairs above);
@@ -1481,28 +1487,30 @@ class CollisionPipeline:
             # ...) warn and are excluded from the edge/face candidate pairs, falling back to
             # per-particle soft contact -- so one such shape does not disable full-surface for the
             # rest of the scene.
-            _capable = _full_surface_capable_shape_mask(model) if model.shape_count > 0 else None
-            if _capable is not None:
-                if full_surface_mesh_backend == "sdf":
-                    _raise_on_unprovisioned_full_surface_meshes(model, _capable)
-                _warn_full_surface_fallbacks(model, _capable)
-                if _bvh_shape_mask is not None:
-                    _capable = _capable & ~_bvh_shape_mask
-            self.soft_edge_rigid_pairs = _build_soft_edge_rigid_contact_pairs(model, _capable)
-            self.soft_face_rigid_pairs = _build_soft_face_rigid_contact_pairs(model, _capable)
+            _full_surface_sdf_shape_mask = _full_surface_capable_mask
+            if _full_surface_capable_mask is not None:
+                _warn_full_surface_fallbacks(model, _full_surface_capable_mask)
+                if _full_surface_bvh_shape_mask is not None:
+                    _full_surface_sdf_shape_mask = _full_surface_capable_mask & ~_full_surface_bvh_shape_mask
+            self.soft_edge_rigid_pairs = _build_soft_edge_rigid_contact_pairs(
+                model, _full_surface_sdf_shape_mask
+            )
+            self.soft_face_rigid_pairs = _build_soft_face_rigid_contact_pairs(
+                model, _full_surface_sdf_shape_mask
+            )
         else:
             _empty_pairs = wp.array(np.empty((0, 2), np.int32), dtype=wp.vec2i, device=model.device)
             self.soft_edge_rigid_pairs, self.soft_face_rigid_pairs = _empty_pairs, _empty_pairs
 
         # BVH back-end data: rigid feature tables + soft-vertex candidate pairs (empty when inactive).
-        if _bvh_shape_mask is not None:
+        if _full_surface_bvh_shape_mask is not None:
             if model.tri_count > 0:
                 (
                     self._full_surface_bvh_rigid_vertex_table,
                     self._full_surface_bvh_rigid_vertex_normals,
                     self._full_surface_bvh_rigid_edge_table,
                     self._full_surface_bvh_rigid_edge_outward_dirs,
-                ) = build_full_surface_bvh_rigid_features(model, _bvh_shape_mask)
+                ) = build_full_surface_bvh_rigid_features(model, _full_surface_bvh_shape_mask)
                 if model.edge_count == 0:
                     # No soft edges -> nothing for the EE query to hit; drop its threads. A full-tree
                     # query on the detector's empty edge BVH is also unsafe (global-world shapes
@@ -1533,7 +1541,7 @@ class CollisionPipeline:
                 model.shape_world.numpy(),
                 int(getattr(model, "world_count", 0) or 0),
                 device,
-                shape_mask=_bvh_shape_mask,
+                shape_mask=_full_surface_bvh_shape_mask,
             )
             # Query AABB inflation for the TV/EE threads (rigid features know no soft radius
             # up front); radii grown past this after finalize can miss candidates.
@@ -2396,6 +2404,8 @@ class CollisionPipeline:
                     model.shape_scale,
                     model.shape_source_ptr,
                     model._shape_mesh_properties,
+                    model._shape_sdf_index,
+                    model._texture_sdf_data,
                     model.shape_world,
                     soft_contact_gap,
                     model.shape_margin,
@@ -2404,6 +2414,7 @@ class CollisionPipeline:
                     model.shape_heightfield_index,
                     model.heightfield_data,
                     model.heightfield_elevations,
+                    self.rigid_soft_mesh_backend == "sdf",
                 ],
                 outputs=[
                     contacts.soft_contact_count,
@@ -2421,7 +2432,7 @@ class CollisionPipeline:
             )
 
         # Full-surface EDGE/FACE passes (opt-in, set at construction): add the soft edge/face contacts
-        # the per-particle path cannot detect. Run after the legacy particle launch on the same stream;
+        # the per-particle path cannot detect. Run after the particle kernel on the same stream;
         # the particle records therefore occupy [0, particle_count) and the edge/face records append.
         # The flag is fixed at construction because soft_contact_max headroom is sized there.
         if self.enable_rigid_soft_full_surface_contact and state.particle_q:

@@ -288,7 +288,7 @@ def _bvh_brute_force_reference(model, box_mesh, gap):
 
 def _run_bvh_pipeline(model, gap=0.01, **kwargs):
     """Construct a BVH-backend full-surface pipeline, refit, collide; returns (pipeline, contacts)."""
-    kwargs.setdefault("full_surface_mesh_backend", "bvh")
+    kwargs.setdefault("rigid_soft_mesh_backend", "bvh")
     pipeline = newton.CollisionPipeline(
         model, soft_contact_gap=gap, enable_rigid_soft_full_surface_contact=True, **kwargs
     )
@@ -797,7 +797,7 @@ def test_bvh_vertex_over_rigid_face(test, device):
     test.assertTrue(np.allclose(bvh_normal, [0.0, 0.0, 1.0], atol=1e-5), "normal is the face normal")
 
     # The legacy per-particle path sees this family too and must agree record-for-record.
-    legacy = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+    legacy = newton.CollisionPipeline(model, soft_contact_gap=0.01, rigid_soft_mesh_backend="bvh")
     c2 = legacy.contacts()
     legacy.collide(model.state(), c2)
     test.assertEqual(int(c2.soft_contact_count.numpy()[0]), 1)
@@ -819,7 +819,7 @@ def test_bvh_rigid_metadata_overwritten_on_buffer_reuse(test, device):
         model,
         soft_contact_gap=0.01,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -882,7 +882,7 @@ def test_bvh_edge_across_rigid_edge(test, device):
     test.assertEqual(int(((idx[:total, 1] < 0) & (idx[:total, 0] >= 0)).sum()), 0)
 
     # The per-particle path (flag off) misses the crossing entirely.
-    flat = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+    flat = newton.CollisionPipeline(model, soft_contact_gap=0.01, rigid_soft_mesh_backend="bvh")
     c2 = flat.contacts()
     flat.collide(model.state(), c2)
     test.assertEqual(int(c2.soft_contact_count.numpy()[0]), 0)
@@ -921,7 +921,7 @@ def test_bvh_face_over_rigid_vertex(test, device):
     )
     test.assertEqual(int(((idx[:, 1] < 0) & (idx[:, 0] >= 0)).sum()), 0, "no VT records: vertices are clear")
 
-    flat = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+    flat = newton.CollisionPipeline(model, soft_contact_gap=0.01, rigid_soft_mesh_backend="bvh")
     c2 = flat.contacts()
     flat.collide(model.state(), c2)
     test.assertEqual(int(c2.soft_contact_count.numpy()[0]), 0)
@@ -1115,7 +1115,7 @@ def test_bvh_normals_under_scale(test, device):
         )
         model = builder.finalize(device=device)
         pipeline = newton.CollisionPipeline(
-            model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+            model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
         )
         contacts = pipeline.contacts()
         state = model.state()
@@ -1141,7 +1141,7 @@ def test_bvh_body_attached_mesh_and_surface_velocity(test, device):
     wp_mesh.velocities.assign(vel)
 
     pipeline = newton.CollisionPipeline(
-        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -1299,11 +1299,11 @@ def test_bvh_vs_sdf_backend_coverage(test, device):
     model, _box = _build_cloth_over_mesh_box(device, provision_sdf=True)
 
     _, c_bvh = _run_bvh_pipeline(model, gap=gap)
-    p_sdf, c_sdf = _run_bvh_pipeline(model, gap=gap, full_surface_mesh_backend="sdf")
+    p_sdf, c_sdf = _run_bvh_pipeline(model, gap=gap, rigid_soft_mesh_backend="sdf")
 
     n_bvh = int(c_bvh.soft_contact_count.numpy()[0])
     idx_bvh = c_bvh.soft_contact_indices.numpy()[:n_bvh]
-    # BVH: particles named by VT records; SDF: by the legacy particle records (first pair_count).
+    # BVH: particles named by VT records; SDF: by texture-SDF particle records (first pair_count).
     bvh_particles = set(idx_bvh[(idx_bvh[:, 1] < 0) & (idx_bvh[:, 0] >= 0), 0].tolist())
     n_sdf = int(c_sdf.soft_contact_count.numpy()[0])
     idx_sdf = c_sdf.soft_contact_indices.numpy()[:n_sdf]
@@ -1722,7 +1722,7 @@ def test_bvh_multi_emission_gradients(test, device):
     model = builder.finalize(device=device, requires_grad=True)
 
     pipeline = newton.CollisionPipeline(
-        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -1788,7 +1788,7 @@ def test_bvh_mixed_scene_stream_offsets(test, device):
     model = builder.finalize(device=device, requires_grad=True)
 
     pipeline = newton.CollisionPipeline(
-        model, soft_contact_gap=gap, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=gap, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     # The sphere puts legacy particle pairs AND SDF edge/face pairs ahead of the BVH passes.
     test.assertGreater(pipeline.soft_contact_pair_count, 0)
@@ -1953,7 +1953,7 @@ def test_bvh_runtime_collide_particles_toggle(test, device):
     model = builder.finalize(device=device)
 
     pipeline = newton.CollisionPipeline(
-        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     test.assertGreater(pipeline._full_surface_bvh_thread_count, 0, "tables must exist for the disabled mesh")
     contacts = pipeline.contacts()
@@ -1989,7 +1989,7 @@ def test_bvh_vt_only_without_triangles(test, device):
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # silently: no warning may be raised
         pipeline = newton.CollisionPipeline(
-            model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+            model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
         )
     test.assertIsNone(pipeline._soft_contact_detector)
     test.assertEqual(len(pipeline._full_surface_bvh_rigid_vertex_table), 0)
@@ -2003,16 +2003,17 @@ def test_bvh_vt_only_without_triangles(test, device):
         pipeline.refit_soft_contact_bvh(model.state())
 
 
-def test_bvh_sdf_backend_keeps_raise(test, device):
-    """The 'sdf' back-end preserves the unprovisioned-mesh raise; 'bvh' removes it."""
+def test_sdf_backend_requires_provisioned_mesh(test, device):
+    """The default SDF back-end requires a provisioned mesh even without full-surface contact."""
     model, _box = _build_cloth_over_mesh_box(device, provision_sdf=False)
     with test.assertRaises(ValueError):
-        newton.CollisionPipeline(model, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="sdf")
+        newton.CollisionPipeline(model)
+    newton.CollisionPipeline(model, rigid_soft_mesh_backend="bvh")  # explicit BVH needs no SDF
     newton.CollisionPipeline(
-        model, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )  # no raise
     with test.assertRaises(ValueError):
-        newton.CollisionPipeline(model, full_surface_mesh_backend="nope")
+        newton.CollisionPipeline(model, rigid_soft_mesh_backend="nope")
 
 
 def test_bvh_contact_headroom(test, device):
@@ -2022,19 +2023,19 @@ def test_bvh_contact_headroom(test, device):
         newton.CollisionPipeline(
             model,
             enable_rigid_soft_full_surface_contact=True,
-            full_surface_mesh_backend="bvh",
+            rigid_soft_mesh_backend="bvh",
             full_surface_bvh_contact_headroom=-1,
         )
     p0 = newton.CollisionPipeline(
         model,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
         full_surface_bvh_contact_headroom=0,
     )
     p7 = newton.CollisionPipeline(
         model,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
         full_surface_bvh_contact_headroom=7,
     )
     threads = p0._full_surface_bvh_thread_count
@@ -2060,7 +2061,7 @@ def test_bvh_refit_api(test, device):
     # collide() without a prior refit: the BVHs were never built -- it warns, then builds them
     # from the current state so detection still works.
     p0 = newton.CollisionPipeline(
-        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     c0 = p0.contacts()
     with warnings.catch_warnings(record=True) as caught:
@@ -2085,7 +2086,7 @@ def test_bvh_refit_api(test, device):
     test.assertTrue(np.array_equal(idx_after, idx_before), "rebuild must not change detection")
 
     # Self-contact owner on a flag-off pipeline.
-    p2 = newton.CollisionPipeline(model)
+    p2 = newton.CollisionPipeline(model, rigid_soft_mesh_backend="bvh")
     with test.assertRaises(ValueError):
         p2.refit_soft_contact_bvh(state)  # no detector yet
     p2.init_soft_self_contact(topological_filter_threshold=0)
@@ -2114,7 +2115,7 @@ def test_bvh_refit_follows_motion(test, device):
     builder.add_triangle(0, 1, 2)
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(
-        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -2150,8 +2151,8 @@ add_function_test(
 )
 add_function_test(
     TestBvhFullSurfaceSoftContact,
-    "test_bvh_sdf_backend_keeps_raise",
-    test_bvh_sdf_backend_keeps_raise,
+    "test_sdf_backend_requires_provisioned_mesh",
+    test_sdf_backend_requires_provisioned_mesh,
     devices=soft_devices,
 )
 add_function_test(
@@ -2186,7 +2187,7 @@ def test_bvh_overflow(test, device):
         model,
         soft_contact_gap=0.01,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
         soft_contact_max=2,
     )
     contacts = pipeline.contacts()
@@ -2232,7 +2233,7 @@ def test_bvh_graph_capture(test, device):
     """A graph-captured collide() with the BVH back-end matches uncaptured results."""
     model, _box = _build_cloth_over_mesh_box(device)
     pipeline = newton.CollisionPipeline(
-        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, full_surface_mesh_backend="bvh"
+        model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -2276,7 +2277,7 @@ def _run_bvh_dat_box_particle(device, enable_dat):
         broad_phase="nxn",
         soft_contact_gap=0.05,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     solver = newton.solvers.SolverVBD(
         model,
@@ -2346,7 +2347,7 @@ def _run_bvh_dat_static_pair(device, family, enable_dat):
         broad_phase="nxn",
         soft_contact_gap=0.01,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
 
     # Read the exact pair that will define the DAT plane, then drive the complete
@@ -2504,7 +2505,7 @@ def test_bvh_solver_owned_pipeline_refits_soft_features(test, device):
         model,
         soft_contact_gap=0.01,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
 
@@ -2537,7 +2538,7 @@ def test_bvh_invalid_adjacent_face_row_does_not_push_particle_sideways(test, dev
         model,
         soft_contact_gap=0.01,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
     state_in, state_out = model.state(), model.state()
@@ -2563,7 +2564,7 @@ def test_analytic_sdf_penetration_remains_force_eligible(test, device):
         model,
         soft_contact_gap=0.01,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
     state_in, state_out = model.state(), model.state()

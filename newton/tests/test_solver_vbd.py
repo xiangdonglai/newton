@@ -4578,7 +4578,7 @@ def test_bvh_force_eligibility_uses_detection_pose(test, device):
         soft_contact_gap=0.01,
         soft_contact_max=64,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     solver = newton.solvers.SolverVBD(model, iterations=0, rigid_compliant_alm=False, pipeline=pipeline)
     state_in, state_out = model.state(), model.state()
@@ -5787,7 +5787,7 @@ def _run_bvh_dat_rotating_mesh(device, enable_dat, use_interval_arithmetic=False
         soft_contact_gap=0.3,
         soft_contact_max=32,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     probe_contacts = pipeline.contacts()
     probe_state = model.state()
@@ -6535,7 +6535,7 @@ def test_rigid_dat_com_centered_body_bounds(test, device):
         broad_phase="nxn",
         soft_contact_gap=soft_gap,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     solver = newton.solvers.SolverVBD(
         model,
@@ -6645,7 +6645,7 @@ def test_rigid_dat_redetects_approaching_cloth_before_crossing(test, device):
         broad_phase="nxn",
         soft_contact_gap=0.02,
         enable_rigid_soft_full_surface_contact=True,
-        full_surface_mesh_backend="bvh",
+        rigid_soft_mesh_backend="bvh",
     )
     state_in, state_out = model.state(), model.state()
     initial_contacts = pipeline.contacts()
