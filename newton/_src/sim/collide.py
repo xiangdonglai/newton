@@ -1025,21 +1025,14 @@ class CollisionPipeline:
                 exact mesh geometry. Without full-surface contact this is the nearest-triangle
                 particle query; with full-surface contact it runs dense vertex/edge/face queries,
                 whose BVHs must be kept fresh via :meth:`refit_soft_contact_bvh`.
-
-                .. experimental::
-
-                    The ``"bvh"`` back-end emits a dense primitive-pair query. Rows whose local
-                    outward-orientation test fails remain available to DAT. SolverVBD recomputes
-                    that local orientation test before applying penalty forces. This local rule
-                    does not recover an already-intersecting watertight mesh.
             full_surface_bvh_contact_headroom: Records reserved in the default ``soft_contact_max``
                 per BVH-back-end feature thread (soft-vertex pairs + rigid vertices + rigid edges).
                 The all-pairs detection has no a-priori bound; on overflow, excess pairs are
                 dropped at the candidate stage (the pipeline's candidate counter keeps the
                 attempted count) and a warning is printed when ``verify_buffers`` is enabled.
-                Rigid DAT additionally fails closed by stalling the current update because missing
-                primitive pairs invalidate its coverage argument. Raise this (or override
-                ``soft_contact_max``) to recover progress. Defaults to 4.
+                For rigid-soft DAT, dropped primitive pairs invalidate the dense-coverage argument,
+                so the penetration-free guarantee does not apply to that collision pass. Increase
+                this value to avoid overflow. Defaults to 4.
             requires_grad: Whether pipeline-generated soft contacts and the
                 deprecated automatic rigid-contact outputs require gradients.
                 If None, uses ``model.requires_grad``. Explicit calls to
