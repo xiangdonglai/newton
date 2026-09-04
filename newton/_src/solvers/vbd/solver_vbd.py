@@ -549,7 +549,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 trajectories curved, so crossing times use sampling and bisection for the rigid
                 primitive identified by a BVH row, or the stored surface point for an analytic SDF
                 row. Requires a solver-owned pipeline (``pipeline=``); each side's motion budget
-                between detections is 0.5 x relaxation x soft-contact gap. With
+                between detections is 0.5 x relaxation x the minimum rigid-soft query radius,
+                where a query radius is the pipeline gap plus the soft feature radius and rigid
+                shape margin. With
                 ``collision_frequency_type`` AUTO, the rigid slot resolves to ``PRE_POST_INIT``
                 (detect before and right after initialization), matching the self-contact slot;
                 raise the detection frequency (``ITERATIONS``) to widen the per-step motion budget
@@ -2601,12 +2603,6 @@ class SolverVBD(SolverBase, CouplingInterface):
             or len(self.pipeline.soft_face_rigid_pairs) > 0
             or self.pipeline._full_surface_bvh_thread_count > 0
         )
-        if has_rigid_soft_queries and self.pipeline.soft_contact_gap <= 0.0:
-            raise ValueError(
-                "rigid_enable_penetration_free requires soft_contact_gap > 0 when rigid-soft "
-                "queries are active: DAT's between-detection motion bound needs positive "
-                "query slack independent of particle radii and shape margins."
-            )
         if self.integrate_with_external_rigid_solver:
             raise ValueError("rigid_enable_penetration_free is not supported with an external rigid solver.")
 
@@ -2618,10 +2614,30 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self._init_rigid_dat_body_bounding_radius(model)
 
-        # Both sides of a rigid-soft pair receive half of the collision query slack.
-        soft_gap = float(self.pipeline.soft_contact_gap) if model.particle_count > 0 else np.inf
-        if model.particle_count > 0 and np.isfinite(soft_gap) and soft_gap > 0.0:
-            rigid_soft_max_displacement = 0.5 * rigid_conservative_bound_relaxation * soft_gap
+        # VT uses one particle radius, TV uses a barycentric average of three radii, and EE uses
+        # the maximum endpoint radius. Every such feature radius is therefore at least the model's
+        # minimum particle radius. Adding the minimum shape margin gives a lower bound on every
+        # rigid-soft query radius, even when the two independently selected minima belong to
+        # incompatible worlds. Do not filter mutable ACTIVE/COLLIDE_PARTICLES flags: the pipeline's
+        # candidate tables deliberately remain valid when those flags are enabled after construction.
+        rigid_soft_query_radius_min = np.inf
+        if has_rigid_soft_queries and model.particle_count > 0 and model.shape_count > 0:
+            particle_radius_min = float(np.min(model.particle_radius.numpy()))
+            shape_margin_min = float(np.min(model.shape_margin.numpy()))
+            rigid_soft_query_radius_min = (
+                float(self.pipeline.soft_contact_gap) + particle_radius_min + shape_margin_min
+            )
+            if not np.isfinite(rigid_soft_query_radius_min) or rigid_soft_query_radius_min <= 0.0:
+                raise ValueError(
+                    "rigid_enable_penetration_free requires a positive minimum rigid-soft query "
+                    "radius (soft_contact_gap + minimum particle radius + minimum shape margin)"
+                )
+
+        self._rigid_soft_query_radius_min = rigid_soft_query_radius_min
+        if np.isfinite(rigid_soft_query_radius_min):
+            rigid_soft_max_displacement = (
+                0.5 * rigid_conservative_bound_relaxation * rigid_soft_query_radius_min
+            )
         else:
             rigid_soft_max_displacement = wp.inf
         self._rigid_dat_particle_max_displacement = rigid_soft_max_displacement

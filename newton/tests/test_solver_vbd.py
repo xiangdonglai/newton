@@ -6339,18 +6339,64 @@ def test_rigid_dat_requires_owned_pipeline(test, device):
         newton.solvers.SolverVBD(model, rigid_enable_penetration_free=True)
 
 
-def test_rigid_dat_requires_positive_rigid_soft_query_gap(test, device):
-    """A zero rigid-soft query gap cannot support DAT's between-detection motion bound."""
+def test_rigid_dat_requires_positive_rigid_soft_query_radius(test, device):
+    """DAT rejects a zero total query radius, not merely a zero pipeline gap."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.2), vel=wp.vec3(0.0), mass=0.1, radius=0.05)
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.2), vel=wp.vec3(0.0), mass=0.1, radius=0.0)
     inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     body = builder.add_body(xform=wp.transform_identity(), mass=1.0, inertia=inertia, lock_inertia=True)
-    builder.add_shape_sphere(body, radius=0.1)
+    builder.add_shape_sphere(body, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(margin=0.0))
     builder.color()
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.0)
-    with test.assertRaisesRegex(ValueError, "soft_contact_gap > 0"):
+    with test.assertRaisesRegex(ValueError, "positive minimum rigid-soft query radius"):
         newton.solvers.SolverVBD(model, rigid_enable_penetration_free=True, pipeline=pipeline)
+
+
+def test_rigid_dat_motion_bound_uses_minimum_query_radius(test, device):
+    """The shared motion budget includes the smallest particle radius and shape margin.
+
+    VT realizes the global particle-radius minimum directly. TV's barycentric radius and EE's
+    maximum endpoint radius cannot be smaller, so this is a lower bound for every feature family.
+    """
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(-1.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.1, radius=0.02)
+    builder.add_particle(pos=wp.vec3(1.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.1, radius=0.05)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(xform=wp.transform_identity(), mass=1.0, inertia=inertia, lock_inertia=True)
+    builder.add_shape_sphere(
+        body,
+        radius=0.1,
+        cfg=newton.ModelBuilder.ShapeConfig(margin=0.03),
+    )
+    builder.add_shape_sphere(
+        body,
+        xform=wp.transform(wp.vec3(0.5, 0.0, 0.0), wp.quat_identity()),
+        radius=0.1,
+        cfg=newton.ModelBuilder.ShapeConfig(margin=0.07),
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    soft_gap = 0.01
+    relaxation = 0.85
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=soft_gap)
+    solver = newton.solvers.SolverVBD(
+        model,
+        rigid_enable_penetration_free=True,
+        rigid_conservative_bound_relaxation=relaxation,
+        pipeline=pipeline,
+    )
+
+    expected_query_radius_min = soft_gap + 0.02 + 0.03
+    expected_max_displacement = 0.5 * relaxation * expected_query_radius_min
+    test.assertAlmostEqual(solver._rigid_soft_query_radius_min, expected_query_radius_min, places=7)
+    test.assertAlmostEqual(solver._rigid_dat_particle_max_displacement, expected_max_displacement, places=7)
+    np.testing.assert_allclose(
+        solver._rigid_dat_body_max_displacement.numpy(),
+        expected_max_displacement,
+        rtol=0.0,
+        atol=1.0e-7,
+    )
 
 
 def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
@@ -6556,8 +6602,13 @@ def test_rigid_dat_com_centered_body_bounds(test, device):
     test.assertAlmostEqual(mesh_radius, expected_mesh_radius, places=6)
     # Flags may enable a currently inactive shape later, so it must already be bounded.
     test.assertAlmostEqual(latent_radius, np.linalg.norm([2.5, 0.25, 0.125]), places=6)
-    test.assertAlmostEqual(max_displacement, 0.5 * relaxation * soft_gap, places=7)
-    test.assertAlmostEqual(solver._rigid_dat_particle_max_displacement, 0.5 * relaxation * soft_gap, places=7)
+    expected_query_radius_min = soft_gap + float(model.particle_radius.numpy().min()) + float(
+        model.shape_margin.numpy().min()
+    )
+    expected_max_displacement = 0.5 * relaxation * expected_query_radius_min
+    test.assertAlmostEqual(solver._rigid_soft_query_radius_min, expected_query_radius_min, places=7)
+    test.assertAlmostEqual(max_displacement, expected_max_displacement, places=7)
+    test.assertAlmostEqual(solver._rigid_dat_particle_max_displacement, expected_max_displacement, places=7)
 
 
 def _run_free_flight_distance(test, device, frequency_type, frequency, speed=6.0, frames=10):
@@ -6771,8 +6822,14 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_rigid_dat_requires_positive_rigid_soft_query_gap",
-    test_rigid_dat_requires_positive_rigid_soft_query_gap,
+    "test_rigid_dat_requires_positive_rigid_soft_query_radius",
+    test_rigid_dat_requires_positive_rigid_soft_query_radius,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_motion_bound_uses_minimum_query_radius",
+    test_rigid_dat_motion_bound_uses_minimum_query_radius,
     devices=devices,
 )
 add_function_test(
