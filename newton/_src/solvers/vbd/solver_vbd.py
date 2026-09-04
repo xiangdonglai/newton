@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Mapping
-from typing import Any, NamedTuple
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -256,33 +256,6 @@ class SolverVBD(SolverBase, CouplingInterface):
     """
 
     supports_collision_pipeline = True
-
-    class _CollisionSchedule(NamedTuple):
-        """Resolved collision mode and effective iteration frequency."""
-
-        mode: SolverBase.CollisionFrequencyType
-        frequency: int
-
-        @property
-        def detects_before_initialization(self) -> bool:
-            """Whether this schedule includes the baseline pre-initialization pass."""
-            Frequency = SolverBase.CollisionFrequencyType
-            return self.mode in (Frequency.PRE_INIT, Frequency.PRE_POST_INIT, Frequency.ITERATIONS)
-
-        def is_due(self, iter_num: int) -> bool:
-            """Whether collision detection is due before this zero-based solver iteration."""
-            Frequency = SolverBase.CollisionFrequencyType
-            if self.mode == Frequency.PRE_POST_INIT:
-                return iter_num == 0
-            if self.mode == Frequency.ITERATIONS:
-                return iter_num > 0 and iter_num % self.frequency == 0
-            return False
-
-        def is_equivalent_to(self, other: SolverVBD._CollisionSchedule) -> bool:
-            """Whether two schedules produce the same collision checkpoints."""
-            if self.mode != other.mode:
-                return False
-            return self.mode != SolverBase.CollisionFrequencyType.ITERATIONS or self.frequency == other.frequency
 
     class JointSlot:
         """Named constraint slot indices for :meth:`set_joint_constraint_mode`.
@@ -2347,18 +2320,25 @@ class SolverVBD(SolverBase, CouplingInterface):
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
-        rigid_collision_schedule = self._resolve_collision_schedule(SolverBase.CollisionSlot.RIGID)
-        soft_self_collision_schedule = self._resolve_collision_schedule(SolverBase.CollisionSlot.SOFT_SELF_CONTACT)
-        self._validate_dat_collision_schedules(rigid_collision_schedule, soft_self_collision_schedule)
+        Frequency = SolverBase.CollisionFrequencyType
+        rigid_collision_slot = SolverBase.CollisionSlot.RIGID
+        rigid_collision_mode = self._resolved_collision_frequency_type(rigid_collision_slot)
+        rigid_collision_frequency = self._collision_frequency[rigid_collision_slot]
+        soft_self_collision_mode, soft_self_collision_frequency = self._resolve_self_contact_schedule()
+        self._validate_dat_collision_schedules(
+            rigid_collision_mode,
+            rigid_collision_frequency,
+            soft_self_collision_mode,
+            soft_self_collision_frequency,
+        )
 
         if self.collision_pipeline is not None:
             contacts = self._resolve_step_contacts(contacts)
 
-        rigid_collision_due = (
-            self.collision_pipeline is not None and rigid_collision_schedule.detects_before_initialization
-        )
+        pre_initialization_modes = (Frequency.PRE_INIT, Frequency.PRE_POST_INIT, Frequency.ITERATIONS)
+        rigid_collision_due = self.collision_pipeline is not None and rigid_collision_mode in pre_initialization_modes
         soft_self_collision_due = (
-            self.particle_enable_self_contact and soft_self_collision_schedule.detects_before_initialization
+            self.particle_enable_self_contact and soft_self_collision_mode in pre_initialization_modes
         )
         if rigid_collision_due or soft_self_collision_due:
             self._refresh_collision_sets(
@@ -2376,15 +2356,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._initialize_particles(state_in, state_out, contacts, dt)
 
         for iter_num in range(self.iterations):
-            rigid_collision_due = self.collision_pipeline is not None and rigid_collision_schedule.is_due(iter_num)
-            soft_self_collision_due = self.particle_enable_self_contact and soft_self_collision_schedule.is_due(
-                iter_num
-            )
+            rigid_collision_due = self.collision_pipeline is not None and self._rigid_collision_is_due(iter_num)
+            soft_self_collision_due = self.particle_enable_self_contact and self._self_contact_is_due(iter_num)
             if rigid_collision_due or soft_self_collision_due:
                 # Detect from the same mid-solve iterate. Before a rigid-pipeline
                 # refresh, preserve in-flight lambdas for contact matching.
                 collision_state = self._rigid_iterate_view(state_in, state_out)
-                restore_in_flight_contacts = rigid_collision_schedule.mode == SolverBase.CollisionFrequencyType.ITERATIONS
+                restore_in_flight_contacts = rigid_collision_mode == Frequency.ITERATIONS
                 if rigid_collision_due:
                     self._snapshot_rigid_contact_history(contacts, force=restore_in_flight_contacts)
                 self._refresh_collision_sets(
@@ -4327,40 +4305,64 @@ class SolverVBD(SolverBase, CouplingInterface):
         view.particle_qd = state_in.particle_qd
         return view
 
-    def _resolve_collision_schedule(self, slot: SolverBase.CollisionSlot) -> SolverVBD._CollisionSchedule:
-        """Resolve one collision slot to its effective mode and frequency."""
+    def _resolve_self_contact_schedule(self) -> tuple[SolverBase.CollisionFrequencyType, int]:
+        """Resolve the soft self-contact slot to its effective mode and frequency."""
         Frequency = SolverBase.CollisionFrequencyType
+        slot = SolverBase.CollisionSlot.SOFT_SELF_CONTACT
         mode = self._resolved_collision_frequency_type(slot)
         freq = self._collision_frequency[slot]
-        if slot == SolverBase.CollisionSlot.SOFT_SELF_CONTACT:
-            interval = self._deprecated_particle_interval
-            if self._collision_frequency_type[slot] == Frequency.AUTO and interval is not None and interval >= 1:
-                freq = interval
-        return self._CollisionSchedule(mode, freq)
+        interval = self._deprecated_particle_interval
+        if self._collision_frequency_type[slot] == Frequency.AUTO and interval is not None and interval >= 1:
+            freq = interval
+        return mode, freq
+
+    def _self_contact_is_due(self, iter_num: int) -> bool:
+        """Return whether soft self-contact detection is due before this zero-based iteration."""
+        Frequency = SolverBase.CollisionFrequencyType
+        mode, frequency = self._resolve_self_contact_schedule()
+        return (mode == Frequency.PRE_POST_INIT and iter_num == 0) or (
+            mode == Frequency.ITERATIONS and iter_num > 0 and iter_num % frequency == 0
+        )
+
+    def _rigid_collision_is_due(self, iter_num: int) -> bool:
+        """Return whether rigid collision detection is due before this zero-based iteration."""
+        Frequency = SolverBase.CollisionFrequencyType
+        slot = SolverBase.CollisionSlot.RIGID
+        mode = self._resolved_collision_frequency_type(slot)
+        frequency = self._collision_frequency[slot]
+        return (mode == Frequency.PRE_POST_INIT and iter_num == 0) or (
+            mode == Frequency.ITERATIONS and iter_num > 0 and iter_num % frequency == 0
+        )
 
     def _validate_dat_collision_schedules(
         self,
-        rigid_collision_schedule: SolverVBD._CollisionSchedule,
-        soft_self_collision_schedule: SolverVBD._CollisionSchedule,
+        rigid_collision_mode: SolverBase.CollisionFrequencyType,
+        rigid_collision_frequency: int,
+        soft_self_collision_mode: SolverBase.CollisionFrequencyType,
+        soft_self_collision_frequency: int,
     ) -> None:
         """Require active DAT families to have usable, mutually consistent schedules."""
         Frequency = SolverBase.CollisionFrequencyType
-        if self.rigid_enable_penetration_free and rigid_collision_schedule.mode == Frequency.NONE:
+        if self.rigid_enable_penetration_free and rigid_collision_mode == Frequency.NONE:
             raise ValueError(
                 "rigid_enable_penetration_free requires an active rigid collision schedule; "
                 "collision_frequency_type NONE cannot maintain DAT's detection-centered "
                 "motion-bound and complete-pair invariants."
             )
-        if self.particle_enable_self_contact and soft_self_collision_schedule.mode == Frequency.NONE:
+        if self.particle_enable_self_contact and soft_self_collision_mode == Frequency.NONE:
             raise ValueError(
                 "particle_enable_self_contact requires an active soft self-collision schedule; "
                 "collision_frequency_type NONE cannot maintain DAT's detection-centered "
                 "motion-bound and complete-pair invariants."
             )
+        schedules_match = rigid_collision_mode == soft_self_collision_mode and (
+            rigid_collision_mode != Frequency.ITERATIONS
+            or rigid_collision_frequency == soft_self_collision_frequency
+        )
         if (
             self.rigid_enable_penetration_free
             and self.particle_enable_self_contact
-            and not rigid_collision_schedule.is_equivalent_to(soft_self_collision_schedule)
+            and not schedules_match
         ):
             raise ValueError(
                 "rigid-soft DAT and soft-self DAT share a particle trajectory reference and "
