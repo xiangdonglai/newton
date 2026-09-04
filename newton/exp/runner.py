@@ -71,8 +71,9 @@ class Experiment:
         self.args = args
         self.dat = bool(getattr(args, "dat", False))
         self.full_surface = bool(getattr(args, "full_surface", False))
+        self.scene = make_scene(args.scene, args)
         self.robot_collision_geometry = getattr(args, "robot_collision_geometry", "urdf")
-        if self.robot_collision_geometry != "urdf" and not self.full_surface:
+        if self.scene.has_robot and self.robot_collision_geometry != "urdf" and not self.full_surface:
             raise ValueError(
                 "non-default --robot-collision-geometry choices require --full-surface "
                 "because their mesh proxies are intended for the dense rigid-soft BVH backend"
@@ -82,9 +83,10 @@ class Experiment:
         if self.dat and args.rigid_collision_frequency_type == "none":
             raise ValueError("--dat requires an active rigid collision schedule")
         self.sim_time = 0.0
-        self.use_graph = bool(args.graph_capture)
+        self.use_graph = bool(args.graph_capture and self.scene.supports_graph_capture)
+        if args.graph_capture and not self.scene.supports_graph_capture:
+            print(f"[graph] disabled for scene '{self.scene.key}'")
 
-        self.scene = make_scene(args.scene, args)
         self.strategy = make_solver(args.solver, args)
         # Let the strategy consult scene-provided physics overrides (materials /
         # solver kwargs) during model assembly and solver construction.
@@ -100,7 +102,10 @@ class Experiment:
         self.frame_dt = self.decimation / _BASE_FPS
 
         self._build_model()
-        self._build_ik()
+        self.ik = None
+        self._ik_on_full = False
+        if self.scene.has_robot:
+            self._build_ik()
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -129,18 +134,25 @@ class Experiment:
         # The model was built at the zero (rest) config so the solver's
         # joint_rest_angle is zero (matching IsaacLab). Spawn the arm at the
         # default config on the STATE, not the model build config.
-        spawn_q = np.asarray(self.scene.robot_init_q(), dtype=np.float32)
-        n = min(spawn_q.shape[0], self.model.joint_coord_count)
-        for state in (self.state_0, self.state_1):
-            jq = state.joint_q.numpy()
-            jq[:n] = spawn_q[:n]
-            state.joint_q.assign(jq)
-            state.joint_qd.zero_()
-            newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+        if self.scene.has_robot:
+            spawn_q = np.asarray(self.scene.robot_init_q(), dtype=np.float32)
+            n = min(spawn_q.shape[0], self.model.joint_coord_count)
+            for state in (self.state_0, self.state_1):
+                jq = state.joint_q.numpy()
+                jq[:n] = spawn_q[:n]
+                state.joint_q.assign(jq)
+                state.joint_qd.zero_()
+                newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
         self.strategy.sync_initial(self.state_0)
 
         self.rest_particle_q = wp.clone(self.state_0.particle_q)
-        self.init_joint_q = np.array(self.state_0.joint_q.numpy(), copy=True)
+        self.rest_body_q = wp.clone(self.state_0.body_q) if self.state_0.body_q is not None else None
+        self.rest_body_qd = wp.clone(self.state_0.body_qd) if self.state_0.body_qd is not None else None
+        self.init_joint_q = (
+            np.array(self.state_0.joint_q.numpy(), copy=True)
+            if self.state_0.joint_q is not None
+            else np.empty(0, dtype=np.float32)
+        )
 
         self.controller = make_controller(args.control, args, self)
         self.graph = None
@@ -154,7 +166,7 @@ class Experiment:
         # times to ramp the penalties, then restore the clean spawn state:
         # reset() keeps the warmed penalties (its reset_internal is a no-op for
         # the monolithic VBD solver).
-        warmup_steps = int(getattr(self.strategy, "warmup_steps", 0))
+        warmup_steps = int(getattr(self.strategy, "warmup_steps", 0)) if self.scene.has_robot else 0
         for _ in range(warmup_steps):
             self.step()
         if warmup_steps:
@@ -198,11 +210,16 @@ class Experiment:
         builder.rigid_gap = 0.01
         self.strategy.register_attributes(builder)
 
-        robot_bodies, robot_joints, robot_shapes = self.scene.build_robot(
-            builder, collapse_fixed_joints=self.strategy.collapse_fixed_joints
-        )
-        robot_shapes.extend(configure_robot_collision_geometry(builder, robot_bodies, self.robot_collision_geometry))
-        self.strategy.configure_robot(builder, robot_bodies, robot_joints)
+        if self.scene.has_robot:
+            robot_bodies, robot_joints, robot_shapes = self.scene.build_robot(
+                builder, collapse_fixed_joints=self.strategy.collapse_fixed_joints
+            )
+            robot_shapes.extend(
+                configure_robot_collision_geometry(builder, robot_bodies, self.robot_collision_geometry)
+            )
+            self.strategy.configure_robot(builder, robot_bodies, robot_joints)
+        else:
+            robot_bodies, robot_joints, robot_shapes = [], [], []
         static_shapes = self.scene.add_static(builder)
         self.strategy.filter_collisions(builder, robot_shapes, static_shapes)
         self.scene.add_deformables(builder)
@@ -211,13 +228,14 @@ class Experiment:
         self.model = builder.finalize()
         self.device = self.model.device
         self.strategy.apply_materials(self.model)
+        self.scene.apply_materials(self.model)
 
         handles = SceneHandles(
             robot_bodies=robot_bodies,
             robot_joints=robot_joints,
             robot_shapes=robot_shapes,
             static_shapes=static_shapes,
-            gripper_bodies=gripper_body_ids(self.model, robot_bodies),
+            gripper_bodies=gripper_body_ids(self.model, robot_bodies) if self.scene.has_robot else [],
             particle_count=self.model.particle_count,
         )
         self.handles = handles
@@ -230,27 +248,36 @@ class Experiment:
     # ------------------------------------------------------------------
     def reset(self):
         for state in (self.state_0, self.state_1):
-            state.joint_q.assign(self.init_joint_q)
-            state.joint_qd.zero_()
-            newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+            if self.scene.has_robot:
+                state.joint_q.assign(self.init_joint_q)
+                state.joint_qd.zero_()
+                newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+            else:
+                if state.body_q is not None:
+                    wp.copy(state.body_q, self.rest_body_q)
+                    wp.copy(state.body_qd, self.rest_body_qd)
             wp.copy(state.particle_q, self.rest_particle_q)
             state.particle_qd.zero_()
             state.clear_forces()
-            if getattr(state, "body_qd", None) is not None:
+            if self.scene.has_robot and getattr(state, "body_qd", None) is not None:
                 state.body_qd.zero_()
 
         self.control.clear()
-        self.ik.seed(self.init_joint_q)
-        wp.copy(self.control.joint_target_q, self.ik.joint_q, count=self.ik.n_coords)
+        if self.ik is not None:
+            self.ik.seed(self.init_joint_q)
+            wp.copy(self.control.joint_target_q, self.ik.joint_q, count=self.ik.n_coords)
 
         self.strategy.reset_internal(self.state_0, self.device)
         self.controller.reset()
+        self.scene.reset()
         self.sim_time = 0.0
         if self.device.is_cuda:
             wp.synchronize_device()
 
     def _stage_home_target(self):
         """Solve IK to the home pose and write it as the control target."""
+        if self.ik is None:
+            return
         self.ik.set_target(
             wp.vec3(*[float(x) for x in self.home_pos]),
             wp.vec4(*[float(x) for x in self.home_quat]),
@@ -295,7 +322,7 @@ class Experiment:
         # (mirrors IsaacLab _apply_ik_action). This is the single point where
         # the per-step target is produced, before it is fed to the IK solve.
         self._ik_print_count = getattr(self, "_ik_print_count", 0)
-        if self._ik_print_count % 60 == 0:
+        if self.ik is not None and self._ik_print_count % 60 == 0:
             print(
                 f"[IK Target] step={self._ik_print_count} t={self.sim_time:6.2f}s  "
                 f"pos=({float(pos[0]):.4f}, {float(pos[1]):.4f}, {float(pos[2]):.4f})  "
@@ -306,6 +333,13 @@ class Experiment:
         if self.controller.consume_reset():
             self.reset()
         for _ in range(self.decimation):
+            if self.ik is None:
+                if self.graph is not None:
+                    with wp.ScopedDevice(self.device):
+                        wp.capture_launch(self.graph)
+                else:
+                    self.simulate()
+                continue
             if self._ik_on_full:
                 # Re-seed IK from the measured joint state (IsaacLab _apply_ik_action).
                 newton.eval_ik(self.model, self.state_0, self._meas_q, self._meas_qd)
@@ -320,6 +354,7 @@ class Experiment:
             else:
                 self.simulate()
         self.sim_time += self.frame_dt
+        self.scene.post_step(self)
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -337,10 +372,11 @@ class Experiment:
                     pass
 
     def test_final(self):
-        body_q = self.state_0.body_q.numpy()
-        body_qd = self.state_0.body_qd.numpy()
-        assert np.all(np.isfinite(body_q)), "Body positions contain NaN or inf"
-        assert np.all(np.isfinite(body_qd)), "Body velocities contain NaN or inf"
+        if self.state_0.body_q is not None:
+            body_q = self.state_0.body_q.numpy()
+            body_qd = self.state_0.body_qd.numpy()
+            assert np.all(np.isfinite(body_q)), "Body positions contain NaN or inf"
+            assert np.all(np.isfinite(body_qd)), "Body velocities contain NaN or inf"
         particle_q = self.state_0.particle_q.numpy()
         assert np.all(np.isfinite(particle_q)), "Particle positions contain NaN or inf"
         lo = np.min(particle_q, axis=0)
@@ -348,6 +384,7 @@ class Experiment:
         bbox = float(np.linalg.norm(hi - lo))
         assert bbox < 5.0, f"Cloth bounding box exploded: {bbox:.2f} m"
         assert lo[2] > -0.1, f"Cloth tunneled below ground: z_min={lo[2]:.4f} m"
+        self.scene.test_final(self)
 
 
 # ----------------------------------------------------------------------

@@ -49,6 +49,10 @@ class Scene:
     ik_iters: int = 24
     #: Default named task sequence (see :meth:`sequences`).
     default_sequence: str = "pick"
+    #: Whether the scene contains a robot controlled through IK.
+    has_robot: bool = True
+    #: Whether the scene can safely replay the simulation through a CUDA graph.
+    supports_graph_capture: bool = True
 
     def __init__(self, args):
         self.args = args
@@ -116,6 +120,18 @@ class Scene:
         """
         del solver_key
         return {}
+
+    def apply_materials(self, model) -> None:
+        """Apply scene-specific material values after strategy-level defaults."""
+
+    def post_step(self, experiment) -> None:
+        """Observe a completed rendered simulation step."""
+
+    def reset(self) -> None:
+        """Reset scene-owned measurement or presentation state."""
+
+    def test_final(self, experiment) -> None:
+        """Run scene-specific final-state checks."""
 
     # -- presentation -----------------------------------------------------
     def camera(self):
