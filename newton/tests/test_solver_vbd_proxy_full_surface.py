@@ -88,6 +88,7 @@ def _run_proxy_harvest(device, corners, bary):
             contacts.soft_contact_body_vel,
             contacts.soft_contact_normal,
             model.shape_margin,
+            False,  # legacy quadratic rigid-soft normal law
             model.shape_body,
             smax,
             contact_counts,

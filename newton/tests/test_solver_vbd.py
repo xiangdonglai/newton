@@ -13,6 +13,8 @@ import warp as wp
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     accumulate_particle_body_contact_force_and_hessian,
+    create_edge_edge_division_plane_closest_pt,
+    create_vertex_triangle_division_plane_closest_pt,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
     evaluate_self_contact_force_norm,
@@ -26,7 +28,9 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _alm_relaxed_ascent,
     _compliant_alm_coefficients,
     _contact_tangent_conditioning_scale,
+    _evaluate_rigid_soft_contact_force_norm,
     _joint_angular_rho_seed,
+    apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     compute_rigid_contact_forces,
@@ -36,6 +40,10 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_rigid_contact_from_collision,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
+    place_dat_division_plane,
+    planar_truncation_t,
+    rigid_point_trajectory,
+    rigid_trajectory_truncation_t,
     snapshot_body_body_contact_history,
     step_body_body_contact_C0_lambda,
     update_duals_body_body_contacts,
@@ -262,6 +270,21 @@ def _eval_self_contact_norm_kernel(
 ):
     i = wp.tid()
     dEdD, d2E = evaluate_self_contact_force_norm(distances[i], collision_radius, k)
+    dEdD_out[i] = dEdD
+    d2E_out[i] = d2E
+
+
+@wp.kernel
+def _eval_rigid_soft_contact_norm_kernel(
+    distances: wp.array[float],
+    collision_radius: float,
+    k: float,
+    use_log_barrier: bool,
+    dEdD_out: wp.array[float],
+    d2E_out: wp.array[float],
+):
+    i = wp.tid()
+    dEdD, d2E = _evaluate_rigid_soft_contact_force_norm(distances[i], collision_radius, k, use_log_barrier)
     dEdD_out[i] = dEdD
     d2E_out[i] = d2E
 
@@ -919,6 +942,46 @@ def test_self_contact_barrier_c2_at_d_min(test, device):
         rtol=1e-3,
         err_msg="Self-contact barrier Hessian is not C2-continuous at d = d_min",
     )
+
+
+def test_rigid_soft_contact_log_barrier_matches_particle(test, device):
+    """The optional rigid-soft law must match self-contact; disabled mode stays quadratic."""
+    collision_radius = 0.02
+    k = 1.0e3
+    distances_np = np.array([0.75, 0.25, 0.0, -0.5], dtype=np.float32) * collision_radius
+    distances = wp.array(distances_np, dtype=float, device=device)
+
+    particle_dEdD = wp.zeros(len(distances_np), dtype=float, device=device)
+    particle_d2E = wp.zeros(len(distances_np), dtype=float, device=device)
+    rigid_dEdD = wp.zeros(len(distances_np), dtype=float, device=device)
+    rigid_d2E = wp.zeros(len(distances_np), dtype=float, device=device)
+    penalty_dEdD = wp.zeros(len(distances_np), dtype=float, device=device)
+    penalty_d2E = wp.zeros(len(distances_np), dtype=float, device=device)
+
+    wp.launch(
+        _eval_self_contact_norm_kernel,
+        dim=len(distances_np),
+        inputs=[distances, collision_radius, k, particle_dEdD, particle_d2E],
+        device=device,
+    )
+    wp.launch(
+        _eval_rigid_soft_contact_norm_kernel,
+        dim=len(distances_np),
+        inputs=[distances, collision_radius, k, True, rigid_dEdD, rigid_d2E],
+        device=device,
+    )
+    wp.launch(
+        _eval_rigid_soft_contact_norm_kernel,
+        dim=len(distances_np),
+        inputs=[distances, collision_radius, k, False, penalty_dEdD, penalty_d2E],
+        device=device,
+    )
+
+    np.testing.assert_allclose(rigid_dEdD.numpy(), particle_dEdD.numpy(), rtol=1.0e-6)
+    np.testing.assert_allclose(rigid_d2E.numpy(), particle_d2E.numpy(), rtol=1.0e-6)
+    np.testing.assert_allclose(penalty_dEdD.numpy(), -k * (collision_radius - distances_np), rtol=1.0e-6)
+    np.testing.assert_allclose(penalty_d2E.numpy(), k, rtol=1.0e-6)
+    test.assertGreater(-rigid_dEdD.numpy()[1], -penalty_dEdD.numpy()[1])
 
 
 def _rigid_joint_angular_rho_seed_uses_mean_mobility(test, device):
@@ -1817,6 +1880,7 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 particle_q,
                 particle_colors,
                 0.01,
+                False,  # legacy quadratic rigid-soft normal law
                 particle_radius,
                 contact_indices,
                 contact_count,
@@ -3762,6 +3826,12 @@ add_function_test(
 )
 add_function_test(
     TestSolverVBD,
+    "test_rigid_soft_contact_log_barrier_matches_particle",
+    test_rigid_soft_contact_log_barrier_matches_particle,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
     "test_rigid_contact_history_restore_from_match_index",
     _rigid_contact_history_restore_from_match_index,
     devices=devices,
@@ -4344,6 +4414,7 @@ def _run_face_section2(device, shape_margin):
             state.particle_q,
             model.particle_colors,
             1.0,  # friction_epsilon
+            False,  # legacy quadratic rigid-soft normal law
             model.particle_radius,
             contacts.soft_contact_indices,
             contacts.soft_contact_count,
@@ -4540,6 +4611,1161 @@ add_function_test(
     TestVBDFullSurfaceContact,
     "test_full_surface_rejected_for_vbd_proxy_particles",
     test_full_surface_rejected_for_vbd_proxy_particles,
+    devices=devices,
+)
+
+
+# =====================================================================================
+# DAT (Divide and Truncate) planar and rigid-body truncation
+# =====================================================================================
+
+_RIGID_SOFT_DAT_TEST_EPS = 1.0e-6
+
+
+@wp.kernel
+def _planar_truncation_probe(
+    signed_distance: wp.array[float],
+    normal_displacement: wp.array[float],
+    gamma: float,
+    minimum_signed_distance: float,
+    t_out: wp.array[float],
+):
+    i = wp.tid()
+    t_out[i] = planar_truncation_t(
+        wp.vec3(0.0, 0.0, signed_distance[i]),
+        wp.vec3(0.0, 0.0, normal_displacement[i]),
+        wp.vec3(0.0, 0.0, 1.0),
+        wp.vec3(0.0),
+        gamma,
+        minimum_signed_distance,
+    )
+
+
+@wp.kernel
+def _large_coordinate_epsilon_ablation_probe(
+    origin: float,
+    initial_gap: float,
+    normal_displacement: float,
+    separation_eps: wp.array[float],
+    t_out: wp.array[float],
+    accepted_gap_out: wp.array[float],
+):
+    """Apply the production plane-placement/truncation math at a large origin."""
+    i = wp.tid()
+    n = wp.vec3(0.0, 0.0, 1.0)
+    rigid_support = wp.vec3(origin, origin, origin)
+    soft_start = wp.vec3(origin, origin, origin + initial_gap)
+    soft_displacement = wp.vec3(0.0, 0.0, normal_displacement)
+    plane_point, _lmbd = place_dat_division_plane(
+        n,
+        rigid_support,
+        initial_gap,
+        wp.max(-normal_displacement, 0.0),
+        0.0,
+        separation_eps[i],
+    )
+    t = planar_truncation_t(
+        soft_start,
+        soft_displacement,
+        n,
+        plane_point,
+        0.85,
+        separation_eps[i],
+    )
+    accepted = soft_start + t * soft_displacement
+    t_out[i] = t
+    # This subtraction happens after ``accepted`` has been stored as a vec3 of
+    # FP32 values, exposing whether its intended positive gap is representable.
+    accepted_gap_out[i] = accepted[2] - origin
+
+
+def test_rigid_soft_dat_scale_aware_epsilon_prevents_fp32_gap_collapse(test, device):
+    """A fixed micrometer band can round a truncated endpoint onto distant geometry."""
+    origin = np.float32(1000.0)
+    adjacent = np.nextafter(origin, np.float32(np.inf))
+    initial_gap = float(adjacent - origin)
+    base_eps = _RIGID_SOFT_DAT_TEST_EPS
+    scale_eps = max(base_eps, 4.0 * np.finfo(np.float32).eps * float(origin))
+
+    t_out = wp.empty(2, dtype=float, device=device)
+    accepted_gap_out = wp.empty(2, dtype=float, device=device)
+    wp.launch(
+        _large_coordinate_epsilon_ablation_probe,
+        dim=2,
+        inputs=[
+            float(origin),
+            initial_gap,
+            -initial_gap,
+            wp.array([base_eps, scale_eps], dtype=float, device=device),
+        ],
+        outputs=[t_out, accepted_gap_out],
+        device=device,
+    )
+
+    fixed_t, scaled_t = t_out.numpy()
+    fixed_gap, scaled_gap = accepted_gap_out.numpy()
+    test.assertGreater(fixed_t, 0.0, "the fixed epsilon control must attempt a partial advance")
+    test.assertEqual(fixed_gap, 0.0, "that partial endpoint must collapse onto the rigid support in FP32")
+    test.assertEqual(scaled_t, 0.0, "a worsening move from inside the representable band must be halted")
+    test.assertEqual(scaled_gap, initial_gap, "halting must retain the original one-ULP separation")
+
+
+def test_planar_truncation_uses_endpoint_signs(test, device):
+    """Small normal motion still truncates when the proposed endpoint changes side."""
+    s0 = 3.797968e-6
+    normal_displacement = -9.053657e-6
+    signed_distances = wp.array([s0, s0, -1.0e-6, -1.0e-6], dtype=float, device=device)
+    normal_displacements = wp.array([normal_displacement, -1.0e-6, -1.0e-6, 1.0e-6], dtype=float, device=device)
+    t_out = wp.empty(4, dtype=float, device=device)
+    wp.launch(
+        _planar_truncation_probe,
+        dim=4,
+        inputs=[signed_distances, normal_displacements, 0.85, 0.0],
+        outputs=[t_out],
+        device=device,
+    )
+    crossing_t = s0 / -normal_displacement
+    expected_crossing_t = 0.85 * crossing_t
+    np.testing.assert_allclose(
+        t_out.numpy(),
+        [expected_crossing_t, 1.0, 0.0, 1.0],
+        rtol=0.0,
+        atol=1.0e-6,
+    )
+
+
+@wp.kernel
+def _soft_self_dat_epsilon_probe(result: wp.array[float]):
+    zero = wp.vec3(0.0)
+
+    vertex = wp.vec3(0.0, 0.0, 8.0e-6)
+    triangle_0 = wp.vec3(-1.0, -1.0, 0.0)
+    triangle_1 = wp.vec3(1.0, -1.0, 0.0)
+    triangle_2 = wp.vec3(0.0, 1.0, 0.0)
+    vertex_displacement = wp.vec3(0.0, 0.0, -10.0e-6)
+    vt_n, vt_d, vt_eps = create_vertex_triangle_division_plane_closest_pt(
+        vertex,
+        vertex_displacement,
+        triangle_0,
+        zero,
+        triangle_1,
+        zero,
+        triangle_2,
+        zero,
+    )
+    vt_t = planar_truncation_t(vertex, vertex_displacement, vt_n, vt_d, 0.85, vt_eps)
+    result[0] = wp.dot(vt_n, vertex - vt_d)
+    result[1] = wp.dot(-vt_n, triangle_0 - vt_d)
+    result[2] = wp.dot(vt_n, vertex + vt_t * vertex_displacement - triangle_0)
+    result[3] = vt_t
+    result[4] = vt_eps
+
+    # A point already inside the positive-side half-band may recover freely,
+    # but it may not move farther into the band.
+    point_inside_band = vt_d + 0.5 * vt_eps * vt_n
+    result[5] = planar_truncation_t(point_inside_band, -0.25 * vt_eps * vt_n, vt_n, vt_d, 0.85, vt_eps)
+    result[6] = planar_truncation_t(point_inside_band, 0.25 * vt_eps * vt_n, vt_n, vt_d, 0.85, vt_eps)
+
+    edge_0_a = wp.vec3(-1.0, 8.0e-6, 0.0)
+    edge_0_b = wp.vec3(1.0, 8.0e-6, 0.0)
+    edge_1_a = wp.vec3(-1.0, 0.0, 0.0)
+    edge_1_b = wp.vec3(1.0, 0.0, 0.0)
+    edge_0_displacement = wp.vec3(0.0, -10.0e-6, 0.0)
+    ee_n, ee_d, ee_eps = create_edge_edge_division_plane_closest_pt(
+        edge_0_a,
+        edge_0_displacement,
+        edge_0_b,
+        edge_0_displacement,
+        edge_1_a,
+        zero,
+        edge_1_b,
+        zero,
+    )
+    ee_t = planar_truncation_t(edge_0_a, edge_0_displacement, ee_n, ee_d, 0.85, ee_eps)
+    result[7] = wp.dot(ee_n, edge_0_a - ee_d)
+    result[8] = wp.dot(-ee_n, edge_1_a - ee_d)
+    result[9] = wp.dot(ee_n, edge_0_a + ee_t * edge_0_displacement - edge_1_a)
+    result[10] = ee_t
+    result[11] = ee_eps
+
+
+def test_soft_self_dat_uses_epsilon_separation(test, device):
+    """VT and EE planes reserve epsilon, and inside-band motion cannot worsen separation."""
+    result = wp.empty(12, dtype=float, device=device)
+    wp.launch(_soft_self_dat_epsilon_probe, dim=1, outputs=[result], device=device)
+    result = result.numpy()
+
+    vt_positive_margin, vt_negative_margin, vt_accepted_gap, vt_t, vt_eps = result[:5]
+    test.assertGreaterEqual(vt_positive_margin, 0.99 * vt_eps)
+    test.assertGreaterEqual(vt_negative_margin, 0.99 * vt_eps)
+    test.assertGreaterEqual(vt_accepted_gap, 2.0 * vt_eps)
+    test.assertGreater(vt_t, 0.0)
+    test.assertLess(vt_t, 1.0)
+    test.assertEqual(result[5], 0.0)
+    test.assertEqual(result[6], 1.0)
+
+    ee_positive_margin, ee_negative_margin, ee_accepted_gap, ee_t, ee_eps = result[7:]
+    test.assertGreaterEqual(ee_positive_margin, 0.99 * ee_eps)
+    test.assertGreaterEqual(ee_negative_margin, 0.99 * ee_eps)
+    test.assertGreaterEqual(ee_accepted_gap, 2.0 * ee_eps)
+    test.assertGreater(ee_t, 0.0)
+    test.assertLess(ee_t, 1.0)
+
+
+@wp.kernel
+def _rigid_trajectory_truncation_probe(
+    n: wp.vec3,
+    d: wp.vec3,
+    c0: wp.vec3,
+    dx: wp.vec3,
+    axis: wp.vec3,
+    angle: float,
+    offset0: wp.vec3,
+    gamma_r: float,
+    use_interval_arithmetic: bool,
+    trajectory_samples: int,
+    t_out: wp.array[float],
+):
+    t_out[0] = rigid_trajectory_truncation_t(
+        n, d, c0, dx, axis, angle, offset0, gamma_r, 1.0e-3, use_interval_arithmetic, trajectory_samples
+    )
+
+
+@wp.kernel
+def _rigid_point_trajectory_probe(
+    t: float,
+    c0: wp.vec3,
+    dx: wp.vec3,
+    axis: wp.vec3,
+    angle: float,
+    offset0: wp.vec3,
+    point_out: wp.array[wp.vec3],
+):
+    point_out[0] = rigid_point_trajectory(t, c0, dx, axis, angle, offset0)
+
+
+def _probe_rigid_point_trajectory(device, t, c0, dx, axis, angle, offset0):
+    point_out = wp.empty(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        _rigid_point_trajectory_probe,
+        dim=1,
+        inputs=[t, wp.vec3(*c0), wp.vec3(*dx), wp.vec3(*axis), angle, wp.vec3(*offset0)],
+        outputs=[point_out],
+        device=device,
+    )
+    return point_out.numpy()[0]
+
+
+def _probe_trajectory_truncation(
+    device,
+    n,
+    d,
+    c0,
+    dx,
+    axis,
+    angle,
+    offset0,
+    gamma_r,
+    use_interval_arithmetic=False,
+    trajectory_samples=8,
+):
+    t_out = wp.zeros(1, dtype=float, device=device)
+    wp.launch(
+        _rigid_trajectory_truncation_probe,
+        dim=1,
+        inputs=[
+            wp.vec3(*n),
+            wp.vec3(*d),
+            wp.vec3(*c0),
+            wp.vec3(*dx),
+            wp.vec3(*axis),
+            angle,
+            wp.vec3(*offset0),
+            gamma_r,
+            use_interval_arithmetic,
+            trajectory_samples,
+        ],
+        outputs=[t_out],
+        device=device,
+    )
+    return float(t_out.numpy()[0])
+
+
+def _probe_rigid_dat_returning_sdf_arc(
+    device,
+    use_interval_arithmetic,
+    *,
+    rigid_anchor=None,
+    plane_normal=(1.0, 0.0, 0.0),
+    plane_point=None,
+    rotation_angle=math.pi,
+    trajectory_samples=8,
+):
+    """Probe a rotating rigid SDF point that crosses and returns through a plane."""
+
+    if rigid_anchor is None:
+        phi = math.pi / 16.0
+        rigid_anchor = (math.cos(phi), -math.sin(phi), 0.0)
+    if plane_point is None:
+        plane_point = (0.5 * (0.99 + rigid_anchor[0]), 0.0, 0.0)
+    return _probe_trajectory_truncation(
+        device,
+        plane_normal,
+        plane_point,
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+        rotation_angle,
+        rigid_anchor,
+        1.0,
+        use_interval_arithmetic,
+        trajectory_samples,
+    )
+
+
+def test_rigid_dat_trajectory_truncation(test, device):
+    """Compare Stage 1 sampling+bisection with optional Stage 2 interval verification."""
+    # The production trajectory uses Rodrigues directly for every angle; there
+    # is no separate first-order branch at small angles.
+    small_angle = 5.0e-8
+    small_angle_point = _probe_rigid_point_trajectory(
+        device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 1), small_angle, (1, 0, 0)
+    )
+    test.assertTrue(np.allclose(small_angle_point, (math.cos(small_angle), math.sin(small_angle), 0.0), atol=1e-12))
+    identity_point = _probe_rigid_point_trajectory(device, 1.0, (0, 0, 0), (0, 0, 0), (0, 0, 0), 0.0, (1, 2, 3))
+    test.assertTrue(np.array_equal(identity_point, (1.0, 2.0, 3.0)))
+
+    # A point already behind its assigned plane is outside Algorithm 1's
+    # precondition. Both modes use the same explicit recovery policy: strict
+    # endpoint improvement is accepted, while further violation is blocked.
+    for use_interval_arithmetic in (False, True):
+        recovery_t = _probe_trajectory_truncation(
+            device,
+            (0, 1, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+            (0, -0.2, 0),
+            (0, 0, 1),
+            0.0,
+            (0, 0.1, 0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        worsening_t = _probe_trajectory_truncation(
+            device,
+            (0, 1, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+            (0, 0.1, 0),
+            (0, 0, 1),
+            0.0,
+            (0, 0.1, 0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        test.assertEqual(recovery_t, 1.0)
+        test.assertEqual(worsening_t, 0.0)
+
+        # Endpoint recovery is insufficient for a curved rigid trajectory. The
+        # point starts behind its negative-side boundary, first moves farther
+        # into the forbidden band, and only then ends on the safe side. Any
+        # penetration-directed portion must halt the complete rigid update.
+        returning_recovery_t = _probe_trajectory_truncation(
+            device,
+            (1.0, 0.0, 0.0),
+            (0.8, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            2.0 * math.pi / 3.0,
+            (math.cos(-math.pi / 6.0), math.sin(-math.pi / 6.0), 0.0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        test.assertEqual(returning_recovery_t, 0.0)
+
+        # The true normal derivative of this quarter-circle recovery is zero
+        # at t=0 and strictly negative afterward. Directed interval rounding
+        # may return a positive subnormal upper bound for that exact zero; it
+        # must not freeze an otherwise monotone separating trajectory.
+        monotone_recovery_t = _probe_trajectory_truncation(
+            device,
+            (1.0, 0.0, 0.0),
+            (0.8, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            math.pi / 2.0,
+            (1.0, 0.0, 0.0),
+            0.85,
+            use_interval_arithmetic,
+        )
+        test.assertEqual(monotone_recovery_t, 1.0)
+
+    # Pure rotation: point at radius 1 rotating pi/2 about z crosses plane y=0.5 at t=1/3
+    # (sin(t*pi/2) = 0.5). gamma_r=1 leaves only the fixed 1e-3 safety backoff.
+    t = _probe_trajectory_truncation(
+        device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, 0, 0), (0, 0, 1), math.pi / 2, (1, 0, 0), 1.0
+    )
+    test.assertAlmostEqual(t, 1.0 / 3.0 - 1e-3, delta=2e-3)
+
+    # Same rotation with the opposite handedness moves the point away: no truncation.
+    t = _probe_trajectory_truncation(
+        device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, 0, 0), (0, 0, -1), math.pi / 2, (1, 0, 0), 1.0
+    )
+    test.assertEqual(t, 1.0)
+
+    # Pure translation degenerates to the straight-ray case: crossing at t=0.5.
+    t = _probe_trajectory_truncation(
+        device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, 1, 0), (0, 0, 1), 0.0, (0, 0, 0), 0.85
+    )
+    test.assertAlmostEqual(t, 0.425, delta=2e-3)
+
+    # The same cross-and-return arc starting exactly on the plane must stall;
+    # checking only the end point would incorrectly release it.
+    phi = math.pi / 16.0
+    t_interval = _probe_trajectory_truncation(
+        device,
+        (1, 0, 0),
+        (math.cos(phi), 0, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (0, 0, 1),
+        math.pi,
+        (math.cos(-phi), math.sin(-phi), 0),
+        1.0,
+        True,
+    )
+    test.assertEqual(t_interval, 0.0, "interval arithmetic must stall a boundary trajectory that returns")
+
+    # Screw motion that stays on the safe side of the plane.
+    t = _probe_trajectory_truncation(
+        device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0.3, -0.2, 0), (0, 0, 1), 0.3, (0.2, -0.3, 0), 0.85
+    )
+    test.assertEqual(t, 1.0)
+
+    # A valid start exactly on the plane blocks an approaching update...
+    t = _probe_trajectory_truncation(
+        device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, 0.1, 0), (0, 0, 1), 0.0, (0, 0.5, 0), 0.85
+    )
+    test.assertEqual(t, 0.0)
+
+    # ...while a separating update from the same boundary point stays free.
+    t = _probe_trajectory_truncation(
+        device, (0, 1, 0), (0, 0.5, 0), (0, 0, 0), (0, -0.1, 0), (0, 0, 1), 0.0, (0, 0.5, 0), 0.85
+    )
+    test.assertEqual(t, 1.0)
+
+
+def test_rigid_dat_interval_flag_catches_returning_sdf_arc(test, device):
+    """Stage 2 catches a crossing that returns between adjacent Stage-1 samples."""
+
+    stage1_t = _probe_rigid_dat_returning_sdf_arc(device, use_interval_arithmetic=False)
+    interval_t = _probe_rigid_dat_returning_sdf_arc(device, use_interval_arithmetic=True)
+    test.assertEqual(stage1_t, 1.0, "Stage 1 endpoint samples intentionally miss this returning arc")
+    test.assertLess(interval_t, 1.0 / 16.0, "Stage 2 must detect the between-sample crossing")
+
+
+def test_rigid_dat_interval_catches_quarter_circle_tangent_peak(test, device):
+    """Interval verification removes Stage-1's even/odd sampling coincidence."""
+
+    epsilon = 1.0e-4
+    plane_rhs = math.sqrt(2.0) - epsilon
+    inv_sqrt_two = 1.0 / math.sqrt(2.0)
+    probe_args = {
+        "rigid_anchor": (1.0, 0.0, 0.0),
+        "plane_normal": (inv_sqrt_two, inv_sqrt_two, 0.0),
+        "plane_point": (0.5 * plane_rhs, 0.5 * plane_rhs, 0.0),
+        "rotation_angle": math.pi / 2.0,
+    }
+
+    even_stage1_t = _probe_rigid_dat_returning_sdf_arc(device, False, trajectory_samples=8, **probe_args)
+    odd_stage1_t = _probe_rigid_dat_returning_sdf_arc(device, False, trajectory_samples=9, **probe_args)
+    odd_interval_t = _probe_rigid_dat_returning_sdf_arc(device, True, trajectory_samples=9, **probe_args)
+
+    first_crossing = (math.pi / 4.0 - math.acos(plane_rhs / math.sqrt(2.0))) / (math.pi / 2.0)
+    expected_t = first_crossing - 1.0e-3
+    test.assertAlmostEqual(even_stage1_t, expected_t, delta=5.0e-5)
+    test.assertEqual(odd_stage1_t, 1.0, "nine samples straddle and miss the narrow peak at t=1/2")
+    test.assertAlmostEqual(odd_interval_t, expected_t, delta=5.0e-5)
+    test.assertLess(odd_interval_t, 0.5)
+
+
+def _run_vt_dat_row(
+    device,
+    particle_z,
+    stored_normal,
+    displacement_z,
+    moving_body=False,
+    body_displacement_z=1.0e-3,
+    world_origin=0.0,
+):
+    """Apply one rigid-soft DAT row (stored surface point and normal) and return its particle and body factors."""
+    # The stored surface point is body-local for a moving body and world-space for a static shape.
+    anchor = [0.0, 0.0, 0.0] if moving_body else [world_origin, world_origin, world_origin]
+    truncation_ts = wp.ones(1, dtype=float, device=device)
+    body_truncation_ts = (
+        wp.ones(1, dtype=float, device=device) if moving_body else wp.empty(0, dtype=float, device=device)
+    )
+    origin_transform = wp.transform(wp.vec3(world_origin), wp.quat_identity())
+    body_q_ref = (
+        wp.array([origin_transform], dtype=wp.transform, device=device)
+        if moving_body
+        else wp.empty(0, dtype=wp.transform, device=device)
+    )
+    body_q = (
+        wp.array(
+            [wp.transform(wp.vec3(world_origin, world_origin, world_origin + body_displacement_z), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        )
+        if moving_body
+        else wp.empty(0, dtype=wp.transform, device=device)
+    )
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([anchor], dtype=wp.vec3, device=device),
+            wp.array([stored_normal], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([0 if moving_body else -1], dtype=wp.int32, device=device),
+            wp.array(
+                [[world_origin, world_origin, world_origin + particle_z]],
+                dtype=wp.vec3,
+                device=device,
+            ),
+            wp.array([[0.0, 0.0, displacement_z]], dtype=wp.vec3, device=device),
+            body_q_ref,
+            body_q,
+            wp.zeros(1, dtype=wp.vec3, device=device) if moving_body else wp.empty(0, dtype=wp.vec3, device=device),
+            0.85,
+            False,
+        ],
+        outputs=[truncation_ts, body_truncation_ts],
+        device=device,
+    )
+    body_t = float(body_truncation_ts.numpy()[0]) if moving_body else 1.0
+    return float(truncation_ts.numpy()[0]), body_t
+
+
+def test_rigid_soft_dat_truncation_maintains_epsilon_band(test, device):
+    """Truncation preserves two epsilon of pair gap and never worsens a short-gap start."""
+    eps = _RIGID_SOFT_DAT_TEST_EPS
+
+    soft_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=10.0 * eps,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-20.0 * eps,
+    )
+    soft_pair_gap = 10.0 * eps + soft_t * (-20.0 * eps)
+    test.assertGreaterEqual(soft_pair_gap, 1.8 * eps)
+
+    _, body_t = _run_vt_dat_row(
+        device,
+        particle_z=10.0 * eps,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=20.0 * eps,
+    )
+    rigid_pair_gap = 10.0 * eps - body_t * (20.0 * eps)
+    test.assertGreaterEqual(rigid_pair_gap, 1.8 * eps)
+
+    short_gap = 1.5 * eps
+    soft_worsening_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-eps,
+    )
+    soft_recovery_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=eps,
+    )
+    test.assertEqual(soft_worsening_t, 0.0)
+    test.assertEqual(soft_recovery_t, 1.0)
+
+    _, rigid_worsening_t = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=eps,
+    )
+    _, rigid_recovery_t = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=-eps,
+    )
+    test.assertEqual(rigid_worsening_t, 0.0)
+    test.assertEqual(rigid_recovery_t, 1.0)
+
+    # Exercise the production kernel's coordinate-scale accumulation and
+    # anchor-plus-scalar thresholds, rather than only the placement helper.
+    large_origin = 1000.0
+    large_eps = max(eps, 4.0 * np.finfo(np.float32).eps * large_origin)
+    adjacent_gap = float(np.nextafter(np.float32(large_origin), np.float32(np.inf))) - large_origin
+    adjacent_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=adjacent_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-adjacent_gap,
+        world_origin=large_origin,
+    )
+    test.assertLess(adjacent_gap, 2.0 * large_eps)
+    test.assertEqual(adjacent_t, 0.0)
+
+    represented_gap = float(np.float32(large_origin + 1.0e-3)) - large_origin
+    large_displacement = -2.0e-3
+    large_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=represented_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=large_displacement,
+        world_origin=large_origin,
+    )
+    accepted_gap = represented_gap + large_t * large_displacement
+    test.assertGreaterEqual(accepted_gap, 1.95 * large_eps)
+
+
+def _build_sphere_drop_on_cloth(device):
+    """A heavy rigid sphere shot at a pinned cloth grid: a stress scene where penalty
+    forces alone cannot prevent penetration within a step."""
+    builder = newton.ModelBuilder()  # Z up, gravity -Z
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.5, -0.5, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=16,
+        dim_y=16,
+        cell_x=1.0 / 16.0,
+        cell_y=1.0 / 16.0,
+        mass=0.05,
+        fix_left=True,
+        fix_right=True,
+        fix_top=True,
+        fix_bottom=True,
+        tri_ke=1.0e3,
+        tri_ka=1.0e3,
+        tri_kd=1.0e-1,
+        edge_ke=1.0e-2,
+        particle_radius=5.0e-3,
+    )
+    inertia_val = 0.4 * 20.0 * 0.25**2
+    inertia = wp.mat33(inertia_val, 0.0, 0.0, 0.0, inertia_val, 0.0, 0.0, 0.0, inertia_val)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_identity()),
+        mass=20.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_sphere(body=body, radius=0.25)
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 1.0e4
+    model.soft_contact_kd = 1.0e-5
+    model.soft_contact_mu = 0.5
+    return model, body
+
+
+def _run_sphere_drop(device, enable_dat, drop_speed=8.0, frames=60):
+    model, body = _build_sphere_drop_on_cloth(device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.1)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=4,
+        rigid_soft_enable_dat=enable_dat,
+        rigid_body_particle_contact_buffer_size=1024,
+        collision_pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][:3] = [0.0, 0.0, -drop_speed]
+    state_in.body_qd.assign(qd)
+
+    worst_pen = 0.0
+    body_z = 0.0
+    for _frame in range(frames):
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+        q = state_in.particle_q.numpy()
+        bq = state_in.body_q.numpy()[body]
+        if not (np.isfinite(q).all() and np.isfinite(bq).all()):
+            raise AssertionError("simulation produced non-finite state")
+        gap = np.linalg.norm(q - bq[None, :3], axis=1) - 0.25
+        worst_pen = max(worst_pen, -float(gap.min()))
+        body_z = float(bq[2])
+    return worst_pen, body_z
+
+
+def test_rigid_dat_sphere_drop_penetration_free(test, device):
+    """Rigid DAT keeps a fast heavy sphere penetration-free against a pinned cloth grid.
+
+    The control run (DAT off) penetrates and tunnels through under the same conditions,
+    verifying that the assertion is meaningful.
+    """
+    worst_pen, body_z = _run_sphere_drop(device, enable_dat=True)
+    test.assertLessEqual(worst_pen, 1.0e-4, "rigid DAT must keep cloth vertices outside the sphere")
+    test.assertGreater(body_z, -0.5, "sphere must be caught by the cloth, not tunnel through")
+
+    worst_pen_ctrl, body_z_ctrl = _run_sphere_drop(device, enable_dat=False)
+    test.assertTrue(
+        worst_pen_ctrl > 1.0e-3 or body_z_ctrl < -1.0,
+        "control without DAT should penetrate or tunnel; if it no longer does, strengthen this stress",
+    )
+
+
+def test_rigid_dat_requires_owned_pipeline(test, device):
+    """Enabling rigid DAT without a solver-owned pipeline raises: the DAT reference poses
+    must be snapshotted at the exact detection instants the solver drives."""
+    model, _body = _build_sphere_drop_on_cloth(device)
+    with test.assertRaises(ValueError):
+        newton.solvers.SolverVBD(model, rigid_soft_enable_dat=True)
+
+
+def test_rigid_dat_requires_positive_rigid_soft_query_gap(test, device):
+    """A zero rigid-soft query gap cannot support DAT's between-detection motion bound."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.2), vel=wp.vec3(0.0), mass=0.1, radius=0.05)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(xform=wp.transform_identity(), mass=1.0, inertia=inertia, lock_inertia=True)
+    builder.add_shape_sphere(body, radius=0.1)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.0)
+    with test.assertRaisesRegex(ValueError, "soft_contact_gap > 0"):
+        newton.solvers.SolverVBD(model, rigid_soft_enable_dat=True, collision_pipeline=pipeline)
+
+
+def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
+    """Rigid DAT requires the strict relaxation interval used by its motion bound."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    model = builder.finalize(device=device)
+
+    for relaxation in (-0.1, 0.0, 1.0, 1.1, np.nan, np.inf):
+        with test.subTest(relaxation=relaxation):
+            with test.assertRaisesRegex(ValueError, r"must be in \(0, 1\)"):
+                newton.solvers.SolverVBD(
+                    model,
+                    rigid_soft_dat_relaxation=relaxation,
+                )
+
+    for relaxation in (1.0e-6, 0.5, 1.0 - 1.0e-6):
+        with test.subTest(relaxation=relaxation):
+            solver = newton.solvers.SolverVBD(
+                model,
+                rigid_soft_dat_relaxation=relaxation,
+            )
+            test.assertEqual(solver.rigid_soft_dat_relaxation, relaxation)
+
+
+def test_rigid_dat_rejects_missing_body_pose(test, device):
+    """A null body pose is valid only for static-world geometry, never for a model with bodies."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.2), vel=wp.vec3(0.0), mass=0.1, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(mass=1.0, inertia=inertia, lock_inertia=True)
+    builder.add_shape_sphere(body, radius=0.1)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.01)
+    solver = newton.solvers.SolverVBD(model, rigid_soft_enable_dat=True, collision_pipeline=pipeline)
+
+    state = model.state()
+    state.body_q = None
+    with test.assertRaisesRegex(ValueError, "requires body_q"):
+        solver._penetration_free_truncation(state, solver.contacts)
+
+
+def _run_rigid_only_contact(device, enable_rigid_soft_dat):
+    """Run an ordinary rigid sphere impact with no soft degrees of freedom."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    radius = 0.2
+    mass = 1.0
+    inertia_value = 0.4 * mass * radius * radius
+    inertia = wp.mat33(
+        inertia_value,
+        0.0,
+        0.0,
+        0.0,
+        inertia_value,
+        0.0,
+        0.0,
+        0.0,
+        inertia_value,
+    )
+    bodies = []
+    for x in (-0.5, 0.5):
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+            mass=mass,
+            inertia=inertia,
+            lock_inertia=True,
+        )
+        builder.add_shape_sphere(body, radius=radius)
+        bodies.append(body)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=8,
+        rigid_compliant_alm=True,
+        rigid_soft_enable_dat=enable_rigid_soft_dat,
+        collision_pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[bodies[0]][0] = 2.0
+    qd[bodies[1]][0] = -2.0
+    state_in.body_qd.assign(qd)
+    saw_contact = False
+    for _ in range(30):
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+        saw_contact |= int(solver.contacts.rigid_contact_count.numpy()[0]) > 0
+    return (
+        state_in.body_q.numpy(),
+        state_in.body_qd.numpy(),
+        saw_contact,
+        solver.rigid_soft_enable_dat,
+        solver._rigid_dat_body_max_displacement.numpy(),
+        solver._rigid_dat_particle_max_displacement,
+    )
+
+
+def test_rigid_soft_dat_initializes_for_rigid_only_model(test, device):
+    """Keep requested DAT initialized while ordinary rigid-only ALM contact remains active."""
+    q_dat, qd_dat, saw_contact, dat_enabled, body_max_displacement, particle_max_displacement = _run_rigid_only_contact(
+        device, True
+    )
+
+    test.assertTrue(dat_enabled)
+    test.assertTrue(saw_contact)
+    test.assertTrue(np.isfinite(q_dat).all())
+    test.assertTrue(np.isfinite(qd_dat).all())
+    test.assertTrue(np.isinf(body_max_displacement).all())
+    test.assertTrue(np.isinf(particle_max_displacement))
+
+
+def test_rigid_dat_com_centered_body_bounds(test, device):
+    """Compute rigid-soft DAT body bounds from collision geometry about the COM.
+
+    The offset, rotated box checks analytic primitive support about a nonzero COM.
+    The asymmetric, scaled, rotated mesh checks vertex transforms and transform direction.
+    The inactive site box checks that potentially enabled shapes are bounded in advance.
+    """
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(100.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(1.0, 0.0, 0.0),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_box(
+        body,
+        xform=wp.transform(
+            wp.vec3(3.0, 0.0, 0.0),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi),
+        ),
+        hx=0.5,
+        hy=0.25,
+        hz=0.125,
+    )
+    mesh_body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(-0.5, 0.25, 0.1),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    mesh_vertices = np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+    mesh = newton.Mesh(mesh_vertices, [0, 1, 2], compute_inertia=False)
+    mesh_scale = np.array([-1.0, 2.0, 0.5])
+    mesh_translation = np.array([0.25, -0.5, 0.75])
+    builder.add_shape_mesh(
+        mesh_body,
+        xform=wp.transform(
+            wp.vec3(*mesh_translation),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi),
+        ),
+        mesh=mesh,
+        scale=wp.vec3(*mesh_scale),
+    )
+    latent_body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(0.0),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_box(
+        latent_body,
+        xform=wp.transform(wp.vec3(2.0, 0.0, 0.0), wp.quat_identity()),
+        hx=0.5,
+        hy=0.25,
+        hz=0.125,
+        as_site=True,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    soft_gap = 0.04
+    relaxation = 0.85
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=soft_gap,
+    )
+    solver = newton.solvers.SolverVBD(
+        model,
+        rigid_soft_enable_dat=True,
+        rigid_soft_dat_relaxation=relaxation,
+        collision_pipeline=pipeline,
+    )
+
+    expected_radius = np.linalg.norm([2.25, 0.5, 0.125])
+    radius = float(solver._rigid_dat_body_bounding_radius.numpy()[body])
+    # Explicit transformed points make this sensitive to confusing X_bs with X_sb.
+    mesh_points_body = np.array([[0.25, -2.5, 0.75], [-1.75, -2.5, 0.75], [0.25, -2.5, 1.25]])
+    expected_mesh_radius = np.max(np.linalg.norm(mesh_points_body - np.array([-0.5, 0.25, 0.1]), axis=1))
+    mesh_radius = float(solver._rigid_dat_body_bounding_radius.numpy()[mesh_body])
+    latent_radius = float(solver._rigid_dat_body_bounding_radius.numpy()[latent_body])
+    max_displacement = float(solver._rigid_dat_body_max_displacement.numpy()[body])
+    test.assertAlmostEqual(radius, expected_radius, places=6)
+    test.assertAlmostEqual(mesh_radius, expected_mesh_radius, places=6)
+    # Flags may enable a currently inactive shape later, so it must already be bounded.
+    test.assertAlmostEqual(latent_radius, np.linalg.norm([2.5, 0.25, 0.125]), places=6)
+    test.assertAlmostEqual(max_displacement, 0.5 * relaxation * soft_gap, places=7)
+    test.assertAlmostEqual(solver._rigid_dat_particle_max_displacement, 0.5 * relaxation * soft_gap, places=7)
+
+
+def _run_free_flight_distance(test, device, frequency_type, frequency, speed=6.0, frames=10):
+    """Measure free rigid motion under the rigid-soft DAT budget for a schedule."""
+    _Frequency = newton.solvers.SolverBase.CollisionFrequencyType
+    _Slot = newton.solvers.SolverBase.CollisionSlot
+    radius = 0.2
+    builder = newton.ModelBuilder(gravity=0.0)
+    builder.add_particle(pos=wp.vec3(100.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia_val = 0.4 * 5.0 * radius * radius
+    inertia = wp.mat33(inertia_val, 0.0, 0.0, 0.0, inertia_val, 0.0, 0.0, 0.0, inertia_val)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        mass=5.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_sphere(body=body, radius=radius)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.05, contact_matching="latest")
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=10,
+        rigid_soft_enable_dat=True,
+        collision_pipeline=pipeline,
+        collision_frequency={_Slot.RIGID: frequency, _Slot.SOFT_SELF_CONTACT: 1},
+        collision_frequency_type={_Slot.RIGID: frequency_type, _Slot.SOFT_SELF_CONTACT: _Frequency.AUTO},
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][:3] = [speed, 0.0, 0.0]
+    state_in.body_qd.assign(qd)
+    for _frame in range(frames):
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+    test.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
+    return float(state_in.body_q.numpy()[body][0])
+
+
+def test_rigid_dat_collision_frequency_budget(test, device):
+    """Raising rigid-soft detection frequency widens the DAT motion budget.
+
+    The per-body budget is 0.5 * gamma * detection slack PER DETECTION INTERVAL, so a
+    body faster than the per-step budget is throttled under PRE_POST_INIT but flies
+    (nearly) freely when the reference resets every iteration (ITERATIONS k=1) — the
+    configuration fix for the momentum-drain failure mode of infrequent detection.
+    """
+    _Frequency = newton.solvers.SolverBase.CollisionFrequencyType
+    # 6 m/s -> 10 cm per step. soft gap 0.05, gamma 0.85: 2.125 cm per interval.
+    # PRE_POST_INIT: 2 intervals/step -> <= ~4.25 cm/step. ITERATIONS k=1 with 10
+    # iterations: 11 intervals/step -> unthrottled.
+    x_slow = _run_free_flight_distance(test, device, _Frequency.PRE_POST_INIT, 1)
+    x_fast = _run_free_flight_distance(test, device, _Frequency.ITERATIONS, 1)
+    expected = 6.0 * 10.0 / 60.0  # unthrottled distance over 10 frames
+    test.assertGreater(x_fast, 0.9 * expected, "ITERATIONS k=1 must not throttle this speed")
+    test.assertLess(x_slow, 0.6 * expected, "PRE_POST_INIT should throttle this speed; retune if not")
+
+
+def test_rigid_dat_redetects_approaching_cloth_before_crossing(test, device):
+    """Periodic VBD detection captures an initially out-of-range rigid-soft pair."""
+    Frequency = newton.solvers.SolverBase.CollisionFrequencyType
+    Slot = newton.solvers.SolverBase.CollisionSlot
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_box(-1, hx=0.2, hy=0.2, hz=0.1)
+    builder.add_cloth_grid(
+        pos=wp.vec3(0.0, 0.0, 0.13),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, -20.0),
+        dim_x=2,
+        dim_y=2,
+        cell_x=0.1,
+        cell_y=0.1,
+        mass=0.1,
+        particle_radius=0.0,
+        tri_ke=1.0e2,
+        tri_ka=1.0e2,
+        tri_kd=1.0e-4,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    # Isolate geometric truncation from the ordinary penalty response.
+    model.soft_contact_ke = 0.0
+    model.shape_material_ke.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.02,
+        enable_rigid_soft_full_surface_contact=True,
+        contact_matching="latest",
+    )
+    state_in, state_out = model.state(), model.state()
+    initial_contacts = pipeline.contacts()
+    pipeline.collide(state_in, initial_contacts)
+    wp.synchronize_device(wp.get_device(device))
+    test.assertEqual(
+        int(initial_contacts.soft_contact_count.numpy()[0]),
+        0,
+        "the cloth must begin outside the query radius",
+    )
+
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=6,
+        collision_pipeline=pipeline,
+        particle_enable_self_contact=True,
+        rigid_soft_enable_dat=True,
+        collision_frequency={Slot.RIGID: 2, Slot.SOFT_SELF_CONTACT: 2},
+        collision_frequency_type={Slot.RIGID: Frequency.ITERATIONS, Slot.SOFT_SELF_CONTACT: Frequency.ITERATIONS},
+    )
+    for _ in range(8):
+        solver.step(state_in, state_out, None, None, 1.0e-3)
+        state_in, state_out = state_out, state_in
+    wp.synchronize_device(wp.get_device(device))
+    test.assertGreaterEqual(float(np.min(state_in.particle_q.numpy()[:, 2])), 0.1 - 1.0e-5)
+
+
+class TestVBDRigidDAT(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestVBDRigidDAT,
+    "test_planar_truncation_uses_endpoint_signs",
+    test_planar_truncation_uses_endpoint_signs,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_soft_dat_scale_aware_epsilon_prevents_fp32_gap_collapse",
+    test_rigid_soft_dat_scale_aware_epsilon_prevents_fp32_gap_collapse,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_soft_self_dat_uses_epsilon_separation",
+    test_soft_self_dat_uses_epsilon_separation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_trajectory_truncation",
+    test_rigid_dat_trajectory_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_interval_flag_catches_returning_sdf_arc",
+    test_rigid_dat_interval_flag_catches_returning_sdf_arc,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_interval_catches_quarter_circle_tangent_peak",
+    test_rigid_dat_interval_catches_quarter_circle_tangent_peak,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_soft_dat_truncation_maintains_epsilon_band",
+    test_rigid_soft_dat_truncation_maintains_epsilon_band,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_sphere_drop_penetration_free",
+    test_rigid_dat_sphere_drop_penetration_free,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_requires_owned_pipeline",
+    test_rigid_dat_requires_owned_pipeline,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_requires_positive_rigid_soft_query_gap",
+    test_rigid_dat_requires_positive_rigid_soft_query_gap,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_validates_conservative_bound_relaxation",
+    test_rigid_dat_validates_conservative_bound_relaxation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_rejects_missing_body_pose",
+    test_rigid_dat_rejects_missing_body_pose,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_soft_dat_initializes_for_rigid_only_model",
+    test_rigid_soft_dat_initializes_for_rigid_only_model,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_com_centered_body_bounds",
+    test_rigid_dat_com_centered_body_bounds,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_collision_frequency_budget",
+    test_rigid_dat_collision_frequency_budget,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_dat_redetects_approaching_cloth_before_crossing",
+    test_rigid_dat_redetects_approaching_cloth_before_crossing,
     devices=devices,
 )
 
