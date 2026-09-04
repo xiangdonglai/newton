@@ -109,7 +109,7 @@ class Experiment:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self._solver_owns_pipeline = getattr(self.solver, "pipeline", None) is self.collision_pipeline
+        self._solver_owns_pipeline = getattr(self.solver, "collision_pipeline", None) is self.collision_pipeline
         self.contacts = self.solver.contacts if self._solver_owns_pipeline else self.collision_pipeline.contacts()
         self.control = self.model.control()
 

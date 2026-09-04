@@ -10,7 +10,6 @@ import warp as wp
 from warp import DeviceLike as Devicelike
 
 from ..geometry.tri_mesh_collision import TriMeshCollisionInfo, build_tri_mesh_collision_info
-from ..utils.deprecation import deprecate_nonkeyword_arguments
 
 GENERATION_SENTINEL = -1
 """Value reserved as an impossible generation; the increment kernel skips it."""
@@ -163,7 +162,6 @@ class Contacts:
             bad = ", ".join(invalid)
             raise ValueError(f"Unknown extended contact attribute(s): {bad}. Allowed: {allowed}.")
 
-    @deprecate_nonkeyword_arguments
     def __init__(
         self,
         rigid_contact_max: int,
@@ -397,23 +395,14 @@ class Contacts:
             self.soft_contact_barycentric = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Barycentric weights of the contact point on the soft feature's particles [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_shape = wp.full(soft_contact_max, -1, dtype=int)
-            # Allocated unconditionally (like the other soft-contact fields): every
-            # writer stamps this field — non-BVH rows store the (-1, -1, -1) sentinel —
-            # so full capacity must exist regardless of the active back-end.
+            # Every emitter writes this field; non-BVH rows use the sentinel.
             self.soft_contact_rigid_indices = wp.full(soft_contact_max, wp.vec3i(-1, -1, -1), dtype=wp.vec3i)
-            """Rigid mesh face-vertex indices per full-surface BVH contact, shape (soft_contact_max,), dtype :class:`vec3i`.
+            """Rigid mesh indices per full-surface BVH contact [dimensionless], shape (soft_contact_max,), dtype :class:`vec3i`.
 
-            ``(v0, v1, v2)`` identifies a rigid triangle for soft-vertex/rigid-triangle
-            contacts, ``(v0, v1, -1)`` a rigid edge, and ``(v0, -1, -1)`` a rigid
+            ``(v0, v1, v2)`` identifies a rigid triangle for a soft-vertex/rigid-triangle
+            contact, ``(v0, v1, -1)`` a rigid edge, and ``(v0, -1, -1)`` a rigid
             vertex. Non-BVH contacts contain ``(-1, -1, -1)`` because an analytic SDF
-            row does not identify a complete rigid mesh primitive. Shape-local mesh
-            points are obtained with :func:`warp.mesh_get_point` and transformed using
-            :attr:`soft_contact_shape`.
-
-            The indices are stable identifiers but not canonical: the same physical
-            rigid vertex may appear under different face-vertex indices depending on
-            the record family (a triangle corner slot vs. the vertex/edge table
-            representative), so do not use the triple as a cross-record key.
+            row does not identify a complete rigid mesh primitive.
             """
             self.soft_contact_body_pos = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact position on body [m], shape (soft_contact_max,), dtype :class:`vec3`.
@@ -454,7 +443,13 @@ class Contacts:
         self.soft_self_contact_data: TriMeshCollisionInfo | None = None
         """Tri-mesh self-contact results owned by this container, written by the
         collision pipeline's tri-mesh collision detector; ``None`` unless
-        constructed with ``soft_self_contact=True``."""
+        constructed with ``soft_self_contact=True``.
+
+        .. experimental::
+
+            This storage-level result attribute may change without the normal
+            deprecation period while the public self-contact API matures.
+        """
         if soft_self_contact:
             mesh_counts = {
                 "particle_count": particle_count,

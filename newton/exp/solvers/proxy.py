@@ -42,7 +42,7 @@ class ProxyCouplingStrategy(SolverStrategy):
 
     def register_attributes(self, builder):
         SolverMuJoCo.register_custom_attributes(builder)
-        SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
+        SolverVBD.register_custom_attributes(builder)
 
     def configure_robot(self, builder, robot_bodies, robot_joints):
         gains = {
@@ -101,11 +101,18 @@ class ProxyCouplingStrategy(SolverStrategy):
             "particle_vertex_contact_buffer_size": 16,
             "particle_edge_contact_buffer_size": 20,
             "rigid_compliant_alm": False,
-            "collision_frequency": [1, 1],
-            "collision_frequency_type": [
-                newton.solvers.SolverBase.CollisionFrequencyType.NONE,
-                newton.solvers.SolverBase.CollisionFrequencyType.PRE_INIT,
-            ],
+            "collision_frequency": {
+                newton.solvers.SolverBase.CollisionSlot.RIGID: 1,
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: 1,
+            },
+            "collision_frequency_type": {
+                newton.solvers.SolverBase.CollisionSlot.RIGID: (
+                    newton.solvers.SolverBase.CollisionFrequencyType.NONE
+                ),
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: (
+                    newton.solvers.SolverBase.CollisionFrequencyType.PRE_INIT
+                ),
+            },
         }
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win
         entries = [

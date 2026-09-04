@@ -1991,7 +1991,7 @@ def test_bvh_vt_only_without_triangles(test, device):
         pipeline = newton.CollisionPipeline(
             model, soft_contact_gap=0.01, enable_rigid_soft_full_surface_contact=True, rigid_soft_mesh_backend="bvh"
         )
-    test.assertIsNone(pipeline._soft_contact_detector)
+    test.assertIsNone(pipeline._soft_self_contact_detector)
     test.assertEqual(len(pipeline._full_surface_bvh_rigid_vertex_table), 0)
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
@@ -2284,7 +2284,7 @@ def _run_bvh_dat_box_particle(device, enable_dat):
         iterations=1,
         rigid_compliant_alm=False,
         rigid_enable_penetration_free=enable_dat,
-        pipeline=pipeline,
+        collision_pipeline=pipeline,
     )
     state_in, state_out = model.state(), model.state()
     qd = state_in.body_qd.numpy()
@@ -2391,7 +2391,7 @@ def _run_bvh_dat_static_pair(device, family, enable_dat):
         iterations=1,
         rigid_compliant_alm=False,
         rigid_enable_penetration_free=enable_dat,
-        pipeline=pipeline,
+        collision_pipeline=pipeline,
     )
     state_in, state_out = model.state(), model.state()
     qd = state_in.particle_qd.numpy()
@@ -2507,7 +2507,7 @@ def test_bvh_solver_owned_pipeline_refits_soft_features(test, device):
         enable_rigid_soft_full_surface_contact=True,
         rigid_soft_mesh_backend="bvh",
     )
-    solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
+    solver = newton.solvers.SolverVBD(model, iterations=1, collision_pipeline=pipeline)
 
     # Seed the detector with a triangle one metre away, then restore the near
     # model state.  The second owned detection finds TV only if it refits first.
@@ -2540,7 +2540,7 @@ def test_bvh_invalid_adjacent_face_row_does_not_push_particle_sideways(test, dev
         enable_rigid_soft_full_surface_contact=True,
         rigid_soft_mesh_backend="bvh",
     )
-    solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
+    solver = newton.solvers.SolverVBD(model, iterations=1, collision_pipeline=pipeline)
     state_in, state_out = model.state(), model.state()
     x0 = state_in.particle_q.numpy().copy()
     solver.step(state_in, state_out, None, None, 1.0 / 60.0)
@@ -2566,7 +2566,7 @@ def test_analytic_sdf_penetration_remains_force_eligible(test, device):
         enable_rigid_soft_full_surface_contact=True,
         rigid_soft_mesh_backend="bvh",
     )
-    solver = newton.solvers.SolverVBD(model, iterations=1, pipeline=pipeline)
+    solver = newton.solvers.SolverVBD(model, iterations=1, collision_pipeline=pipeline)
     state_in, state_out = model.state(), model.state()
     solver.step(state_in, state_out, None, None, 1.0 / 60.0)
     wp.synchronize_device(wp.get_device(device))

@@ -46,7 +46,7 @@ class MonolithicAvbdStrategy(SolverStrategy):
     warmup_steps = 8
 
     def register_attributes(self, builder):
-        SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
+        SolverVBD.register_custom_attributes(builder)
 
     def configure_robot(self, builder, robot_bodies, robot_joints):
         gains = {
@@ -126,12 +126,15 @@ class MonolithicAvbdStrategy(SolverStrategy):
             "particle_rest_shape_contact_exclusion_radius": 0.0,
             "particle_vertex_contact_buffer_size": 16,
             "particle_edge_contact_buffer_size": 20,
-            "pipeline": pipeline,
-            "collision_frequency": [rigid_collision_frequency, soft_self_collision_frequency],
-            "collision_frequency_type": [
-                rigid_collision_frequency_type,
-                soft_self_collision_frequency_type,
-            ],
+            "collision_pipeline": pipeline,
+            "collision_frequency": {
+                newton.solvers.SolverBase.CollisionSlot.RIGID: rigid_collision_frequency,
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: soft_self_collision_frequency,
+            },
+            "collision_frequency_type": {
+                newton.solvers.SolverBase.CollisionSlot.RIGID: rigid_collision_frequency_type,
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: soft_self_collision_frequency_type,
+            },
             "rigid_contact_k_start": 1.0e2,
             "rigid_compliant_alm": False,
             "rigid_body_particle_contact_use_log_barrier": bool(args.rigid_soft_contact_use_log_barrier),

@@ -103,7 +103,7 @@ class Example:
             iterations=self.params["solver_iterations"],
             rigid_enable_penetration_free=self.params["enable_dat"],
             rigid_body_particle_contact_buffer_size=self.params["rigid_body_particle_contact_buffer_size"],
-            pipeline=self.collision_pipeline,
+            collision_pipeline=self.collision_pipeline,
         )
 
         self.state_0 = self.model.state()

@@ -27,6 +27,8 @@ import newton.utils
 from newton import ModelBuilder, eval_fk
 from newton.solvers import SolverFeatherstone, SolverVBD
 
+DUCK_OPACITY = 0.55
+
 
 @wp.kernel
 def set_gripper_q(joint_q: wp.array2d[float], finger_pos: wp.array[float], idx0: int, idx1: int):
@@ -108,6 +110,7 @@ class Example:
             k_lambda=1.0e6,
             k_damp=1e0,
             particle_radius=self.particle_radius,
+            opacity=DUCK_OPACITY,
         )
 
         self.scene.color()
@@ -155,10 +158,9 @@ class Example:
             particle_enable_self_contact=False,
             particle_vertex_contact_buffer_size=32,
             particle_edge_contact_buffer_size=64,
-            collision_frequency_type=[
-                newton.solvers.SolverBase.CollisionFrequencyType.AUTO,
-                newton.solvers.SolverBase.CollisionFrequencyType.PRE_INIT,
-            ],
+            collision_frequency_type={
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.PRE_INIT,
+            },
         )
 
         self.viewer.set_model(self.model)

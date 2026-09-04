@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from collections.abc import Mapping
 from enum import IntEnum
 from typing import Any
 
@@ -195,6 +198,14 @@ class SolverBase:
     necessary.
     """
 
+    class CollisionSlot(IntEnum):
+        """Collision-detection categories scheduled by a solver."""
+
+        RIGID = 0
+        """Rigid-rigid and particle-shape collision detection."""
+        SOFT_SELF_CONTACT = 1
+        """Triangle-mesh soft self-contact detection."""
+
     class CollisionFrequencyType(IntEnum):
         """When, inside a :meth:`step`, a solver-owned collision pipeline runs detection.
 
@@ -211,19 +222,17 @@ class SolverBase:
         PRE_POST_INIT = 2
         """Before and after solver initialization (one detection each)."""
         ITERATIONS = 3
-        """Before initialization, then every k-th solver iteration."""
+        """Before initialization, then immediately before iterations k, 2k, and so on."""
         AUTO = 4
         """Solver-specific default."""
 
     supports_collision_pipeline: bool = False
     """Whether this solver can own a :class:`~newton.CollisionPipeline` and drive detection itself.
 
-    Currently only :class:`~newton.solvers.SolverVBD` opts in; passing ``pipeline``
-    to any other solver raises ``ValueError`` (drive detection externally instead).
+    Currently only :class:`~newton.solvers.SolverVBD` opts in; passing
+    ``collision_pipeline`` to any other solver raises ``ValueError`` (drive
+    detection externally instead).
     """
-
-    _COLLISION_SLOT_RIGID = 0
-    _COLLISION_SLOT_SOFT_SELF = 1
 
     _module_options_revision = 0
 
@@ -231,35 +240,46 @@ class SolverBase:
         self,
         model: Model,
         *,
-        pipeline: CollisionPipeline | None = None,
-        collision_frequency: list[int] | None = None,
-        collision_frequency_type: list[CollisionFrequencyType] | None = None,
+        collision_pipeline: CollisionPipeline | None = None,
+        collision_frequency: Mapping[CollisionSlot, int] | None = None,
+        collision_frequency_type: Mapping[CollisionSlot, CollisionFrequencyType] | None = None,
     ):
+        """Initialize common solver state and optional collision scheduling.
+
+        Args:
+            model: Simulation model integrated by the solver.
+            collision_pipeline: Collision pipeline owned and driven by the
+                solver. The pipeline must use ``model``, and the concrete
+                solver must set :attr:`supports_collision_pipeline`.
+            collision_frequency: Per-slot iteration frequencies. Values must
+                be at least one and are used only for slots scheduled with
+                :attr:`CollisionFrequencyType.ITERATIONS`. Unspecified slots
+                retain their defaults.
+            collision_frequency_type: Per-slot detection points. Unspecified
+                slots retain their defaults.
+        """
         self.model = model
         self._module_options: dict[Any, dict[str, Any]] = {}
         self._applied_module_options_revision = -1
 
-        if pipeline is not None and not self.supports_collision_pipeline:
+        if collision_pipeline is not None and not self.supports_collision_pipeline:
             raise ValueError(
                 f"{type(self).__name__} cannot own a collision pipeline; "
                 "drive detection externally via model.collide()."
             )
-        if pipeline is not None and pipeline.model is not model:
-            raise ValueError("pipeline and solver must use the same model")
-        self.pipeline = pipeline
+        if collision_pipeline is not None and collision_pipeline.model is not model:
+            raise ValueError("collision_pipeline and solver must use the same model")
+        self.collision_pipeline = collision_pipeline
         """The solver-owned collision pipeline, or ``None`` when detection is driven externally."""
-        if pipeline is not None:
-            self._pipeline_contacts = pipeline.contacts()
+        if collision_pipeline is not None:
+            self._pipeline_contacts = collision_pipeline.contacts()
         elif not hasattr(self, "_pipeline_contacts"):
             # Preserve contact storage assigned by existing SolverBase subclasses
             # before calling super().__init__().
             self._pipeline_contacts = None
 
-        self._collision_frequency: list[int] = [1, 1]
-        self._collision_frequency_type: list[SolverBase.CollisionFrequencyType] = [
-            SolverBase.CollisionFrequencyType.AUTO,
-            SolverBase.CollisionFrequencyType.AUTO,
-        ]
+        self._collision_frequency = dict.fromkeys(SolverBase.CollisionSlot, 1)
+        self._collision_frequency_type = dict.fromkeys(SolverBase.CollisionSlot, SolverBase.CollisionFrequencyType.AUTO)
         self.set_collision_frequency(
             collision_frequency=collision_frequency,
             collision_frequency_type=collision_frequency_type,
@@ -282,19 +302,20 @@ class SolverBase:
         self._pipeline_contacts = value
 
     @property
-    def collision_frequency(self) -> list[int]:
-        """Per-slot detection frequency numbers, ``[rigid, soft_self_contact]`` (read-only copy)."""
-        return list(self._collision_frequency)
+    def collision_frequency(self) -> dict[CollisionSlot, int]:
+        """Per-slot detection frequency numbers as a read-only copy."""
+        return dict(self._collision_frequency)
 
     @property
-    def collision_frequency_type(self) -> list[CollisionFrequencyType]:
-        """Per-slot :class:`CollisionFrequencyType`, ``[rigid, soft_self_contact]`` (read-only copy)."""
-        return list(self._collision_frequency_type)
+    def collision_frequency_type(self) -> dict[CollisionSlot, CollisionFrequencyType]:
+        """Per-slot :class:`CollisionFrequencyType` values as a read-only copy."""
+        return dict(self._collision_frequency_type)
 
     def set_collision_frequency(
         self,
-        collision_frequency: list[int] | None = None,
-        collision_frequency_type: list[CollisionFrequencyType] | None = None,
+        *,
+        collision_frequency: Mapping[CollisionSlot, int] | None = None,
+        collision_frequency_type: Mapping[CollisionSlot, CollisionFrequencyType] | None = None,
     ) -> None:
         """Change the detection schedule; takes effect at the next :meth:`step`.
 
@@ -305,47 +326,52 @@ class SolverBase:
         existing CUDA graph after changing the schedule.
 
         Args:
-            collision_frequency: ``[rigid, soft_self_contact]`` frequency
-                numbers; used only by ``ITERATIONS`` slots ("every k-th
-                iteration"), must be >= 1.
-            collision_frequency_type: ``[rigid, soft_self_contact]``
-                :class:`CollisionFrequencyType` entries.
+            collision_frequency: Frequency numbers keyed by
+                :class:`CollisionSlot`; used only by ``ITERATIONS`` slots
+                (before iterations k, 2k, and so on) and must be at least one.
+            collision_frequency_type: Detection points keyed by
+                :class:`CollisionSlot`.
         """
+        Slot = SolverBase.CollisionSlot
         Frequency = SolverBase.CollisionFrequencyType
+        freq = dict(self._collision_frequency)
         if collision_frequency is not None:
-            if len(collision_frequency) != 2:
-                raise ValueError(f"collision_frequency must have length 2, got {len(collision_frequency)}")
-            freq = [int(f) for f in collision_frequency]
-            if any(f < 1 for f in freq):
-                raise ValueError(f"collision_frequency entries must be >= 1, got {freq}")
-        else:
-            freq = self._collision_frequency
+            for slot_key, frequency_value in collision_frequency.items():
+                slot = Slot(slot_key)
+                frequency = int(frequency_value)
+                if frequency < 1:
+                    raise ValueError(f"collision_frequency[{slot.name}] must be >= 1, got {frequency}")
+                freq[slot] = frequency
 
+        ftype = dict(self._collision_frequency_type)
         if collision_frequency_type is not None:
-            if len(collision_frequency_type) != 2:
-                raise ValueError(f"collision_frequency_type must have length 2, got {len(collision_frequency_type)}")
-            ftype = [Frequency(t) for t in collision_frequency_type]
-            if self.pipeline is None and ftype[SolverBase._COLLISION_SLOT_RIGID] not in (
+            for slot, value in collision_frequency_type.items():
+                ftype[Slot(slot)] = Frequency(value)
+            if self.collision_pipeline is None and ftype[Slot.RIGID] not in (
                 Frequency.NONE,
                 Frequency.AUTO,
             ):
                 raise ValueError(
                     "an active rigid collision_frequency_type requires a solver-owned pipeline; "
-                    "pass pipeline=... at construction or drive model.collide() externally."
+                    "pass collision_pipeline=... at construction or drive model.collide() externally."
                 )
-        else:
-            ftype = self._collision_frequency_type
+            if ftype[Slot.RIGID] == Frequency.ITERATIONS and self.collision_pipeline.contact_matching == "disabled":
+                raise ValueError(
+                    "rigid ITERATIONS collision scheduling requires contact matching so in-flight "
+                    "contact state can be carried across re-detection; construct collision_pipeline "
+                    "with contact_matching='latest' or 'sticky'."
+                )
 
-        self._collision_frequency = list(freq)
-        self._collision_frequency_type = list(ftype)
+        self._collision_frequency = freq
+        self._collision_frequency_type = ftype
 
-    def _default_collision_frequency_type(self, slot: int) -> CollisionFrequencyType:
+    def _default_collision_frequency_type(self, slot: CollisionSlot) -> CollisionFrequencyType:
         """Resolve ``AUTO`` for a slot; overridable per solver."""
-        if slot == SolverBase._COLLISION_SLOT_RIGID and self.pipeline is not None:
+        if slot == SolverBase.CollisionSlot.RIGID and self.collision_pipeline is not None:
             return SolverBase.CollisionFrequencyType.PRE_INIT
         return SolverBase.CollisionFrequencyType.NONE
 
-    def _resolved_collision_frequency_type(self, slot: int) -> CollisionFrequencyType:
+    def _resolved_collision_frequency_type(self, slot: CollisionSlot) -> CollisionFrequencyType:
         """The slot's effective type with ``AUTO`` resolved."""
         ftype = self._collision_frequency_type[slot]
         if ftype == SolverBase.CollisionFrequencyType.AUTO:
@@ -358,7 +384,7 @@ class SolverBase:
         With an owned pipeline the ``contacts`` argument must be ``None`` and
         the owned buffer is used (exactly one source of contact data).
         """
-        if self.pipeline is not None:
+        if self.collision_pipeline is not None:
             if contacts is not None:
                 raise ValueError(
                     "step(contacts=...) must be None when the solver owns a collision "
@@ -367,14 +393,13 @@ class SolverBase:
             return self._pipeline_contacts
         return contacts
 
-    def _run_rigid_collision(self, state: State) -> None:
+    def _run_rigid_collision(self, state: State, dt: float | None = None) -> None:
         """Run the owned pipeline into the owned contacts buffer."""
-        # Dense rigid-soft TV/EE queries read the shared soft triangle/edge BVHs.
-        # CollisionPipeline.collide() intentionally never refits those trees, while
-        # an owning solver promises to keep them current at each detection instant.
-        if self.pipeline._full_surface_bvh_needs_detector:
-            self.pipeline.refit_soft_contact_bvh(state)
-        self.pipeline.collide(state, self._pipeline_contacts)
+        # Dense rigid-soft TV/EE queries read the shared soft triangle/edge
+        # BVHs, which an owning solver keeps current at each detection.
+        if self.collision_pipeline._full_surface_bvh_needs_detector:
+            self.collision_pipeline.refit_soft_contact_bvh(state)
+        self.collision_pipeline.collide(state, self._pipeline_contacts, dt=dt)
 
     def _set_module_options(self, options: dict[str, Any], module: Any) -> None:
         self._module_options[module] = dict(options)
