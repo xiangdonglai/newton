@@ -354,7 +354,9 @@ class SolverVBD(SolverBase, CouplingInterface):
 
             Particle parameters:
 
-            particle_enable_self_contact: Whether to enable self-contact detection for particles.
+            particle_enable_self_contact: Whether to enable penetration-free self-contact for particles. When enabled,
+                the ``SOFT_SELF_CONTACT`` collision schedule must be active; selecting ``NONE`` raises an error rather
+                than silently suspending detection. Set this option to ``False`` when self-contact is not desired.
             particle_self_contact_radius: Deprecated; use ``particle_self_contact_margin`` +
                 ``particle_self_contact_gap`` instead. When set, the legacy interpretation applies
                 exactly: radius = interaction distance and ``particle_self_contact_margin`` = detection
