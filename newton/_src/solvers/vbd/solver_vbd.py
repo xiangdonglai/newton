@@ -4376,8 +4376,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         if self.particle_enable_self_contact and self._sc_mode_this_step == Frequency.NONE:
             raise ValueError(
                 "particle_enable_self_contact requires an active soft self-collision schedule; "
-                "collision_frequency_type NONE cannot maintain DAT's detection-centered "
-                "motion-bound and complete-pair invariants."
+                "collision_frequency_type NONE cannot maintain penetration-free soft self-contact. "
+                "Select an active schedule or set particle_enable_self_contact=False."
             )
         schedules_match = self._rigid_mode_this_step == self._sc_mode_this_step and (
             self._rigid_mode_this_step != Frequency.ITERATIONS
