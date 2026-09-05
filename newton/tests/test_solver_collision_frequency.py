@@ -288,9 +288,9 @@ def test_vbd_iteration_schedules_align(test, device):
 
     solver.step(model.state(), model.state(), None, None, 1e-3)
 
-    # One pre-initialization baseline plus a pass before zero-based iteration 2.
-    test.assertEqual(solver.rigid_collision_passes, 2)
-    test.assertEqual(solver.self_collision_passes, 2)
+    # One pre-initialization baseline plus passes before iterations 2 and 4.
+    test.assertEqual(solver.rigid_collision_passes, 3)
+    test.assertEqual(solver.self_collision_passes, 3)
 
 
 def test_vbd_rigid_iterations_preserves_contact_duals(test, device):
@@ -322,8 +322,10 @@ def test_vbd_rigid_iterations_preserves_contact_duals(test, device):
 
     solver.step(model.state(), model.state(), None, None, 1e-3)
 
-    test.assertEqual(len(solver.dual_norms), 2)
-    for before, after in solver.dual_norms:
+    test.assertEqual(len(solver.dual_norms), 3)
+    # The first k=1 refresh precedes the first solve, so no dual exists yet.
+    test.assertEqual(solver.dual_norms[0], (0.0, 0.0))
+    for before, after in solver.dual_norms[1:]:
         test.assertGreater(before, 0.0)
         test.assertGreater(after, 0.0)
 
@@ -353,8 +355,8 @@ def test_vbd_rigid_iterations_refreshes_contact_frame(test, device):
 
     solver.step(model.state(), model.state(), None, None, 1e-3)
 
-    test.assertEqual(len(solver.contact_frame_steps), 3)
-    test.assertEqual(solver.contact_frame_steps[1:], [(1.0, 1.0), (1.0, 1.0)])
+    test.assertEqual(len(solver.contact_frame_steps), 4)
+    test.assertEqual(solver.contact_frame_steps[1:], [(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)])
 
 
 def test_vbd_rigid_iterations_refreshes_body_particle_contacts(test, device):
@@ -389,7 +391,7 @@ def test_vbd_rigid_iterations_refreshes_body_particle_contacts(test, device):
     state_a, state_b = model.state(), model.state()
     solver.step(state_a, state_b, None, None, 1e-3)
 
-    test.assertEqual(solver.body_particle_refreshes, 3)
+    test.assertEqual(solver.body_particle_refreshes, 4)
     test.assertGreater(int(solver.contacts.soft_contact_count.numpy()[0]), 0)
     test.assertGreater(int(solver.body_particle_contact_counts.numpy().sum()), 0)
     test.assertTrue(np.isfinite(state_b.particle_q.numpy()).all())
@@ -425,9 +427,8 @@ def test_vbd_pipeline_iterations_without_internal_bodies(test, device):
     state_a, state_b = model.state(), model.state()
     solver.step(state_a, state_b, None, None, 1e-3)
 
-    # The pre-initialization pass is the first checkpoint; in-loop refreshes
-    # occur before subsequent zero-based iterations.
-    test.assertEqual(solver.collision_passes, 3)
+    # One pre-initialization pass plus one pass before each iteration.
+    test.assertEqual(solver.collision_passes, 4)
     test.assertGreater(int(solver.contacts.soft_contact_count.numpy()[0]), 0)
 
 
@@ -454,17 +455,18 @@ def test_vbd_dat_collision_schedule_coordination(test, device):
             self.self_detection_positions = []
             super().__init__(*args, **kwargs)
 
-        def _refresh_collision_sets(self, state, *, run_rigid_collision, run_soft_self_collision):
+        def _refresh_collision_sets(self, state, dt, *, run_rigid_collision, run_soft_self_collision):
             self.collision_refreshes.append((run_rigid_collision, run_soft_self_collision))
             super()._refresh_collision_sets(
                 state,
+                dt,
                 run_rigid_collision=run_rigid_collision,
                 run_soft_self_collision=run_soft_self_collision,
             )
 
-        def _run_rigid_collision(self, state):
+        def _run_rigid_collision(self, state, dt=None):
             self.rigid_detection_positions.append(state.particle_q.numpy().copy())
-            super()._run_rigid_collision(state)
+            super()._run_rigid_collision(state, dt)
 
         def _collision_detection_penetration_free(self, state, *, reset_reference=True):
             self.self_detection_positions.append(state.particle_q.numpy().copy())
@@ -516,7 +518,7 @@ def test_vbd_dat_collision_schedule_coordination(test, device):
         # DAT families, modes, frequencies, iterations, expected refreshes
         (*both, [Frequency.PRE_INIT, Frequency.PRE_INIT], (1, 1), 3, [(True, True)]),
         (*both, [Frequency.PRE_POST_INIT, Frequency.PRE_POST_INIT], (1, 1), 3, [(True, True)] * 2),
-        (*both, [Frequency.ITERATIONS, Frequency.ITERATIONS], (2, 2), 6, [(True, True)] * 3),
+        (*both, [Frequency.ITERATIONS, Frequency.ITERATIONS], (2, 2), 6, [(True, True)] * 4),
         (*both, [Frequency.AUTO, Frequency.AUTO], (1, 1), 3, [(True, True)] * 2),
         (True, False, [Frequency.PRE_POST_INIT, Frequency.NONE], (1, 1), 3, [(True, False)] * 2),
         (False, True, [Frequency.NONE, Frequency.PRE_POST_INIT], (1, 1), 3, [(False, True)] * 2),
@@ -555,18 +557,19 @@ def test_vbd_collision_refresh_resets_only_active_dat_references(test, device):
             self.collision_events = []
             super().__init__(*args, **kwargs)
 
-        def _run_rigid_collision(self, state):
+        def _run_rigid_collision(self, state, dt=None):
             self.collision_events.append("rigid_collision")
-            super()._run_rigid_collision(state)
+            super()._run_rigid_collision(state, dt)
 
         def _collision_detection_penetration_free(self, state, *, reset_reference=True):
             self.collision_events.append("soft_self_collision")
             super()._collision_detection_penetration_free(state, reset_reference=reset_reference)
 
-        def _refresh_collision_sets(self, state, *, run_rigid_collision, run_soft_self_collision):
+        def _refresh_collision_sets(self, state, dt, *, run_rigid_collision, run_soft_self_collision):
             self.collision_refreshes.append((run_rigid_collision, run_soft_self_collision))
             super()._refresh_collision_sets(
                 state,
+                dt,
                 run_rigid_collision=run_rigid_collision,
                 run_soft_self_collision=run_soft_self_collision,
             )
