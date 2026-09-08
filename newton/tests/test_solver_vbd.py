@@ -5883,6 +5883,78 @@ def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
     test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
 
 
+def test_rigid_phase_applies_joint_dat_truncation(test, device):
+    """A rigid-phase adaptive plane immediately truncates both sides of its BVH VT row."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0), mass=1.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform_identity(),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    rigid_mesh = newton.Mesh(
+        np.array([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        np.array([0, 1, 2], dtype=np.int32),
+        compute_inertia=False,
+    )
+    builder.add_shape_mesh(body, mesh=rigid_mesh)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=2.0,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        rigid_compliant_alm=False,
+        collision_pipeline=pipeline,
+        rigid_enable_penetration_free=True,
+    )
+    state = model.state()
+    pipeline.collide(state, solver.contacts)
+    test.assertEqual(int(solver.contacts.soft_contact_count.numpy()[0]), 1)
+    np.testing.assert_array_equal(solver.contacts.soft_contact_indices.numpy()[0], [0, -1, -1])
+    np.testing.assert_array_equal(solver.contacts.soft_contact_rigid_indices.numpy()[0], [0, 1, 2])
+    solver._reset_dat_references(state, reset_rigid_soft=True, reset_particles=True)
+
+    # From a unit reference gap, let both sides propose 0.8 m of approach. The
+    # adaptive plane lies halfway between the references, so accepting only one
+    # factor would leave the other primitive on the wrong side of that plane.
+    solver.particle_displacements.assign(np.array([[0.0, 0.0, -0.8]], dtype=np.float32))
+    particle_q = state.particle_q.numpy()
+    particle_q[0] = [0.0, 0.0, 0.2]
+    state.particle_q.assign(particle_q)
+    body_q = state.body_q.numpy()
+    body_q[body, :3] = [0.0, 0.0, 0.8]
+    state.body_q.assign(body_q)
+
+    solver._rigid_penetration_free_truncation(state, solver.contacts)
+
+    particle_z = float(state.particle_q.numpy()[0, 2])
+    rigid_z = float(state.body_q.numpy()[body, 2])
+    test.assertLess(float(solver.truncation_ts.numpy()[0]), 1.0)
+    test.assertLess(float(solver.body_truncation_ts.numpy()[body]), 1.0)
+    test.assertGreater(particle_z, 0.2, "the rigid phase must apply the soft truncation factor")
+    test.assertLess(rigid_z, 0.8, "the rigid phase must apply the rigid truncation factor")
+    test.assertGreaterEqual(
+        particle_z - rigid_z,
+        1.9 * _RIGID_SOFT_DAT_TEST_EPS,
+        "both accepted primitives must remain outside the epsilon band",
+    )
+    np.testing.assert_allclose(
+        state.particle_q.numpy(),
+        solver.pos_prev_collision_detection.numpy() + solver.particle_displacements.numpy(),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+
+
 def _run_vt_dat_row(
     device,
     particle_z,
@@ -6811,6 +6883,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_bvh_dat_exact_rigid_triangle_truncates_rotation",
     test_bvh_dat_exact_rigid_triangle_truncates_rotation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_phase_applies_joint_dat_truncation",
+    test_rigid_phase_applies_joint_dat_truncation,
     devices=devices,
 )
 add_function_test(

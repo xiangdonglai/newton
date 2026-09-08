@@ -2825,22 +2825,22 @@ class SolverVBD(SolverBase, CouplingInterface):
                 reset_particles=reset_particles,
             )
 
-    def _rigid_penetration_free_truncation(self, contacts: Contacts | None, body_q):
-        """Truncate accumulated rigid poses against rigid-soft division planes.
+    def _rigid_penetration_free_truncation(self, state: State, contacts: Contacts | None):
+        """Truncate accumulated rigid and particle updates against rigid-soft planes.
 
         Applied after the rigid bodies move (forward step and each AVBD iteration).
-        Particle displacements are not modified here; the particle-phase joint pass
-        (:meth:`_penetration_free_truncation`) re-enforces the rigid-soft planes on both
-        sides.
+        The adaptive plane depends on both sides' accumulated motion, so both resulting
+        truncation factors are applied immediately. The particle-phase joint pass
+        (:meth:`_penetration_free_truncation`) re-enforces the planes after particles move.
         """
-        if not self.rigid_enable_penetration_free or contacts is None or body_q is None:
+        if not self.rigid_enable_penetration_free or contacts is None or state.body_q is None:
             return
 
+        if self.model.particle_count > 0:
+            self.truncation_ts.fill_(1.0)
         self.body_truncation_ts.fill_(1.0)
 
         if self.model.particle_count > 0 and contacts.soft_contact_max > 0:
-            # Also respect the rigid-soft planes; the write to truncation_ts is a
-            # harmless side effect (it is refilled before its next particle-phase use).
             wp.launch(
                 kernel=apply_rigid_soft_truncation,
                 dim=contacts.soft_contact_max,
@@ -2859,7 +2859,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
                     self.body_q_prev_collision_detection,
-                    body_q,
+                    state.body_q,
                     self.model.body_com,
                     self.rigid_conservative_bound_relaxation,
                     self.rigid_dat_use_interval_arithmetic,
@@ -2867,6 +2867,29 @@ class SolverVBD(SolverBase, CouplingInterface):
                 outputs=[
                     self.truncation_ts,
                     self.body_truncation_ts,
+                ],
+                device=self.device,
+            )
+
+        if self.model.particle_count > 0:
+            max_displacement = self._rigid_dat_particle_max_displacement
+            if self.particle_enable_self_contact:
+                max_displacement = min(
+                    max_displacement,
+                    self._self_contact_query_radius * self.particle_conservative_bound_relaxation * 0.5,
+                )
+            wp.launch(
+                kernel=apply_truncation_ts,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.pos_prev_collision_detection,
+                    self.particle_displacements,
+                    self.truncation_ts,
+                    max_displacement,
+                ],
+                outputs=[
+                    self.particle_displacements,
+                    state.particle_q,
                 ],
                 device=self.device,
             )
@@ -2882,7 +2905,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._rigid_dat_body_max_displacement,
             ],
             outputs=[
-                body_q,
+                state.body_q,
             ],
             device=self.device,
         )
@@ -3474,7 +3497,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
             # Truncate the forward step against the division planes before any
             # solve iterations run on the predicted poses.
-            self._rigid_penetration_free_truncation(contacts, state_in.body_q)
+            self._rigid_penetration_free_truncation(state_in, contacts)
 
             if model.joint_count > 0:
                 # Per-step joint setup: penalty-k decay, C0 snapshot, lambda retention,
@@ -3971,7 +3994,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
 
         # Truncate the accumulated pose updates before the dual updates read them.
-        self._rigid_penetration_free_truncation(contacts, state_in.body_q)
+        self._rigid_penetration_free_truncation(state_in, contacts)
 
         if contacts is not None and contacts.rigid_contact_max > 0:
             wp.launch(
