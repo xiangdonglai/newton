@@ -3208,8 +3208,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._contact_history_reset_mask.zero_()
                     self._contact_history_reset_pending.zero_()
 
-        return refresh
-
     def _refresh_body_particle_contact_state(
         self,
         contacts: Contacts | None,
@@ -3262,7 +3260,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-        if not self.integrate_with_external_rigid_solver and model.body_count > 0:
+        if self._integrates_rigid_bodies:
             self.body_particle_contact_counts.zero_()
             self.body_particle_contact_overflow_max.zero_()
             wp.launch(
