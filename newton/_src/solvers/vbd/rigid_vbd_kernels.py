@@ -7061,6 +7061,33 @@ def _certify_primitive_pair_separator(
 
 
 @wp.func
+def _certify_unoriented_primitive_pair_separator(
+    axis: wp.vec3,
+    positive_vertices: wp.mat33,
+    positive_count: int,
+    negative_vertices: wp.mat33,
+    negative_count: int,
+):
+    """Orient and certify one candidate axis against two complete primitives."""
+    valid, n, positive_support, negative_support, gap = _certify_primitive_pair_separator(
+        axis,
+        positive_vertices,
+        positive_count,
+        negative_vertices,
+        negative_count,
+    )
+    if valid:
+        return valid, n, positive_support, negative_support, gap
+    return _certify_primitive_pair_separator(
+        -axis,
+        positive_vertices,
+        positive_count,
+        negative_vertices,
+        negative_count,
+    )
+
+
+@wp.func
 def _normalized_feature_cross(first: wp.vec3, second: wp.vec3):
     """Return a unit cross product only when its relative sine is well-conditioned."""
     first_length_sq = wp.length_sq(first)
@@ -7086,6 +7113,196 @@ def _normalized_feature_cross(first: wp.vec3, second: wp.vec3):
 
 
 @wp.func
+def _closest_point_on_segment_stable(point: wp.vec3, segment_a: wp.vec3, segment_b: wp.vec3):
+    """Project a point onto a segment from the numerically nearer endpoint."""
+    direction = segment_b - segment_a
+    length_sq = wp.length_sq(direction)
+    if length_sq <= _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS:
+        return segment_a
+
+    if wp.length_sq(point - segment_a) <= wp.length_sq(point - segment_b):
+        t = wp.clamp(wp.dot(point - segment_a, direction) / length_sq, 0.0, 1.0)
+        return segment_a + t * direction
+
+    reverse_direction = -direction
+    t = wp.clamp(wp.dot(point - segment_b, reverse_direction) / length_sq, 0.0, 1.0)
+    return segment_b + t * reverse_direction
+
+
+@wp.func
+def find_vertex_triangle_separator(
+    vertex: wp.vec3,
+    triangle_a: wp.vec3,
+    triangle_b: wp.vec3,
+    triangle_c: wp.vec3,
+    normal_hint: wp.vec3,
+    separation_eps: float = DAT_SEPARATION_EPS,
+):
+    """Find a certified separator pointing from a triangle toward a vertex.
+
+    Candidate indices are the recomputed closest-point direction, triangle face
+    normal, the three in-plane edge support axes (AB, AC, BC), and ``normal_hint``.
+    Both signs are tested, and every triangle vertex must lie on the negative side.
+    """
+    vertex_primitive = wp.mat33(0.0)
+    vertex_primitive[0] = vertex
+    triangle = wp.mat33(0.0)
+    triangle[0] = triangle_a
+    triangle[1] = triangle_b
+    triangle[2] = triangle_c
+
+    closest, _bary, _feature = triangle_closest_point(triangle_a, triangle_b, triangle_c, vertex)
+    closest_axis = vertex - closest
+    closest_axis_length = wp.length(closest_axis)
+
+    # The closest-point distance is only a cheap gate. Return this axis only
+    # when its certified complete-primitive support gap also spans the DAT band.
+    if closest_axis_length >= 2.0 * separation_eps:
+        valid, n, vertex_support, triangle_support, gap = _certify_primitive_pair_separator(
+            closest_axis,
+            vertex_primitive,
+            1,
+            triangle,
+            3,
+        )
+        if valid and gap >= 2.0 * separation_eps:
+            return valid, n, vertex_support, triangle_support, gap, 0
+
+    face_axis = _normalized_feature_cross(triangle_b - triangle_a, triangle_c - triangle_a)
+    best_valid = False
+    best_n = wp.vec3(0.0)
+    best_vertex_support = vertex
+    best_triangle_support = triangle_a
+    best_gap = float(0.0)
+    best_candidate_index = int(-1)
+
+    for candidate_index in range(6):
+        candidate_axis = closest_axis
+        if candidate_index == 1:
+            candidate_axis = face_axis
+        elif candidate_index >= 2 and candidate_index <= 4:
+            edge_start = int(0)
+            edge_end = candidate_index - 1
+            if candidate_index == 4:
+                edge_start = int(1)
+                edge_end = int(2)
+            candidate_axis = wp.cross(face_axis, triangle[edge_end] - triangle[edge_start])
+        elif candidate_index == 5:
+            candidate_axis = normal_hint
+
+        valid, n, vertex_support, triangle_support, gap = _certify_unoriented_primitive_pair_separator(
+            candidate_axis,
+            vertex_primitive,
+            1,
+            triangle,
+            3,
+        )
+        if valid and (not best_valid or gap > best_gap):
+            best_valid = True
+            best_n = n
+            best_vertex_support = vertex_support
+            best_triangle_support = triangle_support
+            best_gap = gap
+            best_candidate_index = candidate_index
+
+    return best_valid, best_n, best_vertex_support, best_triangle_support, best_gap, best_candidate_index
+
+
+@wp.func
+def find_edge_edge_separator(
+    edge0_a: wp.vec3,
+    edge0_b: wp.vec3,
+    edge1_a: wp.vec3,
+    edge1_b: wp.vec3,
+    normal_hint: wp.vec3,
+    separation_eps: float = DAT_SEPARATION_EPS,
+):
+    """Find a certified separator pointing from ``edge1`` toward ``edge0``.
+
+    Candidate zero is Warp's ordinary closest-point direction. If it cannot
+    provide the full DAT separation band, candidates one through eight are the
+    edge cross product, the four endpoint-to-opposite-segment directions, the
+    closest direction projected perpendicular to each edge, and ``normal_hint``.
+    Every candidate is tested in both orientations against both complete edges.
+    """
+    edge0_vertices = wp.mat33(0.0)
+    edge0_vertices[0] = edge0_a
+    edge0_vertices[1] = edge0_b
+    edge1_vertices = wp.mat33(0.0)
+    edge1_vertices[0] = edge1_a
+    edge1_vertices[1] = edge1_b
+
+    edge0 = edge0_b - edge0_a
+    edge1 = edge1_b - edge1_a
+    # Warp compares its final argument against squared edge lengths.
+    closest_parameters = wp.closest_point_edge_edge(
+        edge0_a,
+        edge0_b,
+        edge1_a,
+        edge1_b,
+        _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS,
+    )
+    general_closest_axis = edge0_a + closest_parameters[0] * edge0 - edge1_a - closest_parameters[1] * edge1
+
+    best_valid, best_n, best_edge0_support, best_edge1_support, best_gap = (
+        _certify_unoriented_primitive_pair_separator(
+            general_closest_axis,
+            edge0_vertices,
+            2,
+            edge1_vertices,
+            2,
+        )
+    )
+    best_candidate_index = int(0)
+    if not best_valid:
+        best_candidate_index = int(-1)
+    elif best_gap >= 2.0 * separation_eps:
+        return best_valid, best_n, best_edge0_support, best_edge1_support, best_gap, best_candidate_index
+
+    edge0_length_sq = wp.length_sq(edge0)
+    edge1_length_sq = wp.length_sq(edge1)
+    edge_cross_axis = _normalized_feature_cross(edge1, edge0)
+
+    for candidate_index in range(1, 9):
+        candidate_axis = edge_cross_axis
+        if candidate_index == 2:
+            candidate_axis = edge0_a - _closest_point_on_segment_stable(edge0_a, edge1_a, edge1_b)
+        elif candidate_index == 3:
+            candidate_axis = edge0_b - _closest_point_on_segment_stable(edge0_b, edge1_a, edge1_b)
+        elif candidate_index == 4:
+            candidate_axis = _closest_point_on_segment_stable(edge1_a, edge0_a, edge0_b) - edge1_a
+        elif candidate_index == 5:
+            candidate_axis = _closest_point_on_segment_stable(edge1_b, edge0_a, edge0_b) - edge1_b
+        elif candidate_index == 6:
+            candidate_axis = wp.vec3(0.0)
+            if edge0_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS:
+                candidate_axis = general_closest_axis - wp.dot(general_closest_axis, edge0) / edge0_length_sq * edge0
+        elif candidate_index == 7:
+            candidate_axis = wp.vec3(0.0)
+            if edge1_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS:
+                candidate_axis = general_closest_axis - wp.dot(general_closest_axis, edge1) / edge1_length_sq * edge1
+        elif candidate_index == 8:
+            candidate_axis = normal_hint
+
+        valid, n, edge0_support, edge1_support, gap = _certify_unoriented_primitive_pair_separator(
+            candidate_axis,
+            edge0_vertices,
+            2,
+            edge1_vertices,
+            2,
+        )
+        if valid and (not best_valid or gap > best_gap):
+            best_valid = True
+            best_n = n
+            best_edge0_support = edge0_support
+            best_edge1_support = edge1_support
+            best_gap = gap
+            best_candidate_index = candidate_index
+
+    return best_valid, best_n, best_edge0_support, best_edge1_support, best_gap, best_candidate_index
+
+
+@wp.func
 def find_primitive_pair_separator(
     soft_indices: wp.vec3i,
     rigid_indices: wp.vec3i,
@@ -7094,42 +7311,27 @@ def find_primitive_pair_separator(
     rigid_scale: wp.vec3,
     X_wr_ref: wp.transform,
     collision_normal: wp.vec3,
+    separation_eps: float,
 ):
-    """Find and certify a DAT separator for one complete VT, TV, or EE pair.
+    """Assemble and dispatch one indexed rigid-soft BVH primitive pair.
 
-    The ``-1``-padded primitive indices identify VT, TV, or EE directly.
-    For VT/TV, candidate families are the recomputed closest-point delta,
-    triangle support axes, and the collision-pipeline normal. For EE, they are
-    the recomputed closest-point delta, the edge cross product, the longer-edge
-    perpendicular projection, and the collision-pipeline normal. A recomputed
-    closest-point axis whose certified complete-primitive gap exceeds the DAT
-    band is returned directly. Otherwise, every candidate is certified and the
-    widest strictly separating option is kept. Exactly touching or intersecting
-    pairs fail closed.
-
-    Returns ``(valid, n, soft_support, rigid_support, gap, candidate_index)``
-    with ``n`` pointing into the soft primitive's assigned half-space. The
-    candidate index records which enumerated axis produced the widest gap.
+    The ``-1`` padding identifies VT, TV, or EE. Returned ``n`` always points
+    from the rigid primitive toward the soft primitive, independent of which
+    side supplies the vertex in a VT pair.
     """
-    soft_count = int(0)
-    rigid_count = int(0)
     soft_vertices = wp.mat33(0.0)
     rigid_vertices = wp.mat33(0.0)
     for i in range(3):
         soft_index = soft_indices[i]
         if soft_index >= 0:
             soft_vertices[i] = particle_q_ref[soft_index]
-            soft_count += 1
         rigid_index = rigid_indices[i]
         if rigid_index >= 0:
             rigid_vertices[i] = wp.transform_point(
                 X_wr_ref,
                 wp.cw_mul(wp.mesh_get_point(rigid_mesh, rigid_index), rigid_scale),
             )
-            rigid_count += 1
 
-    # Infer the pair family from the -1 padding and construct its geometric
-    # fallback without unpacking three separate soft/rigid variables at callers.
     is_vt = (
         soft_indices[0] >= 0
         and soft_indices[1] < 0
@@ -7154,176 +7356,50 @@ def find_primitive_pair_separator(
         and rigid_indices[1] >= 0
         and rigid_indices[2] < 0
     )
-    if not (is_vt or is_tv or is_ee):
-        wp.printf(
-            "Unsupported rigid-soft DAT primitive layout: soft=(%d, %d, %d), rigid=(%d, %d, %d)\n",
-            soft_indices[0],
-            soft_indices[1],
-            soft_indices[2],
-            rigid_indices[0],
-            rigid_indices[1],
-            rigid_indices[2],
+
+    if is_vt:
+        valid, n, soft_support, rigid_support, gap, candidate_index = find_vertex_triangle_separator(
+            soft_vertices[0],
+            rigid_vertices[0],
+            rigid_vertices[1],
+            rigid_vertices[2],
+            collision_normal,
+            separation_eps,
         )
-        return False, wp.vec3(0.0), soft_vertices[0], rigid_vertices[0], float(0.0), int(-1)
+        return valid, n, soft_support, rigid_support, gap, candidate_index
 
-    best_valid = False
-    best_n = wp.vec3(0.0)
-    best_soft_support = soft_vertices[0]
-    best_rigid_support = rigid_vertices[0]
-    best_gap = float(0.0)
-    best_candidate_index = int(-1)
-
-    if is_vt or is_tv:
-        point = soft_vertices[0]
-        triangle = rigid_vertices
-        if is_tv:
-            point = rigid_vertices[0]
-            triangle = soft_vertices
-        closest, _bary, _feature = triangle_closest_point(
-            triangle[0], triangle[1], triangle[2], point
+    if is_tv:
+        valid, point_n, rigid_support, soft_support, gap, candidate_index = find_vertex_triangle_separator(
+            rigid_vertices[0],
+            soft_vertices[0],
+            soft_vertices[1],
+            soft_vertices[2],
+            collision_normal,
+            separation_eps,
         )
-        recomputed_closest_point_axis = point - closest
-        recomputed_closest_point_norm = wp.length(recomputed_closest_point_axis)
+        return valid, -point_n, soft_support, rigid_support, gap, candidate_index
 
-        # The closest-point distance is only a cheap gate. Return this axis only
-        # when its certified complete-primitive support gap also spans the DAT
-        # band; tangential closest-point error can otherwise make the support
-        # gap much smaller than the point-to-point distance.
-        if recomputed_closest_point_norm > 2.0 * DAT_SEPARATION_EPS:
-            valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
-                recomputed_closest_point_axis if is_vt else -recomputed_closest_point_axis,
-                soft_vertices,
-                soft_count,
-                rigid_vertices,
-                rigid_count,
-            )
-            if valid and gap > 2.0 * DAT_SEPARATION_EPS:
-                return valid, n, soft_support, rigid_support, gap, 0
-
-        face_axis = _normalized_feature_cross(
-            triangle[1] - triangle[0],
-            triangle[2] - triangle[0],
-        )
-
-        # If the closest axis does not provide a full band, enumerate the
-        # recomputed closest-point, face, AB, AC, BC, and collision-pipeline
-        # axes for the widest certified gap.
-        for candidate_index in range(6):
-            candidate_axis = recomputed_closest_point_axis
-            if candidate_index == 1:
-                candidate_axis = face_axis
-            elif candidate_index >= 2 and candidate_index <= 4:
-                edge_start = int(0)
-                edge_end = candidate_index - 1
-                if candidate_index == 4:
-                    edge_start = int(1)
-                    edge_end = int(2)
-                edge = triangle[edge_end] - triangle[edge_start]
-                candidate_axis = wp.cross(face_axis, edge)
-            elif candidate_index == 5:
-                candidate_axis = collision_normal
-
-            for sign_index in range(2):
-                signed_axis = candidate_axis
-                if sign_index == 1:
-                    signed_axis = -signed_axis
-                valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
-                    signed_axis,
-                    soft_vertices,
-                    soft_count,
-                    rigid_vertices,
-                    rigid_count,
-                )
-                if valid and (not best_valid or gap > best_gap):
-                    best_valid = True
-                    best_n = n
-                    best_soft_support = soft_support
-                    best_rigid_support = rigid_support
-                    best_gap = gap
-                    best_candidate_index = candidate_index
-    else:  # EE
-        soft_edge = soft_vertices[1] - soft_vertices[0]
-        rigid_edge = rigid_vertices[1] - rigid_vertices[0]
-        # Warp compares its final argument against squared edge lengths.
-        closest_parameters = wp.closest_point_edge_edge(
+    if is_ee:
+        valid, n, soft_support, rigid_support, gap, candidate_index = find_edge_edge_separator(
             soft_vertices[0],
             soft_vertices[1],
             rigid_vertices[0],
             rigid_vertices[1],
-            _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS,
+            collision_normal,
+            separation_eps,
         )
-        closest_soft = soft_vertices[0] + closest_parameters[0] * soft_edge
-        closest_rigid = rigid_vertices[0] + closest_parameters[1] * rigid_edge
+        return valid, n, soft_support, rigid_support, gap, candidate_index
 
-        # As above, distinguish point-to-point distance from the certified
-        # support gap of the complete edge pair.
-        recomputed_closest_point_axis = closest_soft - closest_rigid
-        recomputed_closest_point_norm = wp.length(recomputed_closest_point_axis)
-        if recomputed_closest_point_norm > 2.0 * DAT_SEPARATION_EPS:
-            valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
-                recomputed_closest_point_axis,
-                soft_vertices,
-                soft_count,
-                rigid_vertices,
-                rigid_count,
-            )
-            if valid and gap > 2.0 * DAT_SEPARATION_EPS:
-                return valid, n, soft_support, rigid_support, gap, 0
-
-        # EE: enumerate all possible separating axes:
-        # recomputed closest, edge cross product, longer-edge projection,
-        # and collision-pipeline axes.
-
-        soft_length_sq = wp.length_sq(soft_edge)
-        rigid_length_sq = wp.length_sq(rigid_edge)
-        edge_cross_axis = _normalized_feature_cross(rigid_edge, soft_edge)
-        parallel_edge_axis = wp.vec3(0.0)
-        if (
-            soft_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS
-            and rigid_length_sq > _SMALL_LENGTH_EPS * _SMALL_LENGTH_EPS
-        ):
-            # Remove the component of the recomputed closest-point axis parallel
-            # to the longer edge. This is useful for near-parallel edges because
-            # the orthogonality is improved.
-            longer_length_sq = soft_length_sq
-            longer_edge = soft_edge
-            if rigid_length_sq > soft_length_sq:
-                longer_length_sq = rigid_length_sq
-                longer_edge = rigid_edge
-            parallel_edge_axis = (
-                recomputed_closest_point_axis
-                - wp.dot(recomputed_closest_point_axis, longer_edge) / longer_length_sq * longer_edge
-            )
-
-        for candidate_index in range(4):
-            candidate_axis = recomputed_closest_point_axis
-            if candidate_index == 1:
-                candidate_axis = edge_cross_axis
-            elif candidate_index == 2:
-                candidate_axis = parallel_edge_axis
-            elif candidate_index == 3:
-                candidate_axis = collision_normal
-
-            for sign_index in range(2):
-                signed_axis = candidate_axis
-                if sign_index == 1:
-                    signed_axis = -signed_axis
-                valid, n, soft_support, rigid_support, gap = _certify_primitive_pair_separator(
-                    signed_axis,
-                    soft_vertices,
-                    soft_count,
-                    rigid_vertices,
-                    rigid_count,
-                )
-                if valid and (not best_valid or gap > best_gap):
-                    best_valid = True
-                    best_n = n
-                    best_soft_support = soft_support
-                    best_rigid_support = rigid_support
-                    best_gap = gap
-                    best_candidate_index = candidate_index
-
-    return best_valid, best_n, best_soft_support, best_rigid_support, best_gap, best_candidate_index
+    wp.printf(
+        "Unsupported rigid-soft DAT primitive layout: soft=(%d, %d, %d), rigid=(%d, %d, %d)\n",
+        soft_indices[0],
+        soft_indices[1],
+        soft_indices[2],
+        rigid_indices[0],
+        rigid_indices[1],
+        rigid_indices[2],
+    )
+    return False, wp.vec3(0.0), soft_vertices[0], rigid_vertices[0], float(0.0), int(-1)
 
 
 @wp.func
@@ -7663,12 +7739,34 @@ def apply_rigid_soft_truncation(
     # contact position on body, transformed to world frame
     bx0 = wp.transform_point(X_wb_ref, soft_contact_body_pos[contact_index])
 
+    # Use a one-micrometer band around meter-scale scenes. At larger
+    # world-coordinate magnitudes, increase it so the band remains several
+    # representable float32 steps wide.
+    coordinate_scale = float(1.0)
+    for i in range(3):
+        vi = indices[i]
+        if vi >= 0:
+            coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(pos_prev_collision_detection[vi])))
     if rigid_indices[0] >= 0:
-        # Dense BVH rows load the complete primitive vertices at this reference
-        # state and certify the plane before accepting it.
         mesh = shape_source_ptr[shape_index]
         X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
+        for i in range(3):
+            rigid_index = rigid_indices[i]
+            if rigid_index >= 0:
+                x_rigid_ref = wp.transform_point(
+                    X_wr_ref,
+                    wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index]),
+                )
+                coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(x_rigid_ref)))
+    else:
+        coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(bx0)))
+    separation_eps = dat_separation_epsilon(coordinate_scale)
 
+    if rigid_indices[0] >= 0:
+        # Dense BVH rows assemble their complete primitive pair and certify its
+        # separating plane before accepting it.
+        mesh = shape_source_ptr[shape_index]
+        X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
         valid_plane, n, x_ref, bx0, gap, _candidate_index = find_primitive_pair_separator(
             indices,
             rigid_indices,
@@ -7677,6 +7775,7 @@ def apply_rigid_soft_truncation(
             shape_scale[shape_index],
             X_wr_ref,
             soft_contact_normal[contact_index],
+            separation_eps,
         )
         if not valid_plane:
             wp.printf(
@@ -7707,36 +7806,6 @@ def apply_rigid_soft_truncation(
         n = soft_contact_normal[contact_index]
         pair_delta = x_ref - bx0
         gap = wp.max(wp.dot(n, pair_delta), 0.0)
-
-    # Use a one-micrometer band around meter-scale scenes. At larger
-    # world-coordinate magnitudes, increase it so the band remains several
-    # representable float32 steps wide. ``_FLOAT32_EPS * coordinate_scale``
-    # estimates one to two local float32 spacings, and
-    # ``DAT_ULP_FACTOR`` supplies the safety factor.
-    coordinate_scale = float(1.0)
-    for i in range(3):
-        vi = indices[i]
-        if vi >= 0:
-            x_v = pos_prev_collision_detection[vi]
-            coordinate_scale = wp.max(coordinate_scale, wp.abs(x_v[0]))
-            coordinate_scale = wp.max(coordinate_scale, wp.abs(x_v[1]))
-            coordinate_scale = wp.max(coordinate_scale, wp.abs(x_v[2]))
-    if rigid_indices[0] >= 0:
-        mesh = shape_source_ptr[shape_index]
-        for i in range(3):
-            rigid_index = rigid_indices[i]
-            if rigid_index >= 0:
-                x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
-                x_body = wp.transform_point(shape_transform[shape_index], x_shape)
-                x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
-                coordinate_scale = wp.max(coordinate_scale, wp.abs(x_rigid_ref[0]))
-                coordinate_scale = wp.max(coordinate_scale, wp.abs(x_rigid_ref[1]))
-                coordinate_scale = wp.max(coordinate_scale, wp.abs(x_rigid_ref[2]))
-    else:
-        coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[0]))
-        coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[1]))
-        coordinate_scale = wp.max(coordinate_scale, wp.abs(bx0[2]))
-    separation_eps = dat_separation_epsilon(coordinate_scale)
 
     # Rigid-body update accumulated since the reference pose.
     c0 = wp.vec3(0.0)
