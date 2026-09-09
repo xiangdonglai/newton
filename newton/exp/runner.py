@@ -96,7 +96,8 @@ class Experiment:
         # Timing (IsaacLab: sim.dt = 1/60, num_substeps VBD sub-steps per sim
         # step, decimation sim steps per control/env step).
         self.num_substeps = max(1, int(args.substeps))
-        self.decimation = max(1, int(self.strategy.decimation))
+        scene_decimation = self.scene.physics_decimation
+        self.decimation = max(1, int(self.strategy.decimation if scene_decimation is None else scene_decimation))
         self.substeps_per_step = self.num_substeps * self.decimation
         self.sim_dt = (1.0 / _BASE_FPS) / self.num_substeps
         self.frame_dt = self.decimation / _BASE_FPS
@@ -306,11 +307,13 @@ class Experiment:
             self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.num_substeps):
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
+            self.scene.pre_substep(self)
             step_contacts = None if self._solver_owns_pipeline else self.contacts
             self.solver.step(self.state_0, self.state_1, self.control, step_contacts, self.sim_dt)
             self.strategy.post_step(self.model, self.state_1)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.state_0.clear_forces()  # IsaacLab clears AFTER step+swap
+            self.scene.post_substep(self)
 
     def step(self):
         # IsaacLab DirectRLEnv: one _pre_physics_step, then `decimation` x
@@ -383,7 +386,8 @@ class Experiment:
         hi = np.max(particle_q, axis=0)
         bbox = float(np.linalg.norm(hi - lo))
         assert bbox < 5.0, f"Cloth bounding box exploded: {bbox:.2f} m"
-        assert lo[2] > -0.1, f"Cloth tunneled below ground: z_min={lo[2]:.4f} m"
+        if self.scene.enforce_ground_clearance:
+            assert lo[2] > -0.1, f"Cloth tunneled below ground: z_min={lo[2]:.4f} m"
         self.scene.test_final(self)
 
 
@@ -433,7 +437,11 @@ def main(num_frames=600):
     controller_cls = CONTROLLERS.get(known.control) or next(iter(CONTROLLERS.values()))
 
     parser = build_parser(scene_cls, solver_cls, controller_cls)
-    parser.set_defaults(num_frames=num_frames)
+    default_num_frames = scene_cls.default_num_frames
+    defaults = {"num_frames": num_frames if default_num_frames is None else default_num_frames}
+    if scene_cls.default_vbd_iterations is not None:
+        defaults["vbd_iterations"] = scene_cls.default_vbd_iterations
+    parser.set_defaults(**defaults)
     viewer, args = newton.examples.init(parser)
     experiment = Experiment(viewer, args)
     try:
@@ -442,3 +450,4 @@ def main(num_frames=600):
         recorder = getattr(experiment, "_recorder", None)
         if recorder is not None:
             recorder.close()
+        experiment.scene.close()

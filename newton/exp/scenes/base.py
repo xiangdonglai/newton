@@ -53,6 +53,14 @@ class Scene:
     has_robot: bool = True
     #: Whether the scene can safely replay the simulation through a CUDA graph.
     supports_graph_capture: bool = True
+    #: Optional override of the solver strategy's physics steps per rendered frame.
+    physics_decimation: int | None = None
+    #: Optional override of ``newton.exp``'s default run length.
+    default_num_frames: int | None = None
+    #: Optional override of the AVBD strategy's default iteration count.
+    default_vbd_iterations: int | None = None
+    #: Whether the generic final-state check requires particles to stay above z=-0.1 m.
+    enforce_ground_clearance: bool = True
 
     def __init__(self, args):
         self.args = args
@@ -124,6 +132,16 @@ class Scene:
     def apply_materials(self, model) -> None:
         """Apply scene-specific material values after strategy-level defaults."""
 
+    def pre_substep(self, experiment) -> None:
+        """Update scene-owned state immediately before one solver substep."""
+
+    def post_substep(self, experiment) -> None:
+        """Observe the accepted state immediately after one solver substep.
+
+        A scene that copies data to the host here must set
+        :attr:`supports_graph_capture` to ``False``.
+        """
+
     def post_step(self, experiment) -> None:
         """Observe a completed rendered simulation step."""
 
@@ -132,6 +150,9 @@ class Scene:
 
     def test_final(self, experiment) -> None:
         """Run scene-specific final-state checks."""
+
+    def close(self) -> None:
+        """Release scene-owned output resources when the example exits."""
 
     # -- presentation -----------------------------------------------------
     def camera(self):
