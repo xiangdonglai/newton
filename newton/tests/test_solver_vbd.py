@@ -4952,7 +4952,7 @@ def _run_soft_self_dat_truncation(
 
 
 def test_soft_self_dat_truncates_complete_primitive_pairs(test, device):
-    """The shared VT/EE separators constrain every vertex, and invalid pairs fail closed."""
+    """The shared VT/EE separators constrain every vertex; uncertifiable pairs are left unconstrained."""
     epsilon = _RIGID_SOFT_DAT_TEST_EPS
 
     with test.subTest(pair="moving VT vertex"):
@@ -4967,8 +4967,10 @@ def test_soft_self_dat_truncates_complete_primitive_pairs(test, device):
             [],
             vertex_triangle_pair=(0, 0),
         )
-        expected = np.array([0.85 * (1.0 - 2.0 * epsilon) / 2.0, 1.0, 1.0, 1.0])
+        # The still triangle keeps 5 % of the gap, so the vertex may travel 0.95 - epsilon.
+        expected = np.array([0.85 * (0.95 - epsilon) / 2.0, 1.0, 1.0, 1.0])
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-6)
+        test.assertLess(float(actual[0]), 0.85 * 0.5)
 
     with test.subTest(pair="moving VT triangle"):
         positions = np.array([[0.0, 0.0, 1.0], [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]])
@@ -4982,8 +4984,9 @@ def test_soft_self_dat_truncates_complete_primitive_pairs(test, device):
             [],
             vertex_triangle_pair=(0, 0),
         )
-        moving_t = 0.85 * (1.0 - 2.0 * epsilon) / 2.0
+        moving_t = 0.85 * (0.95 - epsilon) / 2.0
         np.testing.assert_allclose(actual, [1.0, moving_t, moving_t, moving_t], rtol=0.0, atol=1.0e-6)
+        test.assertLess(float(np.max(actual[1:])), 0.85 * 0.5)
 
     with test.subTest(pair="moving EE edges"):
         positions = np.array(
@@ -5014,30 +5017,98 @@ def test_soft_self_dat_truncates_complete_primitive_pairs(test, device):
             rtol=0.0,
             atol=1.0e-6,
         )
+        test.assertLess(float(np.max(actual[[0, 1, 3, 4]])), 0.85 * 0.5)
 
-    with test.subTest(pair="touching VT fails closed"):
+    with test.subTest(pair="touching VT is left unconstrained"):
+        # The vertex lies in the triangle's plane inside it: no strict separator exists.
+        # Separating motion must pass untouched rather than freeze the pair at the reference.
         positions = np.array([[0.0, 0.0, 0.0], [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]])
+        displacements = np.zeros_like(positions)
+        displacements[0, 2] = 1.0
+        displacements[1:, 2] = -1.0
         actual = _run_soft_self_dat_truncation(
             device,
             positions,
-            np.zeros_like(positions),
+            displacements,
             [[1, 2, 3]],
             [],
             vertex_triangle_pair=(0, 0),
         )
-        np.testing.assert_array_equal(actual, np.zeros(4))
+        np.testing.assert_array_equal(actual, np.ones(4))
 
-    with test.subTest(pair="intersecting EE fails closed"):
+    with test.subTest(pair="intersecting EE is left unconstrained"):
         positions = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 1.0, 0.0]])
+        displacements = np.zeros_like(positions)
+        displacements[:2, 2] = 1.0
+        displacements[2:, 2] = -1.0
         actual = _run_soft_self_dat_truncation(
             device,
             positions,
-            np.zeros_like(positions),
+            displacements,
             [],
             [[-1, -1, 0, 1], [-1, -1, 2, 3]],
             edge_edge_pair=(0, 1),
         )
-        np.testing.assert_array_equal(actual, np.zeros(4))
+        np.testing.assert_array_equal(actual, np.ones(4))
+
+
+def test_soft_self_dat_touching_pair_separates(test, device):
+    """A patch whose edge starts exactly on another sheet lifts off instead of being pinned.
+
+    Regression: freezing every vertex of an uncertifiable pair re-created the same reference at
+    the next detection, so the pair was reported and frozen again indefinitely.
+    """
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    # Static sheet spanning [-0.5, 0.5]^2 at z = 0 (zero mass pins it).
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.5, -0.5, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=2,
+        dim_y=2,
+        cell_x=0.5,
+        cell_y=0.5,
+        mass=0.0,
+        tri_ke=1.0e2,
+        tri_ka=1.0e2,
+        tri_kd=1.0e-4,
+        particle_radius=1.0e-3,
+    )
+    sheet_count = builder.particle_count
+    # Vertical patch whose bottom edge lies exactly in the sheet's interior, moving straight up.
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.1, 0.0, 0.0),
+        rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi / 2.0),
+        vel=wp.vec3(0.0, 0.0, 1.0),
+        dim_x=1,
+        dim_y=1,
+        cell_x=0.1,
+        cell_y=0.1,
+        mass=0.1,
+        tri_ke=1.0e2,
+        tri_ka=1.0e2,
+        tri_kd=1.0e-4,
+        particle_radius=1.0e-3,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=3,
+        particle_enable_self_contact=True,
+        particle_self_contact_margin=0.02,
+        particle_self_contact_gap=0.02,
+        particle_rest_shape_contact_exclusion_radius=0.0,
+        particle_topological_contact_filter_threshold=0,
+    )
+    state_0, state_1 = model.state(), model.state()
+    z_before = state_0.particle_q.numpy()[sheet_count:, 2].copy()
+    for _ in range(5):
+        solver.step(state_0, state_1, None, None, 1.0e-3)
+        state_0, state_1 = state_1, state_0
+    z_after = state_0.particle_q.numpy()[sheet_count:, 2]
+    test.assertTrue(np.all(z_after > z_before), msg=f"patch did not separate: {z_before} -> {z_after}")
+    np.testing.assert_array_equal(solver.truncation_ts.numpy()[sheet_count:], 1.0)
 
 
 @wp.kernel
@@ -5712,12 +5783,12 @@ def _check_primitive_pair_separator_candidate_provenance(test, device):
 
 
 def test_dat_division_plane_reserves_epsilon_band(test, device):
-    """Adaptive placement reserves epsilon per side, or half of a smaller gap."""
+    """Reserve at least 5% and epsilon per side, or half of a gap smaller than two epsilon."""
     soft = [[0.0, 0.0, 1.0]]
     rigid = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
     expected = [
-        (1.0, 0.0, _RIGID_SOFT_DAT_TEST_EPS, _RIGID_SOFT_DAT_TEST_EPS),
-        (0.0, 1.0, 1.0 - _RIGID_SOFT_DAT_TEST_EPS, 1.0 - _RIGID_SOFT_DAT_TEST_EPS),
+        (1.0, 0.0, 0.05, 0.05),
+        (0.0, 1.0, 0.95, 0.95),
         (0.0, 0.0, 0.5, 0.5),
     ]
     for delta_soft, delta_rigid, expected_lambda, expected_z in expected:
@@ -6804,7 +6875,7 @@ def test_rigid_dat_motion_bound_uses_minimum_query_radius(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         rigid_enable_penetration_free=True,
-        rigid_conservative_bound_relaxation=relaxation,
+        dat_conservative_bound_relaxation=relaxation,
         collision_pipeline=pipeline,
     )
 
@@ -6821,7 +6892,7 @@ def test_rigid_dat_motion_bound_uses_minimum_query_radius(test, device):
 
 
 def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
-    """Rigid DAT requires the strict relaxation interval used by its motion bound."""
+    """Require the strict relaxation interval used by both DAT motion bounds."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     model = builder.finalize(device=device)
 
@@ -6830,16 +6901,36 @@ def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
             with test.assertRaisesRegex(ValueError, r"must be in \(0, 1\)"):
                 newton.solvers.SolverVBD(
                     model,
-                    rigid_conservative_bound_relaxation=relaxation,
+                    dat_conservative_bound_relaxation=relaxation,
                 )
 
     for relaxation in (1.0e-6, 0.5, 1.0 - 1.0e-6):
         with test.subTest(relaxation=relaxation):
             solver = newton.solvers.SolverVBD(
                 model,
-                rigid_conservative_bound_relaxation=relaxation,
+                dat_conservative_bound_relaxation=relaxation,
             )
-            test.assertEqual(solver.rigid_conservative_bound_relaxation, relaxation)
+            test.assertEqual(solver.dat_conservative_bound_relaxation, relaxation)
+
+
+def test_dat_conservative_bound_relaxation_deprecated_aliases(test, device):
+    """Keep old relaxation names usable while setting one common DAT value."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    model = builder.finalize(device=device)
+    for name in ("particle_conservative_bound_relaxation", "rigid_conservative_bound_relaxation"):
+        with test.subTest(alias=name):
+            with test.assertWarnsRegex(DeprecationWarning, f"{name} is deprecated"):
+                solver = newton.solvers.SolverVBD(model, dat_conservative_bound_relaxation=0.7, **{name: 0.5})
+            test.assertEqual(solver.dat_conservative_bound_relaxation, 0.5)
+            test.assertEqual(solver.particle_conservative_bound_relaxation, 0.5)
+            test.assertEqual(solver.rigid_conservative_bound_relaxation, 0.5)
+            with test.assertRaisesRegex(ValueError, r"must be in \(0, 1\)"):
+                newton.solvers.SolverVBD(model, **{name: 0.0})
+
+    with test.assertRaisesRegex(ValueError, "must agree"):
+        newton.solvers.SolverVBD(
+            model, particle_conservative_bound_relaxation=0.5, rigid_conservative_bound_relaxation=0.7
+        )
 
 
 def test_rigid_dat_rejects_missing_body_pose(test, device):
@@ -7007,7 +7098,7 @@ def test_rigid_dat_com_centered_body_bounds(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         rigid_enable_penetration_free=True,
-        rigid_conservative_bound_relaxation=relaxation,
+        dat_conservative_bound_relaxation=relaxation,
         collision_pipeline=pipeline,
     )
 
@@ -7188,6 +7279,12 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
+    "test_soft_self_dat_touching_pair_separates",
+    test_soft_self_dat_touching_pair_separates,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_primitive_pair_separator_cases",
     test_primitive_pair_separator_cases,
     devices=devices,
@@ -7281,6 +7378,12 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_validates_conservative_bound_relaxation",
     test_rigid_dat_validates_conservative_bound_relaxation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_dat_conservative_bound_relaxation_deprecated_aliases",
+    test_dat_conservative_bound_relaxation_deprecated_aliases,
     devices=devices,
 )
 add_function_test(

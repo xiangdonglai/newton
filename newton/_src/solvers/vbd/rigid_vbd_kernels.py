@@ -2324,8 +2324,8 @@ def resolve_drive_limit_mode(
 ):
     """Resolve drive/limit priority and compute position error [m or rad].
 
-    Limits take precedence unless the drive target pulls the joint back into
-    range. Otherwise the drive engages with target clamped to the limit range.
+    Limits take precedence: if q is outside [lower, upper], the active limit
+    wins. Otherwise the drive engages with target clamped to the limit range.
 
     Returns:
         (mode, err_pos) -- active mode constant and signed position error.
@@ -2336,19 +2336,11 @@ def resolve_drive_limit_mode(
     if has_limits:
         drive_target = wp.clamp(target_pos, lim_lower, lim_upper)
         if q < lim_lower:
-            if has_drive and drive_target > lim_lower:
-                mode = _DRIVE_LIMIT_MODE_DRIVE
-                err_pos = q - drive_target
-            else:
-                mode = _DRIVE_LIMIT_MODE_LIMIT_LOWER
-                err_pos = q - lim_lower
+            mode = _DRIVE_LIMIT_MODE_LIMIT_LOWER
+            err_pos = q - lim_lower
         elif q > lim_upper:
-            if has_drive and drive_target < lim_upper:
-                mode = _DRIVE_LIMIT_MODE_DRIVE
-                err_pos = q - drive_target
-            else:
-                mode = _DRIVE_LIMIT_MODE_LIMIT_UPPER
-                err_pos = q - lim_upper
+            mode = _DRIVE_LIMIT_MODE_LIMIT_UPPER
+            err_pos = q - lim_upper
     if mode == _DRIVE_LIMIT_MODE_NONE and has_drive:
         mode = _DRIVE_LIMIT_MODE_DRIVE
         err_pos = q - drive_target
@@ -7415,7 +7407,8 @@ def place_dat_division_plane(
 
     ``n`` points from ``negative_support`` toward the positive-side primitive.
     The approach values are the largest motions of the corresponding primitive
-    toward the other side.
+    toward the other side. When the gap permits, each side keeps at least 5%
+    of the gap and at least ``separation_eps``.
     """
     lmbd = float(0.5)
     if gap >= 2.0 * separation_eps:
@@ -7423,9 +7416,9 @@ def place_dat_division_plane(
         if total_approach > 0.0:
             lmbd = negative_approach / total_approach
 
-        # Clamp the adaptive placement to preserve an (-eps, eps) band between
-        # the two primitive supports.
-        minimum_fraction = separation_eps / gap
+        # Keep at least 5% on either side, increasing it when needed to fit
+        # the (-eps, eps) separation band.
+        minimum_fraction = wp.max(0.05, separation_eps / gap)
         lmbd = wp.clamp(lmbd, minimum_fraction, 1.0 - minimum_fraction)
 
     # When the gap is smaller than 2*eps, lambda remains 0.5: the midpoint

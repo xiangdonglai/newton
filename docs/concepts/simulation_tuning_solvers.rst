@@ -141,6 +141,7 @@ repository examples spend tuning effort, not a shared solver API.
        Examples mostly tune ``iterations`` and ``rigid_contact_relaxation``.
    * - :class:`~newton.solvers.SolverVBD`
      - ``iterations``, ``rigid_compliant_alm``, ``friction_epsilon``,
+       ``dat_conservative_bound_relaxation``,
        ``rigid_avbd_alpha``,
        ``rigid_avbd_joint_alpha``, ``rigid_avbd_contact_alpha``,
        ``rigid_avbd_beta``, ``rigid_avbd_linear_beta``,
@@ -155,7 +156,6 @@ repository examples spend tuning effort, not a shared solver API.
        ``integrate_with_external_rigid_solver``,
        ``particle_enable_self_contact``, ``particle_self_contact_margin``,
        ``particle_self_contact_gap``,
-       ``particle_conservative_bound_relaxation``,
        ``particle_vertex_contact_buffer_size``,
        ``particle_edge_contact_buffer_size``,
        ``collision_frequency``, ``collision_frequency_type``,
@@ -170,6 +170,15 @@ repository examples spend tuning effort, not a shared solver API.
        because its default will change to ``True``. Pass ``False`` to retain the
        legacy AVBD path during the migration window. ``rigid_contact_hard``
        selects contact behavior only on that legacy path.
+
+       ``rigid_enable_penetration_free=True`` requires a solver-owned
+       :class:`~newton.CollisionPipeline` with a positive minimum rigid-soft
+       query radius, and cannot be combined with an external rigid solver.
+       ``dat_conservative_bound_relaxation`` must lie in ``(0, 1)`` and scales
+       both soft-self and rigid-soft DAT motion budgets and truncation backoff.
+       The old particle and rigid relaxation names remain deprecated aliases.
+       ``rigid_dat_use_interval_arithmetic`` additionally checks rigid
+       trajectories between samples and remains experimental.
 
        ``rigid_avbd_beta`` and ``*_k_start`` apply only to the legacy path.
        Simulations relying on those controls or on legacy hard constraints may
