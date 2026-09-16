@@ -77,11 +77,12 @@ def _run_proxy_harvest(device, corners, bary):
             wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device),
             model.body_com,
             1.0,  # friction_epsilon
-            False,  # rigid_body_particle_contact_use_log_barrier
+            False,  # quadratic contact law
             wp.full(smax, _KE, dtype=float, device=device),
             wp.zeros(smax, dtype=float, device=device),  # material_kd
             wp.zeros(smax, dtype=float, device=device),  # material_mu
             contacts.soft_contact_count,
+            wp.ones(smax, dtype=wp.int32, device=device),
             contacts.soft_contact_indices,
             contacts.soft_contact_barycentric,
             contacts.soft_contact_shape,

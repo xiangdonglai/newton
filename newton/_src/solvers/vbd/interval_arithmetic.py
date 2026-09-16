@@ -10,7 +10,7 @@ inside the empty band is released for the full update only when this bound
 certifies that its signed plane distance is nonincreasing over the whole
 trajectory. The complete prefix certification built on
 :func:`rigid_point_plane_signed_distance_interval` (Stage 2) runs only with the
-experimental ``rigid_soft_dat_use_interval_arithmetic`` option.
+experimental ``rigid_dat_use_interval_arithmetic`` option.
 
 Algebraic operations expand a correctly rounded float32 result by one ULP.
 Trigonometric endpoints receive a wider provisional expansion because Warp's
@@ -67,7 +67,6 @@ def next_float_down(value: float) -> float:
 
 @wp.func
 def _expand_up(value: float, ulps: int) -> float:
-    """Move ``value`` up by ``ulps`` representable float32 steps."""
     result = value
     for _i in range(ulps):
         result = next_float_up(result)
@@ -76,7 +75,6 @@ def _expand_up(value: float, ulps: int) -> float:
 
 @wp.func
 def _expand_down(value: float, ulps: int) -> float:
-    """Move ``value`` down by ``ulps`` representable float32 steps."""
     result = value
     for _i in range(ulps):
         result = next_float_down(result)

@@ -2325,8 +2325,8 @@ def resolve_drive_limit_mode(
 ):
     """Resolve drive/limit priority and compute position error [m or rad].
 
-    Limits take precedence: if q is outside [lower, upper], the active limit
-    wins. Otherwise the drive engages with target clamped to the limit range.
+    Limits take precedence unless the drive target pulls the joint back into
+    range. Otherwise the drive engages with target clamped to the limit range.
 
     Returns:
         (mode, err_pos) -- active mode constant and signed position error.
@@ -2337,11 +2337,19 @@ def resolve_drive_limit_mode(
     if has_limits:
         drive_target = wp.clamp(target_pos, lim_lower, lim_upper)
         if q < lim_lower:
-            mode = _DRIVE_LIMIT_MODE_LIMIT_LOWER
-            err_pos = q - lim_lower
+            if has_drive and drive_target > lim_lower:
+                mode = _DRIVE_LIMIT_MODE_DRIVE
+                err_pos = q - drive_target
+            else:
+                mode = _DRIVE_LIMIT_MODE_LIMIT_LOWER
+                err_pos = q - lim_lower
         elif q > lim_upper:
-            mode = _DRIVE_LIMIT_MODE_LIMIT_UPPER
-            err_pos = q - lim_upper
+            if has_drive and drive_target < lim_upper:
+                mode = _DRIVE_LIMIT_MODE_DRIVE
+                err_pos = q - drive_target
+            else:
+                mode = _DRIVE_LIMIT_MODE_LIMIT_UPPER
+                err_pos = q - lim_upper
     if mode == _DRIVE_LIMIT_MODE_NONE and has_drive:
         mode = _DRIVE_LIMIT_MODE_DRIVE
         err_pos = q - drive_target
@@ -4071,9 +4079,60 @@ def build_body_body_contact_lists(
 
 
 @wp.kernel
+def compute_body_particle_contact_force_eligibility(
+    body_particle_contact_count: wp.array[int],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    body_particle_contact_shape: wp.array[int],
+    body_particle_contact_body_pos: wp.array[wp.vec3],
+    body_particle_contact_normal: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
+):
+    """Classify whether unified rigid-soft rows may produce contact forces.
+
+    Analytic/SDF rows have no rigid primitive indices and remain eligible because a
+    negative signed distance is precisely the penetration their force should recover.
+    Dense BVH queries retain some non-facing primitive pairs for complete DAT coverage,
+    but penalty and ALM forces must ignore them. The detection-time test
+    ``dot(x_soft - x_rigid, normal) >= 0`` reproduces the query's local orientation
+    classification without adding solver-specific state to :class:`Contacts`.
+    """
+    tid = wp.tid()
+    if tid >= body_particle_contact_count[0]:
+        return
+
+    if soft_contact_rigid_indices[tid][0] < 0:
+        body_particle_contact_force_eligible[tid] = wp.int32(1)
+        return
+
+    corners = soft_contact_indices[tid]
+    bary = soft_contact_barycentric[tid]
+    x_soft = bary[0] * particle_q[corners[0]]
+    if corners[1] >= 0:
+        x_soft = x_soft + bary[1] * particle_q[corners[1]]
+    if corners[2] >= 0:
+        x_soft = x_soft + bary[2] * particle_q[corners[2]]
+
+    shape = body_particle_contact_shape[tid]
+    body = shape_body[shape] if shape >= 0 else -1
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+    x_rigid = wp.transform_point(X_wb, body_particle_contact_body_pos[tid])
+    diff = x_soft - x_rigid
+    eligible = wp.length(diff) <= 1.0e-6 or wp.dot(diff, body_particle_contact_normal[tid]) >= 0.0
+    body_particle_contact_force_eligible[tid] = wp.int32(eligible)
+
+
+@wp.kernel
 def build_body_particle_contact_lists(
     body_particle_contact_count: wp.array[int],
     body_particle_contact_shape: wp.array[int],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     shape_body: wp.array[wp.int32],
     body_inv_mass_effective: wp.array[float],
     body_particle_contact_buffer_pre_alloc: int,
@@ -4092,6 +4151,8 @@ def build_body_particle_contact_lists(
     # Bucket every soft contact (particle + edge + face; single total count) by its rigid body, so
     # the per-body kernel drives all reactions from one adjacency list.
     if tid >= body_particle_contact_count[0]:
+        return
+    if body_particle_contact_force_eligible[tid] == 0:
         return
 
     shape = body_particle_contact_shape[tid]
@@ -6659,6 +6720,7 @@ def update_duals_body_body_contacts(
 def update_duals_body_particle_contacts(
     body_particle_contact_count: wp.array[int],
     soft_contact_indices: wp.array[wp.vec3i],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     body_particle_contact_shape: wp.array[int],
     body_particle_contact_body_pos: wp.array[wp.vec3],
     body_particle_contact_normal: wp.array[wp.vec3],
@@ -6682,6 +6744,8 @@ def update_duals_body_particle_contacts(
     """
     idx = wp.tid()
     if idx >= body_particle_contact_count[0]:
+        return
+    if body_particle_contact_force_eligible[idx] == 0:
         return
 
     corners = soft_contact_indices[idx]
@@ -6911,12 +6975,9 @@ def update_rod_dahl_state(
 # =====================================================================================
 # Rigid-body Divide-and-Truncate (DAT) penetration-free truncation.
 #
-# Reference: "Divide and Truncate: A Penetration and Inversion Free Framework for Coupled
-# Multi-physics Systems" (SIGGRAPH 2026), Algorithm 1.
-#
 # Rigid bodies follow curved vertex trajectories under interpolated pose updates. Per-contact
-# division planes are enforced by sampling + bisection (Alg. 1, Stage 1), optionally
-# followed by interval verification of the complete prefix arc (Alg. 1, Stage 2).
+# division planes are enforced by sampling + bisection (paper Alg. 1, Stage 1), optionally
+# followed by interval verification of the complete prefix arc (paper Alg. 1, Stage 2).
 #
 # The kernels consume only the abstract ``Contacts`` record fields (shape ids, points,
 # normals, margins, soft feature indices + barycentrics) plus reference/candidate poses,
@@ -6927,8 +6988,12 @@ def update_rod_dahl_state(
 DAT_TRAJECTORY_SAMPLES = wp.constant(8)
 # Bisection refinements of the bracketed crossing time.
 DAT_BISECTION_ITERATIONS = wp.constant(16)
+# Below this relative sine, a feature cross product is too poorly conditioned
+# to normalize reliably in float32. EE then uses its parallel-edge fallback.
+DAT_FEATURE_CROSS_SIN_EPS = wp.constant(1.0e-4)
+
 # Empty half-width kept on each side of a DAT plane. This is large relative to
-# the nanometer-scale FP32 plane-crossing failures observed in the meter-scale
+# the nanometer-scale FP32 separator failures observed in the meter-scale
 # examples, while remaining visually negligible.
 DAT_SEPARATION_EPS = wp.constant(1.0e-6)
 
@@ -7035,9 +7100,12 @@ def _normalized_feature_cross(first: wp.vec3, second: wp.vec3):
         return wp.vec3(0.0)
     feature_cross = wp.cross(first, second)
     cross_length_sq = wp.length_sq(feature_cross)
-    # Below a relative sine of 1e-4 (squared: 1e-8) the cross product is too poorly
-    # conditioned to normalize reliably in float32; EE then uses its parallel-edge fallback.
-    threshold_sq = 1.0e-8 * first_length_sq * second_length_sq
+    threshold_sq = (
+        DAT_FEATURE_CROSS_SIN_EPS
+        * DAT_FEATURE_CROSS_SIN_EPS
+        * first_length_sq
+        * second_length_sq
+    )
     if cross_length_sq <= threshold_sq:
         return wp.vec3(0.0)
     # Normalize before generic candidate certification: the raw cross product
@@ -7076,8 +7144,8 @@ def find_vertex_triangle_separator(
     Candidate indices are the recomputed closest-point direction, triangle face
     normal, the three in-plane edge support axes (AB, AC, BC), and ``normal_hint``.
     Both signs are tested, and every triangle vertex must lie on the negative side.
-    ``normal_hint`` is an optional caller-supplied axis (zero skips it): the SDF-row
-    callers pass ``wp.vec3(0.0)``; the slot is reserved for the BVH-query path.
+    ``normal_hint`` is an optional caller-supplied axis (zero skips it). Soft
+    self-contact passes zero; rigid-soft BVH rows pass the collision-pipeline normal.
     """
     vertex_primitive = wp.mat33(0.0)
     vertex_primitive[0] = vertex
@@ -7159,8 +7227,8 @@ def find_edge_edge_separator(
     edge cross product, the four endpoint-to-opposite-segment directions, the
     closest direction projected perpendicular to each edge, and ``normal_hint``.
     Every candidate is tested in both orientations against both complete edges.
-    ``normal_hint`` is an optional caller-supplied axis (zero skips it): the SDF-row
-    callers pass ``wp.vec3(0.0)``; the slot is reserved for the BVH-query path.
+    ``normal_hint`` is an optional caller-supplied axis (zero skips it). Soft
+    self-contact passes zero; rigid-soft BVH rows pass the collision-pipeline normal.
     """
     edge0_vertices = wp.mat33(0.0)
     edge0_vertices[0] = edge0_a
@@ -7181,12 +7249,14 @@ def find_edge_edge_separator(
     )
     general_closest_axis = edge0_a + closest_parameters[0] * edge0 - edge1_a - closest_parameters[1] * edge1
 
-    best_valid, best_n, best_edge0_support, best_edge1_support, best_gap = _certify_unoriented_primitive_pair_separator(
-        general_closest_axis,
-        edge0_vertices,
-        2,
-        edge1_vertices,
-        2,
+    best_valid, best_n, best_edge0_support, best_edge1_support, best_gap = (
+        _certify_unoriented_primitive_pair_separator(
+            general_closest_axis,
+            edge0_vertices,
+            2,
+            edge1_vertices,
+            2,
+        )
     )
     best_candidate_index = int(0)
     if not best_valid:
@@ -7238,6 +7308,106 @@ def find_edge_edge_separator(
 
 
 @wp.func
+def find_primitive_pair_separator(
+    soft_indices: wp.vec3i,
+    rigid_indices: wp.vec3i,
+    particle_q_ref: wp.array[wp.vec3],
+    rigid_mesh: wp.uint64,
+    rigid_scale: wp.vec3,
+    X_wr_ref: wp.transform,
+    collision_normal: wp.vec3,
+    separation_eps: float,
+):
+    """Assemble and dispatch one indexed rigid-soft BVH primitive pair.
+
+    The ``-1`` padding identifies VT, TV, or EE. Returned ``n`` always points
+    from the rigid primitive toward the soft primitive, independent of which
+    side supplies the vertex in a VT pair.
+    """
+    soft_vertices = wp.mat33(0.0)
+    rigid_vertices = wp.mat33(0.0)
+    for i in range(3):
+        soft_index = soft_indices[i]
+        if soft_index >= 0:
+            soft_vertices[i] = particle_q_ref[soft_index]
+        rigid_index = rigid_indices[i]
+        if rigid_index >= 0:
+            rigid_vertices[i] = wp.transform_point(
+                X_wr_ref,
+                wp.cw_mul(wp.mesh_get_point(rigid_mesh, rigid_index), rigid_scale),
+            )
+
+    is_vt = (
+        soft_indices[0] >= 0
+        and soft_indices[1] < 0
+        and soft_indices[2] < 0
+        and rigid_indices[0] >= 0
+        and rigid_indices[1] >= 0
+        and rigid_indices[2] >= 0
+    )
+    is_tv = (
+        soft_indices[0] >= 0
+        and soft_indices[1] >= 0
+        and soft_indices[2] >= 0
+        and rigid_indices[0] >= 0
+        and rigid_indices[1] < 0
+        and rigid_indices[2] < 0
+    )
+    is_ee = (
+        soft_indices[0] >= 0
+        and soft_indices[1] >= 0
+        and soft_indices[2] < 0
+        and rigid_indices[0] >= 0
+        and rigid_indices[1] >= 0
+        and rigid_indices[2] < 0
+    )
+
+    if is_vt:
+        valid, n, soft_support, rigid_support, gap, candidate_index = find_vertex_triangle_separator(
+            soft_vertices[0],
+            rigid_vertices[0],
+            rigid_vertices[1],
+            rigid_vertices[2],
+            collision_normal,
+            separation_eps,
+        )
+        return valid, n, soft_support, rigid_support, gap, candidate_index
+
+    if is_tv:
+        valid, point_n, rigid_support, soft_support, gap, candidate_index = find_vertex_triangle_separator(
+            rigid_vertices[0],
+            soft_vertices[0],
+            soft_vertices[1],
+            soft_vertices[2],
+            collision_normal,
+            separation_eps,
+        )
+        return valid, -point_n, soft_support, rigid_support, gap, candidate_index
+
+    if is_ee:
+        valid, n, soft_support, rigid_support, gap, candidate_index = find_edge_edge_separator(
+            soft_vertices[0],
+            soft_vertices[1],
+            rigid_vertices[0],
+            rigid_vertices[1],
+            collision_normal,
+            separation_eps,
+        )
+        return valid, n, soft_support, rigid_support, gap, candidate_index
+
+    wp.printf(
+        "Unsupported rigid-soft DAT primitive layout: soft=(%d, %d, %d), rigid=(%d, %d, %d)\n",
+        soft_indices[0],
+        soft_indices[1],
+        soft_indices[2],
+        rigid_indices[0],
+        rigid_indices[1],
+        rigid_indices[2],
+    )
+    return False, wp.vec3(0.0), soft_vertices[0], rigid_vertices[0], float(0.0), int(-1)
+
+
+@wp.func
 def place_dat_division_plane(
     n: wp.vec3,
     negative_support: wp.vec3,
@@ -7250,8 +7420,8 @@ def place_dat_division_plane(
 
     ``n`` points from ``negative_support`` toward the positive-side primitive.
     The approach values are the largest motions of the corresponding primitive
-    toward the other side. Each side keeps at least 5 % of the gap and at least
-    ``separation_eps``.
+    toward the other side. When the gap permits, each side keeps at least 5%
+    of the gap and at least ``separation_eps``.
     """
     lmbd = float(0.5)
     if gap >= 2.0 * separation_eps:
@@ -7259,10 +7429,8 @@ def place_dat_division_plane(
         if total_approach > 0.0:
             lmbd = negative_approach / total_approach
 
-        # Clamp the adaptive placement so each side keeps a fraction of the gap (the
-        # rigid trajectory is evaluated at absolute float32 positions and needs real
-        # clearance to its boundary) and, for small gaps, at least the (-eps, eps)
-        # band that keeps the two primitive supports strictly separated.
+        # Keep at least 5% on either side, increasing it when needed to fit
+        # the (-eps, eps) separation band.
         minimum_fraction = wp.max(0.05, separation_eps / gap)
         lmbd = wp.clamp(lmbd, minimum_fraction, 1.0 - minimum_fraction)
 
@@ -7364,7 +7532,9 @@ def _rigid_trajectory_prefix_is_interval_safe(
     if s0 <= 0.0:
         # If the trajectory starts on or behind its assigned rigid-side boundary
         # and its signed plane distance is nonincreasing, the entire prefix is safe.
-        derivative_range = rigid_point_plane_signed_distance_derivative_interval(0.0, t, n, dx, axis, angle, offset0)
+        derivative_range = rigid_point_plane_signed_distance_derivative_interval(
+            0.0, t, n, dx, axis, angle, offset0
+        )
         return derivative_range.upper <= 0.0
 
     return False
@@ -7387,10 +7557,10 @@ def rigid_trajectory_truncation_t(
 ):
     """Return a backed-off interpolation parameter before a rigid point crosses a plane.
 
-    Stage 1 always samples the trajectory and bisects the first bracketed
-    crossing. The optional interval-arithmetic path additionally runs Stage 2:
-    certify the complete prefix arc ``[0, t*]`` and shorten it by prefix
-    bisection when needed.
+    Stage 1 always uses the sampling and bisection implementation from
+    ``ankac/rigid-dat-persistent-planes``. The temporary interval-arithmetic
+    option additionally runs Algorithm 1, Stage 2: certify the complete prefix
+    arc ``[0, t*]`` and shorten it by prefix bisection when needed.
 
     Args:
         n: World-space plane normal away from the rigid side. The allowed rigid
@@ -7425,16 +7595,24 @@ def rigid_trajectory_truncation_t(
         A truncation parameter in ``[0, 1]``. ``1`` accepts the complete proposed
         rigid update, while ``0`` blocks it at the reference pose.
     """
-    s0 = wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d) - maximum_signed_distance
+    s0 = (
+        wp.dot(n, rigid_point_trajectory(0.0, c0, dx, axis, angle, offset0) - d)
+        - maximum_signed_distance
+    )
     candidate_t = float(1.0)
     crossed = bool(False)
     if s0 > 0.0:
         # Algorithm 1 assumes a valid starting half-space. A point already
         # inside the forbidden band may move only monotonically away from it.
-        s_end = wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d) - maximum_signed_distance
+        s_end = (
+            wp.dot(n, rigid_point_trajectory(1.0, c0, dx, axis, angle, offset0) - d)
+            - maximum_signed_distance
+        )
         # An endpoint-only test is insufficient for rotation: an arc can first
         # worsen and then recover. Requiring the derivative to be nonpositive.
-        derivative_range = rigid_point_plane_signed_distance_derivative_interval(0.0, 1.0, n, dx, axis, angle, offset0)
+        derivative_range = rigid_point_plane_signed_distance_derivative_interval(
+            0.0, 1.0, n, dx, axis, angle, offset0
+        )
         if s_end <= s0 and derivative_range.upper <= _FLOAT32_MIN_NORMAL:
             return 1.0
         return 0.0
@@ -7445,7 +7623,10 @@ def rigid_trajectory_truncation_t(
         t_hi = float(1.0)
         for k in range(trajectory_samples):
             t_k = float(k + 1) / float(trajectory_samples)
-            s_k = wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d) - maximum_signed_distance
+            s_k = (
+                wp.dot(n, rigid_point_trajectory(t_k, c0, dx, axis, angle, offset0) - d)
+                - maximum_signed_distance
+            )
             if s_k > 0.0:
                 t_lo = float(k) / float(trajectory_samples)
                 t_hi = t_k
@@ -7456,7 +7637,8 @@ def rigid_trajectory_truncation_t(
             for _j in range(DAT_BISECTION_ITERATIONS):
                 t_mid = 0.5 * (t_lo + t_hi)
                 s_mid = (
-                    wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d) - maximum_signed_distance
+                    wp.dot(n, rigid_point_trajectory(t_mid, c0, dx, axis, angle, offset0) - d)
+                    - maximum_signed_distance
                 )
                 if s_mid <= 0.0:
                     t_lo = t_mid
@@ -7497,7 +7679,11 @@ def apply_rigid_soft_truncation(
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
     soft_contact_barycentric: wp.array[wp.vec3],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
     shape_body: wp.array[wp.int32],
+    shape_transform: wp.array[wp.transform],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
     pos_prev_collision_detection: wp.array[wp.vec3],
     particle_displacements: wp.array[wp.vec3],
     body_q_ref: wp.array[wp.transform],
@@ -7509,18 +7695,26 @@ def apply_rigid_soft_truncation(
     truncation_ts: wp.array[float],
     body_truncation_ts: wp.array[float],
 ):
-    """Joint DAT truncation for one rigid-soft contact row.
+    """Joint DAT truncation for one rigid-soft contact: build the division plane from the
+    reference configuration and atomically min-reduce the truncation scalars of the soft
+    vertices (straight rays) and rigid primitive vertices (curved trajectories).
 
-    Each row (particle, edge, or face record from the collision pipeline) defines one
-    division plane through its stored rigid surface point, oriented by its stored contact
-    normal, both taken at the detection-time reference configuration. Both sides of the
-    row are constrained against that same plane within a single thread: every vertex of
-    the soft record along its straight accumulated displacement, and the rigid body
-    along the curved trajectory of the stored surface point. Truncation scalars are
-    atomically min-reduced per particle and per body.
+    Contacts self-describe their soft feature through ``soft_contact_indices`` (-1 padded
+    particle ids) + barycentrics, uniformly for particle/edge/face records and independent
+    of the detection backend that produced them. Dense BVH rows additionally identify the
+    exact rigid triangle, edge, or vertex through ``soft_contact_rigid_indices``. This is
+    the primitive-pair information required by Planar-DAT. Analytic SDF rows leave those
+    indices negative and truncate only their stored rigid surface point.
 
-    A soft vertex already on the wrong side of its plane may still move toward the
-    allowed side but not deeper; the rigid side follows the same rule along its arc.
+    Both sides of each contact are constrained against the same plane within a single
+    thread, which is what preserves the separating property of the plane. One thread
+    handles one contact row: it builds the plane once, truncates the soft primitive's at
+    most three vertices, then locally reduces the rigid primitive's at most three curved
+    vertex trajectories before one atomic body update.
+
+    The soft straight-ray guard treats a vertex numerically on its plane as a
+    boundary case: approach is blocked and separation remains free. Rigid curved
+    trajectories instead distinguish only valid and wrong-side initial states.
     """
     contact_index = wp.tid()
 
@@ -7531,8 +7725,10 @@ def apply_rigid_soft_truncation(
     if indices[0] < 0:
         return
     bary = soft_contact_barycentric[contact_index]
+    rigid_indices = soft_contact_rigid_indices[contact_index]
 
-    # Stored contact point on the soft feature at the reference (detection) state.
+    # Stored contact point on the soft feature. Analytic SDF rows use it directly;
+    # dense BVH rows additionally load all vertices of their complete pair below.
     x_ref = bary[0] * pos_prev_collision_detection[indices[0]]
     for i in range(1, 3):
         vi = indices[i]
@@ -7546,6 +7742,7 @@ def apply_rigid_soft_truncation(
     X_wb_ref = wp.transform_identity()
     if body_index >= 0:
         X_wb_ref = body_q_ref[body_index]
+    # contact position on body, transformed to world frame
     bx0 = wp.transform_point(X_wb_ref, soft_contact_body_pos[contact_index])
 
     # Use a one-micrometer band around meter-scale scenes. At larger
@@ -7556,14 +7753,65 @@ def apply_rigid_soft_truncation(
         vi = indices[i]
         if vi >= 0:
             coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(pos_prev_collision_detection[vi])))
-    coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(bx0)))
+    if rigid_indices[0] >= 0:
+        mesh = shape_source_ptr[shape_index]
+        X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
+        for i in range(3):
+            rigid_index = rigid_indices[i]
+            if rigid_index >= 0:
+                x_rigid_ref = wp.transform_point(
+                    X_wr_ref,
+                    wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index]),
+                )
+                coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(x_rigid_ref)))
+    else:
+        coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(bx0)))
     separation_eps = dat_separation_epsilon(coordinate_scale)
 
-    # The stored normal points from the rigid surface toward the soft feature. Clamp an
-    # existing penetration to a zero plane gap so DAT does not construct a deeper target.
-    n = soft_contact_normal[contact_index]
-    pair_delta = x_ref - bx0
-    gap = wp.max(wp.dot(n, pair_delta), 0.0)
+    if rigid_indices[0] >= 0:
+        # Dense BVH rows assemble their complete primitive pair and certify its
+        # separating plane before accepting it.
+        mesh = shape_source_ptr[shape_index]
+        X_wr_ref = wp.transform_multiply(X_wb_ref, shape_transform[shape_index])
+        valid_plane, n, x_ref, bx0, gap, _candidate_index = find_primitive_pair_separator(
+            indices,
+            rigid_indices,
+            pos_prev_collision_detection,
+            mesh,
+            shape_scale[shape_index],
+            X_wr_ref,
+            soft_contact_normal[contact_index],
+            separation_eps,
+        )
+        if not valid_plane:
+            wp.printf(
+                "Rigid-soft DAT found no separating normal for BVH row %d: "
+                "shape=%d, soft=(%d, %d, %d), rigid=(%d, %d, %d)\n",
+                contact_index,
+                shape_index,
+                indices[0],
+                indices[1],
+                indices[2],
+                rigid_indices[0],
+                rigid_indices[1],
+                rigid_indices[2],
+            )
+            # A failed dense row must not silently become a no-op: preserve the
+            # reference configuration until a valid separator is available.
+            for i in range(3):
+                vi = indices[i]
+                if vi >= 0:
+                    wp.atomic_min(truncation_ts, vi, 0.0)
+            if body_index >= 0:
+                wp.atomic_min(body_truncation_ts, body_index, 0.0)
+            return
+    else:
+        # Analytic SDF rows have no complete rigid primitive and retain their
+        # stored surface point and normal. Clamp an existing penetration to a
+        # zero plane gap so DAT does not construct a deeper target.
+        n = soft_contact_normal[contact_index]
+        pair_delta = x_ref - bx0
+        gap = wp.max(wp.dot(n, pair_delta), 0.0)
 
     # Rigid-body update accumulated since the reference pose.
     c0 = wp.vec3(0.0)
@@ -7575,8 +7823,10 @@ def apply_rigid_soft_truncation(
         c0, dx_body, rot_axis, rot_angle = rigid_pose_delta(X_wb_ref, body_q[body_index], body_com[body_index])
         body_is_moving = wp.length_sq(dx_body) > 0.0 or rot_angle != 0.0
 
-    # Adaptive plane placement: each side's approach is its largest normal motion
-    # toward the other side. ``n`` points from the rigid surface toward the soft feature.
+    # Adaptive plane placement follows Planar-DAT Eq. (10)/(12): each side's
+    # approach is the maximum normal displacement of the complete paired
+    # primitive, not the displacement interpolated at its closest point.
+    # Here n points from the rigid primitive toward the soft primitive.
     delta_soft = float(0.0)
     for i in range(3):
         vi = indices[i]
@@ -7584,15 +7834,35 @@ def apply_rigid_soft_truncation(
             delta_soft = wp.max(delta_soft, -wp.dot(n, particle_displacements[vi]))
     delta_rigid = float(0.0)
     if body_is_moving:
-        anchor_end = wp.transform_point(body_q[body_index], soft_contact_body_pos[contact_index])
-        delta_rigid = wp.max(wp.dot(n, anchor_end - bx0), 0.0)
+        if rigid_indices[0] >= 0:
+            # BVH mesh query
+            mesh = shape_source_ptr[shape_index]
+            for i in range(3):
+                rigid_index = rigid_indices[i]
+                if rigid_index >= 0:
+                    x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
+                    x_body = wp.transform_point(shape_transform[shape_index], x_shape)
+                    x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
+                    x_rigid_end = wp.transform_point(body_q[body_index], x_body)
+                    delta_rigid = wp.max(delta_rigid, wp.dot(n, x_rigid_end - x_rigid_ref))
+        else:
+            # SDF query
+            anchor_end = wp.transform_point(body_q[body_index], soft_contact_body_pos[contact_index])
+            delta_rigid = wp.max(wp.dot(n, anchor_end - bx0), 0.0)
 
+    # BVH rows supply a certified complete-primitive support gap; SDF rows use
+    # their non-negative signed contact gap. Only the normal coordinate defines
+    # the plane, so the same placement formula applies to both representations.
     plane_point, _lmbd = place_dat_division_plane(n, bx0, gap, delta_soft, delta_rigid, separation_eps)
 
-    # Soft side: every vertex of the record stays in the positive half-space, which
-    # begins ``separation_eps`` beyond the division plane.
+    # Soft side: n points toward its allowed positive half-space. Dense BVH
+    # rows constrain every vertex of the complete soft primitive. The allowed
+    # side begins epsilon beyond the division plane.
     for i in range(3):
         vi = indices[i]
+        # DAT constrains the complete primitive, not only vertices carrying a
+        # positive closest-point barycentric weight.  Endpoint/edge cases still
+        # require every vertex of the paired edge or triangle to stay on its side.
         if vi >= 0:
             x_v = pos_prev_collision_detection[vi]
             t_v = planar_truncation_t(
@@ -7606,23 +7876,49 @@ def apply_rigid_soft_truncation(
             if t_v < 1.0:
                 wp.atomic_min(truncation_ts, vi, t_v)
 
-    # Rigid side: the stored surface point follows the body's curved trajectory and
-    # must stay ``separation_eps`` on the negative side of the plane.
+    # Rigid side: BVH rows truncate the exact rigid triangle/edge/vertex in the
+    # detected primitive pair. Analytic SDF rows have no rigid primitive identity
+    # and conservatively use only their stored surface point.
     if body_is_moving:
-        t_b = rigid_trajectory_truncation_t(
-            n,
-            plane_point,
-            c0,
-            dx_body,
-            rot_axis,
-            rot_angle,
-            bx0 - c0,
-            gamma,
-            1.0e-3,
-            use_interval_arithmetic,
-            DAT_TRAJECTORY_SAMPLES,
-            -separation_eps,
-        )
+        t_b = float(1.0)
+        if rigid_indices[0] >= 0:
+            mesh = shape_source_ptr[shape_index]
+            for i in range(3):
+                rigid_index = rigid_indices[i]
+                if rigid_index >= 0:
+                    x_shape = wp.cw_mul(wp.mesh_get_point(mesh, rigid_index), shape_scale[shape_index])
+                    x_body = wp.transform_point(shape_transform[shape_index], x_shape)
+                    x_rigid_ref = wp.transform_point(X_wb_ref, x_body)
+                    t_v = rigid_trajectory_truncation_t(
+                        n,
+                        plane_point,
+                        c0,
+                        dx_body,
+                        rot_axis,
+                        rot_angle,
+                        x_rigid_ref - c0,
+                        gamma,
+                        1.0e-3,
+                        use_interval_arithmetic,
+                        DAT_TRAJECTORY_SAMPLES,
+                        -separation_eps,
+                    )
+                    t_b = wp.min(t_b, t_v)
+        else:
+            t_b = rigid_trajectory_truncation_t(
+                n,
+                plane_point,
+                c0,
+                dx_body,
+                rot_axis,
+                rot_angle,
+                bx0 - c0,
+                gamma,
+                1.0e-3,
+                use_interval_arithmetic,
+                DAT_TRAJECTORY_SAMPLES,
+                -separation_eps,
+            )
         if t_b < 1.0:
             wp.atomic_min(body_truncation_ts, body_index, t_b)
 

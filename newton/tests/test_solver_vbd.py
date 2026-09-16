@@ -7,6 +7,7 @@ import gc
 import math
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -16,8 +17,8 @@ from newton._src.geometry.tri_mesh_collision import TriMeshCollisionInfo, build_
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+    accumulate_particle_body_contact_force_and_hessian,
     apply_planar_truncation_parallel_by_collision,
-    build_particle_body_contact_adjacency_active,
     create_edge_edge_division_plane_closest_pt,
     create_vertex_triangle_division_plane_closest_pt,
     evaluate_dihedral_angle_based_bending_force_hessian,
@@ -27,7 +28,6 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     evaluate_spring_force_and_hessian_both_vertices,
     evaluate_vertex_triangle_collision_force_hessian_4_vertices,
     evaluate_volumetric_neo_hookean_force_and_hessian,
-    gather_particle_body_contact_force_and_hessian,
     make_solve_elasticity_tile,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
@@ -39,6 +39,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _eval_soft_ef_contact,
     _evaluate_rigid_soft_contact_force_norm,
     _joint_angular_rho_seed,
+    apply_rigid_soft_truncation,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     compute_rigid_contact_forces,
@@ -46,6 +47,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_body_particle_contact,
     evaluate_linear_constraint_force_hessian,
     evaluate_rigid_contact_from_collision,
+    find_primitive_pair_separator,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
     place_dat_division_plane,
@@ -58,9 +60,10 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     update_duals_body_particle_contacts,
     update_duals_joint,
 )
-from newton._src.solvers.vbd.solver_vbd import _PARTICLE_CONTACT_GATHER_BLOCK_DIM, _is_tet_only_elasticity_model
+from newton._src.solvers.vbd.solver_vbd import _is_tet_only_elasticity_model
 from newton.solvers.experimental.coupled import SolverCoupledProxy
 from newton.tests.unittest_utils import (
+    StdOutCapture,
     add_function_test,
     configure_sdf_for_collision_shapes,
     get_test_devices,
@@ -294,7 +297,6 @@ def _eval_rigid_soft_contact_norm_kernel(
     dEdD_out: wp.array[float],
     d2E_out: wp.array[float],
 ):
-    """Evaluate the rigid-soft normal contact law and its first two distance derivatives for a batch of distances."""
     i = wp.tid()
     dEdD, d2E = _evaluate_rigid_soft_contact_force_norm(distances[i], collision_radius, k, use_log_barrier)
     dEdD_out[i] = dEdD
@@ -446,24 +448,7 @@ def _prepare_body_particle_dual_prefix(
 
 
 @wp.kernel
-def _prepare_particle_contact_gather_replay(
-    raw_count: wp.array[int],
-    contact_count: wp.array[int],
-    particle_contact_head: wp.array[int],
-    particle_forces: wp.array[wp.vec3],
-    particle_hessians: wp.array[wp.mat33],
-):
-    i = wp.tid()
-    if i == 0:
-        contact_count[0] = raw_count[0]
-    if i < particle_contact_head.shape[0]:
-        particle_contact_head[i] = -1
-        particle_forces[i] = wp.vec3(0.0)
-        particle_hessians[i] = wp.mat33(0.0)
-
-
-@wp.kernel
-def accumulate_particle_body_contact_force_and_hessian(
+def _reference_particle_body_contact_force_and_hessian(
     # inputs
     dt: float,
     current_color: int,
@@ -498,7 +483,7 @@ def accumulate_particle_body_contact_force_and_hessian(
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
 ):
-    """Legacy capacity-scan scatter accumulation, kept as the reference oracle for the gather kernel."""
+    """Reference accumulation without the production eligibility mask."""
     t_id = wp.tid()
 
     # One unified soft-contact stream. body_particle_contact_count[0] is the total soft-contact count;
@@ -1103,60 +1088,6 @@ def test_self_contact_barrier_c2_at_d_min(test, device):
         rtol=1e-3,
         err_msg="Self-contact barrier Hessian is not C2-continuous at d = d_min",
     )
-
-
-def test_contact_barrier_c2_at_tiny_radius(test, device):
-    """Both log-barrier laws stay C2 when ``collision_radius < 2e-5``.
-
-    ``d_min`` follows ``0.5 * tau`` for such radii, so the barrier interval
-    ``(d_min, tau)`` never empties; force and Hessian must therefore be continuous
-    across both branch boundaries, and the rigid-soft law must still match the
-    particle law.  With a fixed ``d_min = 1e-5`` the interval is empty and the
-    quadratic branch meets the extension branch with a jump at ``d = d_min``.
-    """
-    collision_radius = 1.5e-5
-    k = 1.0e4
-    tau = 0.5 * collision_radius
-    d_min = min(1.0e-5, 0.5 * tau)
-    legacy_d_min = 1.0e-5  # above tau at this radius: the unguarded law jumps here
-    rel = 1.0e-3
-    distances_np = np.array(
-        [
-            d_min * (1.0 - rel),
-            d_min * (1.0 + rel),
-            tau * (1.0 - rel),
-            tau * (1.0 + rel),
-            legacy_d_min * (1.0 - rel),
-            legacy_d_min * (1.0 + rel),
-        ],
-        dtype=np.float32,
-    )
-    distances = wp.array(distances_np, dtype=float, device=device)
-    particle_dEdD = wp.zeros(6, dtype=float, device=device)
-    particle_d2E = wp.zeros(6, dtype=float, device=device)
-    rigid_dEdD = wp.zeros(6, dtype=float, device=device)
-    rigid_d2E = wp.zeros(6, dtype=float, device=device)
-    wp.launch(
-        _eval_self_contact_norm_kernel,
-        dim=6,
-        inputs=[distances, collision_radius, k, particle_dEdD, particle_d2E],
-        device=device,
-    )
-    wp.launch(
-        _eval_rigid_soft_contact_norm_kernel,
-        dim=6,
-        inputs=[distances, collision_radius, k, True, rigid_dEdD, rigid_d2E],
-        device=device,
-    )
-    for name, dEdD, d2E in (
-        ("particle", particle_dEdD.numpy(), particle_d2E.numpy()),
-        ("rigid", rigid_dEdD.numpy(), rigid_d2E.numpy()),
-    ):
-        for lo, hi, where in ((0, 1, "d_min"), (2, 3, "tau"), (4, 5, "legacy d_min")):
-            np.testing.assert_allclose(dEdD[lo], dEdD[hi], rtol=1.0e-2, err_msg=f"{name} force jumps at {where}")
-            np.testing.assert_allclose(d2E[lo], d2E[hi], rtol=1.0e-2, err_msg=f"{name} Hessian jumps at {where}")
-    np.testing.assert_allclose(rigid_dEdD.numpy(), particle_dEdD.numpy(), rtol=1.0e-6)
-    np.testing.assert_allclose(rigid_d2E.numpy(), particle_d2E.numpy(), rtol=1.0e-6)
 
 
 def test_rigid_soft_contact_log_barrier_matches_particle(test, device):
@@ -2083,32 +2014,23 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
         forces = wp.zeros(4, dtype=wp.vec3, device=device)
         hessians = wp.zeros(4, dtype=wp.mat33, device=device)
 
-        # Launch the production gather kernel the way SolverVBD does: build the per-particle
-        # incidence lists over the active prefix, then gather one color (all four particles here).
-        contact_head = wp.full(4, -1, dtype=int, device=device)
-        contact_next = wp.empty(3 * 4, dtype=int, device=device)
+        # One color containing all four particles; one thread per contact row.
         wp.launch(
-            build_particle_body_contact_adjacency_active,
+            accumulate_particle_body_contact_force_and_hessian,
             dim=4,
-            inputs=[contact_indices, contact_count, 4, contact_head, contact_next],
-            device=device,
-        )
-        color_group = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
-        wp.launch(
-            gather_particle_body_contact_force_and_hessian,
-            dim=4,
-            block_dim=_PARTICLE_CONTACT_GATHER_BLOCK_DIM,
             inputs=[
                 0.1,
-                color_group,
+                0,
                 particle_q_prev,
                 particle_q,
+                wp.zeros(4, dtype=int, device=device),  # particle colors
                 0.01,
-                False,  # legacy quadratic rigid-soft normal law
+                False,
                 particle_radius,
                 contact_indices,
-                contact_head,
-                contact_next,
+                contact_count,
+                4,
+                wp.ones(4, dtype=wp.int32, device=device),
                 contact_penalty_k,
                 contact_material_kd,
                 contact_material_mu,
@@ -2135,7 +2057,7 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
         np.testing.assert_allclose(damping_unramped, [0.0, 0.0, 2.0], rtol=1.0e-6, atol=1.0e-6)
 
 
-def _make_particle_contact_gather_data(device, capacity=17, boundary=5, particle_count=6):
+def _make_particle_contact_data(device, capacity=17, boundary=5, particle_count=6):
     particle_q = wp.array(
         [[0.03 * i, 0.02 * (i % 2), 0.04] for i in range(particle_count)],
         dtype=wp.vec3,
@@ -2147,10 +2069,6 @@ def _make_particle_contact_gather_data(device, capacity=17, boundary=5, particle
         device=device,
     )
     particle_colors = wp.array([i % 3 for i in range(particle_count)], dtype=int, device=device)
-    color_groups = [
-        wp.array([i for i in range(particle_count) if i % 3 == color], dtype=wp.int32, device=device)
-        for color in range(3)
-    ]
 
     indices = []
     barycentric = []
@@ -2177,7 +2095,7 @@ def _make_particle_contact_gather_data(device, capacity=17, boundary=5, particle
         "particle_q_prev": particle_q_prev,
         "particle_colors": particle_colors,
         "particle_radius": wp.full(particle_count, 0.1, dtype=float, device=device),
-        "color_groups": color_groups,
+        "color_count": 3,
         "contact_indices": contact_indices,
         "contact_penalty_k": wp.array([100.0 + i for i in range(capacity)], dtype=float, device=device),
         "contact_material_ke": wp.full(capacity, 200.0, dtype=float, device=device),
@@ -2194,10 +2112,11 @@ def _make_particle_contact_gather_data(device, capacity=17, boundary=5, particle
         "contact_normal": wp.array([[0.0, 0.0, 1.0]] * capacity, dtype=wp.vec3, device=device),
         "shape_margin": wp.zeros(0, dtype=float, device=device),
         "contact_barycentric": contact_barycentric,
+        "contact_force_eligible": wp.ones(capacity, dtype=wp.int32, device=device),
     }
 
 
-def _particle_contact_gather_material_inputs(data):
+def _particle_contact_material_inputs(data):
     return [
         data["contact_penalty_k"],
         data["contact_material_kd"],
@@ -2216,144 +2135,41 @@ def _particle_contact_gather_material_inputs(data):
     ]
 
 
-def _launch_particle_contact_gather(data, contact_count, contact_head, contact_next, forces, hessians, device):
-    wp.launch(
-        build_particle_body_contact_adjacency_active,
-        dim=data["capacity"],
-        inputs=[
-            data["contact_indices"],
-            contact_count,
-            data["capacity"],
-            contact_head,
-            contact_next,
-        ],
-        device=device,
-    )
-    for color_group in data["color_groups"]:
+def _launch_particle_contact_accumulation(data, contact_count, forces, hessians, device, *, use_log_barrier=False):
+    for current_color in range(data["color_count"]):
         wp.launch(
-            gather_particle_body_contact_force_and_hessian,
-            dim=color_group.size,
-            block_dim=_PARTICLE_CONTACT_GATHER_BLOCK_DIM,
+            accumulate_particle_body_contact_force_and_hessian,
+            dim=data["capacity"],
             inputs=[
                 0.01,
-                color_group,
+                current_color,
                 data["particle_q_prev"],
                 data["particle_q"],
+                data["particle_colors"],
                 1.0,
-                False,  # rigid_body_particle_contact_use_log_barrier
+                use_log_barrier,
                 data["particle_radius"],
                 data["contact_indices"],
-                contact_head,
-                contact_next,
-                *_particle_contact_gather_material_inputs(data),
+                contact_count,
+                data["capacity"],
+                data["contact_force_eligible"],
+                *_particle_contact_material_inputs(data),
             ],
             outputs=[forces, hessians],
             device=device,
         )
 
 
-def _particle_contact_gather_order_pinned(test, device):
-    """Produce identical gather sums for any chain permutation with the same membership.
+def _particle_contact_accumulation_matches_reference(test, device):
+    """Match mixed-record scatter with both force laws and excluded contact rows.
 
-    The adjacency build's atomic insertions make chain order scheduling-dependent; the gather's
-    ascending-node-id consumption must erase that. Reversing every per-particle chain is one such
-    permutation, so a regression to plain chain-order walking fails this test.
+    The scatter oracle has no eligibility guard: zero its stiffness and damping
+    on excluded rows instead. Production accumulation keeps the original coefficients and
+    must honor the mask. At d=0.04 with radius=0.1 the log-barrier branch is active,
+    so failing to forward that option changes both the force and Hessian.
     """
     with wp.ScopedDevice(device):
-        data = _make_particle_contact_gather_data(device)
-        capacity = data["capacity"]
-        n = data["particle_count"]
-        contact_count = wp.array([capacity], dtype=int, device=device)
-        head = wp.full(n, -1, dtype=wp.int32, device=device)
-        nxt = wp.empty(3 * capacity, dtype=wp.int32, device=device)
-        forces = wp.zeros(n, dtype=wp.vec3, device=device)
-        hessians = wp.zeros(n, dtype=wp.mat33, device=device)
-        _launch_particle_contact_gather(data, contact_count, head, nxt, forces, hessians, device)
-
-        # Reverse every chain on the host: same membership, opposite link order.
-        head_np = head.numpy()
-        next_np = nxt.numpy()
-        rev_head = np.full_like(head_np, -1)
-        rev_next = next_np.copy()
-        for particle in range(n):
-            chain = []
-            node = head_np[particle]
-            while node >= 0:
-                chain.append(node)
-                node = next_np[node]
-            chain.reverse()
-            if chain:
-                rev_head[particle] = chain[0]
-                for i, node in enumerate(chain):
-                    rev_next[node] = chain[i + 1] if i + 1 < len(chain) else -1
-        rev_head_wp = wp.array(rev_head, dtype=wp.int32, device=device)
-        rev_next_wp = wp.array(rev_next, dtype=wp.int32, device=device)
-        forces_rev = wp.zeros(n, dtype=wp.vec3, device=device)
-        hessians_rev = wp.zeros(n, dtype=wp.mat33, device=device)
-        for color_group in data["color_groups"]:
-            wp.launch(
-                gather_particle_body_contact_force_and_hessian,
-                dim=color_group.size,
-                block_dim=_PARTICLE_CONTACT_GATHER_BLOCK_DIM,
-                inputs=[
-                    0.01,
-                    color_group,
-                    data["particle_q_prev"],
-                    data["particle_q"],
-                    1.0,
-                    False,  # rigid_body_particle_contact_use_log_barrier
-                    data["particle_radius"],
-                    data["contact_indices"],
-                    rev_head_wp,
-                    rev_next_wp,
-                    *_particle_contact_gather_material_inputs(data),
-                ],
-                outputs=[forces_rev, hessians_rev],
-                device=device,
-            )
-
-        np.testing.assert_array_equal(forces.numpy().view(np.uint32), forces_rev.numpy().view(np.uint32))
-        np.testing.assert_array_equal(hessians.numpy().view(np.uint32), hessians_rev.numpy().view(np.uint32))
-
-
-def _particle_contact_adjacency_follows_swapped_contacts(test, device):
-    """Rebuild the contact adjacency from whichever contacts buffer each step consumes.
-
-    Steps with buffer A, an empty equal-capacity buffer B, then A again; the adjacency must track
-    the passed buffer each time, including through the zero-contact intermediate.
-    """
-    with wp.ScopedDevice(device):
-        model, _vertices = _build_edge_over_post(device)
-        pipeline = newton.CollisionPipeline(
-            model,
-            broad_phase="nxn",
-            soft_contact_gap=0.1,
-            enable_rigid_soft_full_surface_contact=True,
-        )
-        contacts_a = pipeline.contacts()
-        contacts_b = pipeline.contacts()  # same capacity, never collided: zero contacts
-        state_in = model.state()
-        state_out = model.state()
-        pipeline.collide(state_in, contacts_a)
-        test.assertGreater(int(contacts_a.soft_contact_count.numpy()[0]), 0)
-
-        solver = newton.solvers.SolverVBD(model, iterations=1)
-        solver.step(state_in, state_out, None, contacts_a, 1.0 / 120.0)
-        members_a = solver._particle_contact_head.numpy() >= 0
-        test.assertTrue(np.any(members_a))
-
-        solver.step(state_in, state_out, None, contacts_b, 1.0 / 120.0)
-        test.assertTrue(np.all(solver._particle_contact_head.numpy() == -1))
-
-        solver.step(state_in, state_out, None, contacts_a, 1.0 / 120.0)
-        # Chain fronts are insertion-racy; membership per particle is the stable invariant.
-        np.testing.assert_array_equal(solver._particle_contact_head.numpy() >= 0, members_a)
-
-
-def _particle_contact_gather_matches_legacy(test, device):
-    """Linked particle incidence lists match the legacy mixed-record contact scatter."""
-    with wp.ScopedDevice(device):
-        data = _make_particle_contact_gather_data(device)
+        data = _make_particle_contact_data(device)
         capacity = data["capacity"]
         boundary = data["boundary"]
         particle_count = data["particle_count"]
@@ -2362,107 +2178,97 @@ def _particle_contact_gather_matches_legacy(test, device):
         particle_colors = data["particle_colors"]
         particle_radius = data["particle_radius"]
         contact_indices = data["contact_indices"]
-        common_material_inputs = _particle_contact_gather_material_inputs(data)
+        for mask_name in ("all", "alternating"):
+            # Alternation excludes and retains rows of each type: particle, edge, face.
+            eligible = np.ones(capacity, dtype=np.int32) if mask_name == "all" else np.arange(capacity) % 2
+            data["contact_force_eligible"].assign(eligible)
+            oracle_data = dict(data)
+            for coefficient in ("contact_penalty_k", "contact_material_kd"):
+                oracle_data[coefficient] = wp.array(data[coefficient].numpy() * eligible, dtype=float, device=device)
+            # Friction is already zero in this fixture, so these two coefficients
+            # remove the excluded rows' entire force/Hessian from the oracle.
+            common_material_inputs = _particle_contact_material_inputs(oracle_data)
 
-        for raw_count in (0, 1, boundary - 1, boundary, boundary + 1, capacity, capacity + 2):
-            contact_count = wp.array([raw_count], dtype=int, device=device)
-            contact_head = wp.full(particle_count, -1, dtype=int, device=device)
-            contact_next = wp.empty(3 * capacity, dtype=int, device=device)
-            legacy_forces = wp.zeros(particle_count, dtype=wp.vec3, device=device)
-            legacy_hessians = wp.zeros(particle_count, dtype=wp.mat33, device=device)
-            gather_forces = wp.zeros_like(legacy_forces)
-            gather_hessians = wp.zeros_like(legacy_hessians)
-            for current_color, _color_group in enumerate(data["color_groups"]):
-                wp.launch(
-                    accumulate_particle_body_contact_force_and_hessian,
-                    dim=capacity,
-                    inputs=[
-                        0.01,
-                        current_color,
-                        particle_q_prev,
-                        particle_q,
-                        particle_colors,
-                        1.0,
-                        particle_radius,
-                        contact_indices,
+            for use_log_barrier in (False, True):
+                for raw_count in (0, 1, boundary - 1, boundary, boundary + 1, capacity, capacity + 2):
+                    contact_count = wp.array([raw_count], dtype=int, device=device)
+                    legacy_forces = wp.zeros(particle_count, dtype=wp.vec3, device=device)
+                    legacy_hessians = wp.zeros(particle_count, dtype=wp.mat33, device=device)
+                    scatter_forces = wp.zeros_like(legacy_forces)
+                    scatter_hessians = wp.zeros_like(legacy_hessians)
+                    _launch_particle_contact_accumulation(
+                        data,
                         contact_count,
-                        capacity,
-                        common_material_inputs[0],
-                        data["contact_material_ke"],
-                        *common_material_inputs[1:],
-                        False,  # use_log_barrier
-                    ],
-                    outputs=[legacy_forces, legacy_hessians],
-                    device=device,
-                )
-            _launch_particle_contact_gather(
-                data, contact_count, contact_head, contact_next, gather_forces, gather_hessians, device
-            )
+                        scatter_forces,
+                        scatter_hessians,
+                        device,
+                        use_log_barrier=use_log_barrier,
+                    )
+                    for current_color in range(data["color_count"]):
+                        wp.launch(
+                            _reference_particle_body_contact_force_and_hessian,
+                            dim=capacity,
+                            inputs=[
+                                0.01,
+                                current_color,
+                                particle_q_prev,
+                                particle_q,
+                                particle_colors,
+                                1.0,
+                                particle_radius,
+                                contact_indices,
+                                contact_count,
+                                capacity,
+                                common_material_inputs[0],
+                                data["contact_material_ke"],
+                                *common_material_inputs[1:],
+                                use_log_barrier,
+                            ],
+                            outputs=[legacy_forces, legacy_hessians],
+                            device=device,
+                        )
+                    with test.subTest(mask=mask_name, use_log_barrier=use_log_barrier, raw_count=raw_count):
+                        np.testing.assert_allclose(
+                            scatter_forces.numpy(), legacy_forces.numpy(), rtol=1.0e-5, atol=1.0e-6
+                        )
+                        np.testing.assert_allclose(
+                            scatter_hessians.numpy(), legacy_hessians.numpy(), rtol=1.0e-5, atol=1.0e-6
+                        )
 
-            with test.subTest(raw_count=raw_count):
-                np.testing.assert_allclose(gather_forces.numpy(), legacy_forces.numpy(), rtol=1.0e-5, atol=1.0e-6)
-                np.testing.assert_allclose(gather_hessians.numpy(), legacy_hessians.numpy(), rtol=1.0e-5, atol=1.0e-6)
 
-
-def _particle_contact_gather_capture_replays_device_count(test, device):
-    """A captured adjacency build and gather must consume a changing device-side count."""
+def _particle_contact_accumulation_capture_replays_device_count(test, device):
+    """Captured accumulation must consume changing device counts, including overflow."""
     with wp.ScopedDevice(device):
-        data = _make_particle_contact_gather_data(device)
-        capacity = data["capacity"]
-        particle_count = data["particle_count"]
-        raw_count = wp.zeros(1, dtype=int, device=device)
+        data = _make_particle_contact_data(device)
         contact_count = wp.zeros(1, dtype=int, device=device)
-        contact_head = wp.full(particle_count, -1, dtype=int, device=device)
-        contact_next = wp.empty(3 * capacity, dtype=int, device=device)
-        forces = wp.zeros(particle_count, dtype=wp.vec3, device=device)
-        hessians = wp.zeros(particle_count, dtype=wp.mat33, device=device)
-
-        wp.launch(
-            _prepare_particle_contact_gather_replay,
-            dim=particle_count,
-            inputs=[raw_count, contact_count, contact_head, forces, hessians],
-            device=device,
-        )
-        _launch_particle_contact_gather(data, contact_count, contact_head, contact_next, forces, hessians, device)
+        forces = wp.zeros(data["particle_count"], dtype=wp.vec3, device=device)
+        hessians = wp.zeros(data["particle_count"], dtype=wp.mat33, device=device)
+        _launch_particle_contact_accumulation(data, contact_count, forces, hessians, device)
         wp.synchronize_device(device)
 
         with wp.ScopedCapture(device=device) as capture:
-            wp.launch(
-                _prepare_particle_contact_gather_replay,
-                dim=particle_count,
-                inputs=[raw_count, contact_count, contact_head, forces, hessians],
-                device=device,
-            )
-            _launch_particle_contact_gather(data, contact_count, contact_head, contact_next, forces, hessians, device)
-        graph = capture.graph
-        test.assertIsNotNone(graph)
+            forces.zero_()
+            hessians.zero_()
+            _launch_particle_contact_accumulation(data, contact_count, forces, hessians, device)
+        test.assertIsNotNone(capture.graph)
 
-        for replay_count in (0, data["boundary"] + 1, capacity + 2, 1):
-            reference_count = wp.array([replay_count], dtype=int, device=device)
-            reference_head = wp.full(particle_count, -1, dtype=int, device=device)
-            reference_next = wp.empty(3 * capacity, dtype=int, device=device)
+        for replay_count in (0, data["boundary"] + 1, data["capacity"] + 2, 1):
+            contact_count.assign([replay_count])
             reference_forces = wp.zeros_like(forces)
             reference_hessians = wp.zeros_like(hessians)
-            _launch_particle_contact_gather(
-                data,
-                reference_count,
-                reference_head,
-                reference_next,
-                reference_forces,
-                reference_hessians,
-                device,
-            )
-
-            raw_count.assign([replay_count])
-            wp.capture_launch(graph)
+            _launch_particle_contact_accumulation(data, contact_count, reference_forces, reference_hessians, device)
+            wp.capture_launch(capture.graph)
             with test.subTest(replay_count=replay_count):
-                test.assertEqual(int(contact_count.numpy()[0]), replay_count)
                 np.testing.assert_allclose(forces.numpy(), reference_forces.numpy(), rtol=1.0e-5, atol=1.0e-6)
                 np.testing.assert_allclose(hessians.numpy(), reference_hessians.numpy(), rtol=1.0e-5, atol=1.0e-6)
 
 
-def _particle_contact_gather_solver_step_dispatch_and_capture(test, device):
-    """Exercise production gather dispatch, capture replay, and repeated-step consistency."""
+def _particle_contact_accumulation_dispatch(test, device):
+    """Exercise full-surface contact accumulation in every CUDA deterministic mode.
+
+    Check first-call material initialization even with history updates disabled,
+    then CUDA graph replay with an empty contact buffer and with active contacts.
+    """
     with wp.ScopedDevice(device):
         model, _vertices = _build_edge_over_post(device)
         pipeline = newton.CollisionPipeline(
@@ -2472,62 +2278,39 @@ def _particle_contact_gather_solver_step_dispatch_and_capture(test, device):
             enable_rigid_soft_full_surface_contact=True,
         )
         contacts = pipeline.contacts()
-        state_in = model.state()
-        state_out = model.state()
-        pipeline.collide(state_in, contacts)
-        active_count = min(int(contacts.soft_contact_count.numpy()[0]), contacts.soft_contact_max)
+        pipeline.collide(model.state(), contacts)
+        active_count = int(contacts.soft_contact_count.numpy()[0])
         test.assertGreater(active_count, 0)
-
-        solver = newton.solvers.SolverVBD(model, iterations=1)
-        solver.step(state_in, state_out, None, contacts, 1.0 / 120.0)
-        test.assertTrue(solver._particle_contact_adjacency_initialized)
-
-        raw_count = wp.array([active_count], dtype=int, device=device)
-        with wp.ScopedCapture(device=device) as capture:
-            wp.launch(
-                _prepare_particle_contact_gather_replay,
-                dim=model.particle_count,
-                inputs=[
-                    raw_count,
-                    contacts.soft_contact_count,
-                    solver._particle_contact_head,
-                    solver.particle_forces,
-                    solver.particle_hessians,
-                ],
-                device=device,
-            )
-            solver.step(state_in, state_out, None, contacts, 1.0 / 120.0)
-        graph = capture.graph
-        test.assertIsNotNone(graph)
-
-        for replay_count in (0, active_count):
-            raw_count.assign([replay_count])
-            wp.capture_launch(graph)
-            head = solver._particle_contact_head.numpy()
-            with test.subTest(replay_count=replay_count):
-                test.assertEqual(int(contacts.soft_contact_count.numpy()[0]), replay_count)
-                if replay_count == 0:
-                    test.assertTrue(np.all(head == -1))
-                else:
-                    test.assertTrue(np.any(head >= 0))
-                test.assertTrue(np.all(np.isfinite(state_out.particle_q.numpy())))
-
-        # Repeated identical steps on the same contact buffer must produce identical results.
-        deterministic_solver = newton.solvers.SolverVBD(
-            model,
-            iterations=1,
-            deterministic=wp.DeterministicMode.RUN_TO_RUN,
-        )
-        test.assertEqual(deterministic_solver._particle_contact_head.shape[0], model.particle_count)
-        contacts.soft_contact_count.assign([active_count])
-        results = []
-        for _ in range(2):
-            state_a = model.state()
-            state_b = model.state()
-            deterministic_solver._particle_contact_adjacency_initialized = False
-            deterministic_solver.step(state_a, state_b, None, contacts, 1.0 / 120.0)
-            results.append(state_b.particle_q.numpy().copy())
-        np.testing.assert_array_equal(results[0], results[1])
+        modes = list(wp.DeterministicMode) if wp.get_device(device).is_cuda else [wp.DeterministicMode.NOT_GUARANTEED]
+        for mode in modes:
+            with test.subTest(mode=mode):
+                solver = newton.solvers.SolverVBD(model, iterations=1, deterministic=mode)
+                state_in, state_out = model.state(), model.state()
+                contacts.soft_contact_count.assign([active_count])
+                # Even a first call requesting frozen history must initialize material state.
+                solver.set_rigid_history_update(False)
+                with mock.patch.object(wp, "launch", wraps=wp.launch) as launches:
+                    solver.step(state_in, state_out, None, contacts, 1.0 / 120.0)
+                kernels = [
+                    call.kwargs.get("kernel", call.args[0] if call.args else None) for call in launches.call_args_list
+                ]
+                test.assertIn(accumulate_particle_body_contact_force_and_hessian, kernels)
+                test.assertTrue(solver._body_particle_contact_state_initialized)
+                test.assertGreater(float(np.max(solver.body_particle_contact_penalty_k.numpy()[:active_count])), 0.0)
+                test.assertTrue(np.isfinite(state_out.particle_q.numpy()).all())
+                if wp.get_device(device).is_cuda:
+                    with wp.ScopedCapture(device=device) as capture:
+                        wp.copy(state_in.particle_q, model.particle_q)
+                        wp.copy(state_in.particle_qd, model.particle_qd)
+                        solver.step(state_in, state_out, None, contacts, 1.0 / 120.0)
+                    for count in (0, active_count):
+                        contacts.soft_contact_count.assign([count])
+                        wp.capture_launch(capture.graph)
+                        test.assertTrue(np.isfinite(state_out.particle_q.numpy()).all())
+                    if mode != wp.DeterministicMode.NOT_GUARANTEED:
+                        repeated = state_out.particle_q.numpy().copy()
+                        wp.capture_launch(capture.graph)
+                        np.testing.assert_array_equal(state_out.particle_q.numpy(), repeated)
 
 
 def _make_body_particle_dual_prefix_data(device, capacity):
@@ -2565,6 +2348,7 @@ def _make_body_particle_dual_prefix_data(device, capacity):
         "shape_margin": wp.zeros(0, dtype=float, device=device),
         "body_q": wp.zeros(0, dtype=wp.transform, device=device),
         "material_ke": wp.full(capacity, 100.0, dtype=float, device=device),
+        "contact_force_eligible": wp.ones(capacity, dtype=int, device=device),
     }
 
 
@@ -2575,6 +2359,7 @@ def _launch_body_particle_dual_prefix(data, contact_count, capacity, beta, penal
         inputs=[
             contact_count,
             data["indices"],
+            data["contact_force_eligible"],
             data["shape"],
             data["body_pos"],
             data["normal"],
@@ -4499,6 +4284,7 @@ def _body_particle_contact_lists_skip_static_kinematic(test, device):
         inputs=[
             body_particle_contact_count,
             body_particle_contact_shape,
+            wp.ones(3, dtype=wp.int32, device=device),
             shape_body,
             body_inv_mass_effective,
             buffer_pre_alloc,
@@ -4892,9 +4678,6 @@ add_function_test(
     devices=devices,
 )
 add_function_test(
-    TestSolverVBD, "test_contact_barrier_c2_at_tiny_radius", test_contact_barrier_c2_at_tiny_radius, devices=devices
-)
-add_function_test(
     TestSolverVBD,
     "test_rigid_contact_history_restore_from_match_index",
     _rigid_contact_history_restore_from_match_index,
@@ -4998,32 +4781,20 @@ add_function_test(
 )
 add_function_test(
     TestSolverVBD,
-    "test_particle_contact_gather_matches_legacy",
-    _particle_contact_gather_matches_legacy,
+    "test_particle_contact_accumulation_dispatch",
+    _particle_contact_accumulation_dispatch,
     devices=devices,
 )
 add_function_test(
     TestSolverVBD,
-    "test_particle_contact_gather_capture_replays_device_count",
-    _particle_contact_gather_capture_replays_device_count,
-    devices=cuda_devices,
-)
-add_function_test(
-    TestSolverVBD,
-    "test_particle_contact_gather_solver_step_dispatch_and_capture",
-    _particle_contact_gather_solver_step_dispatch_and_capture,
-    devices=cuda_devices,
-)
-add_function_test(
-    TestSolverVBD,
-    "test_particle_contact_gather_order_pinned",
-    _particle_contact_gather_order_pinned,
+    "test_particle_contact_accumulation_matches_reference",
+    _particle_contact_accumulation_matches_reference,
     devices=devices,
 )
 add_function_test(
     TestSolverVBD,
-    "test_particle_contact_adjacency_follows_swapped_contacts",
-    _particle_contact_adjacency_follows_swapped_contacts,
+    "test_particle_contact_accumulation_capture_replays_device_count",
+    _particle_contact_accumulation_capture_replays_device_count,
     devices=cuda_devices,
 )
 add_function_test(
@@ -5464,11 +5235,10 @@ def _set_slot(arr, idx, value):
 
 def _run_face_section2(device, shape_margin):
     """Build a single soft-FACE contact, seed the shared AVBD per-contact material via
-    ``init_body_particle_contacts``, then run the production two-kernel sequence
-    (``build_particle_body_contact_adjacency_active`` + ``gather_particle_body_contact_force_and_hessian``)
+    ``init_body_particle_contacts``, then run production contact accumulation
     with the given ``shape_margin`` array. The geometry gives a 0.05 penetration along +z; returns
     ``(forces, hessians, ke, bary, (p0, p1, p2))`` where ``ke`` is the mixed effective stiffness
-    section 2 reads. All three vertices form one color group so one gather launch processes the
+    section 2 reads. All three vertices form one color group so one accumulation launch processes the
     whole triangle."""
     builder = newton.ModelBuilder()
     builder.add_shape_box(body=-1, xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), hx=1.0, hy=1.0, hz=1.0)
@@ -5529,39 +5299,23 @@ def _run_face_section2(device, shape_margin):
         device=device,
     )
 
-    # Launch the production gather kernel the way SolverVBD does: build the per-particle
-    # incidence lists over the active prefix, then gather one color group holding all three
-    # triangle vertices.
-    contact_head = wp.full(model.particle_count, -1, dtype=int, device=device)
-    contact_next = wp.empty(3 * smax, dtype=int, device=device)
+    # One contact thread distributes force and Hessian to all three colored vertices.
     wp.launch(
-        build_particle_body_contact_adjacency_active,
+        accumulate_particle_body_contact_force_and_hessian,
         dim=smax,
         inputs=[
+            0.01,  # dt
+            0,  # current color
+            state.particle_q,  # pos_anchor == pos -> no damping / friction
+            state.particle_q,
+            wp.zeros(model.particle_count, dtype=int, device=device),  # particle colors
+            1.0,  # friction_epsilon
+            False,  # legacy quadratic rigid-soft normal law
+            model.particle_radius,
             contacts.soft_contact_indices,
             contacts.soft_contact_count,
             smax,
-            contact_head,
-            contact_next,
-        ],
-        device=device,
-    )
-    color_group = wp.array([p0, p1, p2], dtype=wp.int32, device=device)
-    wp.launch(
-        gather_particle_body_contact_force_and_hessian,
-        dim=color_group.shape[0],
-        block_dim=_PARTICLE_CONTACT_GATHER_BLOCK_DIM,
-        inputs=[
-            0.01,  # dt
-            color_group,
-            state.particle_q,  # pos_anchor == pos -> no damping / friction
-            state.particle_q,
-            1.0,  # friction_epsilon
-            False,  # rigid_body_particle_contact_use_log_barrier
-            model.particle_radius,
-            contacts.soft_contact_indices,
-            contact_head,
-            contact_next,
+            wp.ones(smax, dtype=wp.int32, device=device),
             penalty_k,
             material_kd,
             material_mu,
@@ -5703,6 +5457,67 @@ def test_full_surface_rejected_for_vbd_proxy_particles(test, device):
         )
 
 
+def test_bvh_force_eligibility_uses_detection_pose(test, device):
+    """Classify a dense BVH row at collision detection, before rigid prediction.
+
+    A particle at x=0.195 lies 5 mm behind a box's +x face at x=0.2, so the
+    detection-time orientation test is ``dot(x_soft - x_rigid, n) = -0.005``
+    and the dense row must not produce penalty or ALM forces. During the same
+    solver step the box moves left by 5/60 m, putting that face near x=0.1167;
+    evaluating the stale row after prediction would instead give a positive
+    sign and incorrectly mark it force-eligible. The two sign assertions prove
+    that the setup crosses this boundary, while the final assertion verifies
+    that SolverVBD retains the collision-detection classification.
+    """
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(mass=1.0, inertia=inertia, lock_inertia=True)
+    builder.add_shape_mesh(body, mesh=newton.Mesh.create_box(0.2, 0.2, 0.1))
+    builder.add_particle(pos=wp.vec3(0.195, 0.0, 0.105), vel=wp.vec3(0.0), mass=0.1, radius=0.0)
+    builder.color()
+    model = builder.finalize(device=device)
+
+    # Remove physical contact response so only contact-row classification and
+    # the prescribed rigid forward motion affect this regression.
+    model.soft_contact_ke = 0.0
+    model.shape_material_ke.zero_()
+    model.shape_material_kd.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.01,
+        soft_contact_max=64,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(model, iterations=0, rigid_compliant_alm=False, collision_pipeline=pipeline)
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][:3] = [-5.0, 0.0, 0.0]
+    state_in.body_qd.assign(qd)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    # Select the dense row for the box's +x face. Its local rigid point is in
+    # the detection pose; applying state_out's translation reconstructs where
+    # that point lies after the rigid forward prediction.
+    count = min(int(solver.contacts.soft_contact_count.numpy()[0]), solver.contacts.soft_contact_max)
+    normals = solver.contacts.soft_contact_normal.numpy()[:count]
+    rows = np.flatnonzero(normals[:, 0] > 0.9)
+    test.assertGreater(len(rows), 0, "setup must emit the adjacent +x face row")
+    row = int(rows[0])
+    particle = state_out.particle_q.numpy()[0]
+    rigid_local = solver.contacts.soft_contact_body_pos.numpy()[row]
+    normal = normals[row]
+    detection_sign = float(np.dot(particle - rigid_local, normal))
+    predicted_translation = state_out.body_q.numpy()[body, :3]
+    predicted_sign = float(np.dot(particle - (rigid_local + predicted_translation), normal))
+
+    test.assertLess(detection_sign, 0.0, "the row must be force-ineligible when detected")
+    test.assertGreater(predicted_sign, 0.0, "rigid prediction must reverse the row's orientation")
+    test.assertEqual(int(solver.body_particle_contact_force_eligible.numpy()[row]), 0)
+
+
 class TestVBDFullSurfaceContact(unittest.TestCase):
     pass
 
@@ -5755,6 +5570,12 @@ add_function_test(
     test_full_surface_rejected_for_vbd_proxy_particles,
     devices=devices,
 )
+add_function_test(
+    TestVBDFullSurfaceContact,
+    "test_bvh_force_eligibility_uses_detection_pose",
+    test_bvh_force_eligibility_uses_detection_pose,
+    devices=devices,
+)
 
 
 # =====================================================================================
@@ -5772,7 +5593,6 @@ def _planar_truncation_probe(
     minimum_signed_distance: float,
     t_out: wp.array[float],
 ):
-    """Evaluate ``planar_truncation_t`` for batches of signed distances and normal displacements."""
     i = wp.tid()
     t_out[i] = planar_truncation_t(
         wp.vec3(0.0, 0.0, signed_distance[i]),
@@ -5879,7 +5699,6 @@ def test_planar_truncation_uses_endpoint_signs(test, device):
 
 @wp.kernel
 def _soft_self_dat_epsilon_probe(result: wp.array[float]):
-    """Build one VT and one EE soft-self plane and report band signed distances and truncations."""
     zero = wp.vec3(0.0)
 
     vertex = wp.vec3(0.0, 0.0, 8.0e-6)
@@ -6182,6 +6001,800 @@ def test_soft_self_dat_touching_pair_separates(test, device):
 
 
 @wp.kernel
+def _primitive_pair_separator_probe(
+    soft_indices: wp.vec3i,
+    soft: wp.array[wp.vec3],
+    rigid_indices: wp.vec3i,
+    rigid_mesh: wp.uint64,
+    rigid_scale: wp.vec3,
+    X_wr_ref: wp.transform,
+    collision_normal: wp.vec3,
+    delta_soft: float,
+    delta_rigid: float,
+    separation_eps: float,
+    valid_out: wp.array[wp.int32],
+    normal_out: wp.array[wp.vec3],
+    soft_support_out: wp.array[wp.vec3],
+    rigid_support_out: wp.array[wp.vec3],
+    plane_out: wp.array[wp.vec3],
+    gap_out: wp.array[float],
+    lambda_out: wp.array[float],
+    candidate_index_out: wp.array[wp.int32],
+):
+    valid, n, soft_support, rigid_support, gap, candidate_index = find_primitive_pair_separator(
+        soft_indices,
+        rigid_indices,
+        soft,
+        rigid_mesh,
+        rigid_scale,
+        X_wr_ref,
+        collision_normal,
+        separation_eps,
+    )
+    d = wp.vec3(0.0)
+    lmbd = float(0.0)
+    if valid:
+        d, lmbd = place_dat_division_plane(n, rigid_support, gap, delta_soft, delta_rigid, separation_eps)
+    valid_out[0] = wp.int32(valid)
+    normal_out[0] = n
+    soft_support_out[0] = soft_support
+    rigid_support_out[0] = rigid_support
+    plane_out[0] = d
+    gap_out[0] = gap
+    lambda_out[0] = lmbd
+    candidate_index_out[0] = candidate_index
+
+
+def _probe_primitive_pair_separator(
+    device,
+    soft,
+    rigid,
+    collision_normal,
+    delta_soft=0.0,
+    delta_rigid=0.0,
+    separation_eps=_RIGID_SOFT_DAT_TEST_EPS,
+    rigid_scale=(1.0, 1.0, 1.0),
+    X_wr_ref=None,
+):
+    soft = np.asarray(soft, dtype=np.float32)
+    rigid = np.asarray(rigid, dtype=np.float32)
+    if (len(soft), len(rigid)) not in ((1, 3), (3, 1), (2, 2)):
+        raise ValueError("Expected a VT, TV, or EE primitive pair")
+    soft_indices = wp.vec3i(*(list(range(len(soft))) + [-1] * (3 - len(soft))))
+    rigid_indices = wp.vec3i(*(list(range(len(rigid))) + [-1] * (3 - len(rigid))))
+    soft_padded = np.repeat(soft[:1], 3, axis=0)
+    rigid_padded = np.repeat(rigid[:1], 3, axis=0)
+    soft_padded[: len(soft)] = soft
+    rigid_padded[: len(rigid)] = rigid
+    rigid_mesh = wp.Mesh(
+        points=wp.array(rigid_padded, dtype=wp.vec3, device=device),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    if X_wr_ref is None:
+        X_wr_ref = wp.transform(wp.vec3(0.0), wp.quat_identity())
+    valid_out = wp.empty(1, dtype=wp.int32, device=device)
+    normal_out = wp.empty(1, dtype=wp.vec3, device=device)
+    soft_support_out = wp.empty(1, dtype=wp.vec3, device=device)
+    rigid_support_out = wp.empty(1, dtype=wp.vec3, device=device)
+    plane_out = wp.empty(1, dtype=wp.vec3, device=device)
+    gap_out = wp.empty(1, dtype=float, device=device)
+    lambda_out = wp.empty(1, dtype=float, device=device)
+    candidate_index_out = wp.empty(1, dtype=wp.int32, device=device)
+    wp.launch(
+        _primitive_pair_separator_probe,
+        dim=1,
+        inputs=[
+            soft_indices,
+            wp.array(soft_padded, dtype=wp.vec3, device=device),
+            rigid_indices,
+            rigid_mesh.id,
+            wp.vec3(*rigid_scale),
+            X_wr_ref,
+            wp.vec3(*collision_normal),
+            delta_soft,
+            delta_rigid,
+            separation_eps,
+        ],
+        outputs=[
+            valid_out,
+            normal_out,
+            soft_support_out,
+            rigid_support_out,
+            plane_out,
+            gap_out,
+            lambda_out,
+            candidate_index_out,
+        ],
+        device=device,
+    )
+    return {
+        "valid": bool(valid_out.numpy()[0]),
+        "normal": normal_out.numpy()[0],
+        "soft_support": soft_support_out.numpy()[0],
+        "rigid_support": rigid_support_out.numpy()[0],
+        "plane": plane_out.numpy()[0],
+        "gap": float(gap_out.numpy()[0]),
+        "lambda": float(lambda_out.numpy()[0]),
+        "candidate_index": int(candidate_index_out.numpy()[0]),
+    }
+
+
+def _check_primitive_pair_separator_regular_cases(test, device):
+    """Recomputed closest points produce the maximum-gap separator for regular pairs."""
+    cases = [
+        (
+            [[0.2, 0.2, 1.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]],
+            [[0.2, 0.2, 0.0]],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+        ),
+    ]
+    for soft, rigid, expected_n in cases:
+        result = _probe_primitive_pair_separator(
+            device,
+            soft,
+            rigid,
+            collision_normal=[1.0, 0.0, 0.0],
+            delta_soft=0.75,
+            delta_rigid=0.25,
+        )
+        test.assertTrue(result["valid"])
+        np.testing.assert_allclose(result["normal"], expected_n, atol=1.0e-6)
+        test.assertAlmostEqual(result["gap"], 1.0, places=6)
+        test.assertAlmostEqual(result["lambda"], 0.25, places=6)
+        soft_plane_values = (np.asarray(soft) - result["plane"]) @ result["normal"]
+        rigid_plane_values = (np.asarray(rigid) - result["plane"]) @ result["normal"]
+        test.assertGreaterEqual(float(np.min(soft_plane_values)), -1.0e-6)
+        test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-6)
+
+    # Verify that the same path reads a rigid mesh vertex, scales and
+    # transforms it to world space, and orients a TV result rigid-to-soft.
+    soft = np.array([[10.0, -1.0, 5.0], [12.0, -1.0, 5.0], [11.0, 0.0, 5.0]], dtype=np.float32)
+    transformed_tv = _probe_primitive_pair_separator(
+        device,
+        soft,
+        [[0.5, 0.5, 0.25]],
+        collision_normal=[0.0, 0.0, 1.0],
+        rigid_scale=(2.0, 3.0, 4.0),
+        X_wr_ref=wp.transform(wp.vec3(10.0, -2.0, 3.0), wp.quat_identity()),
+    )
+    test.assertTrue(transformed_tv["valid"])
+    np.testing.assert_allclose(transformed_tv["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    np.testing.assert_allclose(transformed_tv["soft_support"], soft[0], atol=1.0e-6)
+    np.testing.assert_allclose(transformed_tv["rigid_support"], [11.0, -0.5, 4.0], atol=1.0e-6)
+    test.assertAlmostEqual(transformed_tv["gap"], 1.0, places=6)
+    test.assertEqual(transformed_tv["candidate_index"], 0)
+
+
+def _check_primitive_pair_separator_numerical_cases(test, device):
+    """Check numerical boundary cases, failed separation, and captured regressions."""
+    # VT separation must remain valid as the point projection crosses a
+    # triangle edge.
+    triangle = [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    height = 1.0e-6
+    lateral = 1.0e-7
+    cases = [
+        ("inside", [0.0, lateral, height], [0.0, 0.0, 1.0], height),
+        ("on edge", [0.0, 0.0, height], [0.0, 0.0, 1.0], height),
+        (
+            "outside",
+            [0.0, -lateral, height],
+            np.array([0.0, -lateral, height]) / np.hypot(lateral, height),
+            np.hypot(lateral, height),
+        ),
+    ]
+    for label, point, expected_n, expected_gap in cases:
+        result = _probe_primitive_pair_separator(
+            device,
+            [point],
+            triangle,
+            collision_normal=[0.0, 0.0, 1.0],
+        )
+        test.assertTrue(result["valid"], label)
+        np.testing.assert_allclose(result["normal"], expected_n, atol=1.0e-6, err_msg=label)
+        test.assertAlmostEqual(result["gap"], expected_gap, places=10, msg=label)
+        soft_plane_value = float(np.dot(np.asarray(point) - result["plane"], result["normal"]))
+        rigid_plane_values = (np.asarray(triangle) - result["plane"]) @ result["normal"]
+        test.assertGreaterEqual(soft_plane_value, -1.0e-8, label)
+        test.assertLessEqual(float(np.max(rigid_plane_values)), 1.0e-8, label)
+
+    # Captured from the redetection regression. The point is 46 micrometers
+    # above the top edge of a vertical triangle. Recomputing the closest point
+    # from the indexed primitives must recover the complete-triangle separator.
+    captured_point = np.array([3.623332034408122e-08, 0.20000000298023224, 0.10004636645317078])
+    captured_triangle = np.array(
+        [[-0.2, 0.2, -0.1], [-0.2, 0.2, 0.1], [0.2, 0.2, 0.1]]
+    )
+    captured_rigid_closest = np.array(
+        [4.7683716530855236e-08, 0.20000000298023224, 0.10000000149011612]
+    )
+    captured_normal = captured_point - captured_rigid_closest
+    captured_normal /= np.linalg.norm(captured_normal)
+    captured_vt = _probe_primitive_pair_separator(
+        device,
+        [captured_point],
+        captured_triangle,
+        collision_normal=captured_normal,
+    )
+    test.assertTrue(captured_vt["valid"])
+    test.assertGreater(float(np.dot(captured_vt["normal"], [0.0, 0.0, 1.0])), 0.999999)
+    test.assertGreater(captured_vt["gap"], 2.0 * _RIGID_SOFT_DAT_TEST_EPS)
+
+    # The transposed TV family must construct the same closest-feature
+    # direction with the opposite assigned half-space.
+    captured_tv = _probe_primitive_pair_separator(
+        device,
+        captured_triangle,
+        [captured_point],
+        collision_normal=-captured_normal,
+    )
+    test.assertTrue(captured_tv["valid"])
+    test.assertGreater(float(np.dot(captured_tv["normal"], [0.0, 0.0, -1.0])), 0.999999)
+    test.assertGreater(captured_tv["gap"], 2.0 * _RIGID_SOFT_DAT_TEST_EPS)
+
+    # The raw closest-point distance here is about 41.5 micrometers, but a
+    # small tangential error in that direction leaves only 0.685 micrometers
+    # between the complete point and triangle supports. The direct-return test
+    # must use the certified support gap, then fall back to a feature axis.
+    narrow_support_point = captured_point.copy()
+    narrow_support_point[2] = 0.1 + 41.5e-6
+    narrow_support = _probe_primitive_pair_separator(
+        device,
+        [narrow_support_point],
+        captured_triangle,
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertTrue(narrow_support["valid"])
+    test.assertNotEqual(narrow_support["candidate_index"], 0)
+    np.testing.assert_allclose(narrow_support["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertGreater(narrow_support["gap"], 40.0e-6)
+
+    # Separator selection must use the effective epsilon supplied by its
+    # caller. With a small band, the certified closest axis is sufficient; a
+    # larger band must continue to the wider triangle-edge separator.
+    scaled_point = 16.0 * narrow_support_point
+    scaled_triangle = 16.0 * captured_triangle
+    small_band = _probe_primitive_pair_separator(
+        device,
+        [scaled_point],
+        scaled_triangle,
+        collision_normal=[0.0, 0.0, 1.0],
+        separation_eps=1.0e-6,
+    )
+    large_band = _probe_primitive_pair_separator(
+        device,
+        [scaled_point],
+        scaled_triangle,
+        collision_normal=[0.0, 0.0, 1.0],
+        separation_eps=1.0e-4,
+    )
+    for label, result, separation_eps in (
+        ("small band", small_band, 1.0e-6),
+        ("large band", large_band, 1.0e-4),
+    ):
+        test.assertTrue(result["valid"], label)
+        test.assertGreaterEqual(result["gap"], 2.0 * separation_eps, label)
+        test.assertGreater(float(np.dot(result["normal"], [0.0, 0.0, 1.0])), 0.999, label)
+    test.assertGreaterEqual(large_band["gap"], small_band["gap"])
+
+
+    # Positive nanogaps remain usable while zero-gap, intersecting, and
+    # collapsed pairs fail closed.
+    triangle = [[-0.01, -0.01, 0.0], [0.01, -0.01, 0.0], [0.0, 0.01, 0.0]]
+    stable = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 1.0e-7]],
+        triangle,
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertTrue(stable["valid"])
+    np.testing.assert_allclose(stable["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+
+    face_fallback = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 1.0e-7]],
+        triangle,
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(face_fallback["valid"])
+    np.testing.assert_allclose(face_fallback["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertGreater(face_fallback["gap"], 0.0)
+
+    short_face_fallback = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 1.0e-6]],
+        [[-5.0e-6, -5.0e-6, 0.0], [5.0e-6, -5.0e-6, 0.0], [0.0, 5.0e-6, 0.0]],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(short_face_fallback["valid"])
+    np.testing.assert_allclose(short_face_fallback["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertAlmostEqual(short_face_fallback["gap"], 1.0e-6, places=10)
+
+    touching_vt = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 0.0]],
+        triangle,
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertFalse(touching_vt["valid"])
+    test.assertAlmostEqual(touching_vt["gap"], 0.0, places=7)
+
+    coincident_ee = _probe_primitive_pair_separator(
+        device,
+        [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]],
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        collision_normal=[0.0, 0.0, 0.0],
+    )
+    test.assertFalse(coincident_ee["valid"])
+    test.assertAlmostEqual(coincident_ee["gap"], 0.0, places=7)
+
+    intersecting_ee = _probe_primitive_pair_separator(
+        device,
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        [[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertFalse(intersecting_ee["valid"])
+
+    collapsed = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        collision_normal=[0.0, 0.0, 0.0],
+    )
+    test.assertFalse(collapsed["valid"])
+
+
+    # EE feature normals recover separated skew and parallel pairs.
+    # Captured from the approaching-cloth regression. The closest point lies
+    # only about 4.6e-7 of the soft-edge length away from its endpoint. A
+    # general float32 edge-edge solve rounds that tiny interior parameter too
+    # aggressively, while projecting the rigid endpoint onto the soft edge
+    # recovers the approximately +z separator and its 9.2 micrometer gap.
+    near_endpoint_soft = [
+        [0.20000000298023224, 0.10000003129243851, 0.10002366453409195],
+        [0.20000000298023224, 0.20000004768371582, 0.10000923275947571],
+    ]
+    near_endpoint_rigid = [
+        [0.20000000298023224, 0.20000000298023224, -0.10000000149011612],
+        [0.20000000298023224, 0.20000000298023224, 0.10000000149011612],
+    ]
+    near_endpoint = _probe_primitive_pair_separator(
+        device,
+        near_endpoint_soft,
+        near_endpoint_rigid,
+        collision_normal=[0.0, 0.0016142, 0.999999],
+    )
+    test.assertTrue(near_endpoint["valid"])
+    # The coupled closest-point calculation loses the tiny interior parameter;
+    # projecting rigid endpoint A onto the soft edge recovers the separator.
+    test.assertEqual(near_endpoint["candidate_index"], 4)
+    test.assertGreater(float(np.dot(near_endpoint["normal"], [0.0, 0.0, 1.0])), 0.999999)
+    test.assertGreater(near_endpoint["gap"], 9.0e-6)
+
+    near_endpoint_swapped = _probe_primitive_pair_separator(
+        device,
+        near_endpoint_rigid,
+        near_endpoint_soft,
+        collision_normal=[0.0, -0.0016142, -0.999999],
+    )
+    test.assertTrue(near_endpoint_swapped["valid"])
+    # The symmetric edge-1 orthogonalization produces the widest certified gap
+    # after swapping the inputs, and the geometric result reverses cleanly.
+    test.assertEqual(near_endpoint_swapped["candidate_index"], 7)
+    test.assertGreater(float(np.dot(near_endpoint_swapped["normal"], -near_endpoint["normal"])), 0.999999)
+    test.assertAlmostEqual(near_endpoint_swapped["gap"], near_endpoint["gap"], places=7)
+
+    captured_soft = [
+        [0.362191170, -0.0216176156, 0.0115757957],
+        [0.349923998, -0.0210668258, 0.00879837759],
+    ]
+    captured_rigid = [
+        [0.344296515, -0.0221406277, 0.0326073393],
+        [0.356472254, -0.0213688165, 0.0102543645],
+    ]
+    expected_cross = np.cross(
+        np.asarray(captured_rigid[1]) - captured_rigid[0],
+        np.asarray(captured_soft[1]) - captured_soft[0],
+    )
+    expected_cross /= np.linalg.norm(expected_cross)
+    # A slight tangent perturbation of the feature normal also separates this
+    # captured pair. The exact feature direction must win because the closest
+    # candidate fails and feature candidates precede the collision normal.
+    collision_normal = expected_cross + np.array([5.0e-4, 0.0, 0.0])
+    collision_normal /= np.linalg.norm(collision_normal)
+    stable_gap = np.min(np.asarray(captured_soft) @ collision_normal) - np.max(
+        np.asarray(captured_rigid) @ collision_normal
+    )
+    test.assertGreater(stable_gap, 0.0)
+    captured = _probe_primitive_pair_separator(
+        device,
+        captured_soft,
+        captured_rigid,
+        collision_normal=collision_normal,
+    )
+    test.assertTrue(captured["valid"])
+    np.testing.assert_allclose(captured["normal"], expected_cross, atol=1.0e-6)
+    test.assertAlmostEqual(captured["gap"], 9.3565102e-6, places=10)
+
+    short_skew = _probe_primitive_pair_separator(
+        device,
+        [[-5.0e-6, 0.0, 1.0e-6], [5.0e-6, 0.0, 1.0e-6]],
+        [[0.0, -5.0e-6, 0.0], [0.0, 5.0e-6, 0.0]],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(short_skew["valid"])
+    np.testing.assert_allclose(short_skew["normal"], [0.0, 0.0, 1.0], atol=1.0e-6)
+    test.assertAlmostEqual(short_skew["gap"], 1.0e-6, places=10)
+
+    parallel = _probe_primitive_pair_separator(
+        device,
+        [[-1.0, 1.0e-6, 0.0], [1.0, 1.0e-6, 0.0]],
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        collision_normal=[1.0, 0.0, 0.0],
+    )
+    test.assertTrue(parallel["valid"])
+    np.testing.assert_allclose(parallel["normal"], [0.0, 1.0, 0.0], atol=1.0e-6)
+    test.assertAlmostEqual(parallel["gap"], 1.0e-6, places=10)
+
+
+def _check_primitive_pair_separator_candidate_provenance(test, device):
+    """Record which candidate wins representative VT/TV and EE configurations."""
+    # Candidate indices for VT/TV are: recomputed closest, face, AB, AC, BC,
+    # and collision-pipeline normal. Candidate zero is exercised at a large
+    # clear gap. The numerical fallback fixtures are scaled by exact powers of
+    # two so their geometry and FP32 rounding pattern are preserved while their
+    # gaps remain below the two-epsilon direct-return threshold.
+    face_fallback_scale = 1.0 / 128.0
+    vt_cases = [
+        (
+            0,
+            np.array([0.2, 0.2, 1.0]),
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            np.array([0.0, 0.0, 1.0]),
+        ),
+        (
+            1,
+            face_fallback_scale
+            * np.array([547.9113159179688, -122.23348236083984, 717.1705932617188]),
+            face_fallback_scale
+            * np.array(
+                [
+                    [547.8746337890625, -122.140380859375, 717.1693115234375],
+                    [547.933837890625, -122.26324462890625, 717.0872802734375],
+                    [547.9259033203125, -122.29670715332031, 717.2552490234375],
+                ]
+            ),
+            np.zeros(3),
+        ),
+    ]
+
+    # Permuting the captured near-edge triangle makes its same top edge occupy
+    # AB, AC, and BC, proving all three indexed edge candidates independently.
+    captured_point = np.array([3.623332034408122e-08, 0.20000000298023224, 0.10004636645317078])
+    captured_triangle = np.array(
+        [[-0.2, 0.2, -0.1], [-0.2, 0.2, 0.1], [0.2, 0.2, 0.1]]
+    )
+    captured_closest = np.array(
+        [4.7683716530855236e-08, 0.20000000298023224, 0.10000000149011612]
+    )
+    captured_normal = captured_point - captured_closest
+    captured_normal /= np.linalg.norm(captured_normal)
+    edge_fallback_scale = 1.0 / 64.0
+    for candidate_index, permutation in ((2, (1, 2, 0)), (3, (1, 0, 2)), (4, (0, 1, 2))):
+        vt_cases.append(
+            (
+                candidate_index,
+                edge_fallback_scale * captured_point,
+                edge_fallback_scale * captured_triangle[list(permutation)],
+                captured_normal,
+            )
+        )
+
+    pipeline_fallback_scale = 1.0 / 65536.0
+    vt_cases.append(
+        (
+            5,
+            pipeline_fallback_scale
+            * np.array([6859.2255859375, -2215.376953125, -564.0525512695312]),
+            pipeline_fallback_scale
+            * np.array(
+                [
+                    [6859.068359375, -2215.279052734375, -564.6334228515625],
+                    [6859.1865234375, -2215.46484375, -563.5595703125],
+                    [6858.01318359375, -2215.479736328125, -564.3081665039062],
+                ]
+            ),
+            np.array([0.9937951304372967, 0.04554049558062646, -0.10147562259669696]),
+        )
+    )
+
+    observed_vt = set()
+    observed_tv = set()
+    for expected_index, point, triangle, collision_normal in vt_cases:
+        vt = _probe_primitive_pair_separator(
+            device,
+            [point],
+            triangle,
+            collision_normal=collision_normal,
+        )
+        test.assertTrue(vt["valid"])
+        test.assertEqual(vt["candidate_index"], expected_index)
+        observed_vt.add(vt["candidate_index"])
+
+        tv = _probe_primitive_pair_separator(
+            device,
+            triangle,
+            [point],
+            collision_normal=-collision_normal,
+        )
+        test.assertTrue(tv["valid"])
+        test.assertEqual(tv["candidate_index"], expected_index)
+        observed_tv.add(tv["candidate_index"])
+
+    test.assertEqual(observed_vt, set(range(6)))
+    test.assertEqual(observed_tv, set(range(6)))
+
+    # EE candidates are: recomputed closest (0), edge cross product (1), the
+    # four endpoint-to-opposite-segment directions (2-5), the closest direction
+    # projected perpendicular to each edge (6-7), and the collision-pipeline
+    # normal (8). Use a deliberately large epsilon to evaluate every candidate
+    # rather than taking the closest-direction fast path.
+    near_endpoint_soft = [
+        [0.20000000298023224, 0.10000003129243851, 0.10002366453409195],
+        [0.20000000298023224, 0.20000004768371582, 0.10000923275947571],
+    ]
+    near_endpoint_rigid = [
+        [0.20000000298023224, 0.20000000298023224, -0.10000000149011612],
+        [0.20000000298023224, 0.20000000298023224, 0.10000000149011612],
+    ]
+    candidate_five_scale = 512.0
+    ee_cases = [
+        (
+            0,
+            [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+        ),
+        (
+            1,
+            [
+                [0.362191170, -0.0216176156, 0.0115757957],
+                [0.349923998, -0.0210668258, 0.00879837759],
+            ],
+            [
+                [0.344296515, -0.0221406277, 0.0326073393],
+                [0.356472254, -0.0213688165, 0.0102543645],
+            ],
+            [0.03294748, 0.99808204, 0.05240873],
+        ),
+        (
+            2,
+            [
+                [5.78677225112915, -0.5062270164489746, 9.97342300415039],
+                [6.229762554168701, -0.43003392219543457, 9.254591941833496],
+            ],
+            [
+                [5.912074089050293, -0.7273131608963013, 9.02728271484375],
+                [6.547467231750488, -0.13275112211704254, 9.481874465942383],
+            ],
+            [0.0, 0.0, 0.0],
+        ),
+        (
+            3,
+            [
+                [8.118160247802734, 9.147024154663086, 5.249176979064941],
+                [8.200159072875977, 9.105570793151855, 5.288864612579346],
+            ],
+            [
+                [8.143471717834473, 9.155776977539062, 5.206010818481445],
+                [8.092841148376465, 9.138275146484375, 5.292339324951172],
+            ],
+            [0.0, 0.0, 0.0],
+        ),
+        (
+            4,
+            near_endpoint_soft,
+            near_endpoint_rigid,
+            [0.0, 0.0016142, 0.999999],
+        ),
+        (
+            5,
+            candidate_five_scale
+            * np.array(
+                [
+                    [-3.945399761199951, 1.9375426769256592, 0.6255493760108948],
+                    [-4.003862380981445, 1.876218318939209, 0.7300822138786316],
+                ]
+            ),
+            candidate_five_scale
+            * np.array(
+                [
+                    [-3.9746310710906982, 1.906880497932434, 0.677815854549408],
+                    [-3.890192985534668, 1.95919930934906, 0.7557329535484314],
+                ]
+            ),
+            [0.0, 0.0, 0.0],
+        ),
+        (
+            6,
+            [
+                [0.07511226832866669, 0.6257380843162537, 0.23137839138507843],
+                [0.024136168882250786, 0.6058070659637451, 0.2765265703201294],
+            ],
+            [
+                [0.08582332730293274, 0.6299260854721069, 0.22189216315746307],
+                [0.03484739735722542, 0.609994649887085, 0.26704031229019165],
+            ],
+            [-0.691932201385498, 0.19522728025913239, -0.6950655579566956],
+        ),
+        (
+            7,
+            near_endpoint_rigid,
+            near_endpoint_soft,
+            [0.0, -0.0016142, -0.999999],
+        ),
+        (
+            8,
+            [
+                [-0.06112665310502052, -0.07107410579919815, -0.025363503023982048],
+                [-0.03286260738968849, 0.006155697163194418, -0.17437146604061127],
+            ],
+            [
+                [-0.06335166096687317, -0.07715090364217758, -0.01363344956189394],
+                [-0.03508760780096054, 7.889624976087362e-05, -0.16264140605926514],
+            ],
+            [0.0962277352809906, -0.8910560607910156, -0.4435756206512451],
+        ),
+    ]
+    observed_ee = set()
+    for expected_index, soft, rigid, collision_normal in ee_cases:
+        result = _probe_primitive_pair_separator(
+            device,
+            soft,
+            rigid,
+            collision_normal,
+            separation_eps=1.0,
+        )
+        test.assertTrue(result["valid"])
+        test.assertEqual(result["candidate_index"], expected_index)
+        observed_ee.add(result["candidate_index"])
+    test.assertEqual(observed_ee, set(range(9)))
+
+
+def test_dat_division_plane_reserves_epsilon_band(test, device):
+    """Reserve at least 5% and epsilon per side, or half of a gap smaller than two epsilon."""
+    soft = [[0.0, 0.0, 1.0]]
+    rigid = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    expected = [
+        (1.0, 0.0, 0.05, 0.05),
+        (0.0, 1.0, 0.95, 0.95),
+        (0.0, 0.0, 0.5, 0.5),
+    ]
+    for delta_soft, delta_rigid, expected_lambda, expected_z in expected:
+        result = _probe_primitive_pair_separator(
+            device,
+            soft,
+            rigid,
+            collision_normal=[0.0, 0.0, 1.0],
+            delta_soft=delta_soft,
+            delta_rigid=delta_rigid,
+        )
+        test.assertAlmostEqual(result["lambda"], expected_lambda, delta=5.0e-8)
+        test.assertAlmostEqual(float(result["plane"][2]), expected_z, delta=5.0e-8)
+
+    short_gap = 1.5 * _RIGID_SOFT_DAT_TEST_EPS
+    result = _probe_primitive_pair_separator(
+        device,
+        [[0.0, 0.0, short_gap]],
+        rigid,
+        collision_normal=[0.0, 0.0, 1.0],
+        delta_soft=1.0,
+        delta_rigid=0.0,
+    )
+    test.assertAlmostEqual(result["lambda"], 0.5, delta=1.0e-6)
+    test.assertAlmostEqual(float(result["plane"][2]), 0.5 * short_gap, delta=1.0e-9)
+
+    # At this coordinate, one float32 ULP is much larger than one micrometer.
+    # The scale-aware epsilon clamp must produce a representable interior
+    # point instead of rounding the plane onto the rigid support.
+    origin = 1000.0
+    large_world_gap = 1.0e-3
+    large_world_eps = max(
+        _RIGID_SOFT_DAT_TEST_EPS,
+        4.0 * np.finfo(np.float32).eps * origin,
+    )
+    result = _probe_primitive_pair_separator(
+        device,
+        [[origin, origin, origin + large_world_gap]],
+        [
+            [origin - 0.1, origin - 0.1, origin],
+            [origin + 0.1, origin - 0.1, origin],
+            [origin, origin + 0.1, origin],
+        ],
+        collision_normal=[0.0, 0.0, 1.0],
+        delta_soft=1.0,
+        delta_rigid=0.0,
+        separation_eps=large_world_eps,
+    )
+    represented_rigid_margin = float(result["plane"][2]) - origin
+    represented_soft_margin = float(np.float32(origin + large_world_gap)) - float(result["plane"][2])
+    test.assertGreaterEqual(represented_rigid_margin, 0.95 * large_world_eps)
+    test.assertGreaterEqual(represented_soft_margin, 0.95 * large_world_eps)
+
+    adjacent_soft = float(np.nextafter(np.float32(origin), np.float32(np.inf)))
+    adjacent_gap = adjacent_soft - origin
+    result = _probe_primitive_pair_separator(
+        device,
+        [[origin, origin, adjacent_soft]],
+        [
+            [origin - 0.1, origin - 0.1, origin],
+            [origin + 0.1, origin - 0.1, origin],
+            [origin, origin + 0.1, origin],
+        ],
+        collision_normal=[0.0, 0.0, 1.0],
+        delta_soft=1.0,
+        delta_rigid=0.0,
+        separation_eps=large_world_eps,
+    )
+    test.assertLess(adjacent_gap, 2.0 * large_world_eps)
+    test.assertAlmostEqual(result["lambda"], 0.5, delta=1.0e-6)
+
+    # This is the smallest positive representable gap at x=1000. It lies well
+    # inside the effective two-sided band, so motion toward the rigid support
+    # must be halted rather than consuming the remaining adjacent-float gap.
+    t_out = wp.empty(1, dtype=float, device=device)
+    wp.launch(
+        _planar_truncation_probe,
+        dim=1,
+        inputs=[
+            wp.array([adjacent_gap], dtype=float, device=device),
+            wp.array([-adjacent_gap], dtype=float, device=device),
+            0.85,
+            result["lambda"] * result["gap"] + large_world_eps,
+        ],
+        outputs=[t_out],
+        device=device,
+    )
+    test.assertEqual(float(t_out.numpy()[0]), 0.0)
+
+
+def _check_primitive_pair_separator_large_world_coordinates(test, device):
+    """Relative support projections preserve a millimeter gap far from the origin."""
+    origin = 1000.0
+    result = _probe_primitive_pair_separator(
+        device,
+        [[origin, origin, origin + 1.0e-3]],
+        [[origin - 0.1, origin - 0.1, origin], [origin + 0.1, origin - 0.1, origin], [origin, origin + 0.1, origin]],
+        collision_normal=[0.0, 0.0, 1.0],
+    )
+    test.assertTrue(result["valid"])
+    test.assertGreater(result["gap"], 9.0e-4)
+
+
+def test_primitive_pair_separator_cases(test, device):
+    """Validate separator geometry, fallbacks, degeneracy, and every winner index."""
+    sections = (
+        ("regular geometry", _check_primitive_pair_separator_regular_cases),
+        ("numerical and degenerate geometry", _check_primitive_pair_separator_numerical_cases),
+        ("candidate provenance", _check_primitive_pair_separator_candidate_provenance),
+        ("large world coordinates", _check_primitive_pair_separator_large_world_coordinates),
+    )
+    for section, check in sections:
+        with test.subTest(section=section):
+            check(test, device)
+
+
+@wp.kernel
 def _rigid_trajectory_truncation_probe(
     n: wp.vec3,
     d: wp.vec3,
@@ -6195,7 +6808,6 @@ def _rigid_trajectory_truncation_probe(
     trajectory_samples: int,
     t_out: wp.array[float],
 ):
-    """Evaluate ``rigid_trajectory_truncation_t`` for one rigid trajectory against one plane."""
     t_out[0] = rigid_trajectory_truncation_t(
         n, d, c0, dx, axis, angle, offset0, gamma_r, 1.0e-3, use_interval_arithmetic, trajectory_samples
     )
@@ -6211,12 +6823,10 @@ def _rigid_point_trajectory_probe(
     offset0: wp.vec3,
     point_out: wp.array[wp.vec3],
 ):
-    """Evaluate ``rigid_point_trajectory`` at one interpolation parameter."""
     point_out[0] = rigid_point_trajectory(t, c0, dx, axis, angle, offset0)
 
 
 def _probe_rigid_point_trajectory(device, t, c0, dx, axis, angle, offset0):
-    """Launch ``_rigid_point_trajectory_probe`` on ``device`` and return the trajectory point."""
     point_out = wp.empty(1, dtype=wp.vec3, device=device)
     wp.launch(
         _rigid_point_trajectory_probe,
@@ -6241,7 +6851,6 @@ def _probe_trajectory_truncation(
     use_interval_arithmetic=False,
     trajectory_samples=8,
 ):
-    """Launch ``_rigid_trajectory_truncation_probe`` on ``device`` and return the truncation scalar."""
     t_out = wp.zeros(1, dtype=float, device=device)
     wp.launch(
         _rigid_trajectory_truncation_probe,
@@ -6464,6 +7073,556 @@ def test_rigid_dat_interval_catches_quarter_circle_tangent_peak(test, device):
     test.assertLess(odd_interval_t, 0.5)
 
 
+def _run_bvh_dat_rotating_mesh(device, enable_dat, use_interval_arithmetic=False):
+    """Rotate a long rigid mesh bar through a fixed soft vertex and inspect the active VT plane."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    particle = np.array([0.7, 0.3, 0.0])
+    builder.add_particle(pos=wp.vec3(*particle), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), mass=1.0, inertia=inertia, lock_inertia=True
+    )
+    box_mesh = newton.Mesh.create_box(1.0, 0.05, 0.05)
+    builder.add_shape_mesh(body, mesh=box_mesh)
+    builder.color()
+    model = builder.finalize(device=device)
+    # Disable the physical contact response so this regression isolates DAT's
+    # curved-trajectory truncation from the penalty solver.
+    model.soft_contact_ke = 0.0
+    model.shape_material_ke.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.3,
+        soft_contact_max=32,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
+    )
+    probe_contacts = pipeline.contacts()
+    probe_state = model.state()
+    pipeline.collide(probe_state, probe_contacts)
+    probe_count = min(int(probe_contacts.soft_contact_count.numpy()[0]), probe_contacts.soft_contact_max)
+    probe_soft_indices = probe_contacts.soft_contact_indices.numpy()[:probe_count]
+    probe_rigid_indices = probe_contacts.soft_contact_rigid_indices.numpy()[:probe_count]
+    probe_body_pos = probe_contacts.soft_contact_body_pos.numpy()[:probe_count]
+    vt_rows = np.flatnonzero((probe_soft_indices[:, 0] == 0) & (probe_soft_indices[:, 1] < 0))
+    if len(vt_rows) == 0:
+        raise AssertionError("rotation setup emitted no VT pair")
+    pair_normals = particle[None, :] - probe_body_pos[vt_rows]
+    pair_normals /= np.linalg.norm(pair_normals, axis=1)[:, None]
+    row = int(vt_rows[np.argmax(pair_normals[:, 1])])
+    dat_normal = particle - probe_body_pos[row]
+    pair_gap = np.linalg.norm(dat_normal)
+    dat_normal /= pair_gap
+    # The soft vertex is fixed and the rigid triangle approaches, so the raw
+    # adaptive fraction is one. Epsilon-aware placement backs the plane away
+    # from the soft support by one clearance width.
+    plane_point = probe_body_pos[row] + (pair_gap - _RIGID_SOFT_DAT_TEST_EPS) * dat_normal
+    rigid_slots = probe_rigid_indices[row]
+    mesh_indices = np.asarray(box_mesh.indices, dtype=np.int32).reshape(-1)
+    mesh_vertices = np.asarray(box_mesh.vertices, dtype=np.float64)
+    rigid_vertices_local = mesh_vertices[mesh_indices[rigid_slots]]
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=0,
+        rigid_compliant_alm=False,
+        rigid_enable_penetration_free=enable_dat,
+        rigid_dat_use_interval_arithmetic=use_interval_arithmetic,
+        collision_pipeline=pipeline,
+    )
+    state_in, state_out = model.state(), model.state()
+    qd = state_in.body_qd.numpy()
+    qd[body][3:] = [0.0, 0.0, 30.0]
+    state_in.body_qd.assign(qd)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    wp.synchronize_device(wp.get_device(device))
+
+    pose = state_out.body_q.numpy()[body]
+    qx, qy, qz, qw = pose[3:]
+    yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    relative = particle - pose[:3]
+    particle_local_y = -np.sin(yaw) * relative[0] + np.cos(yaw) * relative[1]
+
+    q_vec = pose[3:6]
+    q_w = pose[6]
+    rotated_vertices = []
+    for vertex in rigid_vertices_local:
+        twice_cross = 2.0 * np.cross(q_vec, vertex)
+        rotated_vertices.append(vertex + q_w * twice_cross + np.cross(q_vec, twice_cross) + pose[:3])
+    rigid_plane_gaps = np.asarray(rotated_vertices) @ dat_normal - np.dot(plane_point, dat_normal)
+    return {
+        "particle_local_y": float(particle_local_y),
+        "rigid_vertex_plane_gaps": rigid_plane_gaps,
+        "soft_plane_gap": float(np.dot(dat_normal, particle - plane_point)),
+    }
+
+
+def test_bvh_dat_exact_rigid_triangle_truncates_rotation(test, device):
+    """Exact rigid triangle vertices stop rotational crossing, not only translation."""
+    dat = _run_bvh_dat_rotating_mesh(device, enable_dat=True)
+    dat_interval = _run_bvh_dat_rotating_mesh(device, enable_dat=True, use_interval_arithmetic=True)
+    control = _run_bvh_dat_rotating_mesh(device, enable_dat=False)
+    for result in (dat, dat_interval):
+        test.assertGreaterEqual(
+            result["particle_local_y"], 0.05 - 1.0e-4, "DAT must keep the vertex above the rotating bar"
+        )
+        test.assertGreaterEqual(result["soft_plane_gap"], 0.75 * _RIGID_SOFT_DAT_TEST_EPS)
+        test.assertTrue(
+            np.all(result["rigid_vertex_plane_gaps"] <= -0.75 * _RIGID_SOFT_DAT_TEST_EPS),
+            "every selected rigid-triangle vertex must remain beyond the negative epsilon boundary",
+        )
+    test.assertLess(control["particle_local_y"], 0.05 - 1.0e-3, "control must enter or cross the rotating bar")
+
+
+def test_rigid_phase_applies_joint_dat_truncation(test, device):
+    """A rigid-phase adaptive plane immediately truncates both sides of its BVH VT row."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0), mass=1.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform_identity(),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    rigid_mesh = newton.Mesh(
+        np.array([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        np.array([0, 1, 2], dtype=np.int32),
+        compute_inertia=False,
+    )
+    builder.add_shape_mesh(body, mesh=rigid_mesh)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=2.0,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        rigid_compliant_alm=False,
+        collision_pipeline=pipeline,
+        rigid_enable_penetration_free=True,
+    )
+    state = model.state()
+    pipeline.collide(state, solver.contacts)
+    test.assertEqual(int(solver.contacts.soft_contact_count.numpy()[0]), 1)
+    np.testing.assert_array_equal(solver.contacts.soft_contact_indices.numpy()[0], [0, -1, -1])
+    np.testing.assert_array_equal(solver.contacts.soft_contact_rigid_indices.numpy()[0], [0, 1, 2])
+    solver._reset_dat_references(state, reset_rigid_soft=True, reset_particles=True)
+
+    # From a unit reference gap, let both sides propose 0.8 m of approach. The
+    # adaptive plane lies halfway between the references, so accepting only one
+    # factor would leave the other primitive on the wrong side of that plane.
+    solver.particle_displacements.assign(np.array([[0.0, 0.0, -0.8]], dtype=np.float32))
+    particle_q = state.particle_q.numpy()
+    particle_q[0] = [0.0, 0.0, 0.2]
+    state.particle_q.assign(particle_q)
+    body_q = state.body_q.numpy()
+    body_q[body, :3] = [0.0, 0.0, 0.8]
+    state.body_q.assign(body_q)
+
+    solver._rigid_penetration_free_truncation(state, solver.contacts)
+
+    particle_z = float(state.particle_q.numpy()[0, 2])
+    rigid_z = float(state.body_q.numpy()[body, 2])
+    test.assertLess(float(solver.truncation_ts.numpy()[0]), 1.0)
+    test.assertLess(float(solver.body_truncation_ts.numpy()[body]), 1.0)
+    test.assertGreater(particle_z, 0.2, "the rigid phase must apply the soft truncation factor")
+    test.assertLess(rigid_z, 0.8, "the rigid phase must apply the rigid truncation factor")
+    test.assertGreaterEqual(
+        particle_z - rigid_z,
+        1.9 * _RIGID_SOFT_DAT_TEST_EPS,
+        "both accepted primitives must remain outside the epsilon band",
+    )
+    np.testing.assert_allclose(
+        state.particle_q.numpy(),
+        solver.pos_prev_collision_detection.numpy() + solver.particle_displacements.numpy(),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+
+
+def _run_vt_dat_row(
+    device,
+    particle_z,
+    stored_normal,
+    displacement_z,
+    moving_body=False,
+    body_displacement_z=1.0e-3,
+    world_origin=0.0,
+):
+    """Apply one dense VT DAT row and return its particle and body factors."""
+    rigid_mesh = wp.Mesh(
+        points=wp.array(
+            [[-0.01, -0.01, 0.0], [0.01, -0.01, 0.0], [0.0, 0.01, 0.0]],
+            dtype=wp.vec3,
+            device=device,
+        ),
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+    truncation_ts = wp.ones(1, dtype=float, device=device)
+    body_truncation_ts = (
+        wp.ones(1, dtype=float, device=device) if moving_body else wp.empty(0, dtype=float, device=device)
+    )
+    origin_transform = wp.transform(wp.vec3(world_origin), wp.quat_identity())
+    body_q_ref = (
+        wp.array([origin_transform], dtype=wp.transform, device=device)
+        if moving_body
+        else wp.empty(0, dtype=wp.transform, device=device)
+    )
+    body_q = (
+        wp.array(
+            [wp.transform(wp.vec3(world_origin, world_origin, world_origin + body_displacement_z), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        )
+        if moving_body
+        else wp.empty(0, dtype=wp.transform, device=device)
+    )
+    wp.launch(
+        apply_rigid_soft_truncation,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([[0, -1, -1]], dtype=wp.vec3i, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([stored_normal], dtype=wp.vec3, device=device),
+            wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+            wp.array([[0, 1, 2]], dtype=wp.vec3i, device=device),
+            wp.array([0 if moving_body else -1], dtype=wp.int32, device=device),
+            wp.array(
+                [wp.transform_identity() if moving_body else origin_transform],
+                dtype=wp.transform,
+                device=device,
+            ),
+            wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
+            wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+            wp.array(
+                [[world_origin, world_origin, world_origin + particle_z]],
+                dtype=wp.vec3,
+                device=device,
+            ),
+            wp.array([[0.0, 0.0, displacement_z]], dtype=wp.vec3, device=device),
+            body_q_ref,
+            body_q,
+            wp.zeros(1, dtype=wp.vec3, device=device) if moving_body else wp.empty(0, dtype=wp.vec3, device=device),
+            0.85,
+            False,
+        ],
+        outputs=[truncation_ts, body_truncation_ts],
+        device=device,
+    )
+    body_t = float(body_truncation_ts.numpy()[0]) if moving_body else 1.0
+    return float(truncation_ts.numpy()[0]), body_t
+
+
+@wp.kernel
+def _complete_pair_epsilon_endpoint_probe(
+    soft: wp.array[wp.vec3],
+    soft_count: int,
+    rigid: wp.array[wp.vec3],
+    rigid_count: int,
+    soft_displacement: wp.vec3,
+    rigid_displacement: wp.vec3,
+    n: wp.vec3,
+    d: wp.vec3,
+    eps: float,
+    soft_t: wp.array[float],
+    rigid_t: wp.array[float],
+):
+    i = wp.tid()
+    if i < soft_count:
+        soft_t[i] = planar_truncation_t(
+            soft[i],
+            soft_displacement,
+            n,
+            d,
+            0.85,
+            eps,
+        )
+    if i < rigid_count:
+        rigid_t[i] = rigid_trajectory_truncation_t(
+            n,
+            d,
+            wp.vec3(0.0),
+            rigid_displacement,
+            wp.vec3(0.0),
+            0.0,
+            rigid[i],
+            0.85,
+            1.0e-3,
+            True,
+            8,
+            -eps,
+        )
+
+
+def _probe_complete_pair_epsilon_endpoints(
+    device,
+    soft,
+    rigid,
+    collision_normal,
+    soft_displacement,
+    rigid_displacement,
+):
+    soft = np.asarray(soft, dtype=np.float32)
+    rigid = np.asarray(rigid, dtype=np.float32)
+    soft_displacement = np.asarray(soft_displacement, dtype=np.float32)
+    rigid_displacement = np.asarray(rigid_displacement, dtype=np.float32)
+    result = _probe_primitive_pair_separator(
+        device,
+        soft,
+        rigid,
+        collision_normal,
+        delta_soft=float(np.linalg.norm(soft_displacement)),
+        delta_rigid=float(np.linalg.norm(rigid_displacement)),
+    )
+    test_count = max(len(soft), len(rigid))
+    soft_t = wp.ones(len(soft), dtype=float, device=device)
+    rigid_t = wp.ones(len(rigid), dtype=float, device=device)
+    wp.launch(
+        _complete_pair_epsilon_endpoint_probe,
+        dim=test_count,
+        inputs=[
+            wp.array(soft, dtype=wp.vec3, device=device),
+            len(soft),
+            wp.array(rigid, dtype=wp.vec3, device=device),
+            len(rigid),
+            wp.vec3(*soft_displacement),
+            wp.vec3(*rigid_displacement),
+            wp.vec3(*result["normal"]),
+            wp.vec3(*result["plane"]),
+            _RIGID_SOFT_DAT_TEST_EPS,
+        ],
+        outputs=[soft_t, rigid_t],
+        device=device,
+    )
+    soft_factors = soft_t.numpy()
+    rigid_factor = float(np.min(rigid_t.numpy()))
+    soft_end = soft + soft_factors[:, None] * soft_displacement
+    rigid_end = rigid + rigid_factor * rigid_displacement
+    normal = np.asarray(result["normal"], dtype=np.float64)
+    plane = np.asarray(result["plane"], dtype=np.float64)
+    soft_margin = float(np.min((soft_end - plane) @ normal))
+    rigid_margin = float(-np.max((rigid_end - plane) @ normal))
+    return soft_margin, rigid_margin
+
+
+def test_bvh_dat_truncation_maintains_epsilon_band(test, device):
+    """Truncation preserves two epsilon of pair gap and never worsens a short-gap start."""
+    eps = _RIGID_SOFT_DAT_TEST_EPS
+
+    soft_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=10.0 * eps,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-20.0 * eps,
+    )
+    soft_pair_gap = 10.0 * eps + soft_t * (-20.0 * eps)
+    test.assertGreaterEqual(soft_pair_gap, 1.8 * eps)
+
+    _, body_t = _run_vt_dat_row(
+        device,
+        particle_z=10.0 * eps,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=20.0 * eps,
+    )
+    rigid_pair_gap = 10.0 * eps - body_t * (20.0 * eps)
+    test.assertGreaterEqual(rigid_pair_gap, 1.8 * eps)
+
+    short_gap = 1.5 * eps
+    soft_worsening_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-eps,
+    )
+    soft_recovery_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=eps,
+    )
+    test.assertEqual(soft_worsening_t, 0.0)
+    test.assertEqual(soft_recovery_t, 1.0)
+
+    _, rigid_worsening_t = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=eps,
+    )
+    _, rigid_recovery_t = _run_vt_dat_row(
+        device,
+        particle_z=short_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=0.0,
+        moving_body=True,
+        body_displacement_z=-eps,
+    )
+    test.assertEqual(rigid_worsening_t, 0.0)
+    test.assertEqual(rigid_recovery_t, 1.0)
+
+    # Exercise the production kernel's coordinate-scale accumulation and
+    # anchor-plus-scalar thresholds, rather than only the placement helper.
+    large_origin = 1000.0
+    large_eps = max(eps, 4.0 * np.finfo(np.float32).eps * large_origin)
+    adjacent_gap = float(np.nextafter(np.float32(large_origin), np.float32(np.inf))) - large_origin
+    adjacent_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=adjacent_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-adjacent_gap,
+        world_origin=large_origin,
+    )
+    test.assertLess(adjacent_gap, 2.0 * large_eps)
+    test.assertEqual(adjacent_t, 0.0)
+
+    represented_gap = float(np.float32(large_origin + 1.0e-3)) - large_origin
+    large_displacement = -2.0e-3
+    large_t, _ = _run_vt_dat_row(
+        device,
+        particle_z=represented_gap,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=large_displacement,
+        world_origin=large_origin,
+    )
+    accepted_gap = represented_gap + large_t * large_displacement
+    test.assertGreaterEqual(accepted_gap, 1.95 * large_eps)
+
+    complete_pair_cases = [
+        (
+            "TV",
+            [[-0.01, -0.01, 10.0 * eps], [0.01, -0.01, 10.0 * eps], [0.0, 0.01, 10.0 * eps]],
+            [[0.0, 0.0, 0.0]],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -20.0 * eps],
+            [0.0, 0.0, 0.0],
+        ),
+        (
+            "EE",
+            [[-0.01, 10.0 * eps, 0.0], [0.01, 10.0 * eps, 0.0]],
+            [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0]],
+            [0.0, 1.0, 0.0],
+            [0.0, -20.0 * eps, 0.0],
+            [0.0, 0.0, 0.0],
+        ),
+    ]
+    for pair_type, soft, rigid, collision_normal, soft_displacement, rigid_displacement in complete_pair_cases:
+        with test.subTest(pair_type=pair_type):
+            soft_margin, rigid_margin = _probe_complete_pair_epsilon_endpoints(
+                device,
+                soft,
+                rigid,
+                collision_normal,
+                soft_displacement,
+                rigid_displacement,
+            )
+            test.assertGreaterEqual(soft_margin, 0.95 * eps)
+            test.assertGreaterEqual(rigid_margin, 0.95 * eps)
+
+
+def test_bvh_dat_nanometer_vt_gap_truncates(test, device):
+    """A nanometer-gap VT row truncates against its certified closest-pair separator."""
+    truncation_t, _body_t = _run_vt_dat_row(
+        device,
+        particle_z=1.0e-7,
+        stored_normal=[0.0, 0.0, 1.0],
+        displacement_z=-1.0e-4,
+    )
+    test.assertLess(truncation_t, 1.0, "the particle trajectory crosses the certified face plane")
+
+
+def test_bvh_dat_zero_gap_vt_fails_closed(test, device):
+    """A zero-gap VT row reports separator failure and freezes both sides."""
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        truncation_t, body_t = _run_vt_dat_row(
+            device,
+            particle_z=0.0,
+            stored_normal=[1.0, 0.0, 0.0],
+            displacement_z=-1.0e-4,
+            moving_body=True,
+        )
+        wp.synchronize_device(wp.get_device(device))
+    finally:
+        output = capture.end()
+    test.assertIn("Rigid-soft DAT found no separating normal for BVH row 0", output)
+    test.assertEqual(truncation_t, 0.0)
+    test.assertEqual(body_t, 0.0)
+
+
+def test_bvh_dat_uses_geometric_separator_for_back_facing_ee(test, device):
+    """A separated back-facing EE row uses its valid geometric separator.
+
+    DAT requires assigned primitive sides, not agreement with the rigid surface
+    normal used by the force law. Motion away from the geometric plane remains
+    unconstrained even when that plane's normal is back-facing.
+    """
+    pair_delta = np.array([0.001338402, 0.014236988, -0.002109018], dtype=np.float32)
+    force_normal = np.array([-0.876487, 0.001508, -0.481423], dtype=np.float32)
+    force_normal /= np.linalg.norm(force_normal)
+    dat_normal = pair_delta / np.linalg.norm(pair_delta)
+    rigid_points = wp.array([[0.0, 0.0, 0.0], [0.0, 0.002, 0.0], [0.001, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    rigid_mesh = wp.Mesh(
+        points=rigid_points,
+        indices=wp.array([0, 1, 2], dtype=wp.int32, device=device),
+    )
+
+    test.assertLess(float(np.dot(pair_delta, force_normal)), 0.0)
+    def apply_with_displacement(displacement):
+        truncation_ts = wp.ones(2, dtype=float, device=device)
+        wp.launch(
+            apply_rigid_soft_truncation,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                wp.array([[0, 1, -1]], dtype=wp.vec3i, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+                wp.array([force_normal], dtype=wp.vec3, device=device),
+                wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3, device=device),
+                wp.array([[0, 1, -1]], dtype=wp.vec3i, device=device),
+                wp.array([-1], dtype=wp.int32, device=device),
+                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device),
+                wp.array([rigid_mesh.id], dtype=wp.uint64, device=device),
+                wp.array([pair_delta, pair_delta + np.array([0.0, 0.002, 0.0])], dtype=wp.vec3, device=device),
+                wp.array([displacement, displacement], dtype=wp.vec3, device=device),
+                wp.empty(0, dtype=wp.transform, device=device),
+                wp.empty(0, dtype=wp.transform, device=device),
+                wp.empty(0, dtype=wp.vec3, device=device),
+                0.85,
+                False,
+            ],
+            outputs=[truncation_ts, wp.empty(0, dtype=float, device=device)],
+            device=device,
+        )
+        return truncation_ts.numpy()
+
+    away_displacement = 1.0e-3 * dat_normal
+    test.assertLess(float(np.dot(force_normal, away_displacement)), 0.0)
+    test.assertTrue(
+        np.array_equal(apply_with_displacement(away_displacement), np.ones(2, dtype=np.float32)),
+        "motion away from the certified geometric separator must remain unconstrained",
+    )
+    toward_displacement = -2.0 * pair_delta
+    test.assertTrue(
+        np.all(apply_with_displacement(toward_displacement) < 1.0),
+        "motion crossing the back-facing geometric separator must be truncated",
+    )
+
+
 def _build_sphere_drop_on_cloth(device):
     """A heavy rigid sphere shot at a pinned cloth grid: a stress scene where penalty
     forces alone cannot prevent penetration within a step."""
@@ -6505,14 +7664,13 @@ def _build_sphere_drop_on_cloth(device):
 
 
 def _run_sphere_drop(device, enable_dat, drop_speed=8.0, frames=60):
-    """Drop a rigid sphere onto pinned cloth and return the worst penetration and the final sphere height."""
     model, body = _build_sphere_drop_on_cloth(device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.1)
     solver = newton.solvers.SolverVBD(
         model,
         iterations=4,
         rigid_compliant_alm=True,
-        rigid_soft_enable_dat=enable_dat,
+        rigid_enable_penetration_free=enable_dat,
         rigid_body_particle_contact_buffer_size=1024,
         collision_pipeline=pipeline,
     )
@@ -6553,74 +7711,12 @@ def test_rigid_dat_sphere_drop_penetration_free(test, device):
     )
 
 
-def test_rigid_dat_graph_capture_replays_match_eager(test, device):
-    """A captured DAT step replays penetration-free and tracks the eager run.
-
-    DAT adds per-step launches, device-side reference resets and schedule-dependent
-    host branching; all of it must be capturable. Two identical sphere-drop scenes are
-    warmed up eagerly, then one keeps stepping eagerly while the other replays a graph
-    of the same two-substep sequence. The solver is not run-to-run deterministic
-    (contact ordering; two eager runs differ by ~1e-3 m on this scene), so the replay
-    must stay finite and penetration-free and agree with the eager run within an
-    envelope well above that spread, instead of bit for bit.
-    """
-
-    def make_scene():
-        model, body = _build_sphere_drop_on_cloth(device)
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.1)
-        solver = newton.solvers.SolverVBD(
-            model,
-            iterations=4,
-            rigid_compliant_alm=True,
-            rigid_soft_enable_dat=True,
-            rigid_body_particle_contact_buffer_size=1024,
-            collision_pipeline=pipeline,
-        )
-        state_a, state_b = model.state(), model.state()
-        qd = state_a.body_qd.numpy()
-        qd[body][:3] = [0.0, 0.0, -8.0]
-        state_a.body_qd.assign(qd)
-        return solver, state_a, state_b, body
-
-    dt = 1.0 / 60.0
-    frames = 20
-    eager_solver, e0, e1, body = make_scene()
-    graph_solver, g0, g1, _ = make_scene()
-    for solver, s0, s1 in ((eager_solver, e0, e1), (graph_solver, g0, g1)):
-        solver.step(s0, s1, None, None, dt)
-        solver.step(s1, s0, None, None, dt)
-
-    gc.collect()
-    with wp.ScopedCapture(device=device) as capture:
-        graph_solver.step(g0, g1, None, None, dt)
-        graph_solver.step(g1, g0, None, None, dt)
-    test.assertIsNotNone(capture.graph)
-
-    body_z_before = float(g0.body_q.numpy()[body][2])
-    for _frame in range(frames):
-        eager_solver.step(e0, e1, None, None, dt)
-        eager_solver.step(e1, e0, None, None, dt)
-        wp.capture_launch(capture.graph)
-    wp.synchronize_device(device)
-
-    q_eager, q_graph = e0.particle_q.numpy(), g0.particle_q.numpy()
-    bq_eager, bq_graph = e0.body_q.numpy(), g0.body_q.numpy()
-    test.assertTrue(np.isfinite(q_graph).all() and np.isfinite(bq_graph).all())
-    test.assertLess(float(bq_graph[body][2]), body_z_before, "graph replays must advance the simulation")
-    envelope = 1.0e-2  # ~6x the measured eager run-to-run spread on this scene
-    np.testing.assert_allclose(q_graph, q_eager, rtol=0.0, atol=envelope)
-    np.testing.assert_allclose(bq_graph, bq_eager, rtol=0.0, atol=envelope)
-    for name, q, bq in (("eager", q_eager, bq_eager), ("replayed", q_graph, bq_graph)):
-        gap = np.linalg.norm(q - bq[body][None, :3], axis=1) - 0.25
-        test.assertLessEqual(-float(gap.min()), 1.0e-4, f"{name} DAT steps must keep cloth vertices outside the sphere")
-
-
 def test_rigid_dat_requires_owned_pipeline(test, device):
     """Enabling rigid DAT without a solver-owned pipeline raises: the DAT reference poses
     must be snapshotted at the exact detection instants the solver drives."""
     model, _body = _build_sphere_drop_on_cloth(device)
     with test.assertRaises(ValueError):
-        newton.solvers.SolverVBD(model, rigid_compliant_alm=True, rigid_soft_enable_dat=True)
+        newton.solvers.SolverVBD(model, rigid_compliant_alm=True, rigid_enable_penetration_free=True)
 
 
 def test_rigid_dat_requires_positive_rigid_soft_query_radius(test, device):
@@ -6635,7 +7731,7 @@ def test_rigid_dat_requires_positive_rigid_soft_query_radius(test, device):
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.0)
     with test.assertRaisesRegex(ValueError, "positive minimum rigid-soft query radius"):
         newton.solvers.SolverVBD(
-            model, rigid_compliant_alm=True, rigid_soft_enable_dat=True, collision_pipeline=pipeline
+            model, rigid_compliant_alm=True, rigid_enable_penetration_free=True, collision_pipeline=pipeline
         )
 
 
@@ -6669,7 +7765,7 @@ def test_rigid_dat_motion_bound_uses_minimum_query_radius(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         rigid_compliant_alm=True,
-        rigid_soft_enable_dat=True,
+        rigid_enable_penetration_free=True,
         dat_conservative_bound_relaxation=relaxation,
         collision_pipeline=pipeline,
     )
@@ -6687,7 +7783,7 @@ def test_rigid_dat_motion_bound_uses_minimum_query_radius(test, device):
 
 
 def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
-    """Rigid DAT requires the strict relaxation interval used by its motion bound."""
+    """Require the strict relaxation interval used by both DAT motion bounds."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     model = builder.finalize(device=device)
 
@@ -6708,22 +7804,24 @@ def test_rigid_dat_validates_conservative_bound_relaxation(test, device):
             test.assertEqual(solver.dat_conservative_bound_relaxation, relaxation)
 
 
-def test_dat_conservative_bound_relaxation_deprecated_alias(test, device):
-    """The deprecated particle-only name still sets the shared relaxation, with a warning."""
+def test_dat_conservative_bound_relaxation_deprecated_aliases(test, device):
+    """Keep old relaxation names usable while setting one common DAT value."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     model = builder.finalize(device=device)
+    for name in ("particle_conservative_bound_relaxation", "rigid_conservative_bound_relaxation"):
+        with test.subTest(alias=name):
+            with test.assertWarnsRegex(DeprecationWarning, f"{name} is deprecated"):
+                solver = newton.solvers.SolverVBD(model, dat_conservative_bound_relaxation=0.7, **{name: 0.5})
+            test.assertEqual(solver.dat_conservative_bound_relaxation, 0.5)
+            test.assertEqual(solver.particle_conservative_bound_relaxation, 0.5)
+            test.assertEqual(solver.rigid_conservative_bound_relaxation, 0.5)
+            with test.assertRaisesRegex(ValueError, r"must be in \(0, 1\)"):
+                newton.solvers.SolverVBD(model, **{name: 0.0})
 
-    with test.assertWarnsRegex(DeprecationWarning, "particle_conservative_bound_relaxation is deprecated"):
-        solver = newton.solvers.SolverVBD(model, particle_conservative_bound_relaxation=0.5)
-    test.assertEqual(solver.dat_conservative_bound_relaxation, 0.5)
-
-    with test.assertWarnsRegex(DeprecationWarning, "overrides dat_conservative_bound_relaxation"):
-        solver = newton.solvers.SolverVBD(
-            model,
-            dat_conservative_bound_relaxation=0.7,
-            particle_conservative_bound_relaxation=0.5,
+    with test.assertRaisesRegex(ValueError, "must agree"):
+        newton.solvers.SolverVBD(
+            model, particle_conservative_bound_relaxation=0.5, rigid_conservative_bound_relaxation=0.7
         )
-    test.assertEqual(solver.dat_conservative_bound_relaxation, 0.5)
 
 
 def test_rigid_dat_rejects_missing_body_pose(test, device):
@@ -6737,7 +7835,7 @@ def test_rigid_dat_rejects_missing_body_pose(test, device):
     model = builder.finalize(device=device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.01)
     solver = newton.solvers.SolverVBD(
-        model, rigid_compliant_alm=True, rigid_soft_enable_dat=True, collision_pipeline=pipeline
+        model, rigid_compliant_alm=True, rigid_enable_penetration_free=True, collision_pipeline=pipeline
     )
 
     state = model.state()
@@ -6780,7 +7878,7 @@ def _run_rigid_only_contact(device, enable_rigid_soft_dat):
         model,
         iterations=8,
         rigid_compliant_alm=True,
-        rigid_soft_enable_dat=enable_rigid_soft_dat,
+        rigid_enable_penetration_free=enable_rigid_soft_dat,
         collision_pipeline=pipeline,
     )
     state_in, state_out = model.state(), model.state()
@@ -6797,7 +7895,7 @@ def _run_rigid_only_contact(device, enable_rigid_soft_dat):
         state_in.body_q.numpy(),
         state_in.body_qd.numpy(),
         saw_contact,
-        solver.rigid_soft_enable_dat,
+        solver.rigid_enable_penetration_free,
         solver._rigid_dat_body_max_displacement.numpy(),
         solver._rigid_dat_particle_max_displacement,
     )
@@ -6815,6 +7913,108 @@ def test_rigid_soft_dat_initializes_for_rigid_only_model(test, device):
     test.assertTrue(np.isfinite(qd_dat).all())
     test.assertTrue(np.isinf(body_max_displacement).all())
     test.assertTrue(np.isinf(particle_max_displacement))
+
+
+def test_rigid_dat_com_centered_body_bounds(test, device):
+    """Compute rigid-soft DAT body bounds from collision geometry about the COM.
+
+    The offset, rotated box checks analytic primitive support about a nonzero COM.
+    The asymmetric, scaled, rotated mesh checks vertex transforms and transform direction.
+    The inactive site box checks that potentially enabled shapes are bounded in advance.
+    """
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_particle(pos=wp.vec3(100.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.0, radius=0.0)
+    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(1.0, 0.0, 0.0),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_box(
+        body,
+        xform=wp.transform(
+            wp.vec3(3.0, 0.0, 0.0),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi),
+        ),
+        hx=0.5,
+        hy=0.25,
+        hz=0.125,
+    )
+    mesh_body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(-0.5, 0.25, 0.1),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    mesh_vertices = np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+    mesh = newton.Mesh(mesh_vertices, [0, 1, 2], compute_inertia=False)
+    mesh_scale = np.array([-1.0, 2.0, 0.5])
+    mesh_translation = np.array([0.25, -0.5, 0.75])
+    builder.add_shape_mesh(
+        mesh_body,
+        xform=wp.transform(
+            wp.vec3(*mesh_translation),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi),
+        ),
+        mesh=mesh,
+        scale=wp.vec3(*mesh_scale),
+    )
+    latent_body = builder.add_body(
+        xform=wp.transform_identity(),
+        com=wp.vec3(0.0),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    builder.add_shape_box(
+        latent_body,
+        xform=wp.transform(wp.vec3(2.0, 0.0, 0.0), wp.quat_identity()),
+        hx=0.5,
+        hy=0.25,
+        hz=0.125,
+        as_site=True,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    soft_gap = 0.04
+    relaxation = 0.85
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=soft_gap,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
+    )
+    solver = newton.solvers.SolverVBD(
+        model,
+        rigid_compliant_alm=False,
+        rigid_enable_penetration_free=True,
+        dat_conservative_bound_relaxation=relaxation,
+        collision_pipeline=pipeline,
+    )
+
+    expected_radius = np.linalg.norm([2.25, 0.5, 0.125])
+    radius = float(solver._rigid_dat_body_bounding_radius.numpy()[body])
+    # Explicit transformed points make this sensitive to confusing X_bs with X_sb.
+    mesh_points_body = np.array([[0.25, -2.5, 0.75], [-1.75, -2.5, 0.75], [0.25, -2.5, 1.25]])
+    expected_mesh_radius = np.max(np.linalg.norm(mesh_points_body - np.array([-0.5, 0.25, 0.1]), axis=1))
+    mesh_radius = float(solver._rigid_dat_body_bounding_radius.numpy()[mesh_body])
+    latent_radius = float(solver._rigid_dat_body_bounding_radius.numpy()[latent_body])
+    max_displacement = float(solver._rigid_dat_body_max_displacement.numpy()[body])
+    test.assertAlmostEqual(radius, expected_radius, places=6)
+    test.assertAlmostEqual(mesh_radius, expected_mesh_radius, places=6)
+    # Flags may enable a currently inactive shape later, so it must already be bounded.
+    test.assertAlmostEqual(latent_radius, np.linalg.norm([2.5, 0.25, 0.125]), places=6)
+    expected_query_radius_min = soft_gap + float(model.particle_radius.numpy().min()) + float(
+        model.shape_margin.numpy().min()
+    )
+    expected_max_displacement = 0.5 * relaxation * expected_query_radius_min
+    test.assertAlmostEqual(solver._rigid_soft_query_radius_min, expected_query_radius_min, places=7)
+    test.assertAlmostEqual(max_displacement, expected_max_displacement, places=7)
+    test.assertAlmostEqual(solver._rigid_dat_particle_max_displacement, expected_max_displacement, places=7)
 
 
 def _run_free_flight_distance(test, device, frequency_type, frequency, speed=6.0, frames=10):
@@ -6844,7 +8044,7 @@ def _run_free_flight_distance(test, device, frequency_type, frequency, speed=6.0
         model,
         iterations=10,
         rigid_compliant_alm=True,
-        rigid_soft_enable_dat=True,
+        rigid_enable_penetration_free=True,
         collision_pipeline=pipeline,
         collision_frequency={newton.solvers.SolverBase.CollisionSlot.RIGID: frequency},
         collision_frequency_type={newton.solvers.SolverBase.CollisionSlot.RIGID: frequency_type},
@@ -6879,76 +8079,69 @@ def test_rigid_dat_collision_frequency_budget(test, device):
     test.assertLess(x_slow, 0.6 * expected, "PRE_POST_INIT should throttle this speed; retune if not")
 
 
-def test_rigid_phase_applies_joint_dat_truncation(test, device):
-    """A rigid-phase adaptive plane immediately truncates both sides of its SDF particle row."""
+def test_rigid_dat_redetects_approaching_cloth_before_crossing(test, device):
+    """Periodic VBD detection captures an initially out-of-range rigid-soft pair."""
+    Frequency = newton.solvers.SolverBase.CollisionFrequencyType
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-    builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0), mass=1.0, radius=0.0)
-    inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    body = builder.add_body(
-        xform=wp.transform_identity(),
-        mass=1.0,
-        inertia=inertia,
-        lock_inertia=True,
-    )
-    # Analytic box whose top face lies in the body's z=0 plane, so the stored
-    # rigid surface point sits at the body origin like the upstream mesh triangle.
-    builder.add_shape_box(
-        body,
-        xform=wp.transform(wp.vec3(0.0, 0.0, -0.5), wp.quat_identity()),
-        hx=1.0,
-        hy=1.0,
-        hz=0.5,
+    builder.add_shape_mesh(-1, mesh=newton.Mesh.create_box(0.2, 0.2, 0.1))
+    builder.add_cloth_grid(
+        pos=wp.vec3(0.0, 0.0, 0.13),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, -20.0),
+        dim_x=2,
+        dim_y=2,
+        cell_x=0.1,
+        cell_y=0.1,
+        mass=0.1,
+        particle_radius=0.0,
+        tri_ke=1.0e2,
+        tri_ka=1.0e2,
+        tri_kd=1.0e-4,
     )
     builder.color()
     model = builder.finalize(device=device)
+    # Isolate geometric truncation from the ordinary penalty response.
+    model.soft_contact_ke = 0.0
+    model.shape_material_ke.zero_()
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="nxn",
-        soft_contact_gap=2.0,
+        contact_matching="latest",
+        soft_contact_gap=0.02,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
     )
+    state_in, state_out = model.state(), model.state()
+    initial_contacts = pipeline.contacts()
+    pipeline.refit_soft_contact_bvh(state_in)
+    pipeline.collide(state_in, initial_contacts)
+    wp.synchronize_device(wp.get_device(device))
+    test.assertEqual(
+        int(initial_contacts.soft_contact_count.numpy()[0]),
+        0,
+        "the cloth must begin outside the dense query radius",
+    )
+
     solver = newton.solvers.SolverVBD(
         model,
-        iterations=1,
-        rigid_compliant_alm=False,
+        iterations=6,
         collision_pipeline=pipeline,
-        rigid_soft_enable_dat=True,
+        particle_enable_self_contact=True,
+        rigid_enable_penetration_free=True,
+        collision_frequency={
+            newton.solvers.SolverBase.CollisionSlot.RIGID: 2,
+            newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: 2,
+        },
+        collision_frequency_type={
+            newton.solvers.SolverBase.CollisionSlot.RIGID: Frequency.ITERATIONS,
+            newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: Frequency.ITERATIONS,
+        },
     )
-    state = model.state()
-    pipeline.collide(state, solver.contacts)
-    test.assertEqual(int(solver.contacts.soft_contact_count.numpy()[0]), 1)
-    np.testing.assert_array_equal(solver.contacts.soft_contact_indices.numpy()[0], [0, -1, -1])
-    solver._reset_dat_references(state, reset_rigid_soft=True, reset_particles=True)
-
-    # From a unit reference gap, let both sides propose 0.8 m of approach. The
-    # adaptive plane lies halfway between the references, so accepting only one
-    # factor would leave the other primitive on the wrong side of that plane.
-    solver.particle_displacements.assign(np.array([[0.0, 0.0, -0.8]], dtype=np.float32))
-    particle_q = state.particle_q.numpy()
-    particle_q[0] = [0.0, 0.0, 0.2]
-    state.particle_q.assign(particle_q)
-    body_q = state.body_q.numpy()
-    body_q[body, :3] = [0.0, 0.0, 0.8]
-    state.body_q.assign(body_q)
-
-    solver._rigid_penetration_free_truncation(state, solver.contacts)
-
-    particle_z = float(state.particle_q.numpy()[0, 2])
-    rigid_z = float(state.body_q.numpy()[body, 2])
-    test.assertLess(float(solver.truncation_ts.numpy()[0]), 1.0)
-    test.assertLess(float(solver.body_truncation_ts.numpy()[body]), 1.0)
-    test.assertGreater(particle_z, 0.2, "the rigid phase must apply the soft truncation factor")
-    test.assertLess(rigid_z, 0.8, "the rigid phase must apply the rigid truncation factor")
-    test.assertGreaterEqual(
-        particle_z - rigid_z,
-        1.9 * _RIGID_SOFT_DAT_TEST_EPS,
-        "both accepted primitives must remain outside the epsilon band",
-    )
-    np.testing.assert_allclose(
-        state.particle_q.numpy(),
-        solver.pos_prev_collision_detection.numpy() + solver.particle_displacements.numpy(),
-        rtol=0.0,
-        atol=1.0e-7,
-    )
+    for _ in range(8):
+        solver.step(state_in, state_out, None, None, 1.0e-3)
+        state_in, state_out = state_out, state_in
+    wp.synchronize_device(wp.get_device(device))
+    test.assertGreaterEqual(float(np.min(state_in.particle_q.numpy()[:, 2])), 0.1 - 1.0e-5)
 
 
 class TestVBDRigidDAT(unittest.TestCase):
@@ -6987,6 +8180,18 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
+    "test_primitive_pair_separator_cases",
+    test_primitive_pair_separator_cases,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_dat_division_plane_reserves_epsilon_band",
+    test_dat_division_plane_reserves_epsilon_band,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_rigid_dat_trajectory_truncation",
     test_rigid_dat_trajectory_truncation,
     devices=devices,
@@ -7001,6 +8206,43 @@ add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_interval_catches_quarter_circle_tangent_peak",
     test_rigid_dat_interval_catches_quarter_circle_tangent_peak,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_exact_rigid_triangle_truncates_rotation",
+    test_bvh_dat_exact_rigid_triangle_truncates_rotation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_rigid_phase_applies_joint_dat_truncation",
+    test_rigid_phase_applies_joint_dat_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_nanometer_vt_gap_truncates",
+    test_bvh_dat_nanometer_vt_gap_truncates,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_truncation_maintains_epsilon_band",
+    test_bvh_dat_truncation_maintains_epsilon_band,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_zero_gap_vt_fails_closed",
+    test_bvh_dat_zero_gap_vt_fails_closed,
+    devices=devices,
+    check_output=False,  # the test captures the expected kernel warning itself
+)
+add_function_test(
+    TestVBDRigidDAT,
+    "test_bvh_dat_uses_geometric_separator_for_back_facing_ee",
+    test_bvh_dat_uses_geometric_separator_for_back_facing_ee,
     devices=devices,
 )
 add_function_test(
@@ -7035,8 +8277,8 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_dat_conservative_bound_relaxation_deprecated_alias",
-    test_dat_conservative_bound_relaxation_deprecated_alias,
+    "test_dat_conservative_bound_relaxation_deprecated_aliases",
+    test_dat_conservative_bound_relaxation_deprecated_aliases,
     devices=devices,
 )
 add_function_test(
@@ -7053,21 +8295,147 @@ add_function_test(
 )
 add_function_test(
     TestVBDRigidDAT,
+    "test_rigid_dat_com_centered_body_bounds",
+    test_rigid_dat_com_centered_body_bounds,
+    devices=devices,
+)
+add_function_test(
+    TestVBDRigidDAT,
     "test_rigid_dat_collision_frequency_budget",
     test_rigid_dat_collision_frequency_budget,
     devices=devices,
 )
 add_function_test(
     TestVBDRigidDAT,
-    "test_rigid_phase_applies_joint_dat_truncation",
-    test_rigid_phase_applies_joint_dat_truncation,
+    "test_rigid_dat_redetects_approaching_cloth_before_crossing",
+    test_rigid_dat_redetects_approaching_cloth_before_crossing,
     devices=devices,
+)
+
+
+def test_contact_barrier_c2_at_tiny_radius(test, device):
+    """Both log-barrier laws stay C2 when ``collision_radius < 2e-5``.
+
+    ``d_min`` follows ``0.5 * tau`` for such radii, so the barrier interval
+    ``(d_min, tau)`` never empties; force and Hessian must therefore be continuous
+    across both branch boundaries, and the rigid-soft law must still match the
+    particle law.  With a fixed ``d_min = 1e-5`` the interval is empty and the
+    quadratic branch meets the extension branch with a jump at ``d = d_min``.
+    """
+    collision_radius = 1.5e-5
+    k = 1.0e4
+    tau = 0.5 * collision_radius
+    d_min = min(1.0e-5, 0.5 * tau)
+    legacy_d_min = 1.0e-5  # above tau at this radius: the unguarded law jumps here
+    rel = 1.0e-3
+    distances_np = np.array(
+        [
+            d_min * (1.0 - rel),
+            d_min * (1.0 + rel),
+            tau * (1.0 - rel),
+            tau * (1.0 + rel),
+            legacy_d_min * (1.0 - rel),
+            legacy_d_min * (1.0 + rel),
+        ],
+        dtype=np.float32,
+    )
+    distances = wp.array(distances_np, dtype=float, device=device)
+    particle_dEdD = wp.zeros(6, dtype=float, device=device)
+    particle_d2E = wp.zeros(6, dtype=float, device=device)
+    rigid_dEdD = wp.zeros(6, dtype=float, device=device)
+    rigid_d2E = wp.zeros(6, dtype=float, device=device)
+    wp.launch(
+        _eval_self_contact_norm_kernel,
+        dim=6,
+        inputs=[distances, collision_radius, k, particle_dEdD, particle_d2E],
+        device=device,
+    )
+    wp.launch(
+        _eval_rigid_soft_contact_norm_kernel,
+        dim=6,
+        inputs=[distances, collision_radius, k, True, rigid_dEdD, rigid_d2E],
+        device=device,
+    )
+    for name, dEdD, d2E in (
+        ("particle", particle_dEdD.numpy(), particle_d2E.numpy()),
+        ("rigid", rigid_dEdD.numpy(), rigid_d2E.numpy()),
+    ):
+        for lo, hi, where in ((0, 1, "d_min"), (2, 3, "tau"), (4, 5, "legacy d_min")):
+            np.testing.assert_allclose(dEdD[lo], dEdD[hi], rtol=1.0e-2, err_msg=f"{name} force jumps at {where}")
+            np.testing.assert_allclose(d2E[lo], d2E[hi], rtol=1.0e-2, err_msg=f"{name} Hessian jumps at {where}")
+    np.testing.assert_allclose(rigid_dEdD.numpy(), particle_dEdD.numpy(), rtol=1.0e-6)
+    np.testing.assert_allclose(rigid_d2E.numpy(), particle_d2E.numpy(), rtol=1.0e-6)
+
+
+def test_rigid_dat_graph_capture_replays_match_eager(test, device):
+    """A captured DAT step replays penetration-free and tracks the eager run.
+
+    DAT adds per-step launches, device-side reference resets and schedule-dependent
+    host branching; all of it must be capturable. Two identical sphere-drop scenes are
+    warmed up eagerly, then one keeps stepping eagerly while the other replays a graph
+    of the same two-substep sequence. The solver is not run-to-run deterministic
+    (contact ordering; two eager runs differ by ~1e-3 m on this scene), so the replay
+    must stay finite and penetration-free and agree with the eager run within an
+    envelope well above that spread, instead of bit for bit.
+    """
+
+    def make_scene():
+        model, body = _build_sphere_drop_on_cloth(device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=0.1)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=4,
+            rigid_compliant_alm=True,
+            rigid_enable_penetration_free=True,
+            rigid_body_particle_contact_buffer_size=1024,
+            collision_pipeline=pipeline,
+        )
+        state_a, state_b = model.state(), model.state()
+        qd = state_a.body_qd.numpy()
+        qd[body][:3] = [0.0, 0.0, -8.0]
+        state_a.body_qd.assign(qd)
+        return solver, state_a, state_b, body
+
+    dt = 1.0 / 60.0
+    frames = 20
+    eager_solver, e0, e1, body = make_scene()
+    graph_solver, g0, g1, _ = make_scene()
+    for solver, s0, s1 in ((eager_solver, e0, e1), (graph_solver, g0, g1)):
+        solver.step(s0, s1, None, None, dt)
+        solver.step(s1, s0, None, None, dt)
+
+    gc.collect()
+    with wp.ScopedCapture(device=device) as capture:
+        graph_solver.step(g0, g1, None, None, dt)
+        graph_solver.step(g1, g0, None, None, dt)
+    test.assertIsNotNone(capture.graph)
+
+    body_z_before = float(g0.body_q.numpy()[body][2])
+    for _frame in range(frames):
+        eager_solver.step(e0, e1, None, None, dt)
+        eager_solver.step(e1, e0, None, None, dt)
+        wp.capture_launch(capture.graph)
+
+    q_eager, q_graph = e0.particle_q.numpy(), g0.particle_q.numpy()
+    bq_eager, bq_graph = e0.body_q.numpy(), g0.body_q.numpy()
+    test.assertTrue(np.isfinite(q_graph).all() and np.isfinite(bq_graph).all())
+    test.assertLess(float(bq_graph[body][2]), body_z_before, "graph replays must advance the simulation")
+    envelope = 1.0e-2  # ~6x the measured eager run-to-run spread on this scene
+    np.testing.assert_allclose(q_graph, q_eager, rtol=0.0, atol=envelope)
+    np.testing.assert_allclose(bq_graph, bq_eager, rtol=0.0, atol=envelope)
+    for name, q, bq in (("eager", q_eager, bq_eager), ("replayed", q_graph, bq_graph)):
+        gap = np.linalg.norm(q - bq[body][None, :3], axis=1) - 0.25
+        test.assertLessEqual(-float(gap.min()), 1.0e-4, f"{name} DAT steps must keep cloth vertices outside the sphere")
+
+
+add_function_test(
+    TestSolverVBD, "test_contact_barrier_c2_at_tiny_radius", test_contact_barrier_c2_at_tiny_radius, devices=devices
 )
 add_function_test(
     TestVBDRigidDAT,
     "test_rigid_dat_graph_capture_replays_match_eager",
     test_rigid_dat_graph_capture_replays_match_eager,
-    devices=cuda_devices,
+    devices=[device for device in devices if device.is_cuda],
 )
 
 

@@ -3886,6 +3886,27 @@ def _edge_opt_kernel(
 
 
 @wp.kernel
+def _edge_opt_with_grad_kernel(
+    geo: wp.int32,
+    scale: wp.vec3,
+    p: wp.vec3,
+    q: wp.vec3,
+    shape_sdf_index: wp.int32,
+    table: wp.array[TextureSDFData],
+    n_iter: wp.int32,
+    out_u: wp.array[float],
+    out_phi: wp.array[float],
+    out_x: wp.array[wp.vec3],
+    out_grad: wp.array[wp.vec3],
+):
+    u, x, phi, grad = optimize_edge_sdf(geo, scale, p, q, shape_sdf_index, table, n_iter)
+    out_u[0] = u
+    out_phi[0] = phi
+    out_x[0] = x
+    out_grad[0] = grad
+
+
+@wp.kernel
 def _face_opt_kernel(
     geo: wp.int32,
     scale: wp.vec3,
@@ -4003,6 +4024,33 @@ def test_optimize_edge_sdf_box(test, device):
     pa, qa, ha = np.array(p), np.array(q), np.array(half)
     phi_brute = min(_box_sdf_np((1.0 - u) * pa + u * qa, ha) for u in np.linspace(0.0, 1.0, 20001))
     test.assertLess(abs(phi_opt - phi_brute), 1.0e-4)
+
+
+def test_optimize_edge_sdf_box_flat_minimum(test, device):
+    """Equal golden probes retain the center of a box SDF's flat minimum."""
+    out_u = wp.zeros(1, dtype=float, device=device)
+    out_phi = wp.zeros(1, dtype=float, device=device)
+    out_x = wp.zeros(1, dtype=wp.vec3, device=device)
+    out_grad = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        _edge_opt_with_grad_kernel,
+        dim=1,
+        inputs=[
+            int(GeoType.BOX),
+            wp.vec3(0.1, 0.5, 0.1),
+            wp.vec3(-0.4, 0.47, 0.0),
+            wp.vec3(0.4, 0.47, 0.0),
+            -1,
+            _empty_sdf_table(device),
+            SDF_EDGE_ITERS,
+        ],
+        outputs=[out_u, out_phi, out_x, out_grad],
+        device=device,
+    )
+    test.assertAlmostEqual(float(out_u.numpy()[0]), 0.5, places=5)
+    test.assertAlmostEqual(float(out_phi.numpy()[0]), -0.03, places=5)
+    test.assertTrue(np.allclose(out_x.numpy()[0], (0.0, 0.47, 0.0), atol=1.0e-5))
+    test.assertTrue(np.allclose(out_grad.numpy()[0], (0.0, 1.0, 0.0), atol=1.0e-5))
 
 
 def test_optimize_face_sdf_box(test, device):
@@ -4305,7 +4353,8 @@ def test_backward_compat_bit_for_bit(test, device):
     test.assertEqual(n_particle_on, c0)  # particle-contact count unchanged; E/F only added
     prim_on, shape_on, pos_on, nrm_on = _sorted_particle_records(contacts_on, c0)
 
-    # Bit-identical particle range (same legacy kernel, same inputs; particle records come first).
+    # Same analytic particle contacts from the legacy and full-surface kernels;
+    # full-surface particle records still come before the edge/face passes.
     test.assertTrue(np.array_equal(prim_on, prim_off))
     test.assertTrue(np.array_equal(shape_on, shape_off))
     test.assertTrue(np.array_equal(pos_on, pos_off))
@@ -4358,6 +4407,7 @@ def test_full_surface_catches_what_particles_miss(test, device):
 for _name, _fn in (
     ("test_soft_feature_aabb_cull_boundary", test_soft_feature_aabb_cull_boundary),
     ("test_optimize_edge_sdf_box", test_optimize_edge_sdf_box),
+    ("test_optimize_edge_sdf_box_flat_minimum", test_optimize_edge_sdf_box_flat_minimum),
     ("test_optimize_face_sdf_box", test_optimize_face_sdf_box),
     ("test_optimize_edge_sdf_sphere", test_optimize_edge_sdf_sphere),
     ("test_optimize_face_sdf_sphere", test_optimize_face_sdf_sphere),
@@ -4395,7 +4445,11 @@ def test_mesh_sdf_provisioned_and_emits(test, device):
     test.assertGreaterEqual(int(model._shape_sdf_index.numpy()[mesh_shape]), 0)
 
     pipeline = newton.CollisionPipeline(
-        model, broad_phase="nxn", soft_contact_gap=0.1, enable_rigid_soft_full_surface_contact=True
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.1,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="sdf",
     )
     contacts = pipeline.contacts()
     state = model.state()
@@ -4404,6 +4458,51 @@ def test_mesh_sdf_provisioned_and_emits(test, device):
     idx = contacts.soft_contact_indices.numpy()[:total]
     # The mesh's volume SDF feeds the edge/face passes -> edge/face records emitted.
     test.assertGreater(int(np.sum(idx[:, 1] >= 0)), 0)
+
+
+def test_sdf_backend_particle_mesh_uses_texture_sdf(test, device):
+    """Only full-surface SDF particle queries sample the texture; legacy queries use the mesh.
+
+    After finalization, move only the live Warp mesh far from the baked texture SDF. This deliberate
+    test-only mismatch makes the two query paths distinguishable: a triangle-BVH query misses the
+    particle, while the texture SDF still reports the original box surface.
+    """
+    box_mesh = newton.Mesh.create_box(0.5, 0.5, 0.5)
+    builder = newton.ModelBuilder()
+    shape = builder.add_shape_mesh(body=-1, mesh=box_mesh)
+    particle = builder.add_particle(wp.vec3(0.0, 0.0, 0.55), wp.vec3(0.0), 1.0, radius=0.0)
+    configure_sdf_for_collision_shapes(builder)
+    model = builder.finalize(device=device)
+    test.assertGreaterEqual(int(model._shape_sdf_index.numpy()[shape]), 0)
+
+    # The volume SDF is already baked. Move and refit only the triangle mesh queried by the legacy
+    # particle path; model.shape_source_ptr continues to reference this same Warp mesh.
+    moved_points = box_mesh.mesh.points.numpy() + np.array([10.0, 0.0, 0.0], dtype=np.float32)
+    box_mesh.mesh.points.assign(moved_points)
+    box_mesh.mesh.refit()
+
+    state = model.state()
+    for full_surface in (False, True):
+        for backend in ("sdf", "bvh"):
+            with test.subTest(full_surface=full_surface, backend=backend):
+                pipeline = newton.CollisionPipeline(
+                    model,
+                    broad_phase="nxn",
+                    soft_contact_gap=0.1,
+                    enable_rigid_soft_full_surface_contact=full_surface,
+                    rigid_soft_mesh_backend=backend,
+                )
+                contacts = pipeline.contacts()
+                pipeline.collide(state, contacts)
+                count = int(contacts.soft_contact_count.numpy()[0])
+                # With full-surface off, both settings use main's nearest-triangle
+                # particle query. Only full-surface SDF uses the original baked box.
+                expected = int(full_surface and backend == "sdf")
+                test.assertEqual(count, expected)
+                if expected:
+                    test.assertEqual(int(contacts.soft_contact_particle.numpy()[0]), particle)
+                    test.assertEqual(int(contacts.soft_contact_shape.numpy()[0]), shape)
+                    np.testing.assert_allclose(contacts.soft_contact_body_pos.numpy()[0], (0.0, 0.0, 0.5), atol=0.03)
 
 
 def test_force_sdf_provisions_collision_meshes(test, device):
@@ -4502,6 +4601,7 @@ def test_optimize_against_mesh_texture_sdf(test, device):
 
 for _name, _fn in (
     ("test_mesh_sdf_provisioned_and_emits", test_mesh_sdf_provisioned_and_emits),
+    ("test_sdf_backend_particle_mesh_uses_texture_sdf", test_sdf_backend_particle_mesh_uses_texture_sdf),
     ("test_optimize_against_mesh_texture_sdf", test_optimize_against_mesh_texture_sdf),
 ):
     add_function_test(TestFullSurfaceSoftContact, _name, _fn, devices=get_cuda_test_devices())
@@ -4522,10 +4622,12 @@ def _eval_shape_sdf_kernel(
     out_grad[0] = grad
 
 
-def _make_box_mesh_sdf_model(device):
+def _make_box_mesh_sdf_model(device, *, add_particle=False):
     """A single box MESH with a provisioned (unscaled) volume SDF, for eval_shape_sdf tests."""
     builder = newton.ModelBuilder()
     builder.add_shape_mesh(body=-1, mesh=newton.Mesh.create_box(0.5, 0.5, 0.5))
+    if add_particle:
+        builder.add_particle(wp.vec3(0.0, 0.0, 0.55), wp.vec3(0.0), 1.0, radius=0.0)
     configure_sdf_for_collision_shapes(builder)
     model = builder.finalize(device=device)
     return model, int(model._shape_sdf_index.numpy()[0])
@@ -4621,13 +4723,15 @@ def test_full_surface_empty_sdf_descriptor_rejected(test, device):
     """A participating mesh whose shape_sdf_index points at an empty placeholder descriptor (coarse
     texture None, e.g. a mesh-mesh BVH fallback) is rejected by the full-surface guard rather than
     sampled -- sampling one reproduced CUDA error 700 (E1)."""
-    model, sdf_idx = _make_box_mesh_sdf_model(device)
+    model, sdf_idx = _make_box_mesh_sdf_model(device, add_particle=True)
     test.assertGreaterEqual(sdf_idx, 0)
     # Simulate an empty placeholder descriptor at that slot: a nonnegative index whose descriptor
     # carries no texture (coarse texture None), exactly what a BVH fallback appends.
     model._texture_sdf_coarse_textures[sdf_idx] = None
     with test.assertRaises(ValueError):
-        newton.CollisionPipeline(model, broad_phase="nxn", enable_rigid_soft_full_surface_contact=True)
+        newton.CollisionPipeline(
+            model, broad_phase="nxn", rigid_soft_mesh_backend="sdf", enable_rigid_soft_full_surface_contact=True
+        )
 
 
 def _add_soft_triangle(builder, z=1.0):
@@ -4763,7 +4867,11 @@ def test_full_surface_nonuniform_mesh_accurate_distance(test, device):
     # 0.08 m gap, 0.06 m margin -> outside -> no contact. min_scale would under-report 0.04 < 0.06.
     model_out = _nonuniform_box_mesh_gap_model(device, tri_x=1.08)
     pipe_out = newton.CollisionPipeline(
-        model_out, broad_phase="nxn", soft_contact_gap=0.06, enable_rigid_soft_full_surface_contact=True
+        model_out,
+        broad_phase="nxn",
+        soft_contact_gap=0.06,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="sdf",
     )
     contacts_out = pipe_out.contacts()
     pipe_out.collide(model_out.state(), contacts_out)
@@ -4774,7 +4882,11 @@ def test_full_surface_nonuniform_mesh_accurate_distance(test, device):
     # 0.03 m gap -> inside the margin -> contact, projected onto the true +x surface at x = 1.0.
     model_in = _nonuniform_box_mesh_gap_model(device, tri_x=1.03)
     pipe_in = newton.CollisionPipeline(
-        model_in, broad_phase="nxn", soft_contact_gap=0.06, enable_rigid_soft_full_surface_contact=True
+        model_in,
+        broad_phase="nxn",
+        soft_contact_gap=0.06,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="sdf",
     )
     contacts_in = pipe_in.contacts()
     pipe_in.collide(model_in.state(), contacts_in)
@@ -4810,11 +4922,12 @@ for _name, _fn in (
 
 
 def test_unprovisioned_mesh_raises(test, device):
-    """A participating mesh with no SDF makes CollisionPipeline raise when the flag is enabled.
+    """A participating mesh with no SDF makes the explicit SDF back-end raise.
 
     Mirrors SolverVBD raising on an uncolored model: provisioning an SDF (e.g. via
     ShapeConfig.configure_sdf(force_sdf=True)) is a required build step, and skipping it is an error
-    rather than a silent degrade to the per-particle path.
+    rather than silently degrading to a different mesh query. The explicitly selected ``"bvh"``
+    back-end needs no SDF and must construct cleanly on the same model.
     """
     box_mesh = newton.Mesh.create_box(0.5, 0.5, 0.5)
     builder = newton.ModelBuilder()
@@ -4833,8 +4946,27 @@ def test_unprovisioned_mesh_raises(test, device):
     model = builder.finalize(device=device)
     with test.assertRaises(ValueError):
         newton.CollisionPipeline(
-            model, broad_phase="nxn", soft_contact_gap=0.1, enable_rigid_soft_full_surface_contact=True
+            model,
+            broad_phase="nxn",
+            soft_contact_gap=0.1,
+            enable_rigid_soft_full_surface_contact=True,
+            rigid_soft_mesh_backend="sdf",
         )
+    # The BVH back-end (opt-in) handles the SDF-less mesh instead of raising -- and actually
+    # produces full-surface records for it at runtime (the mesh is excluded from the legacy
+    # per-particle pairs, so every record below comes from the BVH path).
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_gap=0.1,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_mesh_backend="bvh",
+    )
+    contacts = pipeline.contacts()
+    state = model.state()
+    pipeline.refit_soft_contact_bvh(state)
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
 
 
 add_function_test(

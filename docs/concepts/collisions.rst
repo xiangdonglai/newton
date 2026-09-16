@@ -1495,15 +1495,21 @@ do not control collision detection performed inside a solver. For example,
 to the self-contact slot of ``collision_frequency`` /
 ``collision_frequency_type``.
 
-With ``rigid_soft_enable_dat=True``, :class:`~solvers.SolverVBD`
-additionally truncates rigid pose and particle updates against the division
-planes of the rigid-soft contacts its owned :class:`~CollisionPipeline`
-reports, using the rigid entries of ``collision_frequency`` and
-``collision_frequency_type`` as the detection cadence that anchors those
-planes. That slot may not be ``NONE``
-while the option is enabled, and when particle self-contact truncation is
-also active the rigid and self-contact slots must share an equivalent
-schedule.
+With ``rigid_enable_penetration_free=True``, :class:`~solvers.SolverVBD`
+also truncates rigid pose and particle updates against division planes built
+from the rigid-soft contacts its owned :class:`~CollisionPipeline` reports.
+The rigid entries of ``collision_frequency`` and ``collision_frequency_type``
+set the detection schedule. Neither DAT family's schedule may be ``NONE``
+while that family is active; when both families are active, their schedules
+must be equivalent.
+
+``dat_conservative_bound_relaxation`` controls both families' truncation
+backoff and motion budgets. Soft-self pairs for which no strict separator
+can be certified are left unconstrained by DAT on that pass, allowing
+contact forces to attempt recovery. This is not a penetration-free guarantee
+for initially touching or intersecting pairs; start with separated geometry.
+Rigid-soft BVH pairs retain their conservative freezing behavior when no
+separator can be certified.
 
 Start by calling ``collide`` every substep when debugging contact behavior.
 This keeps contacts current as bodies move. Once the behavior is acceptable,

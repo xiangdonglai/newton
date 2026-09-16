@@ -855,8 +855,7 @@ def evaluate_self_contact_force_norm(dis: float, collision_radius: float, k: flo
     dEdD = wp.float32(0.0)
     d2E_dDdD = wp.float32(0.0)
 
-    # C2 continuity calculation; d_min follows tau for radii below 20 um so the
-    # barrier interval (d_min, tau) never empties.
+    # Keep the barrier interval nonempty for contact radii below 20 micrometers.
     tau = collision_radius * 0.5
     d_min = wp.min(1.0e-5, 0.5 * tau)
     if tau > dis > d_min:
@@ -2066,11 +2065,10 @@ def apply_planar_truncation_parallel_by_collision(
                     delta_e2_v2,
                 )
 
-                # Without a strict separator at the reference (the edges intersect within
-                # float precision) DAT cannot tell which side is safe, so the pair is left
-                # unconstrained for this pass: freezing it would pin both edges at the
-                # reference indefinitely. Contact forces separate it and a later detection
-                # certifies a separator.
+                # If no strict separator can be certified at the reference, leave this
+                # pair unconstrained on this pass. Freezing would preserve the same
+                # invalid reference indefinitely; contact forces can instead try to
+                # separate the edges. This does not guarantee recovery.
                 if valid_plane:
                     t = planar_truncation_t(e1_v1_pos, delta_e1_v1, n, d, gamma, separation_eps)
                     if t < 1.0:
@@ -2171,47 +2169,21 @@ def apply_truncation_ts(
 
 
 @wp.kernel
-def build_particle_body_contact_adjacency_active(
-    body_particle_contact_indices: wp.array[wp.vec3i],
-    body_particle_contact_count: wp.array[int],
-    body_particle_contact_max: int,
-    particle_contact_head: wp.array[int],
-    particle_contact_next: wp.array[int],
-):
-    """Build linked per-particle incidence lists over the compact active contact prefix."""
-    contact_index = wp.tid()
-    if contact_index >= min(body_particle_contact_max, body_particle_contact_count[0]):
-        return
-
-    corners = body_particle_contact_indices[contact_index]
-
-    # Corners are -1-padded: (p, -1, -1) is a particle record, (v0, v1, -1) an edge, (v0, v1, v2) a face.
-    corner_count = 1
-    if corners[1] >= 0:
-        corner_count = 3
-
-    for corner in range(corner_count):
-        particle_index = corners[corner]
-        if particle_index >= 0:
-            node = 3 * contact_index + corner
-            previous = wp.atomic_exch(particle_contact_head, particle_index, node)
-            particle_contact_next[node] = previous
-
-
-@wp.kernel
-def gather_particle_body_contact_force_and_hessian(
+def accumulate_particle_body_contact_force_and_hessian(
     # inputs
     dt: float,
-    particle_ids_in_color: wp.array[wp.int32],
+    current_color: int,
     pos_anchor: wp.array[wp.vec3],
     pos: wp.array[wp.vec3],
+    particle_colors: wp.array[int],
     # body-particle contact
     friction_epsilon: float,
     rigid_body_particle_contact_use_log_barrier: bool,
     particle_radius: wp.array[float],
     body_particle_contact_indices: wp.array[wp.vec3i],
-    particle_contact_head: wp.array[int],
-    particle_contact_next: wp.array[int],
+    body_particle_contact_count: wp.array[int],
+    body_particle_contact_max: int,
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
     body_particle_contact_penalty_k: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
@@ -2226,49 +2198,41 @@ def gather_particle_body_contact_force_and_hessian(
     contact_body_vel: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
+    # Barycentric weights on each record's soft particles; (1, 0, 0) for a particle contact.
     contact_barycentric: wp.array[wp.vec3],
-    # outputs
+    # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
 ):
-    """Gather all body-contact contributions for one colored particle without output atomics.
+    """Accumulate each contact into its colored particles using atomic additions."""
+    t_id = wp.tid()
 
-    Contacts are consumed in increasing node order rather than linked-list order, so the
-    summation order follows the contact buffer instead of the lists' insertion order. Selection
-    scans the list once per consumed node (O(k^2) link reads for k contacts on one particle);
-    k is small in practice and the scan cost is trivial next to one contact evaluation.
-    """
-    particle_index = particle_ids_in_color[wp.tid()]
-    force = wp.vec3(0.0)
-    hessian = wp.mat33(0.0)
-    head = particle_contact_head[particle_index]
+    # One unified soft-contact stream. body_particle_contact_count[0] is the total soft-contact count;
+    # each record self-describes via its -1-padded corner ids: (p, -1, -1) is a particle contact,
+    # (v0, v1, -1) an edge, (v0, v1, v2) a face. A contact energy E(x) at x = sum_i bary[i]*pos[c_i]
+    # contributes bary[i]*force to corner i and bary[i]^2*hessian to its block. VBD solves one color
+    # per launch, so only scatter to this record's corners of the active color.
+    count = min(body_particle_contact_max, body_particle_contact_count[0])
+    if t_id >= count:
+        return
+    if body_particle_contact_force_eligible[t_id] == 0:
+        return
 
-    last = int(-1)
-    while True:
-        # Smallest unconsumed node id > last.
-        node = int(2147483647)
-        cursor = head
-        while cursor >= 0:
-            if cursor > last and cursor < node:
-                node = cursor
-            cursor = particle_contact_next[cursor]
-        if node == 2147483647:
-            break
-        last = node
+    corners = body_particle_contact_indices[t_id]
+    # Per-contact AVBD penalty + material properties shared with the rigid side.
+    contact_ke = body_particle_contact_penalty_k[t_id]
+    contact_kd = body_particle_contact_material_kd[t_id]
+    contact_mu = body_particle_contact_material_mu[t_id]
 
-        contact_index = node // 3
-        corner = node - 3 * contact_index
-        corners = body_particle_contact_indices[contact_index]
-        contact_ke = body_particle_contact_penalty_k[contact_index]
-        contact_kd = body_particle_contact_material_kd[contact_index]
-        contact_mu = body_particle_contact_material_mu[contact_index]
-
-        if corners[1] < 0:
-            contact_force, contact_hessian = _eval_body_particle_contact(
-                particle_index,
-                pos[particle_index],
-                pos_anchor[particle_index],
-                contact_index,
+    if corners[1] < 0:
+        # Particle contact (p, -1, -1): single-vertex path, unchanged from the pre-unification code.
+        particle_idx = corners[0]
+        if particle_colors[particle_idx] == current_color:
+            body_contact_force, body_contact_hessian = _eval_body_particle_contact(
+                particle_idx,
+                pos[particle_idx],
+                pos_anchor[particle_idx],
+                t_id,
                 contact_ke,
                 contact_kd,
                 contact_mu,
@@ -2287,41 +2251,42 @@ def gather_particle_body_contact_force_and_hessian(
                 dt,
                 rigid_body_particle_contact_use_log_barrier,
             )
-            force += contact_force
-            hessian += contact_hessian
-        else:
-            bary = contact_barycentric[contact_index]
-            contact_force, contact_hessian, _cp_world = _eval_soft_ef_contact(
-                contact_index,
-                corners,
-                bary,
-                pos,
-                pos_anchor,
-                particle_radius,
-                contact_ke,
-                contact_kd,
-                contact_mu,
-                friction_epsilon,
-                shape_body,
-                body_q,
-                body_q_prev,
-                body_qd,
-                body_com,
-                contact_shape,
-                contact_body_pos,
-                contact_body_vel,
-                contact_normal,
-                shape_margin,
-                dt,
-                rigid_body_particle_contact_use_log_barrier,
-            )
-            weight = bary[corner]
-            force += weight * contact_force
-            hessian += (weight * weight) * contact_hessian
-
-    # Plain write, no atomics: later spring/self-contact kernels accumulate on top.
-    particle_forces[particle_index] = force
-    particle_hessians[particle_index] = hessian
+            wp.atomic_add(particle_forces, particle_idx, body_contact_force)
+            wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+    else:
+        # Edge/face contact: barycentric point over the record's 2-3 soft particles.
+        bary = contact_barycentric[t_id]
+        ef_force, ef_hessian, _cp_world = _eval_soft_ef_contact(
+            t_id,
+            corners,
+            bary,
+            pos,
+            pos_anchor,
+            particle_radius,
+            contact_ke,
+            contact_kd,
+            contact_mu,
+            friction_epsilon,
+            shape_body,
+            body_q,
+            body_q_prev,
+            body_qd,
+            body_com,
+            contact_shape,
+            contact_body_pos,
+            contact_body_vel,
+            contact_normal,
+            shape_margin,
+            dt,
+            rigid_body_particle_contact_use_log_barrier,
+        )
+        for i in range(3):
+            ci = corners[i]
+            if ci >= 0:
+                w = bary[i]
+                if particle_colors[ci] == current_color:
+                    wp.atomic_add(particle_forces, ci, w * ef_force)
+                    wp.atomic_add(particle_hessians, ci, (w * w) * ef_hessian)
 
 
 @functools.cache

@@ -395,6 +395,10 @@ class SolverBase:
 
     def _run_rigid_collision(self, state: State, dt: float | None = None) -> None:
         """Run the owned pipeline into the owned contacts buffer."""
+        # Dense rigid-soft TV/EE queries read the shared soft triangle/edge
+        # BVHs, which an owning solver keeps current at each detection.
+        if self.collision_pipeline._full_surface_bvh_needs_detector:
+            self.collision_pipeline.refit_soft_contact_bvh(state)
         self.collision_pipeline.collide(state, self._pipeline_contacts, dt=dt)
 
     def _set_module_options(self, options: dict[str, Any], module: Any) -> None:

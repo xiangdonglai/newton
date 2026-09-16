@@ -12,26 +12,14 @@
 # without penetration-free truncation they drive the cloth through their
 # surfaces and tunnel out.
 #
-# With ``rigid_soft_enable_dat=True`` the solver truncates both the cloth
+# With ``rigid_enable_penetration_free=True`` the solver truncates both the cloth
 # displacements and the rigid pose updates against per-contact division
 # planes (Divide and Truncate), so the sheets always stay outside the bodies
 # while they catch them; the same truncation keeps the two sheets from
 # passing through each other (particle self-contact). Body-body contacts use
-# compliant ALM with a stiff authored material. Set ``"enable_dat": False`` in
-# PARAMS to compare against penalty contacts alone: at the default 4 substeps x
-# 8 iterations both keep this scene penetration-free, while at 1-2 substeps the
-# penalty-only run lets the sheets sink 6-15 mm into the bodies and DAT still
-# holds them outside.
-#
-# Cost: with the frame replayed as a CUDA graph (the default on CUDA devices),
-# DAT adds a few percent per frame in this scene (23.8 -> 24.5 ms, median of 3
-# runs on an RTX 6000 Ada at 4 substeps x 8 iterations, within the +-1.5 ms
-# run-to-run noise), including the extra ``PRE_POST_INIT`` detection pass that
-# the ``AUTO`` schedule adds. Without graph capture the overhead is about 40 %
-# (35.9 -> 49.6 ms): DAT issues many small kernel launches per iteration and
-# body color, and their host-side launch cost then dominates. All six bodies
-# here share one color, so the per-color rigid truncation costs nothing extra;
-# scenes with several body colors pay one more truncation pass per color.
+# compliant ALM with a stiff authored material. Set ``"enable_dat": False``
+# in PARAMS to compare against penalty contacts alone. Reduce ``sim_substeps``
+# to stress the contact response.
 #
 # Command: python -m newton.examples vbd_dat_rigid_soft
 ###########################################################################
@@ -148,7 +136,7 @@ class Example:
             self.model,
             iterations=self.params["solver_iterations"],
             rigid_compliant_alm=self.params["rigid_compliant_alm"],
-            rigid_soft_enable_dat=self.params["enable_dat"],
+            rigid_enable_penetration_free=self.params["enable_dat"],
             particle_enable_self_contact=True,
             particle_self_contact_margin=self.params["self_contact_margin"],
             particle_self_contact_gap=self.params["self_contact_gap"],
@@ -188,7 +176,7 @@ class Example:
 
         self.capture()
 
-        # ── model construction ──────────────────────────────────────────────
+    # ── model construction ──────────────────────────────────────────────
 
     def _build_cloth(self, builder):
         """Add the four-edge-pinned bottom sheet and the free top sheet to ``builder``."""

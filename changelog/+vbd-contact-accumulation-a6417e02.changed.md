@@ -1,0 +1,1 @@
+Restore atomic accumulation for SolverVBD rigid-soft contact forces and Hessians. Remove ordered per-particle gathering and its linked-list buffers to avoid excessive work for dense full-surface contacts.

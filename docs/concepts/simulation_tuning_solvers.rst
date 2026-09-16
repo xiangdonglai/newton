@@ -159,9 +159,6 @@ repository examples spend tuning effort, not a shared solver API.
        ``particle_vertex_contact_buffer_size``,
        ``particle_edge_contact_buffer_size``,
        ``collision_frequency``, ``collision_frequency_type``,
-       ``rigid_soft_enable_dat``,
-       ``rigid_soft_dat_use_interval_arithmetic``,
-       ``rigid_soft_contact_use_log_barrier``,
        ``particle_edge_parallel_epsilon``, ``particle_enable_tile_solve``,
        ``particle_topological_contact_filter_threshold``,
        ``particle_rest_shape_contact_exclusion_radius``.
@@ -173,6 +170,15 @@ repository examples spend tuning effort, not a shared solver API.
        because its default will change to ``True``. Pass ``False`` to retain the
        legacy AVBD path during the migration window. ``rigid_contact_hard``
        selects contact behavior only on that legacy path.
+
+       ``rigid_enable_penetration_free=True`` requires a solver-owned
+       :class:`~newton.CollisionPipeline` with a positive minimum rigid-soft
+       query radius, and cannot be combined with an external rigid solver.
+       ``dat_conservative_bound_relaxation`` must lie in ``(0, 1)`` and scales
+       both soft-self and rigid-soft DAT motion budgets and truncation backoff.
+       The old particle and rigid relaxation names remain deprecated aliases.
+       ``rigid_dat_use_interval_arithmetic`` additionally checks rigid
+       trajectories between samples and remains experimental.
 
        ``rigid_avbd_beta`` and ``*_k_start`` apply only to the legacy path.
        Simulations relying on those controls or on legacy hard constraints may
@@ -202,14 +208,14 @@ repository examples spend tuning effort, not a shared solver API.
        ``rigid_contact_hard``. ``rigid_avbd_contact_alpha`` remains available
        under compliant ALM as an advanced stabilization override.
 
-       ``rigid_soft_enable_dat=True`` requires a solver-owned
+       ``rigid_enable_penetration_free=True`` requires a solver-owned
        :class:`~newton.CollisionPipeline` with a positive minimum rigid-soft
        query radius and is not supported with
        ``integrate_with_external_rigid_solver=True``; the ``RIGID`` collision
        slot may not be ``NONE``. ``dat_conservative_bound_relaxation`` (shared with
        soft self-contact) must lie in ``(0, 1)`` and scales the per-detection
        motion budget.
-       ``rigid_soft_dat_use_interval_arithmetic`` (Stage-2 prefix certification)
+       ``rigid_dat_use_interval_arithmetic`` (Stage-2 trajectory certification)
        is experimental; the default path already relies on the module's interval
        derivative bound.
    * - :class:`~newton.solvers.SolverFeatherstone`
