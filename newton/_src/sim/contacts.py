@@ -395,6 +395,15 @@ class Contacts:
             self.soft_contact_barycentric = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Barycentric weights of the contact point on the soft feature's particles [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_shape = wp.full(soft_contact_max, -1, dtype=int)
+            # Full-surface emitters write this field; the pipeline clears it for legacy rows.
+            self.soft_contact_rigid_indices = wp.full(soft_contact_max, wp.vec3i(-1, -1, -1), dtype=wp.vec3i)
+            """Rigid mesh index-buffer slots per BVH contact [dimensionless], shape (soft_contact_max,), dtype :class:`vec3i`.
+
+            ``(v0, v1, v2)`` identifies a rigid triangle for a soft-vertex/rigid-triangle
+            contact, ``(v0, v1, -1)`` a rigid edge, and ``(v0, -1, -1)`` a rigid
+            vertex. Resolve each slot with ``wp.mesh_get_point``. Non-BVH contacts contain ``(-1, -1, -1)`` because an analytic SDF
+            row does not identify a complete rigid mesh primitive.
+            """
             self.soft_contact_body_pos = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact position on body [m], shape (soft_contact_max,), dtype :class:`vec3`.
 
@@ -465,6 +474,9 @@ class Contacts:
 
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
+        # Differentiable BVH queries keep candidate identities alive with each result buffer.
+        self._soft_contact_bvh_candidate_count = None
+        self._soft_contact_bvh_candidates = None
 
     def clear(self, bump_generation: bool = True):
         """
@@ -521,6 +533,7 @@ class Contacts:
                 self.rigid_contact_match_index.fill_(-1)
 
             self.soft_contact_indices.fill_(wp.vec3i(-1, -1, -1))
+            self.soft_contact_rigid_indices.fill_(wp.vec3i(-1, -1, -1))
             self.soft_contact_particle.fill_(-1)
             self.soft_contact_shape.fill_(-1)
             self.soft_contact_tids.fill_(-1)

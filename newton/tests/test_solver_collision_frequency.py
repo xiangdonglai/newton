@@ -368,9 +368,9 @@ def test_vbd_rigid_iterations_refreshes_body_particle_contacts(test, device):
             self.body_particle_refreshes = 0
             super().__init__(*args, **kwargs)
 
-        def _refresh_body_particle_contact_state(self, contacts, refresh):
+        def _refresh_body_particle_contact_state(self, contacts, refresh, particle_q, body_q):
             self.body_particle_refreshes += 1
-            super()._refresh_body_particle_contact_state(contacts, refresh)
+            super()._refresh_body_particle_contact_state(contacts, refresh, particle_q, body_q)
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body(xform=wp.transform_identity())

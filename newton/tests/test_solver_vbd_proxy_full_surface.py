@@ -26,7 +26,7 @@ _KE = 1.0e4  # contact stiffness seeded directly, so the expected force is ke * 
 _VERTS = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.5]])
 
 
-def _run_proxy_harvest(device, corners, bary):
+def _run_proxy_harvest(device, corners, bary, *, force_eligible=True):
     """Seed one soft contact and return its proxy-body reaction."""
     builder = newton.ModelBuilder()
     builder.gravity = (0.0, 0.0, 0.0)
@@ -82,6 +82,7 @@ def _run_proxy_harvest(device, corners, bary):
             wp.zeros(smax, dtype=float, device=device),  # material_kd
             wp.zeros(smax, dtype=float, device=device),  # material_mu
             contacts.soft_contact_count,
+            wp.full(smax, int(force_eligible), dtype=int, device=device),
             contacts.soft_contact_indices,
             contacts.soft_contact_barycentric,
             contacts.soft_contact_shape,
@@ -123,6 +124,12 @@ def test_particle_contact_reacts_on_proxy_body(test, device):
     _assert_reaction(test, *_run_proxy_harvest(device, [0, -1, -1], [1.0, 0.0, 0.0]))
 
 
+def test_ineligible_contact_has_no_proxy_reaction(test, device):
+    """Force harvesting must honor eligibility even if a row is present in adjacency."""
+    wrench, _, _ = _run_proxy_harvest(device, [0, 1, 2], [0.6, 0.3, 0.1], force_eligible=False)
+    np.testing.assert_array_equal(wrench, np.zeros(6))
+
+
 class TestVBDProxyFullSurfaceContact(unittest.TestCase):
     pass
 
@@ -143,6 +150,13 @@ add_function_test(
     TestVBDProxyFullSurfaceContact,
     "test_particle_contact_reacts_on_proxy_body",
     test_particle_contact_reacts_on_proxy_body,
+    devices=devices,
+)
+
+add_function_test(
+    TestVBDProxyFullSurfaceContact,
+    "test_ineligible_contact_has_no_proxy_reaction",
+    test_ineligible_contact_has_no_proxy_reaction,
     devices=devices,
 )
 

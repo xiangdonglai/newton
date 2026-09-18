@@ -2090,7 +2090,14 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
         wp.launch(
             build_particle_body_contact_adjacency_active,
             dim=4,
-            inputs=[contact_indices, contact_count, 4, contact_head, contact_next],
+            inputs=[
+                contact_indices,
+                contact_count,
+                4,
+                wp.ones(4, dtype=int, device=device),
+                contact_head,
+                contact_next,
+            ],
             device=device,
         )
         color_group = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
@@ -2224,6 +2231,7 @@ def _launch_particle_contact_gather(data, contact_count, contact_head, contact_n
             data["contact_indices"],
             contact_count,
             data["capacity"],
+            wp.ones(data["capacity"], dtype=int, device=device),
             contact_head,
             contact_next,
         ],
@@ -2575,6 +2583,7 @@ def _launch_body_particle_dual_prefix(data, contact_count, capacity, beta, penal
         inputs=[
             contact_count,
             data["indices"],
+            wp.ones(capacity, dtype=int, device=device),
             data["shape"],
             data["body_pos"],
             data["normal"],
@@ -4499,6 +4508,7 @@ def _body_particle_contact_lists_skip_static_kinematic(test, device):
         inputs=[
             body_particle_contact_count,
             body_particle_contact_shape,
+            wp.ones(3, dtype=int, device=device),
             shape_body,
             body_inv_mass_effective,
             buffer_pre_alloc,
@@ -5541,6 +5551,7 @@ def _run_face_section2(device, shape_margin):
             contacts.soft_contact_indices,
             contacts.soft_contact_count,
             smax,
+            wp.ones(smax, dtype=int, device=device),
             contact_head,
             contact_next,
         ],

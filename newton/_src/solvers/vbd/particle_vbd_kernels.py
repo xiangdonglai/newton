@@ -2175,12 +2175,16 @@ def build_particle_body_contact_adjacency_active(
     body_particle_contact_indices: wp.array[wp.vec3i],
     body_particle_contact_count: wp.array[int],
     body_particle_contact_max: int,
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     particle_contact_head: wp.array[int],
     particle_contact_next: wp.array[int],
 ):
     """Build linked per-particle incidence lists over the compact active contact prefix."""
     contact_index = wp.tid()
     if contact_index >= min(body_particle_contact_max, body_particle_contact_count[0]):
+        return
+
+    if body_particle_contact_force_eligible[contact_index] == 0:
         return
 
     corners = body_particle_contact_indices[contact_index]

@@ -16,7 +16,6 @@ from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
-    create_soft_contacts,
     mesh_sdf,
     resolve_mesh_sign_method,
 )
@@ -28,6 +27,7 @@ from newton._src.geometry.soft_contacts_sdf import (
     _is_analytic,
     _shape_frames,
     _soft_feature_aabb_misses_shape,
+    create_soft_contacts,
     eval_shape_sdf,
     launch_soft_ef_contacts,
     optimize_edge_sdf,
@@ -941,6 +941,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
     soft_contact_indices = wp.empty(1, dtype=wp.vec3i, device=device)
     soft_contact_barycentric = wp.empty(1, dtype=wp.vec3, device=device)
     soft_contact_shape = wp.empty(1, dtype=wp.int32, device=device)
+    soft_contact_rigid_indices = wp.empty(1, dtype=wp.vec3i, device=device)
     soft_contact_body_pos = wp.empty(1, dtype=wp.vec3, device=device)
     soft_contact_body_vel = wp.empty(1, dtype=wp.vec3, device=device)
     soft_contact_normal = wp.empty(1, dtype=wp.vec3, device=device)
@@ -965,6 +966,8 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             # Tagged watertight so the sign method resolves to parity.
             wp.array([int(MeshProperties.WATERTIGHT)], dtype=wp.int32, device=device),
             wp.array([-1], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=TextureSDFData, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
             0.0,
             wp.array([0.0], dtype=wp.float32, device=device),
             1,
@@ -972,6 +975,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             wp.array([0], dtype=wp.int32, device=device),
             wp.empty(0, dtype=HeightfieldData, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
+            False,
         ],
         outputs=[
             soft_contact_count,
@@ -979,6 +983,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             soft_contact_indices,
             soft_contact_barycentric,
             soft_contact_shape,
+            soft_contact_rigid_indices,
             soft_contact_body_pos,
             soft_contact_body_vel,
             soft_contact_normal,
@@ -1140,6 +1145,7 @@ def _launch_open_box_soft_contact(test, device, mesh_id, points, mesh_properties
     contact_indices = wp.empty(1, dtype=wp.vec3i, device=device)
     contact_barycentric = wp.empty(1, dtype=wp.vec3, device=device)
     contact_shape = wp.empty(1, dtype=wp.int32, device=device)
+    contact_rigid_indices = wp.empty(1, dtype=wp.vec3i, device=device)
     contact_body_pos = wp.empty(1, dtype=wp.vec3, device=device)
     contact_body_vel = wp.empty(1, dtype=wp.vec3, device=device)
     contact_normal = wp.empty(1, dtype=wp.vec3, device=device)
@@ -1161,6 +1167,8 @@ def _launch_open_box_soft_contact(test, device, mesh_id, points, mesh_properties
             wp.array([mesh_id], dtype=wp.uint64, device=device),
             wp.array([mesh_properties], dtype=wp.int32, device=device),
             wp.array([-1], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=TextureSDFData, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
             0.0,
             wp.array([0.0], dtype=wp.float32, device=device),
             1,
@@ -1168,6 +1176,7 @@ def _launch_open_box_soft_contact(test, device, mesh_id, points, mesh_properties
             wp.array([0], dtype=wp.int32, device=device),
             wp.empty(0, dtype=HeightfieldData, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
+            False,
         ],
         outputs=[
             count,
@@ -1175,6 +1184,7 @@ def _launch_open_box_soft_contact(test, device, mesh_id, points, mesh_properties
             contact_indices,
             contact_barycentric,
             contact_shape,
+            contact_rigid_indices,
             contact_body_pos,
             contact_body_vel,
             contact_normal,

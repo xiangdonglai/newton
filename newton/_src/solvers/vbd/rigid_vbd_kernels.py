@@ -4071,9 +4071,60 @@ def build_body_body_contact_lists(
 
 
 @wp.kernel
+def compute_body_particle_contact_force_eligibility(
+    body_particle_contact_count: wp.array[int],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    body_particle_contact_shape: wp.array[int],
+    body_particle_contact_body_pos: wp.array[wp.vec3],
+    body_particle_contact_normal: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
+):
+    """Classify whether unified rigid-soft rows may produce contact forces.
+
+    Analytic/SDF rows have no rigid primitive indices and remain eligible because a
+    negative signed distance is precisely the penetration their force should recover.
+    Dense BVH queries retain non-facing primitive pairs in Contacts,
+    but penalty and ALM forces must ignore them. The detection-time test
+    ``dot(x_soft - x_rigid, normal) >= 0`` reproduces the query's local orientation
+    classification without adding solver-specific state to :class:`Contacts`.
+    """
+    tid = wp.tid()
+    if tid >= body_particle_contact_count[0]:
+        return
+
+    if soft_contact_rigid_indices[tid][0] < 0:
+        body_particle_contact_force_eligible[tid] = wp.int32(1)
+        return
+
+    corners = soft_contact_indices[tid]
+    bary = soft_contact_barycentric[tid]
+    x_soft = bary[0] * particle_q[corners[0]]
+    if corners[1] >= 0:
+        x_soft = x_soft + bary[1] * particle_q[corners[1]]
+    if corners[2] >= 0:
+        x_soft = x_soft + bary[2] * particle_q[corners[2]]
+
+    shape = body_particle_contact_shape[tid]
+    body = shape_body[shape] if shape >= 0 else -1
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+    x_rigid = wp.transform_point(X_wb, body_particle_contact_body_pos[tid])
+    diff = x_soft - x_rigid
+    eligible = wp.length(diff) <= 1.0e-6 or wp.dot(diff, body_particle_contact_normal[tid]) >= 0.0
+    body_particle_contact_force_eligible[tid] = wp.int32(eligible)
+
+
+@wp.kernel
 def build_body_particle_contact_lists(
     body_particle_contact_count: wp.array[int],
     body_particle_contact_shape: wp.array[int],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     shape_body: wp.array[wp.int32],
     body_inv_mass_effective: wp.array[float],
     body_particle_contact_buffer_pre_alloc: int,
@@ -4092,6 +4143,8 @@ def build_body_particle_contact_lists(
     # Bucket every soft contact (particle + edge + face; single total count) by its rigid body, so
     # the per-body kernel drives all reactions from one adjacency list.
     if tid >= body_particle_contact_count[0]:
+        return
+    if body_particle_contact_force_eligible[tid] == 0:
         return
 
     shape = body_particle_contact_shape[tid]
@@ -6659,6 +6712,7 @@ def update_duals_body_body_contacts(
 def update_duals_body_particle_contacts(
     body_particle_contact_count: wp.array[int],
     soft_contact_indices: wp.array[wp.vec3i],
+    body_particle_contact_force_eligible: wp.array[wp.int32],
     body_particle_contact_shape: wp.array[int],
     body_particle_contact_body_pos: wp.array[wp.vec3],
     body_particle_contact_normal: wp.array[wp.vec3],
@@ -6682,6 +6736,8 @@ def update_duals_body_particle_contacts(
     """
     idx = wp.tid()
     if idx >= body_particle_contact_count[0]:
+        return
+    if body_particle_contact_force_eligible[idx] == 0:
         return
 
     corners = soft_contact_indices[idx]

@@ -447,30 +447,39 @@ class TriMeshCollisionDetector:
                     topological_contact_filter_threshold, external_edge_edge_filtering_map, adjacency
                 )
 
-        self.lower_bounds_tris = wp.array(shape=(model.tri_count,), dtype=wp.vec3, device=model.device)
-        self.upper_bounds_tris = wp.array(shape=(model.tri_count,), dtype=wp.vec3, device=model.device)
-        self.tri_groups = wp.array(shape=(model.tri_count,), dtype=wp.int32, device=model.device)
-        wp.launch(
-            kernel=compute_tri_aabbs,
-            inputs=[self.vertex_positions, model.tri_indices, self.lower_bounds_tris, self.upper_bounds_tris],
-            dim=model.tri_count,
-            device=model.device,
-        )
-        wp.launch(
-            kernel=compute_tri_groups,
-            inputs=[model.tri_indices, model.particle_world, model.world_count, self.tri_groups],
-            dim=model.tri_count,
-            device=model.device,
-        )
+        # Empty BVHs are unsafe to refit. Leave their group roots at -1, which
+        # downstream queries already interpret as an absent group.
+        if model.tri_count > 0:
+            self.lower_bounds_tris = wp.array(shape=(model.tri_count,), dtype=wp.vec3, device=model.device)
+            self.upper_bounds_tris = wp.array(shape=(model.tri_count,), dtype=wp.vec3, device=model.device)
+            self.tri_groups = wp.array(shape=(model.tri_count,), dtype=wp.int32, device=model.device)
+            wp.launch(
+                kernel=compute_tri_aabbs,
+                inputs=[self.vertex_positions, model.tri_indices, self.lower_bounds_tris, self.upper_bounds_tris],
+                dim=model.tri_count,
+                device=model.device,
+            )
+            wp.launch(
+                kernel=compute_tri_groups,
+                inputs=[model.tri_indices, model.particle_world, model.world_count, self.tri_groups],
+                dim=model.tri_count,
+                device=model.device,
+            )
 
-        self.bvh_tris = wp.Bvh(self.lower_bounds_tris, self.upper_bounds_tris, groups=self.tri_groups)
-        self.bvh_tris_group_roots = wp.zeros(model.world_count + 1, dtype=wp.int32, device=model.device)
-        wp.launch(
-            kernel=compute_bvh_group_roots,
-            dim=model.world_count + 1,
-            inputs=[self.bvh_tris.id, self.bvh_tris_group_roots],
-            device=model.device,
-        )
+            self.bvh_tris = wp.Bvh(self.lower_bounds_tris, self.upper_bounds_tris, groups=self.tri_groups)
+            self.bvh_tris_group_roots = wp.zeros(model.world_count + 1, dtype=wp.int32, device=model.device)
+            wp.launch(
+                kernel=compute_bvh_group_roots,
+                dim=model.world_count + 1,
+                inputs=[self.bvh_tris.id, self.bvh_tris_group_roots],
+                device=model.device,
+            )
+        else:
+            self.lower_bounds_tris = None
+            self.upper_bounds_tris = None
+            self.tri_groups = None
+            self.bvh_tris = None
+            self.bvh_tris_group_roots = wp.full(model.world_count + 1, -1, dtype=wp.int32, device=model.device)
 
         # Collision detection results live in a TriMeshCollisionInfo owned outside
         # the detector. Explicitly one of: injected (collision_info=...), self-built
@@ -493,30 +502,37 @@ class TriMeshCollisionDetector:
             self._validate_collision_info(collision_info)
         self.collision_info = collision_info
 
-        self.lower_bounds_edges = wp.array(shape=(model.edge_count,), dtype=wp.vec3, device=model.device)
-        self.upper_bounds_edges = wp.array(shape=(model.edge_count,), dtype=wp.vec3, device=model.device)
-        self.edge_groups = wp.array(shape=(model.edge_count,), dtype=wp.int32, device=model.device)
-        wp.launch(
-            kernel=compute_edge_aabbs,
-            inputs=[self.vertex_positions, model.edge_indices, self.lower_bounds_edges, self.upper_bounds_edges],
-            dim=model.edge_count,
-            device=model.device,
-        )
-        wp.launch(
-            kernel=compute_edge_groups,
-            inputs=[model.edge_indices, model.particle_world, model.world_count, self.edge_groups],
-            dim=model.edge_count,
-            device=model.device,
-        )
+        if model.edge_count > 0:
+            self.lower_bounds_edges = wp.array(shape=(model.edge_count,), dtype=wp.vec3, device=model.device)
+            self.upper_bounds_edges = wp.array(shape=(model.edge_count,), dtype=wp.vec3, device=model.device)
+            self.edge_groups = wp.array(shape=(model.edge_count,), dtype=wp.int32, device=model.device)
+            wp.launch(
+                kernel=compute_edge_aabbs,
+                inputs=[self.vertex_positions, model.edge_indices, self.lower_bounds_edges, self.upper_bounds_edges],
+                dim=model.edge_count,
+                device=model.device,
+            )
+            wp.launch(
+                kernel=compute_edge_groups,
+                inputs=[model.edge_indices, model.particle_world, model.world_count, self.edge_groups],
+                dim=model.edge_count,
+                device=model.device,
+            )
 
-        self.bvh_edges = wp.Bvh(self.lower_bounds_edges, self.upper_bounds_edges, groups=self.edge_groups)
-        self.bvh_edges_group_roots = wp.zeros(model.world_count + 1, dtype=wp.int32, device=model.device)
-        wp.launch(
-            kernel=compute_bvh_group_roots,
-            dim=model.world_count + 1,
-            inputs=[self.bvh_edges.id, self.bvh_edges_group_roots],
-            device=model.device,
-        )
+            self.bvh_edges = wp.Bvh(self.lower_bounds_edges, self.upper_bounds_edges, groups=self.edge_groups)
+            self.bvh_edges_group_roots = wp.zeros(model.world_count + 1, dtype=wp.int32, device=model.device)
+            wp.launch(
+                kernel=compute_bvh_group_roots,
+                dim=model.world_count + 1,
+                inputs=[self.bvh_edges.id, self.bvh_edges_group_roots],
+                device=model.device,
+            )
+        else:
+            self.lower_bounds_edges = None
+            self.upper_bounds_edges = None
+            self.edge_groups = None
+            self.bvh_edges = None
+            self.bvh_edges_group_roots = wp.full(model.world_count + 1, -1, dtype=wp.int32, device=model.device)
 
         self.resize_flags = wp.zeros(shape=(4,), dtype=wp.int32, device=self.device)
 
@@ -852,38 +868,40 @@ class TriMeshCollisionDetector:
         if new_pos is not None:
             self.vertex_positions = new_pos
 
-        wp.launch(
-            kernel=compute_tri_aabbs,
-            inputs=[
-                self.vertex_positions,
-                self.model.tri_indices,
-            ],
-            outputs=[self.lower_bounds_tris, self.upper_bounds_tris],
-            dim=self.model.tri_count,
-            device=self.model.device,
-        )
-        self.bvh_tris.rebuild()
-        wp.launch(
-            kernel=compute_bvh_group_roots,
-            dim=self.model.world_count + 1,
-            inputs=[self.bvh_tris.id, self.bvh_tris_group_roots],
-            device=self.model.device,
-        )
+        if self.model.tri_count > 0:
+            wp.launch(
+                kernel=compute_tri_aabbs,
+                inputs=[
+                    self.vertex_positions,
+                    self.model.tri_indices,
+                ],
+                outputs=[self.lower_bounds_tris, self.upper_bounds_tris],
+                dim=self.model.tri_count,
+                device=self.model.device,
+            )
+            self.bvh_tris.rebuild()
+            wp.launch(
+                kernel=compute_bvh_group_roots,
+                dim=self.model.world_count + 1,
+                inputs=[self.bvh_tris.id, self.bvh_tris_group_roots],
+                device=self.model.device,
+            )
 
-        wp.launch(
-            kernel=compute_edge_aabbs,
-            inputs=[self.vertex_positions, self.model.edge_indices],
-            outputs=[self.lower_bounds_edges, self.upper_bounds_edges],
-            dim=self.model.edge_count,
-            device=self.model.device,
-        )
-        self.bvh_edges.rebuild()
-        wp.launch(
-            kernel=compute_bvh_group_roots,
-            dim=self.model.world_count + 1,
-            inputs=[self.bvh_edges.id, self.bvh_edges_group_roots],
-            device=self.model.device,
-        )
+        if self.model.edge_count > 0:
+            wp.launch(
+                kernel=compute_edge_aabbs,
+                inputs=[self.vertex_positions, self.model.edge_indices],
+                outputs=[self.lower_bounds_edges, self.upper_bounds_edges],
+                dim=self.model.edge_count,
+                device=self.model.device,
+            )
+            self.bvh_edges.rebuild()
+            wp.launch(
+                kernel=compute_bvh_group_roots,
+                dim=self.model.world_count + 1,
+                inputs=[self.bvh_edges.id, self.bvh_edges_group_roots],
+                device=self.model.device,
+            )
 
     def refit(self, new_pos=None):
         if new_pos is not None:
@@ -893,6 +911,8 @@ class TriMeshCollisionDetector:
         self.refit_edges()
 
     def refit_triangles(self):
+        if self.model.tri_count == 0:
+            return
         wp.launch(
             kernel=compute_tri_aabbs,
             inputs=[self.vertex_positions, self.model.tri_indices, self.lower_bounds_tris, self.upper_bounds_tris],
@@ -902,6 +922,8 @@ class TriMeshCollisionDetector:
         self.bvh_tris.refit()
 
     def refit_edges(self):
+        if self.model.edge_count == 0:
+            return
         wp.launch(
             kernel=compute_edge_aabbs,
             inputs=[self.vertex_positions, self.model.edge_indices, self.lower_bounds_edges, self.upper_bounds_edges],
@@ -913,6 +935,8 @@ class TriMeshCollisionDetector:
     def vertex_triangle_collision_detection(
         self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
     ):
+        if self.bvh_tris is None:
+            return
         self._require_collision_info()
         self.vertex_colliding_triangles.fill_(-1)
 
@@ -974,6 +998,8 @@ class TriMeshCollisionDetector:
     def edge_edge_collision_detection(
         self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
     ):
+        if self.bvh_edges is None:
+            return
         self._require_collision_info()
         self.edge_colliding_edges.fill_(-1)
         wp.launch(
@@ -1018,6 +1044,8 @@ class TriMeshCollisionDetector:
         return int(min(32, max(8, 2 ** round(math.log2(blocks_per_sm)))))
 
     def triangle_triangle_intersection_detection(self):
+        if self.bvh_tris is None:
+            return
         if self.triangle_intersecting_triangles is None:
             self.triangle_intersecting_triangles = wp.zeros(
                 shape=(self.model.tri_count * self.triangle_triangle_collision_buffer_pre_alloc,),

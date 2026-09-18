@@ -1568,6 +1568,66 @@ and increase it while the task behavior remains acceptable:
             solver.step(state_0, state_1, control, contacts, dt=sim_dt)
             state_0, state_1 = state_1, state_0
 
+Dense rigid-soft mesh queries
+----------------------------
+
+Full-surface rigid-soft contact can query mesh and convex-mesh geometry directly,
+without provisioning a texture SDF:
+
+.. code-block:: python
+
+    pipeline = newton.CollisionPipeline(
+        model,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_full_surface_mesh_backend="bvh",
+    )
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+
+The BVH backend emits every nearby soft vertex–rigid triangle (VT), soft
+triangle–rigid vertex (TV), and soft edge–rigid edge (EE) pair that fits in the
+configured buffers. VT uses the rigid mesh's existing BVH; TV and EE share the
+soft triangle and edge BVHs with self-contact. :meth:`CollisionPipeline.collide`
+refits the soft BVHs to the supplied state before detection. Using those trees
+for rigid-soft queries does not enable self-contact or allocate its result
+buffers. The existing :meth:`CollisionPipeline.refit_soft_self_contact_bvh`
+method can explicitly rebuild the shared trees after large deformations.
+
+Dense mesh rows replace the corresponding particle-only and SDF edge/face rows.
+Analytic shapes keep their existing queries. With full-surface contact enabled,
+the default ``"sdf"`` backend uses texture SDFs for mesh particle, edge, and face
+queries. With full-surface contact disabled, the backend option has no effect:
+mesh particles retain the legacy nearest-triangle query and need no texture SDF.
+
+Each dense row includes :attr:`Contacts.soft_contact_rigid_indices`, which
+identifies the rigid primitive using slots in its mesh's triangle index buffer:
+three nonnegative entries for a triangle, two for an edge, and one for a vertex,
+with unused entries set to ``-1``. Non-BVH rows contain ``(-1, -1, -1)``.
+The existing soft indices and barycentric weights identify the soft feature
+and its contact point.
+
+:class:`~solvers.SolverVBD` accepts these dense records and classifies force
+eligibility at the collision-detection configuration. Rows whose displacement
+from the rigid point to the soft point disagrees with the stored outward normal
+produce no force or penalty update; nearly coincident points within ``1e-6`` m
+remain eligible.
+The records remain in ``Contacts``. Analytic/SDF rows remain eligible so their
+signed penetration response is preserved. Dense queries are discrete and do
+not provide continuous collision detection or complete-primitive DAT guarantees.
+
+The default buffer estimate reserves ``full_surface_bvh_contact_headroom``
+records per query feature thread (default ``4``). This is a capacity estimate,
+not a bound on the number of nearby primitive pairs. Both candidate overflow
+and contact overflow drop excess rows and report warnings when
+``verify_buffers=True``. Increase ``soft_contact_max`` or the headroom when
+queries overflow. Reconstruct the pipeline after changing rigid mesh topology
+or increasing particle radii beyond the model's construction-time maximum.
+
+Candidate discovery is discrete; gradients through emitted geometry hold the
+selected primitive pairs fixed. For differentiable BVH queries, allocate
+results with :meth:`CollisionPipeline.contacts` and retain a distinct result
+buffer for each collision call on a tape until its backward pass completes.
+
 .. _Contact Generation:
 
 Contact Data
@@ -1631,6 +1691,8 @@ and is consumed by the solver :meth:`~solvers.SolverBase.step` method for contac
      - Barycentric weights of the contact point over the record's soft particles (``(1, 0, 0)`` for a particle contact).
    * - ``soft_contact_shape``
      - Shape indices.
+   * - ``soft_contact_rigid_indices``
+     - Rigid primitive index-buffer slots for dense BVH rows, padded with ``-1``. Non-BVH rows contain only ``-1``.
    * - ``soft_contact_body_pos``, ``soft_contact_body_vel``
      - Contact position and velocity on shape.
    * - ``soft_contact_normal``
