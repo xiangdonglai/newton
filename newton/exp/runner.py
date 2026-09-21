@@ -76,7 +76,7 @@ class Experiment:
         if self.scene.has_robot and self.robot_collision_geometry != "urdf" and not self.full_surface:
             raise ValueError(
                 "non-default --robot-collision-geometry choices require --full-surface "
-                "because their mesh proxies are intended for the dense rigid-soft BVH backend"
+                "because their mesh proxies use full-surface rigid-soft contacts"
             )
         if args.solver == "avbd" and args.rigid_collision_frequency < 1:
             raise ValueError("--rigid-collision-frequency must be at least 1")
@@ -224,6 +224,14 @@ class Experiment:
         static_shapes = self.scene.add_static(builder)
         self.strategy.filter_collisions(builder, robot_shapes, static_shapes)
         self.scene.add_deformables(builder)
+
+        if self.full_surface and self.args.rigid_soft_mesh_backend == "sdf":
+            # Include meshes added with explicit shape configs as well as imported colliders.
+            for shape, geo_type in enumerate(builder.shape_type):
+                if geo_type in (newton.GeoType.MESH, newton.GeoType.CONVEX_MESH) and (
+                    builder.shape_flags[shape] & newton.ShapeFlags.COLLIDE_PARTICLES
+                ):
+                    builder.shape_force_sdf[shape] = True
 
         builder.color()
         self.model = builder.finalize()

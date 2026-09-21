@@ -74,14 +74,14 @@ class SolverStrategy:
     def make_collision_pipeline(self, model, full_surface=False):
         """Build the collision pipeline (IsaacLab uses broad_phase='explicit').
 
-        Full-surface contact uses dense BVH feature queries for mesh shapes;
+        Full-surface contact uses the selected mesh query backend;
         analytic primitives continue through the SDF backend.
         """
         return newton.CollisionPipeline(
             model,
             broad_phase="explicit",
             enable_rigid_soft_full_surface_contact=full_surface,
-            rigid_soft_mesh_backend="bvh",
+            rigid_soft_mesh_backend=getattr(self.args, "rigid_soft_mesh_backend", "bvh"),
         )
 
     def pre_substeps(self, solver, state):

@@ -181,15 +181,23 @@ class MonolithicAvbdStrategy(SolverStrategy):
             action=argparse.BooleanOptionalAction,
             dest="full_surface",
             default=True,
-            help="Enable unified full-surface rigid-soft contacts. Mesh shapes use dense BVH feature queries; "
+            help="Enable unified full-surface rigid-soft contacts. Mesh shapes use --rigid-soft-mesh-backend; "
             "analytic primitives use their SDF queries. Enabled by default; use --no-full-surface to disable.",
+        )
+        parser.add_argument(
+            "--rigid-soft-mesh-backend",
+            choices=("bvh", "sdf"),
+            default="bvh",
+            help="Rigid mesh/convex query backend with --full-surface. "
+            "'bvh' uses dense feature queries; 'sdf' builds mesh SDFs during model setup. "
+            "Ignored with --no-full-surface; analytic primitives always use SDF queries.",
         )
         parser.add_argument(
             "--robot-collision-geometry",
             choices=ROBOT_COLLISION_GEOMETRIES,
             default="urdf",
             help="Robot collision representation. 'urdf' uses the imported colliders; 'finger-box-to-mesh' "
-            "transfers the finger boxes' particle-contact role to equivalent BVH triangle meshes while "
+            "transfers the finger boxes' particle-contact role to equivalent triangle meshes while "
             "retaining the boxes for rigid-rigid collision.",
         )
         parser.add_argument(
