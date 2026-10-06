@@ -1243,6 +1243,7 @@ class CollisionPipeline:
         soft_contact_gap: float | None = None,
         soft_contact_margin: float | None = None,
         enable_rigid_soft_full_surface_contact: bool = False,
+        full_surface_contact_return_unfiltered: bool = False,
         requires_grad: bool | None = None,
         broad_phase: Literal["nxn", "sap", "explicit"]
         | BroadPhaseAllPairs
@@ -1310,6 +1311,17 @@ class CollisionPipeline:
                 :class:`~newton.solvers.SolverVBD`; other solvers raise on such contacts. Records are
                 emitted into :attr:`Contacts.soft_contact_indices`. Defaults to False. Fixed at
                 construction because it sizes the soft-contact buffer headroom.
+            full_surface_contact_return_unfiltered: Include endpoint-only TV/EE pairs,
+                inactive soft features, and all rigid mesh edges, including edges omitted by
+                SDF preprocessing. Cone filtering is solver-side in either mode. Requires
+                ``enable_rigid_soft_full_surface_contact=True``.
+                Analytic and heightfield contacts are unchanged. Defaults to False; fixed at
+                construction. This is geometric query output for consumers such as DAT/ESP,
+                not a set of independently valid penalty-force contacts. The existing
+                nearest-face recovery contact for a deep-interior particle is retained,
+                even outside the detection distance. The default capacity is only an estimate:
+                increase ``soft_contact_max`` if overflow is reported, since an overflowing
+                result is incomplete.
             requires_grad: Whether pipeline-generated soft contacts and the
                 deprecated automatic rigid-contact outputs require gradients.
                 If None, uses ``model.requires_grad``. Explicit calls to
@@ -1395,6 +1407,10 @@ class CollisionPipeline:
             :func:`newton.eval_rigid_contact_kinematics` may change
             without prior notice; see :meth:`collide`.
         """
+        if full_surface_contact_return_unfiltered and not enable_rigid_soft_full_surface_contact:
+            raise ValueError(
+                "full_surface_contact_return_unfiltered requires enable_rigid_soft_full_surface_contact=True"
+            )
         if contact_matching not in ("disabled", "latest", "sticky"):
             raise ValueError(
                 f"contact_matching must be one of 'disabled', 'latest', 'sticky', got {contact_matching!r}"
@@ -1866,7 +1882,13 @@ class CollisionPipeline:
             self._soft_heightfield_face_pairs = _build_soft_face_rigid_contact_pairs(model, heightfield_capable)
             mesh_vertex_pairs = _build_soft_particle_rigid_contact_pairs(model, shape_ok=mesh_mask)
             if len(mesh_vertex_pairs):
-                self._soft_mesh_contact_data = MeshContactData(model, mesh_mask, mesh_vertex_pairs, soft_contact_gap)
+                self._soft_mesh_contact_data = MeshContactData(
+                    model,
+                    mesh_mask,
+                    mesh_vertex_pairs,
+                    soft_contact_gap,
+                    return_unfiltered=full_surface_contact_return_unfiltered,
+                )
         else:
             self.soft_edge_rigid_pairs = empty_pairs
             self.soft_face_rigid_pairs = empty_pairs
