@@ -13,6 +13,11 @@ pass evaluates the final contacts. No intermediate contact pool is required.
 Incident-feature cones identify redundant representations of one surface patch.
 :func:`filter_soft_mesh_contacts` applies them as a solver-side utility, and
 :func:`mesh_contact_valid` exposes the per-record test to solver kernels.
+
+Both modes retain endpoint pairs. The unfiltered option additionally includes
+inactive soft features and rigid edges omitted by SDF preprocessing, and keeps
+on-surface TV/EE pairs whose side cannot be resolved by the cones. Solver-side
+filtering still decides which rows can be used as independent contact forces.
 """
 
 from __future__ import annotations
@@ -470,7 +475,7 @@ def _mesh_feature_data(
 
 
 def _build_rigid_features(
-    model: Model, meshes: dict[int, Mesh]
+    model: Model, meshes: dict[int, Mesh], *, return_unfiltered: bool = False
 ) -> tuple[wp.array[wp.vec2i], wp.array[wp.vec3], wp.array[wp.vec3i], wp.array[wp.vec3]]:
 
     device = model.device
@@ -487,6 +492,9 @@ def _build_rigid_features(
         # Finalized tables include SDF edges cooked by the builder, which need
         # not be attached to the source Mesh. Slices may differ for one source.
         collision_edges = packed_edges[start : start + count] if start >= 0 else mesh._collision_edges
+        if return_unfiltered:
+            # DAT/ESP need the complete mesh topology, not SDF-selected edges.
+            collision_edges = None
         key = (_geometry_key(mesh), None if collision_edges is None else np.asarray(collision_edges).tobytes())
         data = cache.get(key)
         if data is None:
@@ -613,6 +621,7 @@ def _local_side(outward: bool, inward: bool, separation: wp.vec3, reference: wp.
 def _detect_mesh_vertex_contacts(
     vt_pairs: wp.array[wp.vec2i],
     partition_depth: int,
+    return_unfiltered: bool,
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -640,7 +649,7 @@ def _detect_mesh_vertex_contacts(
     pair = vt_pairs[tid]
     particle_index = pair[0]
     shape_index = pair[1]
-    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+    if not return_unfiltered and (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
         return
     if (shape_flags[shape_index] & ShapeFlags.COLLIDE_PARTICLES) == 0:
         return
@@ -717,6 +726,7 @@ def _detect_mesh_vertex_contacts(
 @wp.kernel(enable_backward=False)
 def _detect_mesh_face_contacts(
     rigid_vertex_table: wp.array[wp.vec2i],
+    return_unfiltered: bool,
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -799,7 +809,7 @@ def _detect_mesh_face_contacts(
                     | (particle_flags[t1] & ParticleFlags.ACTIVE)
                     | (particle_flags[t2] & ParticleFlags.ACTIVE)
                 )
-                if active == 0:
+                if not return_unfiltered and active == 0:
                     continue
 
                 cp, bary, _feature = triangle_closest_point(particle_q[t0], particle_q[t1], particle_q[t2], x_w)
@@ -821,8 +831,11 @@ def _detect_mesh_face_contacts(
                     )
                     if sign == 2:
                         reference = transform_normal_with_scale(X_ws, scale, vertex_outward[tid])
-                        sign = _local_side(outward, inward, cp - x_w, reference)
-                    if sign != 0:
+                        if return_unfiltered:
+                            sign = wp.where(wp.dot(cp - x_w, reference) < 0.0, -1, 1)
+                        else:
+                            sign = _local_side(outward, inward, cp - x_w, reference)
+                    if return_unfiltered or sign != 0:
                         _append_mesh_contact(
                             _MESH_FEATURE_TV + wp.where(sign < 0, _MESH_FEATURE_INSIDE, 0),
                             tri_index,
@@ -838,6 +851,7 @@ def _detect_mesh_face_contacts(
 @wp.kernel(enable_backward=False)
 def _detect_mesh_edge_contacts(
     rigid_edge_table: wp.array[wp.vec3i],
+    return_unfiltered: bool,
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -919,7 +933,7 @@ def _detect_mesh_edge_contacts(
                 sv0 = edge_indices[edge_index, 2]
                 sv1 = edge_indices[edge_index, 3]
                 active = (particle_flags[sv0] & ParticleFlags.ACTIVE) | (particle_flags[sv1] & ParticleFlags.ACTIVE)
-                if active == 0:
+                if not return_unfiltered and active == 0:
                     continue
 
                 std = wp.closest_point_edge_edge(
@@ -944,8 +958,11 @@ def _detect_mesh_edge_contacts(
                     )
                     if sign == 2:
                         reference = transform_normal_with_scale(X_ws, scale, edge_outward[tid])
-                        sign = _local_side(outward, inward, soft_point - rigid_point, reference)
-                    if sign != 0:
+                        if return_unfiltered:
+                            sign = wp.where(wp.dot(soft_point - rigid_point, reference) < 0.0, -1, 1)
+                        else:
+                            sign = _local_side(outward, inward, soft_point - rigid_point, reference)
+                    if return_unfiltered or sign != 0:
                         _append_mesh_contact(
                             _MESH_FEATURE_EE + wp.where(sign < 0, _MESH_FEATURE_INSIDE, 0),
                             edge_index,
@@ -1307,6 +1324,7 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
             inputs=[
                 vt_pairs,
                 partition_depth,
+                data.return_unfiltered,
                 state.particle_q,
                 model.particle_radius,
                 model.particle_flags,
@@ -1335,6 +1353,7 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
             dim=n_tv,
             inputs=[
                 rigid_vertex_table,
+                data.return_unfiltered,
                 state.particle_q,
                 model.particle_radius,
                 model.particle_flags,
@@ -1362,6 +1381,7 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
             dim=n_ee,
             inputs=[
                 rigid_edge_table,
+                data.return_unfiltered,
                 state.particle_q,
                 model.particle_radius,
                 model.particle_flags,
@@ -1705,13 +1725,25 @@ class MeshContactData:
 
     @property
     def edge_edge_parallel_epsilon(self) -> float:
+        if self.return_unfiltered:
+            # Retain every nonzero segment for geometric queries and evaluation.
+            return 0.0
         return self.detector.edge_edge_parallel_epsilon if self.detector is not None else 1.0e-5
 
-    def __init__(self, model: Model, shape_mask: np.ndarray, vertex_pairs: wp.array[wp.vec2i], gap: float):
+    def __init__(
+        self,
+        model: Model,
+        shape_mask: np.ndarray,
+        vertex_pairs: wp.array[wp.vec2i],
+        gap: float,
+        *,
+        return_unfiltered: bool = False,
+    ):
         self.vertex_pairs = vertex_pairs
+        self.return_unfiltered = return_unfiltered
         meshes = _collision_meshes(model, shape_mask)
         if model.tri_count:
-            self.rigid_features = _build_rigid_features(model, meshes)
+            self.rigid_features = _build_rigid_features(model, meshes, return_unfiltered=return_unfiltered)
             if model.edge_count == 0:
                 self.rigid_features = (
                     *self.rigid_features[:2],
