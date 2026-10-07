@@ -7,8 +7,9 @@ Run from newton_4227:
     .venv/bin/python ctx/2026-10-04-esp-discussion/evaluate_esp_box_cloth.py
     .venv/bin/python ctx/2026-10-04-esp-discussion/evaluate_esp_box_cloth.py --device cuda:0 --gap 0.00015
 
-Two kernels: P(q) at vertices, and unnormalized P_ee from native pipeline EE
-records. The static box has an identity transform. Distances are in metres;
+Evaluate P(q) from native pipeline VT/TV records, and P_ee from EE records.
+A count-building pass cancels matching terms before evaluating barriers.
+The static box has an identity transform. Distances are in metres;
 energies use float64, unit stiffness, and the camera-ready ESP weights.
 This evaluates energies only, not forces, recovery, or simulation.
 Each run compares point values and integrated energies with esp_numpy_oracle.py.
@@ -33,6 +34,8 @@ class Surface:
     face_edges: wp.array[wp.vec3i]
     interior_edges: wp.array[int]
     interior_vertices: wp.array[int]
+    feature_scale: wp.array[int]
+    feature_owner_face: wp.array[int]
 
 
 @wp.func
@@ -125,18 +128,116 @@ def point_mesh_potential(
     return result
 
 
+@wp.func
+def accumulate_triangle_feature_counts(
+    point: wp.vec3d, target: Surface, face: int, counts: wp.array2d[int], vertex: int
+):
+    """Accumulate one face and its incidence-weighted edge/vertex corrections."""
+    _closest, feature = triangle_feature(point, target, face)
+    wp.atomic_add(counts, vertex, feature, target.feature_scale[feature])
+    for corner in range(3):
+        edge = target.face_edges[face][corner]
+        if target.interior_edges[edge] != 0:
+            _closest, feature = segment_feature(point, target, edge)
+            wp.atomic_add(counts, vertex, feature, -target.feature_scale[feature] / 2)
+        v = target.faces[face][corner]
+        if target.interior_vertices[v] != 0:
+            # scale = 2*n_v, so the correction (1/n_v)*scale is exactly 2.
+            wp.atomic_add(counts, vertex, v, 2)
+
+
 @wp.kernel
-def evaluate_point_potential(
-    points: wp.array[wp.vec3d],
+def build_point_feature_counts(
+    soft_contact_count: wp.array[int],
+    mesh_features: wp.array[wp.vec3i],
+    rigid_vertices: wp.array[wp.vec2i],
+    rigid_mesh: wp.uint64,
+    cloth: Surface,
+    box: Surface,
+    box_counts: wp.array2d[int],
+    cloth_counts: wp.array2d[int],
+):
+    """One thread per native VT/TV row; integer cancellation across triangles."""
+    i = wp.tid()
+    if i >= soft_contact_count[0]:
+        return
+    row = mesh_features[i]
+    if row[0] < 0:
+        return
+    family = row[0] & 7
+    if family == 0:  # Soft vertex against rigid triangle.
+        accumulate_triangle_feature_counts(cloth.vertices[row[1]], box, row[2], box_counts, row[1])
+    elif family == 1:  # Rigid vertex against soft triangle.
+        vertex = wp.mesh_get_index(rigid_mesh, rigid_vertices[row[2]][1])
+        accumulate_triangle_feature_counts(box.vertices[vertex], cloth, row[1], cloth_counts, vertex)
+
+
+@wp.func
+def triangle_potential_from_counts(
+    point: wp.vec3d,
     target: Surface,
+    face: int,
+    counts: wp.array2d[int],
+    vertex: int,
     support: wp.float64,
     near_cutoff: wp.float64,
-    counts: wp.array2d[int],
-    values: wp.array[wp.vec2d],
 ):
-    """One thread per point; output (P, P_near)."""
+    """Evaluate this triangle's uncancelled terms, counting shared features once."""
+    vertex_count, edge_count = target.vertices.shape[0], target.edges.shape[0]
+    result = wp.vec2d(0.0)
+    for slot in range(7):  # Face, three edges, three vertices.
+        feature = vertex_count + edge_count + face
+        if slot > 0 and slot <= 3:
+            feature = vertex_count + target.face_edges[face][slot - 1]
+        elif slot > 3:
+            feature = target.faces[face][slot - 4]
+        if target.feature_owner_face[feature] == face and counts[vertex, feature] != 0:
+            closest = wp.vec3d(0.0)
+            if slot == 0:
+                closest, _id = triangle_feature(point, target, face)
+            elif slot <= 3:
+                closest, _id = segment_feature(point, target, feature - vertex_count)
+            else:
+                closest = target.vertices[feature]
+            coefficient = wp.float64(counts[vertex, feature]) / wp.float64(target.feature_scale[feature])
+            result += coefficient * barrier_parts(wp.length(point - closest), support, near_cutoff)
+    return result
+
+
+@wp.kernel
+def evaluate_point_potential(
+    soft_contact_count: wp.array[int],
+    mesh_features: wp.array[wp.vec3i],
+    rigid_vertices: wp.array[wp.vec2i],
+    rigid_mesh: wp.uint64,
+    cloth: Surface,
+    box: Surface,
+    box_counts: wp.array2d[int],
+    cloth_counts: wp.array2d[int],
+    support: wp.float64,
+    near_cutoff: wp.float64,
+    cloth_values: wp.array[wp.vec2d],
+    box_values: wp.array[wp.vec2d],
+):
+    """One thread per native VT/TV row; accumulate vertex (P, P_near)."""
     i = wp.tid()
-    values[i] = point_mesh_potential(points[i], target, support, near_cutoff, counts, i)
+    if i >= soft_contact_count[0]:
+        return
+    row = mesh_features[i]
+    if row[0] < 0:
+        return
+    family = row[0] & 7
+    if family == 0:
+        value = triangle_potential_from_counts(
+            cloth.vertices[row[1]], box, row[2], box_counts, row[1], support, near_cutoff
+        )
+        wp.atomic_add(cloth_values, row[1], value)
+    elif family == 1:
+        vertex = wp.mesh_get_index(rigid_mesh, rigid_vertices[row[2]][1])
+        value = triangle_potential_from_counts(
+            box.vertices[vertex], cloth, row[1], cloth_counts, vertex, support, near_cutoff
+        )
+        wp.atomic_add(box_values, vertex, value)
 
 
 @wp.func
@@ -179,6 +280,7 @@ def ee_sample(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d, d: wp.vec3d, near_cutoff: w
 
 @wp.kernel
 def evaluate_ee_potential(
+    soft_contact_count: wp.array[int],
     mesh_features: wp.array[wp.vec3i],
     soft_edges: wp.array2d[int],
     rigid_edges: wp.array[wp.vec3i],
@@ -195,6 +297,8 @@ def evaluate_ee_potential(
 ):
     """One thread per native contact row; output (cloth->box, box->cloth) energy."""
     i = wp.tid()
+    if i >= soft_contact_count[0]:
+        return
     # (family/sign bits, soft feature ID, rigid feature-table row).
     row = mesh_features[i]
     if row[0] < 0 or (row[0] & 7) != 2:
@@ -215,7 +319,7 @@ def evaluate_ee_potential(
 
 
 def make_surface(vertices, faces):
-    """Upload topology; precompute A_f/3 vertex weights and 2*sum(A_f) edge factors."""
+    """Upload topology; precompute sum(A_f)/3 vertex weights and 2*sum(A_f) edge factors."""
     vertices, faces = np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int32).reshape(-1, 3)
     triangles = vertices[faces]
     areas = 0.5 * np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
@@ -226,6 +330,15 @@ def make_surface(vertices, faces):
     edge_area, vertex_area = np.zeros(len(edges)), np.zeros(len(vertices))
     np.add.at(edge_area, inverse, np.repeat(2 * areas, 3))
     np.add.at(vertex_area, faces.ravel(), np.repeat(areas / 3, 3))
+    vertex_incidence = np.bincount(faces.ravel(), minlength=len(vertices))
+    # Per-feature integer scales represent 1/2 and 1/n_v corrections exactly.
+    feature_scale = np.concatenate((2 * vertex_incidence, np.full(len(edges), 2), np.ones(len(faces)))).astype(np.int32)
+    # The lowest incident face evaluates each shared edge/vertex once.
+    feature_owner_face = np.full(len(feature_scale), len(faces), dtype=np.int32)
+    face_ids = np.repeat(np.arange(len(faces)), 3)
+    np.minimum.at(feature_owner_face, faces.ravel(), face_ids)
+    np.minimum.at(feature_owner_face, len(vertices) + inverse, face_ids)
+    feature_owner_face[len(vertices) + len(edges) :] = np.arange(len(faces))
     surface = Surface()
     surface.vertices = wp.array(vertices, dtype=wp.vec3d)
     surface.faces = wp.array(faces, dtype=wp.vec3i)
@@ -233,6 +346,8 @@ def make_surface(vertices, faces):
     surface.face_edges = wp.array(inverse.reshape(-1, 3), dtype=wp.vec3i)
     surface.interior_edges = wp.array((incidence == 2).astype(np.int32), dtype=int)
     surface.interior_vertices = wp.array(interior_vertices, dtype=int)
+    surface.feature_scale = wp.array(feature_scale, dtype=int)
+    surface.feature_owner_face = wp.array(feature_owner_face, dtype=int)
     return surface, vertex_area, dict(zip(map(tuple, edges), edge_area, strict=True))
 
 
@@ -289,67 +404,77 @@ def run_example(device, gap):
         )
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
-        count = int(contacts.soft_contact_count.numpy()[0])
-        if count > contacts.soft_contact_max:
-            raise RuntimeError("Increase soft_contact_max: candidate buffer overflow")
+        contact_max = contacts.soft_contact_max
         mesh = model.shape_source[box_shape]
         cloth, cloth_vertex_area, cloth_edge_area = make_surface(state.particle_q.numpy(), model.tri_indices.numpy())
         box, box_vertex_area, box_edge_area = make_surface(mesh.vertices, mesh.indices)
         numpy_point_values, numpy_energy = reference_energies(
             cloth.vertices.numpy(), cloth.faces.numpy(), box.vertices.numpy(), box.faces.numpy(), support, near_cutoff
         )
-        # Fixed vertex quadrature: integrate P(q) with incident rest areas A_f/3.
-        fixed = []
-        for direction, (label, source, target, vertex_area) in enumerate(
-            [
-                ("cloth", cloth, box, cloth_vertex_area),
-                ("box", box, cloth, box_vertex_area),
-            ]
-        ):
-            values = wp.zeros(source.vertices.shape[0], dtype=wp.vec2d)
-            wp.launch(
-                evaluate_point_potential,
-                dim=source.vertices.shape[0],
-                inputs=[
-                    source.vertices,
-                    target,
-                    wp.float64(support),
-                    wp.float64(near_cutoff),
-                    allocate_counts(source.vertices.shape[0], target),
-                    values,
-                ],
-            )
-            point_values = values.numpy()
-            np.testing.assert_allclose(point_values, numpy_point_values[direction], rtol=1e-10, atol=1e-12)
-            p = point_values[:, 0]
-            print(f"P at {label} vertices: {p}")
-            fixed.append(vertex_area @ p)
+        # Use the returned VT/TV rows for both passes, with no target-mesh scan.
+        rigid_mesh = model.shape_source_ptr.numpy()[box_shape]
+        rigid_vertices = pipeline._soft_mesh_contact_data.rigid_features[0]
+        box_counts = allocate_counts(cloth.vertices.shape[0], box)
+        cloth_counts = allocate_counts(box.vertices.shape[0], cloth)
+        cloth_values = wp.zeros(cloth.vertices.shape[0], dtype=wp.vec2d)
+        box_values = wp.zeros(box.vertices.shape[0], dtype=wp.vec2d)
+        # Launch at capacity; each kernel checks the device-side contact count.
+        inputs = [
+            contacts.soft_contact_count,
+            contacts._soft_contact_mesh_features,
+            rigid_vertices,
+            rigid_mesh,
+            cloth,
+            box,
+            box_counts,
+            cloth_counts,
+        ]
+        wp.launch(build_point_feature_counts, dim=contact_max, inputs=inputs)
+        wp.launch(
+            evaluate_point_potential,
+            dim=contact_max,
+            inputs=[*inputs, wp.float64(support), wp.float64(near_cutoff), cloth_values, box_values],
+        )
 
         # Map rest-area factors to the pipeline's native edge numbering.
         rigid_edges = pipeline._soft_mesh_contact_data.rigid_features[2]
         soft_factors = [cloth_edge_area[tuple(sorted(edge))] for edge in model.edge_indices.numpy()[:, 2:4]]
         rigid_factors = [box_edge_area[tuple(sorted(mesh.indices[row[1:]]))] for row in rigid_edges.numpy()]
-        energy = wp.zeros(count, dtype=wp.vec2d)
-        if count:
-            wp.launch(
-                evaluate_ee_potential,
-                dim=count,
-                inputs=[
-                    contacts._soft_contact_mesh_features,
-                    model.edge_indices,
-                    rigid_edges,
-                    model.shape_source_ptr.numpy()[box_shape],
-                    wp.array(soft_factors, dtype=wp.float64),
-                    wp.array(rigid_factors, dtype=wp.float64),
-                    cloth,
-                    box,
-                    wp.float64(support),
-                    wp.float64(near_cutoff),
-                    allocate_counts(count, box),
-                    allocate_counts(count, cloth),
-                    energy,
-                ],
-            )
+        energy = wp.zeros(contact_max, dtype=wp.vec2d)
+        wp.launch(
+            evaluate_ee_potential,
+            dim=contact_max,
+            inputs=[
+                contacts.soft_contact_count,
+                contacts._soft_contact_mesh_features,
+                model.edge_indices,
+                rigid_edges,
+                rigid_mesh,
+                wp.array(soft_factors, dtype=wp.float64),
+                wp.array(rigid_factors, dtype=wp.float64),
+                cloth,
+                box,
+                wp.float64(support),
+                wp.float64(near_cutoff),
+                allocate_counts(contact_max, box),
+                allocate_counts(contact_max, cloth),
+                energy,
+            ],
+        )
+        # Host reads below are only for diagnostics and the NumPy comparison.
+        count = int(contacts.soft_contact_count.numpy()[0])
+        if count > contact_max:
+            raise RuntimeError("Increase soft_contact_max: candidate buffer overflow")
+        # Fixed vertex weights are (1/3)*sum of incident rest-triangle areas.
+        fixed = []
+        for direction, (label, values, vertex_area) in enumerate(
+            [("cloth", cloth_values, cloth_vertex_area), ("box", box_values, box_vertex_area)]
+        ):
+            point_values = values.numpy()
+            np.testing.assert_allclose(point_values, numpy_point_values[direction], rtol=1e-10, atol=1e-12)
+            p = point_values[:, 0]
+            print(f"P at {label} vertices: {p}")
+            fixed.append(vertex_area @ p)
         ee = energy.numpy().sum(axis=0)
         families = np.bincount(contacts._soft_contact_mesh_features.numpy()[:count, 0] & 7, minlength=4)
         print(f"{device}, gap={gap:g} m: VT/TV/EE/depth rows = {families.tolist()}")
