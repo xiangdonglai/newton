@@ -1,0 +1,100 @@
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 12.4
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA RTX 6000 Ada Generation" (47 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/donglaix/.cache/warp/1.17.0
+Module __main__ ed21db7 load on device 'cpu' took 2028.38 ms  (compiled)
+
+cpu: point-to-box P(q), support=0.03 m, near_cutoff=0.0015 m
+  flat face        q=[0.01, 0.005, 0.008]  P=0.710810918  P_near=0
+  top edge         q=[0.055, 0.0, 0.006]  P=0.736258095  P_near=0
+  corner           q=[0.055, 0.045, 0.005]  P=0.62866034  P_near=0
+  outside support  q=[0.0, 0.0, 0.06]  P=0  P_near=0
+Module newton._src.utils.mesh 92b663b load on device 'cpu' took 0.32 ms  (cached)
+Module newton._src.geometry.bvh 4a1c07f load on device 'cpu' took 0.19 ms  (cached)
+Module newton._src.geometry.kernels ad796d9 load on device 'cpu' took 0.34 ms  (cached)
+Module newton._src.sim.collide 764cc4c load on device 'cpu' took 0.19 ms  (cached)
+Module narrow_phase_primitive_write_contact_False_False_False b8baf6c load on device 'cpu' took 0.17 ms  (cached)
+Module newton._src.geometry.narrow_phase df76fe5 load on device 'cpu' took 0.16 ms  (cached)
+Module newton._src.geometry.contact_reduction_global cb1f853 load on device 'cpu' took 0.16 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_1420d64e 278bf94 load on device 'cpu' took 0.17 ms  (cached)
+Module export_reduced_contacts_write_contact 2049828 load on device 'cpu' took 0.15 ms  (cached)
+Module newton._src.geometry.soft_contacts_mesh 7e0f73f load on device 'cpu' took 0.20 ms  (cached)
+
+  flat patch: cloth gap=0.008 m; pipeline VT/TV/EE/depth=[10, 0, 11, 0]; 0 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0005572756945194856, 0.0]
+    P_ee    (cloth->box, box->cloth) = [0.0, 0.0]
+    P_fixed + P_ee = 0.000557275695
+
+  near ridge: cloth gap=0.0003 m; pipeline VT/TV/EE/depth=[15, 4, 30, 0]; 3 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0020940277881261226, 0.00039261781215821383]
+    P_ee    (cloth->box, box->cloth) = [0.011436772427233906, 0.17505263604030963]
+    P_fixed + P_ee = 0.188976054
+    pipeline edges (soft ID, rigid-table row)=[2, 1]  d=0.0003  w=0.808  P_near(q,q_bar)=[4.513527248403747, 4.513527248403747]  energy=[0.005718386213616953, 0.058350878680103205]
+    pipeline edges (soft ID, rigid-table row)=[0, 1]  d=0.0003  w=0.808  P_near(q,q_bar)=[4.513527248403747, 4.513527248403747]  energy=[0.002859192976897949, 0.058350878680103205]
+    pipeline edges (soft ID, rigid-table row)=[3, 1]  d=0.0003  w=0.808  P_near(q,q_bar)=[4.513527248403747, 4.513527248403747]  energy=[0.002859193236719004, 0.058350878680103205]
+
+  closer ridge: cloth gap=0.00015 m; pipeline VT/TV/EE/depth=[15, 4, 30, 0]; 3 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0023813502803601973, 0.00039284889567241254]
+    P_ee    (cloth->box, box->cloth) = [0.015561495050081307, 0.23818614443688882]
+    P_fixed + P_ee = 0.256521839
+    pipeline edges (soft ID, rigid-table row)=[2, 1]  d=0.00015  w=0.946  P_near(q,q_bar)=[5.245466601289074, 5.245466601289074]  energy=[0.007780747525040653, 0.07939538147896294]
+    pipeline edges (soft ID, rigid-table row)=[0, 1]  d=0.00015  w=0.946  P_near(q,q_bar)=[5.245466601289074, 5.245466601289074]  energy=[0.003890373585756992, 0.07939538147896294]
+    pipeline edges (soft ID, rigid-table row)=[3, 1]  d=0.00015  w=0.946  P_near(q,q_bar)=[5.245466601289074, 5.245466601289074]  energy=[0.0038903739392836616, 0.07939538147896294]
+
+  separated: cloth gap=0.06 m; pipeline VT/TV/EE/depth=[0, 0, 0, 0]; 0 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0, 0.0]
+    P_ee    (cloth->box, box->cloth) = [0.0, 0.0]
+    P_fixed + P_ee = 0
+
+cpu: PASS analytic point energies, alternate box triangulation, exhaustive NumPy point sums, active EE samples, and increasing P_ee as the gap decreases.
+Module __main__ f09bce1 load on device 'cuda:0' took 1208.64 ms  (compiled)
+
+cuda:0: point-to-box P(q), support=0.03 m, near_cutoff=0.0015 m
+  flat face        q=[0.01, 0.005, 0.008]  P=0.710810918  P_near=0
+  top edge         q=[0.055, 0.0, 0.006]  P=0.736258095  P_near=0
+  corner           q=[0.055, 0.045, 0.005]  P=0.62866034  P_near=0
+  outside support  q=[0.0, 0.0, 0.06]  P=0  P_near=0
+Module newton._src.geometry.bvh 58a3a49 load on device 'cuda:0' took 0.35 ms  (cached)
+Module newton._src.geometry.kernels 4fd60c9 load on device 'cuda:0' took 0.56 ms  (cached)
+Module newton._src.sim.collide 56e960b load on device 'cuda:0' took 0.29 ms  (cached)
+Module narrow_phase_primitive_write_contact_False_False_False 6b2fd5c load on device 'cuda:0' took 0.29 ms  (cached)
+Module newton._src.geometry.narrow_phase 5f08bfe load on device 'cuda:0' took 4.94 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 3aefb0e load on device 'cuda:0' took 0.28 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_1420d64e 2832bb1 load on device 'cuda:0' took 0.38 ms  (cached)
+Module newton._src.geometry.contact_reduction_global c36c6c0 load on device 'cuda:0' took 0.28 ms  (cached)
+Module export_reduced_contacts_write_contact c09a53f load on device 'cuda:0' took 0.30 ms  (cached)
+Module newton._src.geometry.soft_contacts_mesh 6bff348 load on device 'cuda:0' took 0.52 ms  (cached)
+Module newton._src.geometry.soft_contacts_mesh fee845e load on device 'cuda:0' took 0.55 ms  (cached)
+
+  flat patch: cloth gap=0.008 m; pipeline VT/TV/EE/depth=[10, 0, 11, 0]; 0 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0005572756945194856, 0.0]
+    P_ee    (cloth->box, box->cloth) = [0.0, 0.0]
+    P_fixed + P_ee = 0.000557275695
+
+  near ridge: cloth gap=0.0003 m; pipeline VT/TV/EE/depth=[15, 4, 30, 0]; 3 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0020940277881261226, 0.00039261781215821383]
+    P_ee    (cloth->box, box->cloth) = [0.011436772427233906, 0.17505263604030963]
+    P_fixed + P_ee = 0.188976054
+    pipeline edges (soft ID, rigid-table row)=[3, 1]  d=0.0003  w=0.808  P_near(q,q_bar)=[4.513527248403747, 4.513527248403747]  energy=[0.002859193236719004, 0.058350878680103205]
+    pipeline edges (soft ID, rigid-table row)=[0, 1]  d=0.0003  w=0.808  P_near(q,q_bar)=[4.513527248403747, 4.513527248403747]  energy=[0.002859192976897949, 0.058350878680103205]
+    pipeline edges (soft ID, rigid-table row)=[2, 1]  d=0.0003  w=0.808  P_near(q,q_bar)=[4.513527248403747, 4.513527248403747]  energy=[0.005718386213616953, 0.058350878680103205]
+
+  closer ridge: cloth gap=0.00015 m; pipeline VT/TV/EE/depth=[15, 4, 30, 0]; 3 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0023813502803601973, 0.00039284889567241254]
+    P_ee    (cloth->box, box->cloth) = [0.015561495050081305, 0.23818614443688882]
+    P_fixed + P_ee = 0.256521839
+    pipeline edges (soft ID, rigid-table row)=[3, 1]  d=0.00015  w=0.946  P_near(q,q_bar)=[5.245466601289074, 5.245466601289074]  energy=[0.0038903739392836616, 0.07939538147896294]
+    pipeline edges (soft ID, rigid-table row)=[0, 1]  d=0.00015  w=0.946  P_near(q,q_bar)=[5.245466601289074, 5.245466601289074]  energy=[0.003890373585756992, 0.07939538147896294]
+    pipeline edges (soft ID, rigid-table row)=[2, 1]  d=0.00015  w=0.946  P_near(q,q_bar)=[5.245466601289074, 5.245466601289074]  energy=[0.007780747525040653, 0.07939538147896294]
+
+  separated: cloth gap=0.06 m; pipeline VT/TV/EE/depth=[0, 0, 0, 0]; 0 EE samples with positive weight
+    P_fixed (cloth->box, box->cloth) = [0.0, 0.0]
+    P_ee    (cloth->box, box->cloth) = [0.0, 0.0]
+    P_fixed + P_ee = 0
+
+cuda:0: PASS analytic point energies, alternate box triangulation, exhaustive NumPy point sums, active EE samples, and increasing P_ee as the gap decreases.
+
+PASS CPU/CUDA agreement.

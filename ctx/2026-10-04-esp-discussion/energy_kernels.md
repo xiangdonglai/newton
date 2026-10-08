@@ -1,4 +1,4 @@
-# ESP box–cloth energy kernels — 2026-10-06
+# ESP box–cloth energy kernels — updated 2026-10-07
 
 Run from `newton_4227`:
 
@@ -15,36 +15,43 @@ solves, literal feature sums, and exhaustive edge-pair enumeration rather than
 the pipeline candidates. The larger validation suite and additional scenes are
 no longer embedded in the main script.
 
-The current oracle comparison passed on CPU and CUDA at gaps of 0.001 mm,
-0.15 mm, 0.30 mm, 8 mm, 30 mm, and 60 mm, using `rtol=1e-10, atol=1e-12`.
-Each run prints the NumPy energies and maximum absolute energy difference,
-and fails if a comparison
-exceeds these tolerances.
+The kernels now evaluate and accumulate signed barrier terms directly in
+float32. The independent NumPy oracle retains float64 arithmetic on the same
+input coordinates. Comparisons use `rtol=2e-5, atol=5e-6` for point potentials
+and `rtol=2e-5, atol=1e-8` for integrated energies. Each run prints both maximum
+absolute errors and fails if a comparison exceeds these tolerances.
 
-The fixed-vertex energy now uses the returned BVH VT/TV rows. The script has
-one count-building pass and two energy kernels:
+The fixed-vertex energy uses the returned BVH VT/TV rows. There are two kernels:
 
 | Kernel | Parallel work | Output |
 |---|---|---|
-| `build_point_feature_counts` | One thread per collision-pipeline record | Integer coefficients that cancel matching VT/TV terms before evaluating barriers |
-| `evaluate_point_potential` | One thread per collision-pipeline record | Accumulated vertex `P(q)` and `P_near(q)`; `P_far = P - P_near` |
+| `evaluate_point_potential` | One thread per collision-pipeline record | Directly sum each VT/TV triangle's signed terms and atomically accumulate vertex `P(q)` and `P_near(q)` |
 | `evaluate_ee_potential` | One thread per collision-pipeline record | Both directional EE energy contributions |
 
-All three kernels launch with `dim=contacts.soft_contact_max` and return when
+Both kernels launch with `dim=contacts.soft_contact_max` and return when
 `wp.tid() >= soft_contact_count[0]`, before reading a contact record. The EE
-output and per-row scratch buffers are also allocated at this capacity. No
+output is also allocated at this capacity. No
 host contact-count read is needed to size launches or buffers; the count is
 read afterward only for diagnostic output and overflow validation. Other host
 reads remain for scene setup and the independent NumPy comparison.
-CPU/CUDA checks preserved the energies at all six gaps. Additional checks
-filled unused slots with stale valid records, including a zero-contact case:
-the oracle still matched, and all three capacity-sized launches occurred before
-the diagnostic contact-count read.
+
+There are no source-vertex × target-feature or contact-row × target-feature
+scratch arrays. Each thread uses a local two-component sum. Persistent energy
+outputs occupy two floats per source vertex and two floats per contact slot;
+mesh topology and incidence arrays are linear in the mesh size. The per-vertex
+outputs are retained for oracle comparisons. A total-energy-only implementation
+could instead apply the area weight per row and atomically sum into a scalar.
+
+The previous float64 implementation with integer coefficient cancellation is
+saved in commit `2cb7a1566d5160413e8372a8b6fe34ad67421d07`. That version cancels
+matching coefficients exactly before barrier evaluation, using dense scratch
+arrays. The current version saves memory and one kernel launch, but cancellation
+and atomic summation can leave floating-point residuals.
 
 The script calls `CollisionPipeline` with
 `enable_rigid_soft_full_surface_contact=True` and
 `full_surface_contact_return_unfiltered=True`. The EE kernel receives the
-pipeline arrays directly. The fixed-vertex passes accept VT/TV rows
+pipeline arrays directly. The fixed-vertex kernel accepts VT/TV rows
 (`family & 7 == 0/1`); the EE kernel accepts ordinary EE rows
 (`family & 7 == 2`).
 
@@ -57,9 +64,11 @@ pipeline arrays directly. The fixed-vertex passes accept VT/TV rows
 | `pipeline._soft_mesh_contact_data.rigid_features[2][rigid row]` | `(shape ID, rigid mesh index-buffer slot 0, slot 1)` |
 
 For VT, the feature IDs are `(soft vertex ID, rigid face ID)`. For TV, they
-are `(soft face ID, rigid vertex-table row)`. The two fixed-vertex passes
-visit only each returned triangle and its three edges/vertices. Shared-feature
-incidence coefficients and integer cancellation are explained in `discussion.md`.
+are `(soft face ID, rigid vertex-table row)`. The fixed-vertex kernel
+visits only each returned triangle and its three edges/vertices. It evaluates
+one positive face term, negative interior-edge terms with coefficient `1/2`,
+and positive interior-vertex terms with coefficient `1/n_v`. The coefficients
+come from the target topology, as explained in `discussion.md`.
 
 The rigid slots are resolved with `wp.mesh_get_index`. The box is static and
 its shape transform is identity, so its authored coordinates are world
@@ -92,7 +101,32 @@ and its own sample weights are unchanged.
 The barrier is `-(1-d/support)^2 log(d/support)` with support 30 mm and near
 cutoff 1.5 mm. The energy scale is set to one; physical stiffness is not fitted.
 
-## Pruned VT/TV results
+## Direct float32 results — 2026-10-07
+
+All six gaps passed on CPU and CUDA. Errors below are measured against the independent
+float64 NumPy oracle on the same input geometry. They include both geometry
+roundoff and summation error; they do not isolate cancellation error alone.
+The table reports the larger observed error across the two devices; integrated
+energies agree to the printed precision. At 0.30 mm, the maximum point-potential
+error was 6.22e-7 on CPU and 1.45e-7 on CUDA.
+Additional CPU and CUDA checks filled unused contact slots with stale valid records at
+gaps of 0.30, 8, and 60 mm. All passed, including the zero-contact case, and
+verified that both capacity-sized launches precede the diagnostic count read.
+
+| Gap [mm] | P_fixed, both directions | P_ee, both directions | Max absolute point-potential error | Max absolute directional energy error |
+|---:|---:|---:|---:|---:|
+| 0.001 | 0.004759027623 | 0.527122080326 | 1.23e-6 | 2.42e-8 |
+| 0.15 | 0.002774199238 | 0.253747671843 | 1.08e-7 | 3.62e-8 |
+| 0.30 | 0.002486645710 | 0.186489418149 | 6.22e-7 | 6.78e-9 |
+| 8 | 0.000641907507 | 0 | 3.14e-8 | 3.61e-11 |
+| 30 | 0 | 0 | 1.12e-23 | 4.38e-27 |
+| 60 | 0 | 0 | 0 | 0 |
+
+The earlier CUDA initialization error 304 disappeared after unrestricted
+execution was restored. The float32 GPU checks above then completed on the
+RTX 6000 Ada without changes to the kernels or comparison tolerances.
+
+## Integer-cancellation reference results (commit `2cb7a1566`)
 
 The cloth patch is centered above the ridge in all rows below. Both devices
 passed comparison with the independent complete-target NumPy oracle. A negative
@@ -140,8 +174,9 @@ The earlier validation run, preserved in `basic_examples.log`, checked:
   edge-pair oracle, and the total directional EE energies against that oracle.
 
 The current fixed-vertex evaluation visits only returned VT/TV triangles. EE
-sample evaluation still scans the complete small target mesh. Both cancel
-matching feature terms before evaluating barriers. Classification uses ordinary
-float64 comparisons, not the supplement's adaptive exact predicates. These
-checks cover the stated separate-surface examples; they do not establish
-robustness for arbitrary degenerate inputs. This step evaluates energies only.
+sample evaluation still scans the complete small target mesh, directly summing
+its face/edge/vertex terms without scratch arrays. Geometry and barriers use
+float32; the supplement's adaptive exact predicates are not implemented.
+These checks cover the stated separate-surface examples; they do not establish
+robustness for arbitrary degenerate inputs or exact contact, where individually
+infinite terms can produce undefined differences. This step evaluates energies only.

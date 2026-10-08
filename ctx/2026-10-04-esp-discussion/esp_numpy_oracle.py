@@ -3,8 +3,8 @@
 
 """Independent NumPy reference for the box-cloth script's positive-gap energies.
 
-Use literal face/edge/vertex sums and least-squares closest-point solves, rather
-than the Warp kernels' integer cancellation and cross-product formulas. Enumerate
+Use float64 face/edge/vertex sums and least-squares closest-point solves,
+independent of the float32 Warp kernels' cross-product formulas. Enumerate
 all edge pairs, independently of the collision pipeline's returned candidates.
 """
 
@@ -73,6 +73,8 @@ def ee_sample(a, b, c, d, near_cutoff):
 
 def reference_energies(cloth_vertices, cloth_faces, box_vertices, box_faces, support, near_cutoff):
     """Return vertex (P, P_near) values and bidirectional [P_fixed, P_ee]."""
+    cloth_vertices = np.asarray(cloth_vertices, dtype=np.float64)
+    box_vertices = np.asarray(box_vertices, dtype=np.float64)
 
     def weights(vertices, faces):
         triangles = vertices[faces]
