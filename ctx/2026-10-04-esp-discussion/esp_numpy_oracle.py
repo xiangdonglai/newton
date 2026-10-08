@@ -71,12 +71,23 @@ def ee_sample(a, b, c, d, near_cutoff):
     return q, q_bar, step * mu
 
 
-def reference_energies(cloth_vertices, cloth_faces, box_vertices, box_faces, support, near_cutoff):
+def reference_energies(
+    cloth_vertices,
+    cloth_faces,
+    box_vertices,
+    box_faces,
+    support,
+    near_cutoff,
+    *,
+    cloth_rest_vertices=None,
+    box_rest_vertices=None,
+):
     """Return vertex (P, P_near) values and bidirectional [P_fixed, P_ee]."""
     cloth_vertices = np.asarray(cloth_vertices, dtype=np.float64)
     box_vertices = np.asarray(box_vertices, dtype=np.float64)
 
     def weights(vertices, faces):
+        vertices = np.asarray(vertices, dtype=np.float64)
         triangles = vertices[faces]
         areas = 0.5 * np.linalg.norm(
             np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
@@ -89,8 +100,12 @@ def reference_energies(cloth_vertices, cloth_faces, box_vertices, box_faces, sup
                 edge_area[edge] = edge_area.get(edge, 0.0) + 2 * area
         return vertex_area, edge_area
 
-    cloth_vertex_area, cloth_edge_area = weights(cloth_vertices, cloth_faces)
-    box_vertex_area, box_edge_area = weights(box_vertices, box_faces)
+    cloth_vertex_area, cloth_edge_area = weights(
+        cloth_vertices if cloth_rest_vertices is None else cloth_rest_vertices, cloth_faces
+    )
+    box_vertex_area, box_edge_area = weights(
+        box_vertices if box_rest_vertices is None else box_rest_vertices, box_faces
+    )
     cloth_point_values = np.array(
         [point_potential(q, box_vertices, box_faces, support, near_cutoff) for q in cloth_vertices]
     )
