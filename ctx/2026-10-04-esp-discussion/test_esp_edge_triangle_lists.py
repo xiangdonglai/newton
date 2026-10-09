@@ -25,7 +25,8 @@ import newton
 class Case:
     """Keep native detection, topology, and device buffers alive across updates."""
 
-    def __init__(self, soft=None, rigid=None, *, radius=0.03, contact_capacity=512):
+    def __init__(self, soft=None, rigid=None, *, radius=0.03, contact_capacity=512, list_type=EdgeTriangleLists):
+        self.list_type = list_type
         soft, rigid = patch() if soft is None else soft, box_mesh() if rigid is None else rigid
         builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
         builder.add_shape_mesh(body=-1, mesh=newton.Mesh(rigid[0], rigid[1].ravel(), compute_inertia=False))
@@ -57,6 +58,8 @@ class Case:
         self.mesh_id = self.model.shape_source_ptr.numpy()[0]
         self.rigid_vertices = self.pipeline._soft_mesh_contact_data.rigid_features[0]
         self.rigid_edges = self.pipeline._soft_mesh_contact_data.rigid_features[2]
+        self.rigid_vertex_indices = wp.array(self.mesh.indices[self.rigid_vertices.numpy()[:, 1]], dtype=int)
+        self.rigid_face_offsets = wp.zeros(self.model.shape_count, dtype=int)
         self.soft_edges_np = self.model.edge_indices.numpy()[:, 2:4]
         self.rigid_edges_np = self.mesh.indices[self.rigid_edges.numpy()[:, 1:]]
         self.cloth, _, soft_area = make_surface(
@@ -73,7 +76,7 @@ class Case:
         self.rows = self.contacts._soft_contact_mesh_features.numpy()[:count].copy()
 
     def allocate(self, capacity=None):
-        return EdgeTriangleLists(
+        return self.list_type(
             self.cloth,
             self.box,
             self.contacts.soft_contact_max,
@@ -84,8 +87,9 @@ class Case:
         self.edge_triangle_lists.rebuild(
             self.contacts.soft_contact_count,
             self.contacts._soft_contact_mesh_features,
-            self.rigid_vertices,
-            self.mesh_id,
+            self.contacts.soft_contact_shape,
+            self.rigid_vertex_indices,
+            self.rigid_face_offsets,
             self.cloth,
             self.box,
         )
@@ -97,6 +101,8 @@ class Case:
             inputs=[
                 self.contacts.soft_contact_count,
                 self.contacts._soft_contact_mesh_features,
+                self.contacts.soft_contact_shape,
+                self.rigid_face_offsets,
                 self.soft_area,
                 self.rigid_area,
                 self.cloth,
@@ -114,6 +120,7 @@ class Case:
         data = np.tile(self.rows[0] if len(self.rows) else np.array([0, 0, 0]), (self.contacts.soft_contact_max, 1))
         data[: len(rows)] = rows
         self.contacts._soft_contact_mesh_features.assign(data.astype(np.int32))
+        self.contacts.soft_contact_shape.fill_(0)  # All scripted rows target the single box.
         self.contacts.soft_contact_count.assign(np.array([len(rows)], dtype=np.int32))
 
     def expected_lists(self, rows):
@@ -142,12 +149,13 @@ class Case:
         lists = self.edge_triangle_lists.data
         keys, starts, ends = lists.keys.numpy(), lists.starts.numpy(), lists.ends.numpy()
         count = int(lists.count.numpy()[0])
-        assert np.all(keys[1:count] >= keys[: max(0, count - 1)])
+        assert int(np.sum(ends - starts)) == count
         result = []
-        for edge, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        for start, end in zip(starts, ends, strict=True):
             assert 0 <= start <= end <= count
-            assert np.all(keys[start:end] // lists.face_stride == edge)
-            result.append(set((keys[start:end] % lists.face_stride).tolist()))
+            faces = keys[start:end] % lists.face_stride
+            assert np.all(faces[1:] >= faces[:-1])
+            result.append(set(faces.tolist()))
         return result
 
     def check_energies(self, *, exhaustive=True):

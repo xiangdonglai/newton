@@ -100,8 +100,15 @@ def validate(case, sample_count):
         np.testing.assert_allclose(sparse[index], expected, rtol=2e-5, atol=1e-8)
         np.testing.assert_allclose(full[index], expected, rtol=2e-5, atol=1e-8)
         max_oracle_error = max(max_oracle_error, float(np.max(np.abs(sparse[index] - expected))))
-    entry_count = int(case.edge_triangle_lists.data.count.numpy()[0])
-    keys = case.edge_triangle_lists.data.keys.numpy()[:entry_count]
+    data = case.edge_triangle_lists.data
+    entry_count = int(data.count.numpy()[0])
+    keys = data.keys.numpy()[:entry_count]
+    # Count distinct (source edge, target triangle) entries, not globally
+    # distinct triangle IDs: segmented keys no longer encode the edge ID.
+    unique_entries = sum(
+        len(np.unique(keys[start:end] % data.face_stride))
+        for start, end in zip(data.starts.numpy(), data.ends.numpy(), strict=True)
+    )
     return {
         "soft_vertices": len(sv),
         "soft_triangles": len(sf),
@@ -112,7 +119,8 @@ def validate(case, sample_count):
         "families_vt_tv_ee_depth": np.bincount(case.rows[:, 0] & 7, minlength=4).tolist(),
         "active_ee_pairs": len(active),
         "list_entries": entry_count,
-        "unique_entries": int(len(np.unique(keys))),
+        "unique_entries": unique_entries,
+        "list_builder": type(case.edge_triangle_lists).__name__,
         "list_capacity": case.edge_triangle_lists.data.capacity,
         "sparse_ee_energy": sparse.sum(axis=0, dtype=np.float64).tolist(),
         "max_gpu_row_difference": float(np.max(np.abs(sparse - full))),

@@ -9,7 +9,8 @@ Run from newton_4227:
 
 Evaluate P(q) from native pipeline VT/TV records, and P_ee from EE records.
 Each thread directly sums the signed barrier terms in float32.
-EE samples use sorted per-edge triangle lists built from those same records.
+EE samples use per-edge triangle lists built with segmented sorting from those
+same records. Only each edge's filled range is sorted, not unused capacity.
 Lists require complete unfiltered queries and nonintersecting surfaces.
 The static box has an identity transform. Distances are in metres;
 energies use unit stiffness and the camera-ready ESP weights.
@@ -22,6 +23,7 @@ The complete-target float32 EE version is preserved in commit 5ffc2c289.
 """
 
 import argparse
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -44,125 +46,105 @@ class Surface:
     vertex_edge_offsets: wp.array[int]
     vertex_edges: wp.array[int]
     edge_faces: wp.array[wp.vec2i]
+    vertex_mesh: wp.array[int]  # Mesh ownership within this combined geometry.
+    edge_mesh: wp.array[int]
+    face_mesh: wp.array[int]
 
 
 @wp.struct
 class EdgeTriangleListData:
-    """Store candidate target triangles for each source edge, in GPU arrays.
+    """Store sorted int32 target-face IDs in one packed slice per source edge.
 
-    Layout (currently one soft mesh and one rigid mesh):
-        Source edge IDs are soft edges first, then rigid edges. A soft edge
-        keeps its native ID; a rigid edge uses soft_edge_count + its native ID.
-        The target is the opposite mesh: rigid triangles for a soft source
-        edge, soft triangles for a rigid source edge. Target face IDs index
-        that Surface.faces array, not a collision feature-table row.
+    Source edge IDs are soft edges first, then rigid edges. A soft edge keeps
+    its native ID; a rigid edge uses soft_edge_count + its native ID. Target
+    face IDs index the opposite combined Surface.faces array. Rigid
+    shape-local triangle IDs acquire a per-shape offset during collection.
+    keys[i] is just a face ID, not a packed (edge, face) integer.
+    starts/ends identify the source edge. Duplicates still remain and are
+    skipped by the same energy evaluator. An empty edge has start == end,
+    which need not be zero. count includes all entries, including duplicates.
 
-        Each (source_edge, target_face) entry is encoded as one int64:
-            key = source_edge * face_stride + target_face
-        face_stride = max(1, soft face count, rigid face count), so integer
-        division recovers the source edge and remainder recovers the face.
-        Sorting these keys groups entries by edge, then by target face.
+    Build: count entries per edge, scan those counts into starts, compute
+    ends, then repeat the contact expansion to fill each edge's slice.
+    Sort only [starts[e], ends[e]) for each edge. GPU arrays control every
+    range, so graph replay handles changing counts without host readback.
+    Key/value arrays still have 2*capacity slots as required by Warp's sorter.
+    An edge's list can include several target meshes. Evaluation filters by
+    Surface.face_mesh using the target mesh of the particular EE sample.
 
-        starts[e] and ends[e] select the half-open slice of keys for edge e;
-        both are zero for an empty list. Duplicates remain in the slice.
-        edge_list_near_potential skips consecutive equal keys, so each target
-        triangle contributes once per sample, not once per collision row.
+    Each contact row contributes the same triangles as before:
+        VT: add the rigid triangle to each edge incident to the soft vertex.
+        TV: add the soft triangle to each edge incident to the rigid vertex.
+        EE: add each rigid edge's adjacent triangles to the soft edge, and
+            each soft edge's adjacent triangles to the rigid edge. Include
+            ordinary EE rows even when their quadrature weight is zero.
+    Analytic-shape rows have no mesh features and are skipped. Overflow and
+    EE_DEPTH recovery rows invalidate the result; check error before use.
 
-    Population by EdgeTriangleLists.rebuild():
-        1. Reset count, error, starts, and ends to zero; fill keys with the
-           maximum int64 value so unused slots sort after real entries.
-        2. collect_edge_triangles runs one thread per contact-buffer slot,
-           returning early beyond the active contact count. Each row adds:
-           - VT (soft vertex / rigid triangle): the rigid triangle to every
-             soft edge incident to the soft vertex.
-           - TV (soft triangle / rigid vertex): the soft triangle to every
-             rigid edge incident to the rigid vertex.
-           - EE: each rigid edge's adjacent triangles to the soft edge's
-             list, and each soft edge's adjacent triangles to the rigid
-             edge's list. Boundary edges have only one adjacent triangle.
-           Include ordinary EE rows even when their sample weight is zero;
-           their triangles can contribute to samples from other EE rows.
-        3. Each append atomically increments count[0] to reserve a slot and
-           writes its encoded key. count includes duplicates and attempted
-           writes beyond capacity; those excess writes set error bit 2.
-        4. Sort the first capacity keys, then find_edge_triangle_ranges sets
-           starts/ends over the first min(count[0], capacity) sorted entries.
-
-    Worked example (three selected contact rows, not a full detection result):
-        Let each mesh be a square split into two triangles, with the same
-        local numbering on both meshes:
-            faces: f0=(v0,v1,v2), f1=(v0,v2,v3)
-            edges: e0=(v0,v1), e1=(v1,v2), e2=(v2,v0),
-                   e3=(v2,v3), e4=(v3,v0)
-        Thus v1 touches edges e0/e1, edge e0 touches only f0, and the diagonal
-        e2 touches f0/f1. soft_edge_count=5 and face_stride=2. Soft source
-        edges use IDs 0..4; rigid source edges use IDs 5..9.
-
-        These contact rows emit the following (source_edge, target_face)
-        entries. Vertex/edge/face labels below are decoded mesh-local IDs:
-            VT: soft v1 / rigid f0 -> (0,0), (1,0)         -> keys 0, 2
-            TV: soft f1 / rigid v1 -> (5,1), (6,1)         -> keys 11, 13
-            EE: soft e0 / rigid e2 -> (0,0), (0,1), (7,0) -> keys 0, 1, 14
-        The EE row adds both rigid faces to soft e0, and soft f0 to rigid e2.
-        The entry (0,0) is emitted by both VT and EE, so it appears twice.
-
-        With capacity=8, one possible atomic insertion order is:
-            keys[:8] = [0, 2, 11, 13, 0, 1, 14, MAX_INT64]
-            count[0] = 7, error[0] = 0
-        GPU insertion order can vary. Sorting gives the same result:
-            keys[:8] = [0, 0, 1, 2, 11, 13, 14, MAX_INT64]
-            starts   = [0, 3, 0, 0, 0, 4, 5, 6, 0, 0]
-            ends     = [3, 4, 0, 0, 0, 5, 6, 7, 0, 0]
-
-        For an EE sample q on soft e0, read keys[0:3] = [0,0,1]. Decode
-        target faces using key % 2, giving [0,0,1]; skip the repeated 0.
-        Evaluate the rigid triangles f0 and f1 once each at q, applying the
-        near-support cutoff. For the opposite sample on rigid e2 (source
-        ID 7), read keys[6:7] = [14], which selects soft triangle f0.
-        Unlisted edges have starts[e]=ends[e]=0 and perform no evaluations.
-
-    These are candidate lists, not cached sample positions or energies.
-    Evaluation uses current geometry and checks the near-support distance.
-    Completeness requires the unfiltered queries and geometric assumptions
-    described at the top of this script. Overflow or EE_DEPTH recovery rows
-    set error bits; the partial lists must not be accepted as a valid result.
+    Worked example (three selected contacts, not a full detection result):
+        Both meshes are squares with faces f0=(v0,v1,v2), f1=(v0,v2,v3),
+        and edges e0=(v0,v1), e1=(v1,v2), e2=(v2,v0), e3=(v2,v3),
+        e4=(v3,v0). Thus v1 is an endpoint of e0/e1, e0 belongs to f0,
+        and e2 belongs to both faces. With five soft edges, rigid edges
+        have global source IDs 5..9. The three contacts add:
+            VT: soft v1 / rigid f0 -> (0,0), (1,0)
+            TV: soft f1 / rigid v1 -> (5,1), (6,1)
+            EE: soft e0 / rigid e2 -> (0,0), (0,1), (7,0)
+        These are seven (source_edge, target_face) entries, including the
+        repeated (0,0). The per-edge counts and their exclusive scan are:
+            edge_counts = [3,1,0,0,0,1,1,1,0,0]
+            starts      = [0,3,4,4,4,4,5,6,7,7]
+            ends        = [3,4,4,4,4,5,6,7,7,7]
+        With capacity=8, after filling and sorting each edge's range:
+            keys[:7] = [0,0,1, 0, 1, 1, 0]
+            count[0] = 7
+        Slot 7 is unused and not sorted; no MAX_INT64 sentinel is needed.
+        For soft e0, keys[0:3]=[0,0,1] directly identifies rigid faces
+        f0/f0/f1. Evaluation skips the repeated f0. For rigid e2 (global
+        source 7), keys[6:7]=[0] directly identifies soft face f0.
+        Packing and modulo decoding are needed only by the old radix
+        reference in esp_radix_edge_triangle_lists.py, not by this layout.
     """
 
-    keys: wp.array[wp.int64]  # Length 2*capacity; second half is radix-sort scratch.
-    starts: wp.array[int]  # One entry per source edge, soft and rigid combined.
-    ends: wp.array[int]  # Exclusive end index in keys; same length as starts.
-    count: wp.array[int]  # Length 1; attempted appends, not number of unique pairs.
-    error: wp.array[int]  # 1: contact overflow; 2: list overflow; 4: recovery row
-    capacity: int  # Maximum number of stored entries, including duplicates.
-    face_stride: wp.int64
+    keys: wp.array[int]
+    starts: wp.array[int]
+    ends: wp.array[int]
+    count: wp.array[int]
+    error: wp.array[int]
+    capacity: int
+    face_stride: wp.int64  # Shared decoding with the radix benchmark; face % stride == face here.
     soft_edge_count: int
+    edge_counts: wp.array[int]
+    write_offsets: wp.array[int]
 
 
 @wp.func
-def append_edge_triangle(lists: EdgeTriangleListData, edge: int, face: int):
-    slot = wp.atomic_add(lists.count, 0, 1)
-    if slot < lists.capacity:
-        lists.keys[slot] = wp.int64(edge) * lists.face_stride + wp.int64(face)
-    else:
-        wp.atomic_or(lists.error, 0, 2)
+def add_edge_triangle(lists: EdgeTriangleListData, edge: int, face: int, count_only: bool):
+    if count_only:
+        wp.atomic_add(lists.edge_counts, edge, 1)
+    elif lists.error[0] == 0:
+        slot = wp.atomic_add(lists.write_offsets, edge, 1)
+        lists.keys[slot] = face
 
 
 @wp.kernel
 def collect_edge_triangles(
     contact_count: wp.array[int],
     mesh_features: wp.array[wp.vec3i],
-    rigid_vertices: wp.array[wp.vec2i],
-    rigid_mesh: wp.uint64,
+    contact_shapes: wp.array[int],
+    rigid_vertex_indices: wp.array[int],
+    rigid_face_offsets: wp.array[int],
     cloth: Surface,
     box: Surface,
     lists: EdgeTriangleListData,
+    count_only: bool,
 ):
-    """Expand each native VT/TV/EE record into source-edge/target-face keys."""
+    """Count or fill each contact's incident edge/triangle entries."""
     i = wp.tid()
     if contact_count[0] > mesh_features.shape[0]:
         wp.atomic_or(lists.error, 0, 1)
         return
-    if i >= contact_count[0]:
+    if i >= contact_count[0] or rigid_face_offsets[contact_shapes[i]] < 0:
         return
     row = mesh_features[i]
     if row[0] < 0:
@@ -170,50 +152,45 @@ def collect_edge_triangles(
     family = row[0] & 7
     if family == 0:
         vertex = row[1]
+        face = rigid_face_offsets[contact_shapes[i]] + row[2]
         for j in range(cloth.vertex_edge_offsets[vertex], cloth.vertex_edge_offsets[vertex + 1]):
-            append_edge_triangle(lists, cloth.vertex_edges[j], row[2])
+            add_edge_triangle(lists, cloth.vertex_edges[j], face, count_only)
     elif family == 1:
-        vertex = wp.mesh_get_index(rigid_mesh, rigid_vertices[row[2]][1])
+        vertex = rigid_vertex_indices[row[2]]
         for j in range(box.vertex_edge_offsets[vertex], box.vertex_edge_offsets[vertex + 1]):
-            append_edge_triangle(lists, lists.soft_edge_count + box.vertex_edges[j], row[1])
+            add_edge_triangle(lists, lists.soft_edge_count + box.vertex_edges[j], row[1], count_only)
     elif family == 2:
-        soft_edge, rigid_edge = row[1], row[2]
-        # Include endpoint/parallel/zero-weight EE rows too: their adjacent
-        # triangles can contribute to samples created by other EE pairs.
         for side in range(2):
-            rigid_face = box.edge_faces[rigid_edge][side]
-            if rigid_face >= 0:
-                append_edge_triangle(lists, soft_edge, rigid_face)
-            soft_face = cloth.edge_faces[soft_edge][side]
-            if soft_face >= 0:
-                append_edge_triangle(lists, lists.soft_edge_count + rigid_edge, soft_face)
+            face = box.edge_faces[row[2]][side]
+            if face >= 0:
+                add_edge_triangle(lists, row[1], face, count_only)
+            face = cloth.edge_faces[row[1]][side]
+            if face >= 0:
+                add_edge_triangle(lists, lists.soft_edge_count + row[2], face, count_only)
     elif family == 3:
-        # Not an EE sample. Its presence also invalidates the nonintersection
-        # assumption behind list completeness; do not return a partial energy.
         wp.atomic_or(lists.error, 0, 4)
 
 
 @wp.kernel
-def find_edge_triangle_ranges(lists: EdgeTriangleListData):
-    i = wp.tid()
-    if i >= wp.min(lists.count[0], lists.capacity):
-        return
-    key = lists.keys[i]
-    edge = int(key / lists.face_stride)
-    if i == 0 or lists.keys[i - 1] / lists.face_stride != wp.int64(edge):
-        lists.starts[edge] = i
-    if i + 1 == wp.min(lists.count[0], lists.capacity):
-        lists.ends[edge] = i + 1
-    elif lists.keys[i + 1] / lists.face_stride != wp.int64(edge):
-        lists.ends[edge] = i + 1
+def finish_edge_triangle_offsets(lists: EdgeTriangleListData):
+    edge = wp.tid()
+    start = lists.starts[edge]
+    end = start + lists.edge_counts[edge]
+    if edge == lists.starts.shape[0] - 1:
+        lists.count[0] = end
+        if end > lists.capacity:
+            wp.atomic_or(lists.error, 0, 2)
+    # Keep every sort range in bounds even when the whole result is invalid.
+    lists.starts[edge] = wp.min(start, lists.capacity)
+    lists.ends[edge] = wp.min(end, lists.capacity)
+    lists.write_offsets[edge] = start
 
 
 class EdgeTriangleLists:
-    """Allocate once; rebuild after detection, reuse during VBD iterations.
+    """Allocate once; rebuild per-edge lists with device-side segmented sorting.
 
-    This prototype accepts one shared-index rigid mesh and one soft mesh.
-    Surface topology keeps the collision pipeline's edge numbering. Multiple shapes,
-    welded feature IDs, and world isolation need explicit integration later.
+    Both Surface inputs may contain multiple meshes and keep the pipeline's
+    edge numbering. Reuse the lists between collision detections.
     """
 
     def __init__(self, cloth, box, contact_capacity, *, capacity=None):
@@ -222,51 +199,51 @@ class EdgeTriangleLists:
             int(np.diff(cloth.vertex_edge_offsets.numpy()).max(initial=0)),
             int(np.diff(box.vertex_edge_offsets.numpy()).max(initial=0)),
         )
-        # This bound covers every row without a host read of the active count.
+        if contact_capacity * max_fanout > np.iinfo(np.int32).max:
+            raise ValueError("Attempted entry count does not fit int32")
         capacity = max(1, contact_capacity * max_fanout) if capacity is None else capacity
         if capacity < 1 or capacity > np.iinfo(np.int32).max // 2:
             raise ValueError("Unsupported edge-triangle capacity")
-        self.data = EdgeTriangleListData()
-        self.data.capacity = capacity
-        self.data.face_stride = max(1, cloth.faces.shape[0], box.faces.shape[0])
-        self.data.soft_edge_count = cloth.edges.shape[0]
+        data = self.data = EdgeTriangleListData()
+        data.capacity = capacity
+        data.face_stride = max(1, cloth.faces.shape[0], box.faces.shape[0])
+        data.soft_edge_count = cloth.edges.shape[0]
         edge_count = cloth.edges.shape[0] + box.edges.shape[0]
-        if edge_count * self.data.face_stride >= np.iinfo(np.int64).max:
-            raise ValueError("Edge-triangle keys do not fit int64")
-        # Warp radix sort uses the second half of both arrays as scratch.
-        self.data.keys = wp.empty(2 * capacity, dtype=wp.int64)
+        # Initialize storage once: unused capacity is neither cleared nor
+        # sorted on rebuild. Warp may still copy capacity-sized buffers.
+        data.keys = wp.zeros(2 * capacity, dtype=int)
         self.sort_values = wp.zeros(2 * capacity, dtype=int)
-        self.data.starts = wp.zeros(edge_count, dtype=int)
-        self.data.ends = wp.zeros(edge_count, dtype=int)
-        self.data.count = wp.zeros(1, dtype=int)
-        self.data.error = wp.zeros(1, dtype=int)
+        data.starts = wp.zeros(edge_count, dtype=int)
+        data.ends = wp.zeros(edge_count, dtype=int)
+        data.edge_counts = wp.zeros(edge_count, dtype=int)
+        data.write_offsets = wp.zeros(edge_count, dtype=int)
+        data.count = wp.zeros(1, dtype=int)
+        data.error = wp.zeros(1, dtype=int)
 
-    def rebuild(self, contact_count, mesh_features, rigid_vertices, rigid_mesh, cloth, box):
-        """Reuse application buffers without reading the active count on the host.
-
-        Warp's sort manages its own temporary storage. Warm it up before CUDA
-        graph capture, as tested by test_esp_edge_triangle_lists.py.
-        """
-        self.data.keys.fill_(9223372036854775807)
-        self.data.count.zero_()
-        self.data.error.zero_()
-        self.data.starts.zero_()
-        self.data.ends.zero_()
-        wp.launch(
-            collect_edge_triangles,
-            dim=mesh_features.shape[0],
-            inputs=[
-                contact_count,
-                mesh_features,
-                rigid_vertices,
-                rigid_mesh,
-                cloth,
-                box,
-                self.data,
-            ],
-        )
-        wp.utils.radix_sort_pairs(self.data.keys, self.sort_values, self.data.capacity)
-        wp.launch(find_edge_triangle_ranges, dim=self.data.capacity, inputs=[self.data])
+    def rebuild(
+        self, contact_count, mesh_features, contact_shapes, rigid_vertex_indices, rigid_face_offsets, cloth, box
+    ):
+        """Rebuild with device counts; contacts must stay unchanged between passes."""
+        data = self.data
+        data.count.zero_()
+        data.error.zero_()
+        data.edge_counts.zero_()
+        inputs = [
+            contact_count,
+            mesh_features,
+            contact_shapes,
+            rigid_vertex_indices,
+            rigid_face_offsets,
+            cloth,
+            box,
+            data,
+        ]
+        wp.launch(collect_edge_triangles, dim=mesh_features.shape[0], inputs=[*inputs, True])
+        wp.utils.array_scan(data.edge_counts, data.starts, inclusive=False)
+        wp.launch(finish_edge_triangle_offsets, dim=data.starts.shape[0], inputs=[data])
+        wp.launch(collect_edge_triangles, dim=mesh_features.shape[0], inputs=[*inputs, False])
+        if data.starts.shape[0]:
+            wp.utils.segmented_sort_pairs(data.keys, self.sort_values, data.capacity, data.starts, data.ends)
 
     def check(self):
         """Diagnostic host check; production must handle error before accepting a step."""
@@ -326,17 +303,23 @@ def barrier_parts(distance: float, support: float, near_cutoff: float):
 
 
 @wp.func
-def point_mesh_potential(point: wp.vec3, surface: Surface, support: float, near_cutoff: float):
+def point_mesh_potential(point: wp.vec3, surface: Surface, support: float, near_cutoff: float, target_mesh: int = -1):
     """P = sum_faces b - sum_interior_edges b + sum_interior_vertices b."""
     result = wp.vec2(0.0)
     for face in range(surface.faces.shape[0]):
+        if target_mesh >= 0 and surface.face_mesh[face] != target_mesh:
+            continue
         closest = triangle_closest(point, surface, face)
         result += barrier_parts(wp.length(point - closest), support, near_cutoff)
     for edge in range(surface.edges.shape[0]):
+        if target_mesh >= 0 and surface.edge_mesh[edge] != target_mesh:
+            continue
         if surface.interior_edges[edge] != 0:
             closest = edge_closest(point, surface, edge)
             result -= barrier_parts(wp.length(point - closest), support, near_cutoff)
     for vertex in range(surface.vertices.shape[0]):
+        if target_mesh >= 0 and surface.vertex_mesh[vertex] != target_mesh:
+            continue
         if surface.interior_vertices[vertex] != 0:
             result += barrier_parts(wp.length(point - surface.vertices[vertex]), support, near_cutoff)
     return result
@@ -367,15 +350,24 @@ def triangle_potential(point: wp.vec3, target: Surface, face: int, support: floa
 
 @wp.func
 def edge_list_near_potential(
-    point: wp.vec3, edge: int, target: Surface, lists: EdgeTriangleListData, support: float, near_cutoff: float
+    point: wp.vec3,
+    edge: int,
+    target: Surface,
+    lists: Any,
+    support: float,
+    near_cutoff: float,
+    target_mesh: int,
 ):
     result = float(0.0)
     previous = wp.int64(-1)
     for i in range(lists.starts[edge], lists.ends[edge]):
-        key = lists.keys[i]
+        # Global radix lists store packed int64 keys; segmented lists store
+        # int32 face IDs. Both decode with the same face_stride remainder.
+        key = wp.int64(lists.keys[i])
         if key != previous:
             face = int(key % lists.face_stride)
-            result += triangle_potential(point, target, face, support, near_cutoff, True)[1]
+            if target.face_mesh[face] == target_mesh:
+                result += triangle_potential(point, target, face, support, near_cutoff, True)[1]
         previous = key
     return result
 
@@ -384,8 +376,9 @@ def edge_list_near_potential(
 def evaluate_point_potential(
     soft_contact_count: wp.array[int],
     mesh_features: wp.array[wp.vec3i],
-    rigid_vertices: wp.array[wp.vec2i],
-    rigid_mesh: wp.uint64,
+    contact_shapes: wp.array[int],
+    rigid_vertex_indices: wp.array[int],
+    rigid_face_offsets: wp.array[int],
     cloth: Surface,
     box: Surface,
     support: float,
@@ -399,15 +392,18 @@ def evaluate_point_potential(
         return  # The list builder records overflow; the caller must reject it.
     if i >= soft_contact_count[0]:
         return
+    if rigid_face_offsets[contact_shapes[i]] < 0:
+        return
     row = mesh_features[i]
     if row[0] < 0:
         return
     family = row[0] & 7
     if family == 0:
-        value = triangle_potential(cloth.vertices[row[1]], box, row[2], support, near_cutoff, False)
+        face = rigid_face_offsets[contact_shapes[i]] + row[2]
+        value = triangle_potential(cloth.vertices[row[1]], box, face, support, near_cutoff, False)
         wp.atomic_add(cloth_values, row[1], value)
     elif family == 1:
-        vertex = wp.mesh_get_index(rigid_mesh, rigid_vertices[row[2]][1])
+        vertex = rigid_vertex_indices[row[2]]
         value = triangle_potential(box.vertices[vertex], cloth, row[1], support, near_cutoff, False)
         wp.atomic_add(box_values, vertex, value)
 
@@ -454,13 +450,15 @@ def ee_sample(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3, near_cutoff: float
 def evaluate_ee_potential(
     soft_contact_count: wp.array[int],
     mesh_features: wp.array[wp.vec3i],
+    contact_shapes: wp.array[int],
+    rigid_face_offsets: wp.array[int],
     soft_edge_area: wp.array[float],
     rigid_edge_area: wp.array[float],
     cloth: Surface,
     box: Surface,
     support: float,
     near_cutoff: float,
-    lists: EdgeTriangleListData,
+    lists: Any,
     use_full_mesh: bool,
     energy: wp.array[wp.vec2],
 ):
@@ -471,6 +469,8 @@ def evaluate_ee_potential(
         energy[i] = wp.vec2(wp.nan)
         return
     if i >= soft_contact_count[0]:
+        return
+    if rigid_face_offsets[contact_shapes[i]] < 0:
         return
     # (family/sign bits, soft feature ID, rigid feature-table row).
     row = mesh_features[i]
@@ -484,19 +484,19 @@ def evaluate_ee_potential(
     if weight > 0.0:
         near_box, near_cloth = float(0.0), float(0.0)
         if use_full_mesh:
-            near_box = point_mesh_potential(q, box, support, near_cutoff)[1]
-            near_cloth = point_mesh_potential(q_bar, cloth, support, near_cutoff)[1]
+            near_box = point_mesh_potential(q, box, support, near_cutoff, box.edge_mesh[rigid_id])[1]
+            near_cloth = point_mesh_potential(q_bar, cloth, support, near_cutoff, cloth.edge_mesh[soft_id])[1]
         else:
-            near_box = edge_list_near_potential(q, soft_id, box, lists, support, near_cutoff)
+            near_box = edge_list_near_potential(q, soft_id, box, lists, support, near_cutoff, box.edge_mesh[rigid_id])
             near_cloth = edge_list_near_potential(
-                q_bar, lists.soft_edge_count + rigid_id, cloth, lists, support, near_cutoff
+                q_bar, lists.soft_edge_count + rigid_id, cloth, lists, support, near_cutoff, cloth.edge_mesh[soft_id]
             )
         energy[i] = wp.vec2(
             soft_edge_area[soft_id] * weight * near_box, rigid_edge_area[rigid_id] * weight * near_cloth
         )
 
 
-def make_surface(vertices, faces, edges):
+def make_surface(vertices, faces, edges, *, vertex_mesh=None):
     """Keep supplied edge numbering; compute adjacency and rest-area weights.
 
     Edges contain endpoint vertex IDs in the collision pipeline's order.
@@ -504,6 +504,15 @@ def make_surface(vertices, faces, edges):
     """
     vertices, faces = np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.int32).reshape(-1, 3)
     edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    vertex_mesh = (
+        np.zeros(len(vertices), dtype=np.int32) if vertex_mesh is None else np.asarray(vertex_mesh, dtype=np.int32)
+    )
+    if vertex_mesh.shape != (len(vertices),) or np.any(vertex_mesh < 0):
+        raise ValueError("Expected one nonnegative mesh ID per vertex")
+    if np.any(vertex_mesh[faces] != vertex_mesh[faces[:, :1]]) or np.any(
+        vertex_mesh[edges] != vertex_mesh[edges[:, :1]]
+    ):
+        raise ValueError("A triangle or edge cannot span different meshes")
     triangles = vertices[faces]
     areas = 0.5 * np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
     raw_edges = faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
@@ -524,6 +533,7 @@ def make_surface(vertices, faces, edges):
     np.add.at(edge_area, face_edge_ids, np.repeat(2 * areas, 3))
     np.add.at(vertex_area, faces.ravel(), np.repeat(areas / 3, 3))
     vertex_incidence = np.bincount(faces.ravel(), minlength=len(vertices))
+    interior_vertices[vertex_incidence == 0] = 0
     surface = Surface()
     surface.vertices = wp.array(vertices, dtype=wp.vec3)
     surface.faces = wp.array(faces, dtype=wp.vec3i)
@@ -545,6 +555,9 @@ def make_surface(vertices, faces, edges):
     surface.vertex_edge_offsets = wp.array(np.cumsum([0, *map(len, vertex_edges)]), dtype=int)
     surface.vertex_edges = wp.array([edge for incident in vertex_edges for edge in incident], dtype=int)
     surface.edge_faces = wp.array(edge_faces, dtype=wp.vec2i)
+    surface.vertex_mesh = wp.array(vertex_mesh, dtype=int)
+    surface.edge_mesh = wp.array(vertex_mesh[edges[:, 0]], dtype=int)
+    surface.face_mesh = wp.array(vertex_mesh[faces[:, 0]], dtype=int)
     return surface, vertex_area, edge_area
 
 
@@ -610,16 +623,18 @@ def run_example(device, gap):
             cloth.vertices.numpy(), cloth.faces.numpy(), box.vertices.numpy(), box.faces.numpy(), support, near_cutoff
         )
         # Each returned VT/TV row contributes its signed triangle potential.
-        rigid_mesh = model.shape_source_ptr.numpy()[box_shape]
         rigid_vertices = pipeline._soft_mesh_contact_data.rigid_features[0]
+        rigid_vertex_indices = wp.array(mesh.indices[rigid_vertices.numpy()[:, 1]], dtype=int)
+        rigid_face_offsets = wp.zeros(model.shape_count, dtype=int)
         cloth_values = wp.zeros(cloth.vertices.shape[0], dtype=wp.vec2)
         box_values = wp.zeros(box.vertices.shape[0], dtype=wp.vec2)
         # Launch at capacity; each kernel checks the device-side contact count.
         inputs = [
             contacts.soft_contact_count,
             contacts._soft_contact_mesh_features,
-            rigid_vertices,
-            rigid_mesh,
+            contacts.soft_contact_shape,
+            rigid_vertex_indices,
+            rigid_face_offsets,
             cloth,
             box,
         ]
@@ -638,6 +653,8 @@ def run_example(device, gap):
             inputs=[
                 contacts.soft_contact_count,
                 contacts._soft_contact_mesh_features,
+                contacts.soft_contact_shape,
+                rigid_face_offsets,
                 wp.array(cloth_edge_area, dtype=float),
                 wp.array(box_edge_area, dtype=float),
                 cloth,
@@ -670,7 +687,11 @@ def run_example(device, gap):
         families = np.bincount(contacts._soft_contact_mesh_features.numpy()[:count, 0] & 7, minlength=4)
         print(f"{device}, gap={gap:g} m: VT/TV/EE/depth rows = {families.tolist()}")
         entry_count = int(edge_triangle_lists.data.count.numpy()[0])
-        unique_count = len(np.unique(edge_triangle_lists.data.keys.numpy()[:entry_count]))
+        data = edge_triangle_lists.data
+        keys = data.keys.numpy()
+        unique_count = sum(
+            len(np.unique(keys[start:end])) for start, end in zip(data.starts.numpy(), data.ends.numpy(), strict=True)
+        )
         print(
             f"Per-edge lists: {entry_count} entries, {unique_count} unique; capacity={edge_triangle_lists.data.capacity}"
         )
