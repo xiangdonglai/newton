@@ -20,7 +20,12 @@ from newton._src.geometry.soft_contacts_sdf import (
     optimize_edge_sdf,
     optimize_face_sdf,
 )
-from newton.tests.unittest_utils import add_function_test, configure_sdf_for_collision_shapes, get_test_devices
+from newton.tests.unittest_utils import (
+    StdOutCapture,
+    add_function_test,
+    configure_sdf_for_collision_shapes,
+    get_test_devices,
+)
 
 
 class TestDeformableRigidRegressions(unittest.TestCase):
@@ -776,11 +781,16 @@ def test_separated_mesh_shells_keep_default_capacity(test, device):
         return newton.CollisionPipeline(model, enable_rigid_soft_full_surface_contact=True).soft_contact_max
 
     # No particle can be near faces of two shells, so each particle reserves at most one
-    # shell's faces, however many shells the mesh has.
+    # shell's faces, however many shells the mesh has. The additional estimate for
+    # TV/EE endpoint rows and particle recovery depends only on the soft topology.
     particles = 17 * 17
+    soft_triangles = 2 * 16 * 16
+    soft_edges = 2 * 16 * 17 + 16 * 16
     shell_faces = len(indices) // 3
     for shell_count in (1, 16):
-        test.assertLessEqual(default_capacity(shell_count), particles * shell_faces)
+        test.assertLessEqual(
+            default_capacity(shell_count), particles * shell_faces + particles + 3 * soft_triangles + 2 * soft_edges
+        )
 
 
 def _cloth_over_mesh_contacts(device, gap=0.02):
@@ -927,6 +937,131 @@ def test_mixed_mesh_edge_dispatch(test, device):
     np.testing.assert_allclose(records[1][1], records[0][1], atol=1.0e-6)
 
 
+def _box_patch_contacts(device, points, triangles, *, capacity=512, reverse_faces=False):
+    """Detect a small soft patch against a box without solver-side filtering."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    mesh = newton.Mesh.create_box(0.1, 0.1, 0.05, compute_inertia=False)
+    if reverse_faces:
+        mesh = newton.Mesh(mesh.vertices, np.asarray(mesh.indices).reshape(-1, 3)[::-1].reshape(-1))
+    builder.add_shape_mesh(-1, mesh=mesh, cfg=builder.ShapeConfig(margin=0.0, gap=0.0))
+    if triangles:
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=points,
+            indices=np.asarray(triangles).reshape(-1).tolist(),
+            density=1.0,
+            particle_radius=0.01,
+        )
+    else:
+        for point in points:
+            builder.add_particle(wp.vec3(*point), wp.vec3(0.0), mass=1.0, radius=0.01)
+    model = builder.finalize(device=device)
+    state = model.state()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        enable_rigid_soft_full_surface_contact=True,
+        soft_contact_gap=0.02,
+        soft_contact_max=capacity,
+    )
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    return model, state, contacts
+
+
+def test_mesh_endpoint_pairs_filter_only_in_solver(test, device):
+    """Keep endpoint feature pairs during detection, then remove their force duplicates."""
+    # The rigid top corner is closest to soft vertex 0. Its TV and incident EE
+    # queries must reach detection consumers, even though VT supplies the force.
+    model, state, contacts = _box_patch_contacts(
+        device,
+        [(0.103, 0.104, 0.055), (0.15, 0.104, 0.055), (0.103, 0.15, 0.055)],
+        [(0, 1, 2)],
+    )
+    count = int(contacts.soft_contact_count.numpy()[0])
+    families = contacts._soft_contact_mesh_features.numpy()[:count, 0] & 7
+    weights = contacts.soft_contact_barycentric.numpy()[:count]
+    test.assertTrue(np.any((families == 1) & (weights.max(axis=1) == 1.0)))
+    test.assertTrue(np.any((families == 2) & (weights.max(axis=1) == 1.0)))
+    soft_contacts_mesh.filter_soft_mesh_contacts(model, state, contacts)
+    count = int(contacts.soft_contact_count.numpy()[0])
+    families = contacts._soft_contact_mesh_features.numpy()[:count, 0] & 7
+    test.assertEqual(count, 1)
+    test.assertEqual(int(families[0]), 0)
+
+
+def test_mesh_tv_shared_soft_edge_has_one_owner(test, device):
+    """Apply one contact when a rigid corner projects onto two triangles' shared edge."""
+    # Both triangles return the identical point (0.1, 0.1, 0.055), with equal
+    # weights on particles 0 and 2. Counting both doubles the same contact force.
+    points = [(0.095, 0.095, 0.055), (0.105, 0.095, 0.055), (0.105, 0.105, 0.055), (0.095, 0.105, 0.055)]
+    for triangles in ([(0, 1, 2), (0, 2, 3)], [(0, 2, 3), (0, 1, 2)]):
+        model, state, contacts = _box_patch_contacts(device, points, triangles)
+        soft_contacts_mesh.filter_soft_mesh_contacts(model, state, contacts)
+        count = int(contacts.soft_contact_count.numpy()[0])
+        families = contacts._soft_contact_mesh_features.numpy()[:count, 0] & 7
+        tv = np.flatnonzero(families == 1)
+        test.assertEqual(len(tv), 1)
+        indices = contacts.soft_contact_indices.numpy()[tv[0]]
+        weights = contacts.soft_contact_barycentric.numpy()[tv[0]]
+        force_weights = np.zeros(4)
+        np.add.at(force_weights, indices, weights)
+        np.testing.assert_allclose(force_weights, (0.5, 0.0, 0.5, 0.0), atol=1.0e-6)
+
+
+def test_mesh_edge_recovery_shared_triangle_boundary(test, device):
+    """Recover each box chord once, including crossings on a face triangulation diagonal."""
+    # Edge 0--1 crosses the bottom and top faces. At x=y=0 both crossings
+    # lie on shared triangle edges: neither a missed entry nor two owners is valid.
+    # The one chord midpoint is z=0; an extra almost-zero-depth row at z=0.05
+    # is not another chord. Shifting x and reversing face order check both sides.
+    for x in (0.0, -0.005, 0.005):
+        for reverse_faces in (False, True):
+            with test.subTest(x=x, reverse_faces=reverse_faces):
+                model, state, contacts = _box_patch_contacts(
+                    device,
+                    [(x, 0.0, -0.08), (x, 0.0, 0.08), (0.3, 0.3, 0.08)],
+                    [(0, 1, 2)],
+                    reverse_faces=reverse_faces,
+                )
+                soft_contacts_mesh.filter_soft_mesh_contacts(model, state, contacts)
+                count = int(contacts.soft_contact_count.numpy()[0])
+                families = contacts._soft_contact_mesh_features.numpy()[:count, 0] & 7
+                indices = contacts.soft_contact_indices.numpy()[:count]
+                target = (families == 3) & (np.min(indices[:, :2], axis=1) == 0) & (np.max(indices[:, :2], axis=1) == 1)
+                test.assertEqual(int(target.sum()), 1)
+                weights = contacts.soft_contact_barycentric.numpy()[:count][target][0]
+                np.testing.assert_allclose(weights, (0.5, 0.5, 0.0), atol=1.0e-6)
+
+
+def test_mesh_filter_preserves_overflow(test, device):
+    """Leave an overflowing buffer intact instead of hiding its incomplete detection."""
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        model, state, contacts = _box_patch_contacts(
+            device,
+            [(0.02, 0.02, 0.055), (-0.02, -0.02, 0.055)],
+            [],
+            capacity=1,
+        )
+        wp.synchronize()
+    finally:
+        output = capture.end()
+    test.assertIn("Mesh soft-contact capacity exceeded (1)", output)
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), contacts.soft_contact_max)
+    features = contacts._soft_contact_mesh_features.numpy().copy()
+    positions = contacts.soft_contact_body_pos.numpy().copy()
+    for _ in range(2):
+        soft_contacts_mesh.filter_soft_mesh_contacts(model, state, contacts)
+        test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), contacts.soft_contact_max)
+        np.testing.assert_array_equal(contacts._soft_contact_mesh_features.numpy(), features)
+        np.testing.assert_array_equal(contacts.soft_contact_body_pos.numpy(), positions)
+
+
 for device in get_test_devices():
     for fn in (
         test_disconnected_mesh_contact_capacity,
@@ -947,8 +1082,18 @@ for device in get_test_devices():
         test_mesh_detection_reports_every_feature_pair,
         test_mesh_contact_filter_runs_once_per_detection,
         test_mesh_evaluation_skips_particle_contacts,
+        test_mesh_endpoint_pairs_filter_only_in_solver,
+        test_mesh_tv_shared_soft_edge_has_one_owner,
+        test_mesh_edge_recovery_shared_triangle_boundary,
+        test_mesh_filter_preserves_overflow,
     ):
-        add_function_test(TestDeformableRigidRegressions, fn.__name__, fn, devices=[device])
+        add_function_test(
+            TestDeformableRigidRegressions,
+            fn.__name__,
+            fn,
+            devices=[device],
+            check_output=fn is not test_mesh_filter_preserves_overflow,
+        )
     if device.is_cuda:
         add_function_test(
             TestDeformableRigidRegressions,
