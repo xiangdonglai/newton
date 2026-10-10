@@ -1614,13 +1614,20 @@ class TestSolverCoupledBasic(unittest.TestCase):
         )
         coupled.step(state, model.state(), None, contacts, dt=1.0 / 60.0)
 
-        # The coupled step keeps only canonical mesh pairs in the source before copying them.
-        kept = int(contacts.soft_contact_count.numpy()[0])
-        self.assertGreater(kept, contacts.soft_contact_tids.shape[0], "kept contacts must exceed the replay range")
-        self.assertLessEqual(kept, count)
+        # Full-surface entries retain the raw rows, with the force mask copied separately.
+        self.assertEqual(int(contacts.soft_contact_count.numpy()[0]), count)
         filtered = coupled._entry_contact_buffers["A"]
-        self.assertEqual(int(filtered.soft_contact_count.numpy()[0]), kept)
-        np.testing.assert_array_equal(filtered.soft_contact_tids.numpy()[:kept], -1)
+        self.assertEqual(int(filtered.soft_contact_count.numpy()[0]), count)
+        mapping = coupled._entry_soft_contact_src_to_dst["A"].numpy()[:count]
+        self.assertTrue(np.all(mapping >= 0))
+        np.testing.assert_array_equal(
+            filtered.soft_contact_indices.numpy()[mapping], contacts.soft_contact_indices.numpy()[:count]
+        )
+        mask = contacts.soft_contact_force_mask.numpy()[:count]
+        self.assertGreater(np.count_nonzero(mask), 0)
+        self.assertLess(np.count_nonzero(mask), count)
+        np.testing.assert_array_equal(filtered.soft_contact_force_mask.numpy()[mapping], mask)
+        np.testing.assert_array_equal(filtered.soft_contact_tids.numpy()[:count], -1)
 
     def test_entry_control_arrays_are_mapped_to_local_dofs(self):
         """Entry solvers should receive control arrays in their local DOF namespace."""
@@ -4100,6 +4107,7 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
         inputs=[
             wp.array([1], dtype=wp.int32, device=device),  # update_filter (dirty)
             wp.array([1], dtype=wp.int32, device=device),  # src_count
+            None,  # no force filtering
             wp.array([0], dtype=wp.int32, device=device),  # src_particle
             wp.array([0], dtype=wp.int32, device=device),  # src_shape
             wp.array([wp.vec3(0.1, 0.2, 0.3)], dtype=wp.vec3, device=device),  # src_body_pos
@@ -4114,6 +4122,7 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
             int(ParticleFlags.ACTIVE),
             0,  # keep_full_surface_contacts
             wp.zeros(1, dtype=wp.int32, device=device),  # dst_count
+            wp.ones(1, dtype=bool, device=device),  # dst_force_mask
             wp.full(1, -1, dtype=wp.int32, device=device),  # dst_particle
             wp.full(1, -1, dtype=wp.int32, device=device),  # dst_shape
             wp.zeros(1, dtype=wp.vec3, device=device),  # dst_body_pos

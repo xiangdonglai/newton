@@ -314,6 +314,7 @@ def _harvest_vbd_proxy_particle_body_contact_forces_kernel(
     rigid_body_particle_contact_use_log_barrier: bool,
     particle_radius: wp.array[float],
     body_particle_contact_count: wp.array[int],
+    soft_contact_force_mask: wp.array[bool],
     body_particle_contact_particle: wp.array[int],
     body_particle_contact_penalty_k: wp.array[float],
     body_particle_contact_material_kd: wp.array[float],
@@ -334,7 +335,9 @@ def _harvest_vbd_proxy_particle_body_contact_forces_kernel(
     out_particle_f: wp.array[wp.vec3],
 ):
     contact_idx = wp.tid()
-    if contact_idx >= body_particle_contact_count[0]:
+    if contact_idx >= body_particle_contact_count[0] or (
+        soft_contact_force_mask and not soft_contact_force_mask[contact_idx]
+    ):
         return
 
     particle_idx = body_particle_contact_particle[contact_idx]

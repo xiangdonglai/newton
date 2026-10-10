@@ -404,8 +404,14 @@ class Contacts:
             self._soft_contact_mesh_features = None
             self._soft_contact_mesh_params = None
             self._soft_contact_mesh_state = None
-            self._soft_contact_mesh_scratch = None
             self._soft_contact_mesh_data = None
+            self.soft_contact_force_mask = None
+            """Optional solver-side force selection, shape (soft_contact_max,), dtype bool.
+
+            Experimental: False suppresses a row's force, not its geometric constraint.
+            None accepts all rows. Mesh filtering fills this mask once per detection without
+            changing contact rows or their count; penetration-prevention consumers ignore it.
+            """
             # Particle-only view kept for solvers that consume particle contacts exclusively (XPBD,
             # semi-implicit, Style3D). Holds the particle id for particle contacts; -1 for edge/face.
             self.soft_contact_particle = wp.full(soft_contact_max, -1, dtype=int)

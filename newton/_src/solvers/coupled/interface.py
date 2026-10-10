@@ -256,7 +256,12 @@ class CouplingInterface:
         return False
 
     def coupling_supports_full_surface_soft_contacts(self) -> bool:
-        """Return whether the solver consumes edge and face soft contacts."""
+        """Return whether the solver consumes edge and face soft contacts.
+
+        Full-surface entry buffers retain detected geometry and carry the optional
+        :attr:`newton.Contacts.soft_contact_force_mask` separately. OGC force
+        evaluation must honor this mask; geometric constraints need not use it.
+        """
         return False
 
     def coupling_eval_gravity_acceleration(

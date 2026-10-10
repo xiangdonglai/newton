@@ -2217,6 +2217,7 @@ def apply_truncation_ts(
 def build_particle_body_contact_adjacency_active(
     body_particle_contact_indices: wp.array[wp.vec3i],
     body_particle_contact_count: wp.array[int],
+    soft_contact_force_mask: wp.array[bool],
     body_particle_contact_max: int,
     particle_contact_head: wp.array[int],
     particle_contact_next: wp.array[int],
@@ -2224,6 +2225,9 @@ def build_particle_body_contact_adjacency_active(
     """Build linked per-particle incidence lists over the compact active contact prefix."""
     contact_index = wp.tid()
     if contact_index >= min(body_particle_contact_max, body_particle_contact_count[0]):
+        return
+
+    if soft_contact_force_mask and not soft_contact_force_mask[contact_index]:
         return
 
     corners = body_particle_contact_indices[contact_index]
@@ -2381,6 +2385,7 @@ def scatter_particle_body_contact_force_and_hessian(
     particle_radius: wp.array[float],
     body_particle_contact_indices: wp.array[wp.vec3i],
     body_particle_contact_count: wp.array[int],
+    soft_contact_force_mask: wp.array[bool],
     body_particle_contact_max: int,
     worker_count: int,
     # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
@@ -2416,6 +2421,9 @@ def scatter_particle_body_contact_force_and_hessian(
     count = min(body_particle_contact_max, body_particle_contact_count[0])
     contact_index = wp.tid()
     while contact_index < count:
+        if soft_contact_force_mask and not soft_contact_force_mask[contact_index]:
+            contact_index += worker_count
+            continue
         corners = body_particle_contact_indices[contact_index]
         contact_ke = body_particle_contact_penalty_k[contact_index]
         contact_kd = body_particle_contact_material_kd[contact_index]

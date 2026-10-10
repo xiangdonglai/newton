@@ -5516,11 +5516,12 @@ def _full_surface_mesh_contacts(vertices, faces, points, gap, device):
     # Keep the pairs the solver applies forces to.
     filter_soft_mesh_contacts(model, state, contacts)
     count = int(contacts.soft_contact_count.numpy()[0])
-    particles = contacts.soft_contact_particle.numpy()[:count]
-    normals = contacts.soft_contact_normal.numpy()[:count]
+    rows = np.flatnonzero(contacts.soft_contact_force_mask.numpy()[:count])
+    particles = contacts.soft_contact_particle.numpy()[rows]
+    normals = contacts.soft_contact_normal.numpy()[rows]
     # Signed separation along each contact normal, as consumed by the VBD contact model.
     separation = np.einsum(
-        "ij,ij->i", normals, state.particle_q.numpy()[particles] - contacts.soft_contact_body_pos.numpy()[:count]
+        "ij,ij->i", normals, state.particle_q.numpy()[particles] - contacts.soft_contact_body_pos.numpy()[rows]
     )
     return particles, normals, separation
 

@@ -2346,8 +2346,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self.validate_observables(observables, contacts)
         self._distribute_state(state_in, dt=dt)
         if contacts is not None:
-            # Entry buffers do not carry full-surface mesh feature records, so keep only the
-            # canonical mesh pairs before they are copied (see filter_soft_mesh_contacts).
+            # Entry buffers do not carry mesh feature records. Compute force selection here
+            # and propagate it separately from geometry to full-surface entry solvers.
             filter_soft_mesh_contacts(self.model, state_in, contacts)
         self._active_observables = observables
         try:
@@ -3022,6 +3022,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 inputs=[
                     self._entry_soft_contact_update[entry.name],
                     contacts.soft_contact_count,
+                    contacts.soft_contact_force_mask,
                     contacts.soft_contact_particle,
                     contacts.soft_contact_shape,
                     contacts.soft_contact_body_pos,
@@ -3036,6 +3037,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     int(ParticleFlags.ACTIVE),
                     int(keep_full_surface_contacts),
                     filtered.soft_contact_count,
+                    filtered.soft_contact_force_mask,
                     filtered.soft_contact_particle,
                     filtered.soft_contact_shape,
                     filtered.soft_contact_body_pos,
@@ -3067,6 +3069,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 contact_matching=contacts.rigid_contact_match_index is not None,
                 rigid_contact_surface_velocity=contacts.rigid_contact_surface_velocity is not None,
             )
+            filtered.soft_contact_force_mask = wp.ones(contacts.soft_contact_max, dtype=bool, device=contacts.device)
             self._entry_contact_buffers[entry.name] = filtered
             self._entry_contact_sources[entry.name] = contacts
             self._entry_rigid_contact_generation[entry.name] = wp.full(
@@ -3916,6 +3919,7 @@ def _copy_filtered_rigid_contact_diff_kernel(
 def _filter_soft_contacts_global_shape_ids_kernel(
     update_filter: wp.array[wp.int32],
     src_count: wp.array[wp.int32],
+    src_force_mask: wp.array[bool],
     src_particle: wp.array[int],
     src_shape: wp.array[int],
     src_body_pos: wp.array[wp.vec3],
@@ -3930,6 +3934,7 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     active_particle_mask: int,
     keep_full_surface_contacts: int,
     dst_count: wp.array[wp.int32],
+    dst_force_mask: wp.array[bool],
     dst_particle: wp.array[int],
     dst_shape: wp.array[int],
     dst_body_pos: wp.array[wp.vec3],
@@ -3945,6 +3950,11 @@ def _filter_soft_contacts_global_shape_ids_kernel(
 
     contact_id = wp.tid()
     if contact_id >= src_count[0]:
+        return
+
+    # Full-surface solvers consume the force mask separately from geometry.
+    # Particle-only solvers do not support this mask, so retain their filtered view.
+    if keep_full_surface_contacts == 0 and src_force_mask and not src_force_mask[contact_id]:
         return
 
     particle = src_particle[contact_id]
@@ -3970,6 +3980,7 @@ def _filter_soft_contacts_global_shape_ids_kernel(
 
     dst_id = wp.atomic_add(dst_count, 0, wp.int32(1))
     src_to_dst[contact_id] = dst_id
+    dst_force_mask[dst_id] = not src_force_mask or src_force_mask[contact_id]
 
     dst_particle[dst_id] = particle
     dst_shape[dst_id] = shape
