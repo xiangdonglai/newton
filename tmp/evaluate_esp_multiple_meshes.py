@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evaluate ESP for multiple rigid meshes and disconnected soft meshes.
+"""Evaluate ESP energy and VBD contact blocks for multiple rigid/soft meshes.
 
 Run from newton_4227:
     uv run --no-sync python tmp/evaluate_esp_multiple_meshes.py --device all
@@ -12,8 +12,11 @@ Run from newton_4227:
 Use the shared energy and list kernels in esp_common.py. All contact
 rows are processed together, not with a separate launch per mesh pair. Geometry
 is flattened, but each feature retains its mesh owner. An EE sample evaluates
-P_near only on the target mesh in that EE pair. Optional force/Hessian checks
-are a standalone derivative reference, not a VBD implementation.
+P_near only on the target mesh in that EE pair. Every run assembles particle
+forces/3x3 Hessians and body forces, torques/6x6 Hessians using reusable device
+buffers. Optional checks compare these blocks against dense derivatives.
+This prepares the contact terms, not a VBD simulation: the raw Hessians can
+be indefinite, and no time stepping or penetration recovery is performed.
 Use a nonzero cloth tilt for second-derivative checks away from feature switches.
 
 The demo has two boxes with a narrow space between them and two cloth patches
@@ -37,6 +40,7 @@ from esp_common import (
 )
 from esp_derivatives import EspDerivativeEvaluator
 from esp_derivatives import check_derivatives as check_energy_derivatives
+from esp_vbd_blocks import EspVbdBlockEvaluator
 
 import newton
 
@@ -290,6 +294,10 @@ def run_example(device, *, check_derivatives=False, check_autodiff=False, check_
         meshes.update(state)
         lists = EdgeTriangleLists(meshes.soft, meshes.rigid, contacts.soft_contact_max)
         lists.rebuild(*meshes.contact_inputs(contacts))
+        # Reuse these buffers when positions change. New collision detection
+        # requires rebuilding the lists before assembling the next blocks.
+        blocks = EspVbdBlockEvaluator(meshes, contacts, lists)
+        blocks.assemble(state)
         soft_values = wp.zeros(model.particle_count, dtype=wp.vec2)
         rigid_values = wp.zeros(meshes.rigid.vertices.shape[0], dtype=wp.vec2)
         wp.launch(
@@ -318,6 +326,7 @@ def run_example(device, *, check_derivatives=False, check_autodiff=False, check_
             ],
         )
         lists.check()
+        blocks.check()
         fixed = [
             meshes.soft_vertex_area @ soft_values.numpy()[:, 0],
             meshes.rigid_vertex_area @ rigid_values.numpy()[:, 0],
@@ -327,10 +336,16 @@ def run_example(device, *, check_derivatives=False, check_autodiff=False, check_
         np.testing.assert_allclose(soft_values.numpy(), points[0], rtol=2e-5, atol=5e-6)
         np.testing.assert_allclose(rigid_values.numpy(), points[1], rtol=2e-5, atol=5e-6)
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-8)
+        np.testing.assert_allclose(blocks.energy.numpy(), expected.sum(axis=1), rtol=2e-5, atol=1e-8)
         count = int(contacts.soft_contact_count.numpy()[0])
         print(f"{device}: two rigid shapes, two soft meshes, {count} contact rows")
         print(f"P_fixed / P_ee (soft->rigid, rigid->soft):\n{actual}")
         print(f"NumPy:\n{expected}\nPASS; max absolute error={np.max(np.abs(actual - expected)):.3g}")
+        print(f"Total unnormalized energy (block assembly): {blocks.energy.numpy().sum():.12g}")
+        force = blocks.force.numpy().sum(axis=0)
+        print(f"Particle contact force (fixed + EE):\n{force[: model.particle_count, :3]}")
+        print(f"Body contact [force, torque] (fixed + EE):\n{force[model.particle_count :]}")
+        print(f"VBD contact blocks: {model.particle_count} particle 3x3; {model.body_count} body 6x6")
         if check_derivatives or check_autodiff or check_torch_energy:
             evaluator = EspDerivativeEvaluator(
                 meshes.contact_inputs(contacts),
@@ -340,6 +355,8 @@ def run_example(device, *, check_derivatives=False, check_autodiff=False, check_
                 meshes.soft_edge_area,
                 meshes.rigid_edge_area,
             )
+            if check_derivatives or check_autodiff:
+                blocks.check_against_dense(evaluator)
 
             def numpy_energy(soft_positions, rigid_positions):
                 return numpy_mesh_pair_energies(meshes, soft_positions, rigid_positions)[1].sum(axis=1)

@@ -18,6 +18,8 @@ At a geometric branch switch the returned Hessian differentiates the chosen
 branches; a classical Hessian need not exist. Float64 makes checking meaningful.
 """
 
+from typing import Any
+
 import numpy as np
 import warp as wp
 from esp_common import EdgeTriangleListData, Surface
@@ -74,6 +76,56 @@ def vertex(positions: wp.array[wp.vec3d], index: int, offset: int, i: int, j: in
         dof = 3 * (index + offset) + axis
         result[axis] = wp.vec4d(positions[index][axis], wp.float64(dof == i), wp.float64(dof == j), wp.float64(0.0))
     return result
+
+
+@wp.struct
+class BlockPositions:
+    """Seed one particle's xyz or one body's COM translation/world rotation.
+
+    The same geometric functions then evaluate a local VBD block, instead of
+    independent coordinates for every mesh vertex. All vertices belonging to
+    the active body receive the same six seeds; mixed vertex effects are not
+    discarded. ``enabled=False`` holds this entire surface fixed.
+    """
+
+    values: wp.array[wp.vec3d]
+    vertex_body: wp.array[int]
+    active: int
+    rigid: bool
+    enabled: bool
+    com: wp.vec3d
+
+
+@wp.func
+def vertex(positions: BlockPositions, index: int, offset: int, i: int, j: int):
+    x = positions.values[index]
+    di, dj, dij = wp.vec3d(), wp.vec3d(), wp.vec3d()
+    active = index == positions.active
+    if positions.rigid:
+        active = positions.vertex_body[index] == positions.active
+    if positions.enabled and active:
+        ei, ej = wp.vec3d(), wp.vec3d()
+        if i >= 0:
+            ei[i % 3] = wp.float64(1.0)
+        if j >= 0:
+            ej[j % 3] = wp.float64(1.0)
+        di, dj = ei, ej
+        if positions.rigid:
+            r = x - positions.com
+            if i >= 3:
+                di = wp.cross(ei, r)
+            if j >= 3:
+                dj = wp.cross(ej, r)
+            if i >= 3 and j >= 3:
+                # x(u,w) = c + u + exp([w]x)(x-c). This is the exact second
+                # derivative at zero, also shared by VBD's normalized small-
+                # angle quaternion update. Do not omit this curvature term.
+                dij = wp.float64(0.5) * (wp.cross(ei, wp.cross(ej, r)) + wp.cross(ej, wp.cross(ei, r)))
+    return wp.matrix_from_rows(
+        wp.vec4d(x[0], di[0], dj[0], dij[0]),
+        wp.vec4d(x[1], di[1], dj[1], dij[1]),
+        wp.vec4d(x[2], di[2], dj[2], dij[2]),
+    )
 
 
 @wp.func
@@ -144,7 +196,7 @@ def barrier(delta: Point, support: wp.float64, near_cutoff: wp.float64, near_onl
 @wp.func
 def triangle_potential(
     p: Point,
-    positions: wp.array[wp.vec3d],
+    positions: Any,
     surface: Surface,
     face: int,
     offset: int,

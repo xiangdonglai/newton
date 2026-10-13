@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evaluate ESP energies for a cloth patch above a rigid box's top-right edge.
+"""Evaluate ESP energy and VBD contact blocks for cloth above a rigid box edge.
 
 Run from newton_4227:
     uv run --no-sync python tmp/evaluate_esp_box_cloth.py
@@ -17,8 +17,11 @@ same records. Only each edge's filled range is sorted, not unused capacity.
 Lists require complete unfiltered queries and nonintersecting surfaces.
 The static box has an identity transform. Distances are in metres;
 energies use unit stiffness and the camera-ready ESP weights.
-Optional derivative checks evaluate forces and a dense reference Hessian on
-both surfaces. This does not implement penetration recovery or simulation.
+Every run assembles particle forces and 3x3 Hessian blocks in reusable device
+buffers, using EspVbdBlockEvaluator. The box is static, so it has no body block.
+Optional derivative checks compare these blocks against the dense reference
+and finite differences. This does not implement VBD stepping or recovery;
+the raw Hessians have not been projected to positive semidefinite matrices.
 Use --cloth-tilt 0.003 for the Hessian check: the exactly horizontal setup has
 EE samples at closest-feature switches, where a classical Hessian need not exist.
 Each run compares point values and integrated energies with the NumPy reference in esp_common.py.
@@ -37,12 +40,13 @@ from esp_common import (
     box_mesh,
     evaluate_ee_potential,
     evaluate_point_potential,
-    make_surface,
     patch,
     reference_energies,
 )
 from esp_derivatives import EspDerivativeEvaluator
 from esp_derivatives import check_derivatives as check_energy_derivatives
+from esp_vbd_blocks import EspVbdBlockEvaluator
+from evaluate_esp_multiple_meshes import EspMeshes
 
 import newton
 
@@ -59,9 +63,7 @@ def run_example(
             raise ValueError("The cloth tilt must leave all vertices above the box")
 
         builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-        box_shape = builder.add_shape_mesh(
-            body=-1, mesh=newton.Mesh(box_vertices, box_faces.ravel(), compute_inertia=False)
-        )
+        builder.add_shape_mesh(body=-1, mesh=newton.Mesh(box_vertices, box_faces.ravel(), compute_inertia=False))
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0),
             rot=wp.quat_identity(),
@@ -84,34 +86,19 @@ def run_example(
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         contact_max = contacts.soft_contact_max
-        mesh = model.shape_source[box_shape]
-        rigid_edges = pipeline._soft_mesh_contact_data.rigid_features[2]
-        cloth, cloth_vertex_area, cloth_edge_area = make_surface(
-            state.particle_q.numpy(), model.tri_indices.numpy(), model.edge_indices.numpy()[:, 2:4]
-        )
-        # Decode rigid index-buffer slots once, preserving feature-table order.
-        box, box_vertex_area, box_edge_area = make_surface(
-            mesh.vertices, mesh.indices, mesh.indices[rigid_edges.numpy()[:, 1:]]
-        )
+        meshes = EspMeshes(model, pipeline)
+        meshes.update(state)
+        cloth, box = meshes.soft, meshes.rigid
+        cloth_vertex_area, box_vertex_area = meshes.soft_vertex_area, meshes.rigid_vertex_area
+        cloth_edge_area, box_edge_area = meshes.soft_edge_area, meshes.rigid_edge_area
         numpy_point_values, numpy_energy = reference_energies(
             cloth.vertices.numpy(), cloth.faces.numpy(), box.vertices.numpy(), box.faces.numpy(), support, near_cutoff
         )
         # Each returned VT/TV row contributes its signed triangle potential.
-        rigid_vertices = pipeline._soft_mesh_contact_data.rigid_features[0]
-        rigid_vertex_indices = wp.array(mesh.indices[rigid_vertices.numpy()[:, 1]], dtype=int)
-        rigid_face_offsets = wp.zeros(model.shape_count, dtype=int)
         cloth_values = wp.zeros(cloth.vertices.shape[0], dtype=wp.vec2)
         box_values = wp.zeros(box.vertices.shape[0], dtype=wp.vec2)
         # Launch at capacity; each kernel checks the device-side contact count.
-        inputs = [
-            contacts.soft_contact_count,
-            contacts._soft_contact_mesh_features,
-            contacts.soft_contact_shape,
-            rigid_vertex_indices,
-            rigid_face_offsets,
-            cloth,
-            box,
-        ]
+        inputs = meshes.contact_inputs(contacts)
         wp.launch(
             evaluate_point_potential,
             dim=contact_max,
@@ -120,6 +107,10 @@ def run_example(
 
         edge_triangle_lists = EdgeTriangleLists(cloth, box, contact_max)
         edge_triangle_lists.rebuild(*inputs)
+        # Allocate once. Reuse assemble(state) after position updates; rebuild
+        # edge_triangle_lists after new collision detection, not every solve.
+        blocks = EspVbdBlockEvaluator(meshes, contacts, edge_triangle_lists, support=support, near_cutoff=near_cutoff)
+        blocks.assemble(state)
         energy = wp.zeros(contact_max, dtype=wp.vec2)
         wp.launch(
             evaluate_ee_potential,
@@ -128,9 +119,9 @@ def run_example(
                 contacts.soft_contact_count,
                 contacts._soft_contact_mesh_features,
                 contacts.soft_contact_shape,
-                rigid_face_offsets,
-                wp.array(cloth_edge_area, dtype=float),
-                wp.array(box_edge_area, dtype=float),
+                meshes.rigid_face_offsets,
+                cloth_edge_area,
+                box_edge_area,
                 cloth,
                 box,
                 support,
@@ -142,6 +133,7 @@ def run_example(
         )
         # Host reads below are only for diagnostics and the NumPy comparison.
         edge_triangle_lists.check()
+        blocks.check()
         count = int(contacts.soft_contact_count.numpy()[0])
         if count > contact_max:
             raise RuntimeError("Increase soft_contact_max: candidate buffer overflow")
@@ -173,10 +165,13 @@ def run_example(
         print(f"P_ee    (cloth->box, box->cloth): {ee}")
         actual = np.array([fixed, ee])
         np.testing.assert_allclose(actual, numpy_energy, rtol=2e-5, atol=1e-8)
+        np.testing.assert_allclose(blocks.energy.numpy(), numpy_energy.sum(axis=1), rtol=2e-5, atol=1e-8)
         print(f"NumPy P_fixed: {numpy_energy[0]}; P_ee: {numpy_energy[1]}")
         print(f"Max point-potential error = {max_point_error:.3g}")
         print(f"Oracle comparison PASS; max energy error = {np.max(np.abs(actual - numpy_energy)):.3g}")
-        print(f"Total unnormalized energy: {np.sum(fixed) + np.sum(ee):.12g}\n")
+        print(f"Total unnormalized energy (block assembly): {blocks.energy.numpy().sum():.12g}")
+        print(f"Particle contact force (fixed + EE):\n{blocks.force.numpy().sum(axis=0)[:, :3]}")
+        print(f"VBD contact blocks: {model.particle_count} particle 3x3; static box (no body block)")
         if check_derivatives or check_autodiff or check_torch_energy:
             soft_rest, rigid_rest = cloth.vertices.numpy(), box.vertices.numpy()
             soft_faces, rigid_faces = cloth.faces.numpy(), box.faces.numpy()
@@ -203,6 +198,8 @@ def run_example(
                 support=support,
                 near_cutoff=near_cutoff,
             )
+            if check_derivatives or check_autodiff:
+                blocks.check_against_dense(evaluator)
             if check_autodiff or check_torch_energy:
                 import esp_autodiff  # noqa: PLC0415 -- Optional PyTorch checks.
 
