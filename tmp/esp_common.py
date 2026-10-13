@@ -667,10 +667,10 @@ def box_mesh():
     return vertices, np.asarray(faces, dtype=np.int32)
 
 
-def patch(gap=0.0003):
+def patch(gap=0.0003, *, tilt=0.0):
+    """Create the cloth patch; optional z slope avoids horizontal feature ties."""
     xy = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]]) * 0.014
     angle = np.pi / 6
     xy = xy @ np.array([[np.cos(angle), np.sin(angle)], [-np.sin(angle), np.cos(angle)]])
-    return np.column_stack((xy + np.array([0.05, 0]), np.full(4, gap))), np.array(
-        [[0, 1, 2], [0, 2, 3]], dtype=np.int32
-    )
+    z = gap + tilt * (xy[:, 0] + 0.7 * xy[:, 1])
+    return np.column_stack((xy + np.array([0.05, 0]), z)), np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)

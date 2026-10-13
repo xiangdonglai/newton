@@ -6,6 +6,9 @@
 Run from newton_4227:
     uv run --no-sync python tmp/evaluate_esp_box_cloth.py
     uv run --no-sync python tmp/evaluate_esp_box_cloth.py --device cuda:0 --gap 0.00015
+    uv run --no-sync python tmp/evaluate_esp_box_cloth.py --device all --cloth-tilt 0.003 --check-derivatives
+    uv run --no-sync --with torch python tmp/evaluate_esp_box_cloth.py --check-autodiff
+    uv run --no-sync --with torch python tmp/evaluate_esp_box_cloth.py --device all --check-torch-energy
 
 Evaluate P(q) from native pipeline VT/TV records, and P_ee from EE records.
 Each thread directly sums the signed barrier terms in float32.
@@ -14,7 +17,10 @@ same records. Only each edge's filled range is sorted, not unused capacity.
 Lists require complete unfiltered queries and nonintersecting surfaces.
 The static box has an identity transform. Distances are in metres;
 energies use unit stiffness and the camera-ready ESP weights.
-This evaluates energies only, not forces, recovery, or simulation.
+Optional derivative checks evaluate forces and a dense reference Hessian on
+both surfaces. This does not implement penetration recovery or simulation.
+Use --cloth-tilt 0.003 for the Hessian check: the exactly horizontal setup has
+EE samples at closest-feature switches, where a classical Hessian need not exist.
 Each run compares point values and integrated energies with the NumPy reference in esp_common.py.
 
 The float64 version with integer coefficient cancellation is preserved in
@@ -35,16 +41,22 @@ from esp_common import (
     patch,
     reference_energies,
 )
+from esp_derivatives import EspDerivativeEvaluator
+from esp_derivatives import check_derivatives as check_energy_derivatives
 
 import newton
 
 
-def run_example(device, gap):
+def run_example(
+    device, gap, *, check_derivatives=False, check_autodiff=False, check_torch_energy=False, cloth_tilt=0.0
+):
     support, near_cutoff = 0.03, 0.0015
     with wp.ScopedDevice(device):
         # Shared-vertex box: x=+/-50 mm, y=+/-40 mm, top z=0, bottom z=-100 mm.
         box_vertices, box_faces = box_mesh()
-        cloth_vertices, cloth_faces = patch(gap)
+        cloth_vertices, cloth_faces = patch(gap, tilt=cloth_tilt)
+        if np.min(cloth_vertices[:, 2]) <= 0:
+            raise ValueError("The cloth tilt must leave all vertices above the box")
 
         builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
         box_shape = builder.add_shape_mesh(
@@ -165,6 +177,40 @@ def run_example(device, gap):
         print(f"Max point-potential error = {max_point_error:.3g}")
         print(f"Oracle comparison PASS; max energy error = {np.max(np.abs(actual - numpy_energy)):.3g}")
         print(f"Total unnormalized energy: {np.sum(fixed) + np.sum(ee):.12g}\n")
+        if check_derivatives or check_autodiff or check_torch_energy:
+            soft_rest, rigid_rest = cloth.vertices.numpy(), box.vertices.numpy()
+            soft_faces, rigid_faces = cloth.faces.numpy(), box.faces.numpy()
+
+            def numpy_energy(soft_positions, rigid_positions):
+                return reference_energies(
+                    soft_positions,
+                    soft_faces,
+                    rigid_positions,
+                    rigid_faces,
+                    support,
+                    near_cutoff,
+                    cloth_rest_vertices=soft_rest,
+                    box_rest_vertices=rigid_rest,
+                )[1].sum(axis=1)
+
+            evaluator = EspDerivativeEvaluator(
+                inputs,
+                edge_triangle_lists,
+                cloth_vertex_area,
+                box_vertex_area,
+                cloth_edge_area,
+                box_edge_area,
+                support=support,
+                near_cutoff=near_cutoff,
+            )
+            if check_autodiff or check_torch_energy:
+                import esp_autodiff  # noqa: PLC0415 -- Optional PyTorch checks.
+
+                esp_autodiff.check_energy(evaluator, actual.sum(axis=1))
+                if check_autodiff:
+                    esp_autodiff.check_autodiff(evaluator)
+            if check_derivatives:
+                check_energy_derivatives(evaluator, numpy_energy)
         return actual
 
 
@@ -172,9 +218,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="cpu", help="cpu, cuda:0, or all")
     parser.add_argument("--gap", type=float, default=0.0003, help="Positive cloth height above the box [m]")
+    parser.add_argument(
+        "--cloth-tilt", type=float, default=0.0, help="Cloth z slope; use 0.003 for smooth Hessian validation"
+    )
+    parser.add_argument(
+        "--check-derivatives", action="store_true", help="Check forces/Hessians against finite differences (slow)"
+    )
+    parser.add_argument(
+        "--check-autodiff", action="store_true", help="Check against independent PyTorch autodiff (slow)"
+    )
+    parser.add_argument(
+        "--check-torch-energy", action="store_true", help="Compare original Warp and PyTorch energies; skip derivatives"
+    )
     args = parser.parse_args()
     if args.gap <= 0:
         parser.error("--gap must be positive; this script does not evaluate penetration recovery")
     devices = wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]
     for device in devices:
-        run_example(device, args.gap)
+        run_example(
+            device,
+            args.gap,
+            check_derivatives=args.check_derivatives,
+            check_autodiff=args.check_autodiff,
+            check_torch_energy=args.check_torch_energy,
+            cloth_tilt=args.cloth_tilt,
+        )

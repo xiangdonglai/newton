@@ -5,12 +5,16 @@
 
 Run from newton_4227:
     uv run --no-sync python tmp/evaluate_esp_multiple_meshes.py --device all
+    uv run --no-sync python tmp/evaluate_esp_multiple_meshes.py --device cuda:0 --cloth-tilt 0.003 --check-derivatives
+    uv run --no-sync --with torch python tmp/evaluate_esp_multiple_meshes.py --check-autodiff
+    uv run --no-sync --with torch python tmp/evaluate_esp_multiple_meshes.py --device all --check-torch-energy
 
 Use the shared energy and list kernels in esp_common.py. All contact
 rows are processed together, not with a separate launch per mesh pair. Geometry
 is flattened, but each feature retains its mesh owner. An EE sample evaluates
-P_near only on the target mesh in that EE pair. This remains an energy-only
-prototype, not a VBD force/Hessian implementation.
+P_near only on the target mesh in that EE pair. Optional force/Hessian checks
+are a standalone derivative reference, not a VBD implementation.
+Use a nonzero cloth tilt for second-derivative checks away from feature switches.
 
 The demo has two boxes with a narrow space between them and two cloth patches
 at different heights. Both patches query both boxes, deliberately exercising
@@ -31,6 +35,8 @@ from esp_common import (
     patch,
     reference_energies,
 )
+from esp_derivatives import EspDerivativeEvaluator
+from esp_derivatives import check_derivatives as check_energy_derivatives
 
 import newton
 
@@ -181,7 +187,7 @@ class EspMeshes:
         ]
 
 
-def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False):
+def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False, cloth_tilt=0.0):
     """Build two cloths and two instanced boxes with nontrivial transforms."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     # An unrelated shape makes rigid mesh shape IDs differ from mesh indices.
@@ -208,7 +214,9 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False)
             shape_tf = wp.transform(wp.vec3(0.002, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.145))
             scale = (0.65, 0.8, 1.2)
         shapes.append(builder.add_shape_mesh(body=body, mesh=mesh, xform=shape_tf, scale=scale))
-        sv, sf = patch(gap=0.0003 if separate_worlds else 0.0003 + i * 0.0006)
+        sv, sf = patch(gap=0.0003 if separate_worlds else 0.0003 + i * 0.0006, tilt=cloth_tilt)
+        if np.min(sv[:, 2]) <= 0:
+            raise ValueError("The cloth tilt must leave all vertices above the box")
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0),
             rot=wp.quat_identity(),
@@ -235,9 +243,10 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False)
     return model, state, pipeline, contacts, shapes
 
 
-def numpy_mesh_pair_energies(meshes):
+def numpy_mesh_pair_energies(meshes, soft_positions=None, rigid_positions=None):
     """Return per-vertex values and energies summed over allowed mesh pairs."""
-    sv, rv = meshes.soft.vertices.numpy(), meshes.rigid.vertices.numpy()
+    sv = meshes.soft.vertices.numpy() if soft_positions is None else soft_positions
+    rv = meshes.rigid.vertices.numpy() if rigid_positions is None else rigid_positions
     sf, rf = meshes.soft.faces.numpy(), meshes.rigid.faces.numpy()
     soft_owners, rigid_owners = meshes.soft.vertex_mesh.numpy(), meshes.rigid.vertex_mesh.numpy()
     particle_world = meshes.model.particle_world.numpy()
@@ -274,9 +283,9 @@ def numpy_mesh_pair_energies(meshes):
     return (soft_values, rigid_values), expected
 
 
-def run_example(device):
+def run_example(device, *, check_derivatives=False, check_autodiff=False, check_torch_energy=False, cloth_tilt=0.0):
     with wp.ScopedDevice(device):
-        model, state, pipeline, contacts, _shapes = make_example()
+        model, state, pipeline, contacts, _shapes = make_example(cloth_tilt=cloth_tilt)
         meshes = EspMeshes(model, pipeline)
         meshes.update(state)
         lists = EdgeTriangleLists(meshes.soft, meshes.rigid, contacts.soft_contact_max)
@@ -322,11 +331,50 @@ def run_example(device):
         print(f"{device}: two rigid shapes, two soft meshes, {count} contact rows")
         print(f"P_fixed / P_ee (soft->rigid, rigid->soft):\n{actual}")
         print(f"NumPy:\n{expected}\nPASS; max absolute error={np.max(np.abs(actual - expected)):.3g}")
+        if check_derivatives or check_autodiff or check_torch_energy:
+            evaluator = EspDerivativeEvaluator(
+                meshes.contact_inputs(contacts),
+                lists,
+                meshes.soft_vertex_area,
+                meshes.rigid_vertex_area,
+                meshes.soft_edge_area,
+                meshes.rigid_edge_area,
+            )
+
+            def numpy_energy(soft_positions, rigid_positions):
+                return numpy_mesh_pair_energies(meshes, soft_positions, rigid_positions)[1].sum(axis=1)
+
+            if check_autodiff or check_torch_energy:
+                import esp_autodiff  # noqa: PLC0415 -- Optional PyTorch checks.
+
+                esp_autodiff.check_energy(evaluator, actual.sum(axis=1))
+                if check_autodiff:
+                    esp_autodiff.check_autodiff(evaluator)
+            if check_derivatives:
+                check_energy_derivatives(evaluator, numpy_energy)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="cpu", help="cpu, cuda:0, or all")
+    parser.add_argument(
+        "--cloth-tilt", type=float, default=0.0, help="Cloth z slope; use 0.003 for smooth Hessian validation"
+    )
+    parser.add_argument(
+        "--check-derivatives", action="store_true", help="Check forces/Hessians against finite differences (slow)"
+    )
+    parser.add_argument(
+        "--check-autodiff", action="store_true", help="Check against independent PyTorch autodiff (slow)"
+    )
+    parser.add_argument(
+        "--check-torch-energy", action="store_true", help="Compare original Warp and PyTorch energies; skip derivatives"
+    )
     args = parser.parse_args()
     for device in wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]:
-        run_example(device)
+        run_example(
+            device,
+            check_derivatives=args.check_derivatives,
+            check_autodiff=args.check_autodiff,
+            check_torch_energy=args.check_torch_energy,
+            cloth_tilt=args.cloth_tilt,
+        )
