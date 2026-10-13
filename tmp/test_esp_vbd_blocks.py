@@ -11,10 +11,9 @@ import unittest
 
 import numpy as np
 import warp as wp
-from esp_common import EdgeTriangleLists
 from esp_derivatives import EspDerivativeEvaluator
 from esp_vbd_blocks import EspVbdBlockEvaluator
-from evaluate_esp_multiple_meshes import EspMeshes, make_example
+from evaluate_esp_multiple_meshes import make_example
 
 
 def skew(r):
@@ -23,7 +22,7 @@ def skew(r):
 
 def make_case(device, *, shared_body=False, static=False):
     with wp.ScopedDevice(device):
-        model, state, pipeline, contacts, shapes = make_example(cloth_tilt=0.003, separate_worlds=static)
+        model, state, pipeline, shapes = make_example(cloth_tilt=0.003, separate_worlds=static)
         if shared_body:
             # Put two differently scaled/placed mesh shapes on one body,
             # preserving both world geometries. This tests grouping by body,
@@ -37,25 +36,12 @@ def make_case(device, *, shared_body=False, static=False):
             model.shape_body.assign(bodies)
             model.shape_transform.assign(transforms)
             model.body_com.assign(np.array([[0.013, -0.004, 0.007]], dtype=np.float32))
-            pipeline.collide(state, contacts)
-        meshes = EspMeshes(model, pipeline)
-        meshes.update(state)
-        lists = EdgeTriangleLists(meshes.soft, meshes.rigid, contacts.soft_contact_max)
-        lists.rebuild(*meshes.contact_inputs(contacts))
-        blocks = EspVbdBlockEvaluator(meshes, contacts, lists)
+        blocks = EspVbdBlockEvaluator(model, pipeline, state)
     return state, blocks
 
 
 def dense_reference(blocks):
-    meshes = blocks.meshes
-    return EspDerivativeEvaluator(
-        meshes.contact_inputs(blocks.contacts),
-        blocks.lists,
-        meshes.soft_vertex_area,
-        meshes.rigid_vertex_area,
-        meshes.soft_edge_area,
-        meshes.rigid_edge_area,
-    )
+    return EspDerivativeEvaluator(blocks)
 
 
 def compare_dense(test, blocks):
@@ -69,8 +55,8 @@ def compare_dense(test, blocks):
     expected_f[:, :count, :3] = force[:, :count]
     for p in range(count):
         expected_h[:, p, :3, :3] = hessian[:, 3 * p : 3 * p + 3, 3 * p : 3 * p + 3]
-    bodies = blocks.data.rigid_vertex_body.numpy()
-    centers = blocks.data.body_com_world.numpy()
+    bodies = blocks.model.shape_body.numpy()[blocks.data.rigid.vertex_mesh.numpy()]
+    centers = blocks.body_com_world.numpy()
     omitted_curvature = 0.0
     for body in range(blocks.model.body_count):
         ids = np.flatnonzero(bodies == body)
@@ -106,6 +92,22 @@ class TestEspVbdBlocks(unittest.TestCase):
                     blocks.assemble(state)
                     blocks.check()
                     compare_dense(self, blocks)
+                    blocks.check_against_solver(state)
+                    # Parallel EE slices must sum exactly the same potential
+                    # and derivative blocks as one unsliced list traversal.
+                    reference = (
+                        blocks.energy.numpy().copy(),
+                        blocks.force.numpy().copy(),
+                        blocks.hessian.numpy().copy(),
+                    )
+                    for partitions in (1, 4, 8):
+                        blocks._ee_partitions = partitions
+                        blocks.assemble(state)
+                        blocks.check()
+                        for output, expected in zip(
+                            (blocks.energy, blocks.force, blocks.hessian), reference, strict=True
+                        ):
+                            np.testing.assert_allclose(output.numpy(), expected, rtol=1e-9, atol=1e-8)
                     # Repeated assembly replaces, rather than doubles, values.
                     before = blocks.force.numpy().copy()
                     blocks.assemble(state)
@@ -121,8 +123,8 @@ class TestEspVbdBlocks(unittest.TestCase):
                 blocks.check()
                 reference, e, f, h = compare_dense(self, blocks)
                 body, n = 0, blocks.model.particle_count
-                ids = np.flatnonzero(blocks.data.rigid_vertex_body.numpy() == body)
-                center = blocks.data.body_com_world.numpy()[body]
+                ids = np.flatnonzero(blocks.model.shape_body.numpy()[blocks.data.rigid.vertex_mesh.numpy()] == body)
+                center = blocks.body_com_world.numpy()[body]
                 r = reference.rigid_positions[ids] - center
 
                 def pose_energy(delta, reference=reference, ids=ids, center=center, r=r):
@@ -194,11 +196,11 @@ class TestEspVbdBlocks(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "flags=1"):
                     blocks.check()
                 blocks.contacts.soft_contact_count.fill_(count)
-                blocks.lists.data.error.fill_(2)
+                blocks.lists.error.fill_(2)
                 assemble()
                 with self.assertRaisesRegex(ValueError, "flags=2"):
                     blocks.check()
-                blocks.lists.data.error.zero_()
+                blocks.lists.error.zero_()
                 features = blocks.contacts._soft_contact_mesh_features.numpy().copy()
                 original = features.copy()
                 features[0, 0] = 3
@@ -209,9 +211,9 @@ class TestEspVbdBlocks(unittest.TestCase):
                 blocks.contacts._soft_contact_mesh_features.assign(original)
                 row_id = np.flatnonzero((original[:count, 0] >= 0) & ((original[:count, 0] & 7) == 0))[0]
                 shape = blocks.contacts.soft_contact_shape.numpy()[row_id]
-                face = blocks.meshes.rigid_face_offsets.numpy()[shape] + original[row_id, 2]
-                target_vertex = blocks.meshes.rigid.faces.numpy()[face, 0]
-                moved[original[row_id, 1]] = blocks.meshes.rigid.vertices.numpy()[target_vertex]
+                face = blocks.data.rigid_face_offsets.numpy()[shape] + original[row_id, 2]
+                target_vertex = blocks.data.rigid.faces.numpy()[face, 0]
+                moved[original[row_id, 1]] = blocks.solver._esp_rigid_positions.numpy()[target_vertex]
                 state.particle_q.assign(moved)
                 assemble()
                 with self.assertRaisesRegex(ValueError, "flags=4"):

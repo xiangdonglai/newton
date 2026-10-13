@@ -18,186 +18,36 @@ At a geometric branch switch the returned Hessian differentiates the chosen
 branches; a classical Hessian need not exist. Float64 makes checking meaningful.
 """
 
-from typing import Any
-
 import numpy as np
 import warp as wp
-from esp_common import EdgeTriangleListData, Surface
+
+from newton._src.solvers.vbd.esp_contact import (  # noqa: F401
+    BlockPositions,
+    EdgeTriangleListData,
+    EspSurfaceData,
+    Point,
+    barrier,
+    chain,
+    cross,
+    divide,
+    dot,
+    ee_sample,
+    mollifier,
+    multiply,
+    scale,
+    segment_closest,
+    triangle_closest,
+    vertex,
+)
 
 wp.set_module_options({"enable_backward": False})
-
-Point = wp.types.matrix(shape=(3, 4), dtype=wp.float64)
-
-
-@wp.func
-def multiply(a: wp.vec4d, b: wp.vec4d):
-    return wp.vec4d(
-        a[0] * b[0],
-        a[1] * b[0] + a[0] * b[1],
-        a[2] * b[0] + a[0] * b[2],
-        a[3] * b[0] + a[1] * b[2] + a[2] * b[1] + a[0] * b[3],
-    )
-
-
-@wp.func
-def chain(a: wp.vec4d, value: wp.float64, first: wp.float64, second: wp.float64):
-    return wp.vec4d(value, first * a[1], first * a[2], first * a[3] + second * a[1] * a[2])
-
-
-@wp.func
-def divide(a: wp.vec4d, b: wp.vec4d):
-    inv = wp.float64(1.0) / b[0]
-    return multiply(a, chain(b, inv, -inv * inv, wp.float64(2.0) * inv * inv * inv))
-
-
-@wp.func
-def dot(a: Point, b: Point):
-    return multiply(a[0], b[0]) + multiply(a[1], b[1]) + multiply(a[2], b[2])
-
-
-@wp.func
-def scale(a: Point, s: wp.vec4d):
-    return wp.matrix_from_rows(multiply(a[0], s), multiply(a[1], s), multiply(a[2], s))
-
-
-@wp.func
-def cross(a: Point, b: Point):
-    return wp.matrix_from_rows(
-        multiply(a[1], b[2]) - multiply(a[2], b[1]),
-        multiply(a[2], b[0]) - multiply(a[0], b[2]),
-        multiply(a[0], b[1]) - multiply(a[1], b[0]),
-    )
-
-
-@wp.func
-def vertex(positions: wp.array[wp.vec3d], index: int, offset: int, i: int, j: int):
-    result = Point()
-    for axis in range(3):
-        dof = 3 * (index + offset) + axis
-        result[axis] = wp.vec4d(positions[index][axis], wp.float64(dof == i), wp.float64(dof == j), wp.float64(0.0))
-    return result
-
-
-@wp.struct
-class BlockPositions:
-    """Seed one particle's xyz or one body's COM translation/world rotation.
-
-    The same geometric functions then evaluate a local VBD block, instead of
-    independent coordinates for every mesh vertex. All vertices belonging to
-    the active body receive the same six seeds; mixed vertex effects are not
-    discarded. ``enabled=False`` holds this entire surface fixed.
-    """
-
-    values: wp.array[wp.vec3d]
-    vertex_body: wp.array[int]
-    active: int
-    rigid: bool
-    enabled: bool
-    com: wp.vec3d
-
-
-@wp.func
-def vertex(positions: BlockPositions, index: int, offset: int, i: int, j: int):
-    x = positions.values[index]
-    di, dj, dij = wp.vec3d(), wp.vec3d(), wp.vec3d()
-    active = index == positions.active
-    if positions.rigid:
-        active = positions.vertex_body[index] == positions.active
-    if positions.enabled and active:
-        ei, ej = wp.vec3d(), wp.vec3d()
-        if i >= 0:
-            ei[i % 3] = wp.float64(1.0)
-        if j >= 0:
-            ej[j % 3] = wp.float64(1.0)
-        di, dj = ei, ej
-        if positions.rigid:
-            r = x - positions.com
-            if i >= 3:
-                di = wp.cross(ei, r)
-            if j >= 3:
-                dj = wp.cross(ej, r)
-            if i >= 3 and j >= 3:
-                # x(u,w) = c + u + exp([w]x)(x-c). This is the exact second
-                # derivative at zero, also shared by VBD's normalized small-
-                # angle quaternion update. Do not omit this curvature term.
-                dij = wp.float64(0.5) * (wp.cross(ei, wp.cross(ej, r)) + wp.cross(ej, wp.cross(ei, r)))
-    return wp.matrix_from_rows(
-        wp.vec4d(x[0], di[0], dj[0], dij[0]),
-        wp.vec4d(x[1], di[1], dj[1], dij[1]),
-        wp.vec4d(x[2], di[2], dj[2], dij[2]),
-    )
-
-
-@wp.func
-def segment_closest(p: Point, a: Point, b: Point):
-    edge = b - a
-    t = divide(dot(p - a, edge), dot(edge, edge))
-    if t[0] <= wp.float64(0.0):
-        return a
-    if t[0] >= wp.float64(1.0):
-        return b
-    return a + scale(edge, t)
-
-
-@wp.func
-def triangle_closest(p: Point, a: Point, b: Point, c: Point):
-    ab, ac = b - a, c - a
-    n = cross(ab, ac)
-    n_sq = dot(n, n)
-    projected = p - scale(n, divide(dot(p - a, n), n_sq))
-    u = divide(dot(cross(projected - a, ac), n), n_sq)
-    v = divide(dot(cross(ab, projected - a), n), n_sq)
-    if u[0] > wp.float64(0.0) and v[0] > wp.float64(0.0) and u[0] + v[0] < wp.float64(1.0):
-        return projected
-    closest = segment_closest(p, a, b)
-    for k in range(2):
-        candidate = segment_closest(p, b, c)
-        if k == 1:
-            candidate = segment_closest(p, c, a)
-        if dot(p - candidate, p - candidate)[0] < dot(p - closest, p - closest)[0]:
-            closest = candidate
-    return closest
-
-
-@wp.func
-def barrier(delta: Point, support: wp.float64, near_cutoff: wp.float64, near_only: bool):
-    d_sq = dot(delta, delta)
-    if d_sq[0] >= support * support or (near_only and d_sq[0] >= near_cutoff * near_cutoff):
-        return wp.vec4d()
-    if d_sq[0] <= wp.float64(0.0):
-        return wp.vec4d(wp.float64(wp.inf), wp.float64(wp.nan), wp.float64(wp.nan), wp.float64(wp.nan))
-    root = wp.sqrt(d_sq[0])
-    d = chain(d_sq, root, wp.float64(0.5) / root, -wp.float64(0.25) / (root * root * root))
-    ratio = d / support
-    gap = wp.vec4d(wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)) - ratio
-    log_ratio = chain(ratio, wp.log(ratio[0]), wp.float64(1.0) / ratio[0], -wp.float64(1.0) / (ratio[0] * ratio[0]))
-    total = -multiply(multiply(gap, gap), log_ratio)
-    if near_only:
-        x = d * (wp.float64(2.0) / near_cutoff) - wp.vec4d(
-            wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)
-        )
-        if x[0] >= wp.float64(1.0):
-            return wp.vec4d()
-        if x[0] > wp.float64(0.0):
-            t = x[0]
-            window = chain(
-                x,
-                wp.float64(1.0)
-                - wp.float64(10.0) * t * t * t
-                + wp.float64(15.0) * t * t * t * t
-                - wp.float64(6.0) * t * t * t * t * t,
-                -wp.float64(30.0) * t * t * (wp.float64(1.0) - t) * (wp.float64(1.0) - t),
-                -wp.float64(60.0) * t + wp.float64(180.0) * t * t - wp.float64(120.0) * t * t * t,
-            )
-            total = multiply(total, window)
-    return total
 
 
 @wp.func
 def triangle_potential(
     p: Point,
-    positions: Any,
-    surface: Surface,
+    positions: wp.array[wp.vec3d],
+    surface: EspSurfaceData,
     face: int,
     offset: int,
     i: int,
@@ -206,72 +56,31 @@ def triangle_potential(
     near_cutoff: wp.float64,
     near_only: bool,
 ):
+    # Keep the original differentiated closest-point calculation as an oracle
+    # for the solver's faster analytical distance derivatives.
     ids = surface.faces[face]
-    a = vertex(positions, ids[0], offset, i, j)
-    b = vertex(positions, ids[1], offset, i, j)
-    c = vertex(positions, ids[2], offset, i, j)
-    value = barrier(p - triangle_closest(p, a, b, c), support, near_cutoff, near_only)
-    for k in range(3):
-        edge_id = surface.face_edges[face][k]
-        if surface.interior_edges[edge_id] != 0:
-            edge = surface.edges[edge_id]
-            ea = vertex(positions, edge[0], offset, i, j)
-            eb = vertex(positions, edge[1], offset, i, j)
-            value -= wp.float64(0.5) * barrier(p - segment_closest(p, ea, eb), support, near_cutoff, near_only)
-        if surface.interior_vertices[ids[k]] != 0:
-            v = vertex(positions, ids[k], offset, i, j)
-            value += barrier(p - v, support, near_cutoff, near_only) / wp.float64(surface.vertex_face_count[ids[k]])
-    return value
-
-
-@wp.func
-def mollifier(excess: wp.vec4d, distance_sq: wp.vec4d):
-    x = divide(excess, wp.float64(0.01) * distance_sq)
-    if x[0] <= wp.float64(0.0):
+    a, b, c = (
+        vertex(positions, ids[0], offset, i, j),
+        vertex(positions, ids[1], offset, i, j),
+        vertex(positions, ids[2], offset, i, j),
+    )
+    delta = p - triangle_closest(p, a, b, c)
+    cutoff = support
+    if near_only:
+        cutoff = near_cutoff
+    if dot(delta, delta)[0] >= cutoff * cutoff:
         return wp.vec4d()
-    if x[0] >= wp.float64(1.0):
-        return wp.vec4d(wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    return chain(x, x[0] * (wp.float64(2.0) - x[0]), wp.float64(2.0) - wp.float64(2.0) * x[0], -wp.float64(2.0))
-
-
-@wp.func
-def ee_sample(a: Point, b: Point, c: Point, d: Point, near_cutoff: wp.float64):
-    u, v = b - a, d - c
-    n = cross(u, v)
-    n_sq = dot(n, n)
-    q, q_bar, weight = a, c, wp.vec4d()
-    if n_sq[0] > wp.float64(0.0):
-        s = divide(dot(cross(c - a, v), n), n_sq)
-        t = divide(dot(cross(c - a, u), n), n_sq)
-        if s[0] > wp.float64(0.0) and s[0] < wp.float64(1.0) and t[0] > wp.float64(0.0) and t[0] < wp.float64(1.0):
-            q, q_bar = a + scale(u, s), c + scale(v, t)
-            d_sq = dot(q - q_bar, q - q_bar)
-            if d_sq[0] > wp.float64(0.0) and d_sq[0] < near_cutoff * near_cutoff:
-                root = wp.sqrt(d_sq[0])
-                distance = chain(d_sq, root, wp.float64(0.5) / root, -wp.float64(0.25) / (root * root * root))
-                ca, cb = segment_closest(a, c, d), segment_closest(b, c, d)
-                cc, cd = segment_closest(c, a, b), segment_closest(d, a, b)
-                mu = multiply(mollifier(dot(a - ca, a - ca) - d_sq, d_sq), mollifier(dot(b - cb, b - cb) - d_sq, d_sq))
-                mu = multiply(mu, mollifier(dot(c - cc, c - cc) - d_sq, d_sq))
-                mu = multiply(mu, mollifier(dot(d - cd, d - cd) - d_sq, d_sq))
-                x = distance * (wp.float64(2.0) / near_cutoff)
-                t0 = x[0]
-                remaining = wp.float64(2.0) - t0
-                step = chain(
-                    x,
-                    wp.float64(0.25) * remaining * remaining * remaining,
-                    -wp.float64(0.75) * remaining * remaining,
-                    wp.float64(1.5) * remaining,
-                )
-                if t0 < wp.float64(1.0):
-                    step = chain(
-                        x,
-                        wp.float64(1.0) - wp.float64(1.5) * t0 * t0 + wp.float64(0.75) * t0 * t0 * t0,
-                        -wp.float64(3.0) * t0 + wp.float64(2.25) * t0 * t0,
-                        -wp.float64(3.0) + wp.float64(4.5) * t0,
-                    )
-                weight = multiply(step, mu)
-    return q, q_bar, weight
+    value = barrier(delta, support, near_cutoff, near_only)
+    for k in range(3):
+        edge_id = surface.adjacency.tri_edge_indices[face, k]
+        if surface.adjacency.edge_tri_indices[edge_id, 0] >= 0 and surface.adjacency.edge_tri_indices[edge_id, 1] >= 0:
+            edge = surface.edges[edge_id]
+            ea, eb = vertex(positions, edge[0], offset, i, j), vertex(positions, edge[1], offset, i, j)
+            value -= wp.float64(0.5) * barrier(p - segment_closest(p, ea, eb), support, near_cutoff, near_only)
+        if surface.vertex_term_weight[ids[k]] != wp.float64(0.0):
+            v = vertex(positions, ids[k], offset, i, j)
+            value += barrier(p - v, support, near_cutoff, near_only) * surface.vertex_term_weight[ids[k]]
+    return value
 
 
 @wp.func
@@ -280,7 +89,7 @@ def edge_potential(
     edge: int,
     target_mesh: int,
     positions: wp.array[wp.vec3d],
-    surface: Surface,
+    surface: EspSurfaceData,
     offset: int,
     i: int,
     j: int,
@@ -292,7 +101,7 @@ def edge_potential(
     previous = int(-1)
     for k in range(lists.starts[edge], lists.ends[edge]):
         face = lists.keys[k]
-        if face != previous and surface.face_mesh[face] == target_mesh:
+        if face != previous and surface.vertex_mesh[surface.faces[face][0]] == target_mesh:
             result += triangle_potential(p, positions, surface, face, offset, i, j, support, near_cutoff, True)
         previous = face
     return result
@@ -303,10 +112,9 @@ def evaluate_energy_derivatives(
     contact_count: wp.array[int],
     features: wp.array[wp.vec3i],
     shapes: wp.array[int],
-    rigid_vertex_indices: wp.array[int],
     rigid_face_offsets: wp.array[int],
-    soft: Surface,
-    rigid: Surface,
+    soft: EspSurfaceData,
+    rigid: EspSurfaceData,
     soft_positions: wp.array[wp.vec3d],
     rigid_positions: wp.array[wp.vec3d],
     soft_vertex_area: wp.array[wp.float64],
@@ -339,7 +147,7 @@ def evaluate_energy_derivatives(
                 p, rigid_positions, rigid, rigid_face_offsets[shape] + row[2], offset, i, j, support, near_cutoff, False
             )
         elif family == 1:
-            v_id = rigid_vertex_indices[row[2]]
+            v_id = row[2]
             p = vertex(rigid_positions, v_id, offset, i, j)
             fixed += rigid_vertex_area[v_id] * triangle_potential(
                 p, soft_positions, soft, row[1], 0, i, j, support, near_cutoff, False
@@ -353,7 +161,7 @@ def evaluate_energy_derivatives(
                 value = soft_edge_area[row[1]] * edge_potential(
                     q,
                     row[1],
-                    rigid.edge_mesh[row[2]],
+                    rigid.vertex_mesh[rigid.edges[row[2]][0]],
                     rigid_positions,
                     rigid,
                     offset,
@@ -366,7 +174,7 @@ def evaluate_energy_derivatives(
                 value += rigid_edge_area[row[2]] * edge_potential(
                     q_bar,
                     lists.soft_edge_count + row[2],
-                    soft.edge_mesh[row[1]],
+                    soft.vertex_mesh[soft.edges[row[1]][0]],
                     soft_positions,
                     soft,
                     0,
@@ -395,35 +203,26 @@ class EspDerivativeEvaluator:
     list sorting, rest-area recomputation, or host reduction is differentiated.
     """
 
-    def __init__(
-        self,
-        contact_inputs,
-        lists,
-        soft_vertex_area,
-        rigid_vertex_area,
-        soft_edge_area,
-        rigid_edge_area,
-        *,
-        support=0.03,
-        near_cutoff=0.0015,
-    ):
-        if not 0 < near_cutoff <= support:
-            raise ValueError("Require 0 < near_cutoff <= support")
-        lists.check()
-        count, features = contact_inputs[:2]
-        if int(count.numpy()[0]) > features.shape[0]:
+    def __init__(self, blocks):
+        contacts, data = blocks.contacts, blocks.data
+        if int(blocks.lists.error.numpy()[0]):
+            raise ValueError("Incomplete per-edge triangle lists")
+        if int(contacts.soft_contact_count.numpy()[0]) > contacts.soft_contact_max:
             raise ValueError("Incomplete contact rows")
-        self.inputs = contact_inputs
-        self.lists = lists
-        self.device = count.device
-        self.soft_positions = contact_inputs[-2].vertices.numpy().astype(np.float64)
-        self.rigid_positions = contact_inputs[-1].vertices.numpy().astype(np.float64)
-        with wp.ScopedDevice(self.device):
-            self.weights = [
-                wp.array(w.numpy() if isinstance(w, wp.array) else w, dtype=wp.float64)
-                for w in (soft_vertex_area, rigid_vertex_area, soft_edge_area, rigid_edge_area)
-            ]
-        self.support, self.near_cutoff = support, near_cutoff
+        self.inputs = (
+            contacts.soft_contact_count,
+            contacts._soft_contact_mesh_features,
+            contacts.soft_contact_shape,
+            data.rigid_face_offsets,
+            data.soft,
+            data.rigid,
+        )
+        self.lists = blocks.lists
+        self.device = blocks.model.device
+        self.soft_positions = blocks.state.particle_q.numpy().astype(np.float64)
+        self.rigid_positions = blocks.solver._esp_rigid_positions.numpy()
+        self.weights = [data.soft_vertex_area, data.rigid_vertex_area, data.soft_edge_area, data.rigid_edge_area]
+        self.support, self.near_cutoff = blocks.support, blocks.near_cutoff
 
     def evaluate(self, soft_positions=None, rigid_positions=None, *, compute_hessian=True):
         """Return energy[2], force[2,N,3], Hessian[2,3N,3N] (or None).
@@ -451,7 +250,7 @@ class EspDerivativeEvaluator:
                     *self.weights,
                     self.support,
                     self.near_cutoff,
-                    self.lists.data,
+                    self.lists,
                     compute_hessian,
                     energy,
                     force,

@@ -2075,17 +2075,25 @@ def _compute_body_particle_contact_force(
     friction_epsilon: float,
     dt: float,
     use_log_barrier: bool,
+    include_normal_elasticity: bool = True,
 ):
     """Pure force law for body-particle contacts: normal elasticity + damping + friction.
 
     All geometry and kinematics (distance, contact radius, normal, relative displacement) are
     resolved by the caller.  This function only computes the contact force and
     Hessian from those scalar/vector inputs.
+
+    With ``include_normal_elasticity=False``, ESP supplies elasticity separately.
+    Damping and friction are unchanged, including the penalty-based normal load
+    used for the Coulomb limit. This is not an ESP-derived friction formulation.
     """
     dE_dD, d2E_dDdD = _evaluate_rigid_soft_contact_force_norm(distance, collision_radius, ke, use_log_barrier)
     f_n = -dE_dD
-    force = n * f_n
-    hessian = d2E_dDdD * wp.outer(n, n)
+    force = wp.vec3(0.0)
+    hessian = wp.mat33(0.0)
+    if include_normal_elasticity:
+        force = n * f_n
+        hessian = d2E_dDdD * wp.outer(n, n)
 
     if wp.dot(n, relative_translation) < 0.0:
         damping_hessian = (kd / dt) * wp.outer(n, n)
@@ -2123,6 +2131,7 @@ def _eval_body_particle_contact(
     shape_margin: wp.array[float],
     dt: float,
     use_log_barrier: bool,
+    include_normal_elasticity: bool = True,
 ):
     """Particle-rigid contact force/Hessian - resolves geometry from arrays then
     delegates to ``_compute_body_particle_contact_force``.
@@ -2177,6 +2186,7 @@ def _eval_body_particle_contact(
             friction_epsilon,
             dt,
             use_log_barrier,
+            include_normal_elasticity,
         )
     else:
         return wp.vec3(0.0), wp.mat33(0.0)
@@ -2206,6 +2216,7 @@ def _eval_soft_ef_contact(
     shape_margin: wp.array[float],
     dt: float,
     use_log_barrier: bool,
+    include_normal_elasticity: bool = True,
 ):
     """Soft-contact force/Hessian at a barycentric contact point over a record's soft particles.
 
@@ -2287,6 +2298,7 @@ def _eval_soft_ef_contact(
             friction_epsilon,
             dt,
             use_log_barrier,
+            include_normal_elasticity,
         )
 
     return force, hessian, bx
@@ -5949,6 +5961,7 @@ def accumulate_body_particle_contacts_per_body(
     body_particle_contact_buffer_pre_alloc: int,
     body_particle_contact_counts: wp.array[wp.int32],
     body_particle_contact_indices: wp.array[wp.int32],
+    esp_shape_mask: wp.array[bool],
     # Outputs
     body_forces: wp.array[wp.vec3],
     body_torques: wp.array[wp.vec3],
@@ -6005,6 +6018,9 @@ def accumulate_body_particle_contacts_per_body(
         if contact_idx >= max_contacts:
             continue
 
+        include_normal = True
+        if esp_shape_mask:
+            include_normal = not esp_shape_mask[body_particle_contact_shape[contact_idx]]
         f_soft = wp.vec3(0.0)
         h_soft = wp.mat33(0.0)
         cp_world = wp.vec3(0.0)
@@ -6046,6 +6062,7 @@ def accumulate_body_particle_contacts_per_body(
                 friction_epsilon,
                 dt,
                 rigid_body_particle_contact_use_log_barrier,
+                include_normal,
             )
         else:
             # Edge/face: barycentric contact point over the record's 2-3 soft particles. Uses the
@@ -6074,6 +6091,7 @@ def accumulate_body_particle_contacts_per_body(
                 shape_margin,
                 dt,
                 rigid_body_particle_contact_use_log_barrier,
+                include_normal,
             )
 
         # Equal-and-opposite reaction on the body at the rigid contact point (shared by both kinds).

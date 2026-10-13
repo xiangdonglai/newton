@@ -9,12 +9,15 @@ Run from newton_4227:
     uv run --no-sync --with torch python tmp/evaluate_esp_multiple_meshes.py --check-autodiff
     uv run --no-sync --with torch python tmp/evaluate_esp_multiple_meshes.py --device all --check-torch-energy
 
-Use the shared energy and list kernels in esp_common.py. All contact
+Use SolverVBD's current ESP kernels and native radius/material settings. All contact
 rows are processed together, not with a separate launch per mesh pair. Geometry
 is flattened, but each feature retains its mesh owner. An EE sample evaluates
 P_near only on the target mesh in that EE pair. Every run assembles particle
 forces/3x3 Hessians and body forces, torques/6x6 Hessians using reusable device
-buffers. Optional checks compare these blocks against dense derivatives.
+buffers. Each run checks the production per-color assembly and a full-feature NumPy sum.
+Optional checks compare these blocks against dense derivatives and PyTorch.
+Radius=0.03 m, shape margin=0 and unit contact stiffness keep those independent
+references comparable without overriding the solver's ESP parameters.
 This prepares the contact terms, not a VBD simulation: the raw Hessians can
 be indefinite, and no time stepping or penetration recovery is performed.
 Use a nonzero cloth tilt for second-derivative checks away from feature switches.
@@ -29,166 +32,10 @@ import argparse
 
 import numpy as np
 import warp as wp
-from esp_common import (
-    EdgeTriangleLists,
-    box_mesh,
-    evaluate_ee_potential,
-    evaluate_point_potential,
-    make_surface,
-    patch,
-    reference_energies,
-)
-from esp_derivatives import EspDerivativeEvaluator
-from esp_derivatives import check_derivatives as check_energy_derivatives
-from esp_vbd_blocks import EspVbdBlockEvaluator
+from esp_common import box_mesh, patch
+from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks
 
 import newton
-
-wp.set_module_options({"enable_backward": False})
-
-
-@wp.kernel
-def update_rigid_vertices(
-    local_vertices: wp.array[wp.vec3],
-    vertex_shape: wp.array[int],
-    shape_transform: wp.array[wp.transform],
-    shape_body: wp.array[int],
-    body_q: wp.array[wp.transform],
-    vertices: wp.array[wp.vec3],
-):
-    i = wp.tid()
-    shape = vertex_shape[i]
-    transform = shape_transform[shape]
-    body = shape_body[shape]
-    if body >= 0:
-        transform = body_q[body] * transform
-    vertices[i] = wp.transform_point(transform, local_vertices[i])
-
-
-def soft_mesh_components(vertex_count, faces):
-    """Assign connected soft components distinct IDs without welding vertices."""
-    parent = np.arange(vertex_count)
-
-    def root(vertex):
-        while parent[vertex] != vertex:
-            parent[vertex] = parent[parent[vertex]]
-            vertex = parent[vertex]
-        return vertex
-
-    for a, b, c in faces:
-        parent[root(b)] = root(a)
-        parent[root(c)] = root(a)
-    return np.unique([root(v) for v in range(vertex_count)], return_inverse=True)[1].astype(np.int32)
-
-
-class EspMeshes:
-    """Build mesh topology once; update world-space positions on the device.
-
-    Soft particles, triangles, and edges keep their model indices. By default,
-    each connected soft component is one mesh; pass soft_mesh_ids explicitly
-    to group disconnected components of one object. Rigid shapes stay distinct
-    even when they share a source Mesh. Rigid edges keep feature-table row IDs.
-
-    This prototype reads private pipeline feature tables because public contact
-    arrays do not identify rigid primitives. Exact duplicate seam vertices are
-    welded using the pipeline's canonical IDs. Near-coincident but unequal
-    positions are rejected rather than silently changing the queried geometry.
-    Shape scales and topology must remain fixed after construction. Analytic
-    shape contacts are outside this ESP prototype and are ignored.
-    """
-
-    def __init__(self, model, pipeline, *, soft_mesh_ids=None):
-        data = pipeline._soft_mesh_contact_data
-        if data is None or not data.return_unfiltered:
-            raise ValueError("ESP requires unfiltered full-surface mesh contacts")
-        self.model = model
-        with wp.ScopedDevice(model.device):
-            soft_faces = model.tri_indices.numpy()
-            if soft_mesh_ids is None:
-                soft_mesh_ids = soft_mesh_components(model.particle_count, soft_faces)
-            self.soft, soft_vertex_area, soft_edge_area = make_surface(
-                model.particle_q.numpy(), soft_faces, model.edge_indices.numpy()[:, 2:4], vertex_mesh=soft_mesh_ids
-            )
-            owners = self.soft.vertex_mesh.numpy()
-            worlds = model.particle_world.numpy()
-            for mesh_id in np.unique(owners):
-                if len(np.unique(worlds[owners == mesh_id])) != 1:
-                    raise ValueError("A soft mesh must belong to one world")
-            self.soft_rest_vertices = model.particle_q.numpy().copy()
-            vertices = data.rigid_features[0].numpy()
-            edges = data.rigid_features[2].numpy()
-            if not len(vertices) or not len(edges):
-                raise ValueError("Expected rigid mesh vertices and complete rigid mesh edges")
-            scale = model.shape_scale.numpy()
-            local_positions = np.empty((len(vertices), 3), dtype=np.float32)
-            rigid_edges = np.empty((len(edges), 2), dtype=np.int32)
-            face_offsets = np.full(model.shape_count, -1, dtype=np.int32)
-            rigid_faces = []
-            face_count = 0
-            for shape in np.unique(vertices[:, 0]):
-                mesh = model.shape_source[shape]
-                canonical = mesh._canonical_vertex_ids()
-                vertex_rows = np.flatnonzero(vertices[:, 0] == shape)
-                original_vertices = mesh.indices[vertices[vertex_rows, 1]]
-                to_global = np.full(int(canonical.max()) + 1, -1, dtype=np.int32)
-                to_global[canonical[original_vertices]] = vertex_rows
-                local_positions[vertex_rows] = mesh.vertices[original_vertices] * scale[shape]
-                used = mesh.indices
-                mapped = to_global[canonical[used]]
-                if np.any(mapped < 0):
-                    raise ValueError("Rigid feature table does not cover every face vertex")
-                representatives = mesh.indices[vertices[mapped, 1]]
-                if not np.array_equal(mesh.vertices[used], mesh.vertices[representatives]):
-                    raise ValueError("Near-coincident welded vertices differ: only exact seam duplicates are supported")
-                face_offsets[shape] = face_count
-                rigid_faces.append(mapped.reshape(-1, 3))
-                face_count += len(used) // 3
-                edge_rows = np.flatnonzero(edges[:, 0] == shape)
-                rigid_edges[edge_rows] = to_global[canonical[mesh.indices[edges[edge_rows, 1:]]]]
-
-            self.rigid, rigid_vertex_area, rigid_edge_area = make_surface(
-                local_positions, np.concatenate(rigid_faces), rigid_edges, vertex_mesh=vertices[:, 0]
-            )
-            # Area weights use scaled rest geometry, never deformed geometry.
-            self.rigid_rest_vertices = local_positions.copy()
-            self.rigid_local_vertices = wp.array(local_positions, dtype=wp.vec3)
-            # Packed rigid vertices already follow the native vertex table.
-            self.rigid_vertex_indices = wp.array(np.arange(len(vertices)), dtype=int)
-            self.rigid_face_offsets = wp.array(face_offsets, dtype=int)
-            self.soft_vertex_area = soft_vertex_area
-            self.rigid_vertex_area = rigid_vertex_area
-            self.soft_edge_area = wp.array(soft_edge_area, dtype=float)
-            self.rigid_edge_area = wp.array(rigid_edge_area, dtype=float)
-            self.empty_body_q = wp.empty(0, dtype=wp.transform)
-
-    def update(self, state):
-        """Read the current state without host transfers or new device buffers."""
-        self.soft.vertices = state.particle_q
-        wp.launch(
-            update_rigid_vertices,
-            dim=self.rigid.vertices.shape[0],
-            inputs=[
-                self.rigid_local_vertices,
-                self.rigid.vertex_mesh,
-                self.model.shape_transform,
-                self.model.shape_body,
-                state.body_q if state.body_q is not None else self.empty_body_q,
-            ],
-            outputs=[self.rigid.vertices],
-            device=self.model.device,
-        )
-
-    def contact_inputs(self, contacts):
-        """Share contact indexing between list construction and vertex energies."""
-        return [
-            contacts.soft_contact_count,
-            contacts._soft_contact_mesh_features,
-            contacts.soft_contact_shape,
-            self.rigid_vertex_indices,
-            self.rigid_face_offsets,
-            self.soft,
-            self.rigid,
-        ]
 
 
 def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False, cloth_tilt=0.0):
@@ -217,7 +64,15 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False,
             )
             shape_tf = wp.transform(wp.vec3(0.002, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.145))
             scale = (0.65, 0.8, 1.2)
-        shapes.append(builder.add_shape_mesh(body=body, mesh=mesh, xform=shape_tf, scale=scale))
+        shapes.append(
+            builder.add_shape_mesh(
+                body=body,
+                mesh=mesh,
+                xform=shape_tf,
+                scale=scale,
+                cfg=builder.ShapeConfig(ke=1.0, kd=0.0, mu=0.0, margin=0.0),
+            )
+        )
         sv, sf = patch(gap=0.0003 if separate_worlds else 0.0003 + i * 0.0006, tilt=cloth_tilt)
         if np.min(sv[:, 2]) <= 0:
             raise ValueError("The cloth tilt must leave all vertices above the box")
@@ -229,11 +84,13 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False,
             vertices=sv.tolist(),
             indices=sf.ravel().tolist(),
             density=1.0,
-            particle_radius=0.0,
+            particle_radius=0.03,
         )
         if separate_worlds:
             builder.end_world()
+    builder.color()
     model = builder.finalize()
+    model.soft_contact_ke = 1.0
     state = model.state()
     pipeline = newton.CollisionPipeline(
         model,
@@ -242,133 +99,20 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False,
         soft_contact_gap=0.03,
         soft_contact_max=4096,
     )
-    contacts = pipeline.contacts()
-    pipeline.collide(state, contacts)
-    return model, state, pipeline, contacts, shapes
-
-
-def numpy_mesh_pair_energies(meshes, soft_positions=None, rigid_positions=None):
-    """Return per-vertex values and energies summed over allowed mesh pairs."""
-    sv = meshes.soft.vertices.numpy() if soft_positions is None else soft_positions
-    rv = meshes.rigid.vertices.numpy() if rigid_positions is None else rigid_positions
-    sf, rf = meshes.soft.faces.numpy(), meshes.rigid.faces.numpy()
-    soft_owners, rigid_owners = meshes.soft.vertex_mesh.numpy(), meshes.rigid.vertex_mesh.numpy()
-    particle_world = meshes.model.particle_world.numpy()
-    shape_world = meshes.model.shape_world.numpy()
-    expected = np.zeros((2, 2))
-    soft_values = np.zeros((len(sv), 2))
-    rigid_values = np.zeros((len(rv), 2))
-    for soft_id in np.unique(meshes.soft.face_mesh.numpy()):
-        si = np.flatnonzero(soft_owners == soft_id)
-        sfaces = sf[np.all(np.isin(sf, si), axis=1)]
-        sfaces = np.searchsorted(si, sfaces)
-        worlds = np.unique(particle_world[si])
-        if len(worlds) != 1:
-            raise ValueError("A soft mesh must belong to one world")
-        for shape in np.unique(rigid_owners):
-            if worlds[0] >= 0 and shape_world[shape] >= 0 and worlds[0] != shape_world[shape]:
-                continue
-            ri = np.flatnonzero(rigid_owners == shape)
-            rfaces = rf[np.all(np.isin(rf, ri), axis=1)]
-            rfaces = np.searchsorted(ri, rfaces)
-            points, value = reference_energies(
-                sv[si],
-                sfaces,
-                rv[ri],
-                rfaces,
-                0.03,
-                0.0015,
-                cloth_rest_vertices=meshes.soft_rest_vertices[si],
-                box_rest_vertices=meshes.rigid_rest_vertices[ri],
-            )
-            soft_values[si] += points[0]
-            rigid_values[ri] += points[1]
-            expected += value
-    return (soft_values, rigid_values), expected
+    return model, state, pipeline, shapes
 
 
 def run_example(device, *, check_derivatives=False, check_autodiff=False, check_torch_energy=False, cloth_tilt=0.0):
     with wp.ScopedDevice(device):
-        model, state, pipeline, contacts, _shapes = make_example(cloth_tilt=cloth_tilt)
-        meshes = EspMeshes(model, pipeline)
-        meshes.update(state)
-        lists = EdgeTriangleLists(meshes.soft, meshes.rigid, contacts.soft_contact_max)
-        lists.rebuild(*meshes.contact_inputs(contacts))
-        # Reuse these buffers when positions change. New collision detection
-        # requires rebuilding the lists before assembling the next blocks.
-        blocks = EspVbdBlockEvaluator(meshes, contacts, lists)
-        blocks.assemble(state)
-        soft_values = wp.zeros(model.particle_count, dtype=wp.vec2)
-        rigid_values = wp.zeros(meshes.rigid.vertices.shape[0], dtype=wp.vec2)
-        wp.launch(
-            evaluate_point_potential,
-            dim=contacts.soft_contact_max,
-            inputs=[*meshes.contact_inputs(contacts), 0.03, 0.0015, soft_values, rigid_values],
+        model, state, pipeline, _shapes = make_example(cloth_tilt=cloth_tilt)
+        blocks = EspVbdBlockEvaluator(model, pipeline, state)
+        return run_checks(
+            blocks,
+            state,
+            check_derivatives=check_derivatives,
+            check_autodiff=check_autodiff,
+            check_torch_energy=check_torch_energy,
         )
-        ee_values = wp.zeros(contacts.soft_contact_max, dtype=wp.vec2)
-        wp.launch(
-            evaluate_ee_potential,
-            dim=contacts.soft_contact_max,
-            inputs=[
-                contacts.soft_contact_count,
-                contacts._soft_contact_mesh_features,
-                contacts.soft_contact_shape,
-                meshes.rigid_face_offsets,
-                meshes.soft_edge_area,
-                meshes.rigid_edge_area,
-                meshes.soft,
-                meshes.rigid,
-                0.03,
-                0.0015,
-                lists.data,
-                False,
-                ee_values,
-            ],
-        )
-        lists.check()
-        blocks.check()
-        fixed = [
-            meshes.soft_vertex_area @ soft_values.numpy()[:, 0],
-            meshes.rigid_vertex_area @ rigid_values.numpy()[:, 0],
-        ]
-        actual = np.array([fixed, ee_values.numpy().sum(axis=0, dtype=np.float64)])
-        points, expected = numpy_mesh_pair_energies(meshes)
-        np.testing.assert_allclose(soft_values.numpy(), points[0], rtol=2e-5, atol=5e-6)
-        np.testing.assert_allclose(rigid_values.numpy(), points[1], rtol=2e-5, atol=5e-6)
-        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-8)
-        np.testing.assert_allclose(blocks.energy.numpy(), expected.sum(axis=1), rtol=2e-5, atol=1e-8)
-        count = int(contacts.soft_contact_count.numpy()[0])
-        print(f"{device}: two rigid shapes, two soft meshes, {count} contact rows")
-        print(f"P_fixed / P_ee (soft->rigid, rigid->soft):\n{actual}")
-        print(f"NumPy:\n{expected}\nPASS; max absolute error={np.max(np.abs(actual - expected)):.3g}")
-        print(f"Total unnormalized energy (block assembly): {blocks.energy.numpy().sum():.12g}")
-        force = blocks.force.numpy().sum(axis=0)
-        print(f"Particle contact force (fixed + EE):\n{force[: model.particle_count, :3]}")
-        print(f"Body contact [force, torque] (fixed + EE):\n{force[model.particle_count :]}")
-        print(f"VBD contact blocks: {model.particle_count} particle 3x3; {model.body_count} body 6x6")
-        if check_derivatives or check_autodiff or check_torch_energy:
-            evaluator = EspDerivativeEvaluator(
-                meshes.contact_inputs(contacts),
-                lists,
-                meshes.soft_vertex_area,
-                meshes.rigid_vertex_area,
-                meshes.soft_edge_area,
-                meshes.rigid_edge_area,
-            )
-            if check_derivatives or check_autodiff:
-                blocks.check_against_dense(evaluator)
-
-            def numpy_energy(soft_positions, rigid_positions):
-                return numpy_mesh_pair_energies(meshes, soft_positions, rigid_positions)[1].sum(axis=1)
-
-            if check_autodiff or check_torch_energy:
-                import esp_autodiff  # noqa: PLC0415 -- Optional PyTorch checks.
-
-                esp_autodiff.check_energy(evaluator, actual.sum(axis=1))
-                if check_autodiff:
-                    esp_autodiff.check_autodiff(evaluator)
-            if check_derivatives:
-                check_energy_derivatives(evaluator, numpy_energy)
 
 
 if __name__ == "__main__":
@@ -384,7 +128,9 @@ if __name__ == "__main__":
         "--check-autodiff", action="store_true", help="Check against independent PyTorch autodiff (slow)"
     )
     parser.add_argument(
-        "--check-torch-energy", action="store_true", help="Compare original Warp and PyTorch energies; skip derivatives"
+        "--check-torch-energy",
+        action="store_true",
+        help="Compare production Warp and PyTorch energies; skip derivatives",
     )
     args = parser.parse_args()
     for device in wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]:

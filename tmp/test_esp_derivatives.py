@@ -13,7 +13,13 @@ import unittest
 
 import numpy as np
 import warp as wp
-from esp_derivatives import barrier, ee_sample, multiply, triangle_closest, vertex
+from esp_derivatives import Point, barrier, dot, ee_sample, multiply, segment_closest, triangle_closest, vertex
+
+from newton._src.solvers.vbd.esp_contact import (
+    barrier_from_squared_distance,
+    segment_distance_squared,
+    triangle_distance_squared,
+)
 
 wp.set_module_options({"enable_backward": False})
 
@@ -25,7 +31,9 @@ def primitive_derivatives(positions: wp.array[wp.vec3d], kind: int, values: wp.a
     c, d = vertex(positions, 2, 0, i, j), vertex(positions, 3, 0, i, j)
     value = wp.vec4d()
     if kind < 2:
-        value = barrier(a - triangle_closest(a, b, c, d), wp.float64(1.0), wp.float64(0.15), kind == 1)
+        value = barrier_from_squared_distance(
+            triangle_distance_squared(a, b, c, d), wp.float64(1.0), wp.float64(0.15), kind == 1
+        )
     else:
         q, q_bar, weight = ee_sample(a, b, c, d, wp.float64(0.15))
         # Depend on both moving sample positions, not just their separation.
@@ -37,6 +45,18 @@ def primitive_derivatives(positions: wp.array[wp.vec3d], kind: int, values: wp.a
             )
     for k in range(4):
         values[i, j, k] = value[k]
+
+
+@wp.kernel
+def compare_distance_derivatives(points: wp.array2d[Point], values: wp.array2d[wp.vec4d]):
+    row = wp.tid()
+    p, a, b, c = points[row, 0], points[row, 1], points[row, 2], points[row, 3]
+    delta = p - triangle_closest(p, a, b, c)
+    values[row, 0] = dot(delta, delta)
+    values[row, 1] = triangle_distance_squared(p, a, b, c)
+    delta = p - segment_closest(p, a, b)
+    values[row, 2] = dot(delta, delta)
+    values[row, 3] = segment_distance_squared(p, a, b)
 
 
 def numpy_primitive_energy(x, kind):
@@ -113,6 +133,33 @@ def primitive_cases():
 
 
 class TestEspDerivatives(unittest.TestCase):
+    def test_analytical_distance_derivatives(self):
+        """Match the old derivative calculation for nonlinear moving inputs.
+
+        Seed arbitrary first and second input derivatives, not just coordinate
+        directions. This exercises the extra chain-rule terms needed by moving
+        EE samples and rotating bodies, across face/edge/vertex branches.
+        """
+        rng = np.random.default_rng(4317)
+        points = rng.normal(size=(128, 4, 3, 4))
+        triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        for row in range(len(points)):
+            rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+            scale = 10 ** rng.uniform(-3, 1)
+            vertices = np.vstack((rng.uniform(-1, 1, size=3), triangle))
+            points[row, :, :, 0] = scale * vertices @ rotation + rng.normal(size=3)
+            points[row, :, :, 1:] *= scale
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                values = wp.empty((len(points), 4), dtype=wp.vec4d)
+                wp.launch(compare_distance_derivatives, dim=len(points), inputs=[wp.array(points, dtype=Point), values])
+                actual = values.numpy()
+                for reference, optimized in ((0, 1), (2, 3)):
+                    scale = np.maximum(np.abs(actual[:, reference]).max(axis=1), 1e-12)[:, None]
+                    np.testing.assert_allclose(
+                        actual[:, optimized] / scale, actual[:, reference] / scale, rtol=0, atol=2e-10
+                    )
+
     def test_smooth_primitive_cases(self):
         """Check face/edge/vertex distances and both EE weight branches."""
         for device in wp.get_devices():

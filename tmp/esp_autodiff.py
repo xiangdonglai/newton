@@ -134,25 +134,30 @@ class TorchEspEnergy:
     """Read the same fixed contact/topology arrays; rebuild only scalar energies."""
 
     def __init__(self, evaluator):
-        count, features, shapes, vertex_indices, face_offsets, soft, rigid = evaluator.inputs
+        count, features, shapes, face_offsets, soft, rigid = evaluator.inputs
         self.features = features.numpy()[: int(count.numpy()[0])]
         self.shapes = shapes.numpy()
-        self.vertex_indices, self.face_offsets = vertex_indices.numpy(), face_offsets.numpy()
-        names = (
-            "faces",
-            "edges",
-            "face_edges",
-            "interior_edges",
-            "interior_vertices",
-            "vertex_face_count",
-            "edge_mesh",
-            "face_mesh",
-        )
-        self.surfaces = [{name: getattr(surface, name).numpy() for name in names} for surface in (soft, rigid)]
+        self.face_offsets = face_offsets.numpy()
+        self.surfaces = []
+        for surface in (soft, rigid):
+            faces, edges = surface.faces.numpy(), surface.edges.numpy()
+            owners = surface.vertex_mesh.numpy()
+            self.surfaces.append(
+                {
+                    "faces": faces,
+                    "edges": edges,
+                    "face_edges": surface.adjacency.tri_edge_indices.numpy(),
+                    "interior_edges": np.all(surface.adjacency.edge_tri_indices.numpy() >= 0, axis=1),
+                    "interior_vertices": surface.vertex_term_weight.numpy() > 0,
+                    "vertex_face_count": np.diff(surface.adjacency.v_adj_tris_offsets.numpy()) // 2,
+                    "edge_mesh": owners[edges[:, 0]],
+                    "face_mesh": owners[faces[:, 0]],
+                }
+            )
         self.weights = [a.numpy() for a in evaluator.weights]
         self.soft_count = len(evaluator.soft_positions)
         self.support, self.near_cutoff = evaluator.support, evaluator.near_cutoff
-        data = evaluator.lists.data
+        data = evaluator.lists
         keys = data.keys.numpy()
         self.edge_faces = [
             np.unique(keys[start:end]) for start, end in zip(data.starts.numpy(), data.ends.numpy(), strict=True)
@@ -197,7 +202,7 @@ class TorchEspEnergy:
                     soft_positions[row[1]], rigid_positions, rigid, self.face_offsets[shape] + row[2], False
                 )
             elif term == 0 and family == 1:
-                v = self.vertex_indices[row[2]]
+                v = row[2]
                 total = total + rv[v] * self.triangle_potential(rigid_positions[v], soft_positions, soft, row[1], False)
             elif term == 1 and family == 2:
                 a, b = soft_positions[soft["edges"][row[1]]]
@@ -215,9 +220,9 @@ class TorchEspEnergy:
 
 
 def check_energy(evaluator, warp_energy):
-    """Compare original float32 kernels and the float64 reference with Torch.
+    """Compare production block energies and the dense reference with Torch.
 
-    warp_energy contains the original example's [fixed-vertex, EE] energies,
+    warp_energy contains the production kernels' [fixed-vertex, EE] energies,
     each summed in both directions. It is not the energy returned by the
     derivative evaluator. Compare the two terms separately to prevent errors
     in one term from being hidden by the other.
@@ -228,17 +233,16 @@ def check_energy(evaluator, warp_energy):
     warp_energy = np.asarray(warp_energy)
     warp64_energy = evaluator.evaluate(compute_hessian=False)[0]
     if warp_energy.shape != (2,):
-        raise ValueError("Expected original Warp energies [fixed-vertex, EE]")
-    print("Energy comparison (both directions summed; original Warp kernels use float32):")
-    print(f"{'term':<15} {'Warp original':>20} {'PyTorch float64':>20} {'absolute difference':>20}")
+        raise ValueError("Expected production Warp energies [fixed-vertex, EE]")
+    print("Energy comparison (both directions summed; float64):")
+    print(f"{'term':<15} {'Warp production':>20} {'PyTorch float64':>20} {'absolute difference':>20}")
     for term, name in enumerate(("fixed vertices", "EE")):
         print(
             f"{name:<15} {warp_energy[term]:20.12g} {torch_energy[term]:20.12g} "
             f"{abs(warp_energy[term] - torch_energy[term]):20.6g}",
             flush=True,
         )
-    # Retain the original examples' float32 energy tolerances.
-    np.testing.assert_allclose(warp_energy, torch_energy, rtol=2e-5, atol=1e-8)
+    np.testing.assert_allclose(warp_energy, torch_energy, rtol=1e-12, atol=1e-14)
     np.testing.assert_allclose(warp64_energy, torch_energy, rtol=1e-12, atol=1e-14)
     print(f"Float64 Warp reference vs. PyTorch: absolute differences [fixed, EE]={abs(warp64_energy - torch_energy)}")
     print("Direct Warp/PyTorch energy comparison PASS", flush=True)

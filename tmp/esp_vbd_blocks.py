@@ -3,14 +3,17 @@
 
 """Assemble ESP particle/body derivative blocks without a dense scene Hessian.
 
-This is preparation for VBD, not a solver integration. Reuse the geometric
-energy/derivative functions in esp_derivatives; keep its dense evaluator as
-an independent assembly reference. Run: uv run --no-sync python tmp/test_esp_vbd_blocks.py -v
+This uses the same local assembly as SolverVBD's experimental ESP mode,
+and adds a dense-reference comparison for the examples. Run:
+    uv run --no-sync python tmp/test_esp_vbd_blocks.py -v
 
-One kernel thread handles (contact row, block coordinate i, coordinate j).
+Kernel threads process contact rows and lower-triangular block entries,
+using a stride loop over the device contact count.
 VT/TV contribute one triangle potential. Each ordinary EE row visits the
 unique target triangles in its existing per-edge lists, in both directions.
-For each term, evaluate only the participating particles and rigid body.
+EE samples/weights are reused across target faces. For each term, evaluate
+only the participating particles and rigid body. Solver calls further limit
+this to the active particle or body color; assemble() evaluates all blocks.
 No extra collision query, dense vertex-by-feature table, or host contact-count
 read is needed. Duplicate particle IDs are handled once per term; several
 rigid vertices/shapes belonging to one body share that body's six coordinates.
@@ -24,302 +27,179 @@ after detection. Re-evaluate after positions change, e.g. between VBD colors;
 these contact terms can couple particles beyond the original cloth coloring.
 
 Outputs retain float64 for validation. They are exact selected-branch energy
-Hessians, potentially indefinite, NOT PSD-projected solve matrices. Choosing
-VBD regularization, coloring, float32 assembly, friction, and recovery is
-outside this prototype. The camera-ready EE sample and weight derivatives
-are included, not frozen. Error flags invalidate the entire result.
+Hessians, potentially indefinite, NOT PSD-projected solve matrices. SolverVBD
+separately projects these blocks before solving; this diagnostic compares
+the raw derivatives. The camera-ready EE sample and weight derivatives are
+included, not frozen. Error flags invalidate the entire result.
 """
 
 import numpy as np
 import warp as wp
-from esp_common import EdgeTriangleListData, Surface
-from esp_derivatives import BlockPositions, ee_sample, multiply, triangle_potential, vertex
+from esp_common import numpy_mesh_pair_energies
+from esp_derivatives import EspDerivativeEvaluator
+from esp_derivatives import check_derivatives as check_numerical
 
-wp.set_module_options({"enable_backward": False})
-
-SoftVertices = wp.types.vector(length=5, dtype=wp.int32)
-
-
-@wp.struct
-class EspBlockData:
-    soft: Surface
-    rigid: Surface
-    soft_positions: wp.array[wp.vec3d]
-    rigid_positions: wp.array[wp.vec3d]
-    rigid_vertex_body: wp.array[int]
-    body_com_world: wp.array[wp.vec3d]
-    soft_vertex_area: wp.array[wp.float64]
-    rigid_vertex_area: wp.array[wp.float64]
-    soft_edge_area: wp.array[wp.float64]
-    rigid_edge_area: wp.array[wp.float64]
-    support: wp.float64
-    near_cutoff: wp.float64
+from newton._src.solvers.vbd import esp_contact
+from newton.solvers import SolverVBD
 
 
 @wp.kernel
-def copy_positions(source: wp.array[wp.vec3], destination: wp.array[wp.vec3d]):
+def _body_centers(body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3], output: wp.array[wp.vec3d]):
     i = wp.tid()
-    destination[i] = wp.vec3d(source[i])
-
-
-@wp.kernel
-def map_vertex_bodies(vertex_shape: wp.array[int], shape_body: wp.array[int], vertex_body: wp.array[int]):
-    i = wp.tid()
-    vertex_body[i] = shape_body[vertex_shape[i]]
-
-
-@wp.kernel
-def update_body_centers(body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3], centers: wp.array[wp.vec3d]):
-    i = wp.tid()
-    centers[i] = wp.vec3d(wp.transform_point(body_q[i], body_com[i]))
-
-
-@wp.func
-def accumulate_triangle_term(
-    row: wp.vec3i,
-    face: int,
-    rigid_vertex: int,
-    side: int,
-    body: int,
-    data: EspBlockData,
-    i: int,
-    j: int,
-    energy: wp.array[wp.float64],
-    force: wp.array3d[wp.float64],
-    hessian: wp.array4d[wp.float64],
-    error: wp.array[int],
-):
-    family = row[0] & 7
-    soft_ids = SoftVertices(-1)
-    if family == 0:
-        soft_ids[0] = row[1]
-    elif family == 1:
-        for k in range(3):
-            soft_ids[k] = data.soft.faces[face][k]
-    else:
-        for k in range(2):
-            soft_ids[k] = data.soft.edges[row[1]][k]
-        if side == 1:
-            # The EE weight and sample depend on both edges, and the opposite
-            # direction's potential also depends on all target face vertices.
-            for k in range(3):
-                soft_ids[k + 2] = data.soft.faces[face][k]
-
-    for slot in range(6):
-        block = int(-1)
-        if slot == 0:
-            if body >= 0:
-                block = data.soft_positions.shape[0] + body
-        else:
-            block = soft_ids[slot - 1]
-            if i >= 3 or j >= 3:
-                continue
-            for previous in range(slot - 1):
-                if soft_ids[previous] == block:
-                    block = -1
-        if block < 0:
-            continue
-
-        sp, rp = BlockPositions(), BlockPositions()
-        sp.values = data.soft_positions
-        sp.vertex_body = data.rigid_vertex_body  # Unused on the soft side.
-        sp.active = block
-        sp.enabled = slot != 0
-        sp.rigid = False
-        rp.values = data.rigid_positions
-        rp.vertex_body = data.rigid_vertex_body
-        rp.active = body
-        rp.enabled = slot == 0
-        rp.rigid = True
-        if body >= 0:
-            rp.com = data.body_com_world[body]
-
-        value = wp.vec4d()
-        if family == 0:
-            p = vertex(sp, row[1], 0, i, j)
-            value = data.soft_vertex_area[row[1]] * triangle_potential(
-                p, rp, data.rigid, face, 0, i, j, data.support, data.near_cutoff, False
-            )
-        elif family == 1:
-            p = vertex(rp, rigid_vertex, 0, i, j)
-            value = data.rigid_vertex_area[rigid_vertex] * triangle_potential(
-                p, sp, data.soft, face, 0, i, j, data.support, data.near_cutoff, False
-            )
-        else:
-            se, re = data.soft.edges[row[1]], data.rigid.edges[row[2]]
-            a, b = vertex(sp, se[0], 0, i, j), vertex(sp, se[1], 0, i, j)
-            c, d = vertex(rp, re[0], 0, i, j), vertex(rp, re[1], 0, i, j)
-            q, q_bar, weight = ee_sample(a, b, c, d, data.near_cutoff)
-            if weight[0] > wp.float64(0.0):
-                potential = wp.vec4d()
-                if side == 0:
-                    potential = data.soft_edge_area[row[1]] * triangle_potential(
-                        q, rp, data.rigid, face, 0, i, j, data.support, data.near_cutoff, True
-                    )
-                else:
-                    potential = data.rigid_edge_area[row[2]] * triangle_potential(
-                        q_bar, sp, data.soft, face, 0, i, j, data.support, data.near_cutoff, True
-                    )
-                value = multiply(weight, potential)
-        if not wp.isfinite(value):
-            wp.atomic_or(error, 0, 4)
-            continue
-        term = int(family == 2)
-        # Every term contains at least soft_ids[0]. Count its energy only once,
-        # even for a static world shape (which has no rigid output block).
-        if slot == 1 and i == 0 and j == 0:
-            wp.atomic_add(energy, term, value[0])
-        if j == 0:
-            wp.atomic_add(force, term, block, i, -value[1])
-        wp.atomic_add(hessian, term, block, i, j, value[3])
-
-
-@wp.kernel
-def accumulate_contact_blocks(
-    contact_count: wp.array[int],
-    features: wp.array[wp.vec3i],
-    shapes: wp.array[int],
-    rigid_vertex_indices: wp.array[int],
-    rigid_face_offsets: wp.array[int],
-    shape_body: wp.array[int],
-    data: EspBlockData,
-    lists: EdgeTriangleListData,
-    energy: wp.array[wp.float64],
-    force: wp.array3d[wp.float64],
-    hessian: wp.array4d[wp.float64],
-    error: wp.array[int],
-):
-    row_id, i, j = wp.tid()
-    if contact_count[0] > features.shape[0]:
-        wp.atomic_or(error, 0, 1)
-        return
-    if lists.error[0] != 0:
-        wp.atomic_or(error, 0, 2)
-        return
-    if row_id >= contact_count[0]:
-        return
-    row = features[row_id]
-    shape = shapes[row_id]
-    if row[0] < 0 or rigid_face_offsets[shape] < 0:
-        return
-    family = row[0] & 7
-    body = shape_body[shape]
-    if family == 0:
-        face = rigid_face_offsets[shape] + row[2]
-        accumulate_triangle_term(row, face, -1, 0, body, data, i, j, energy, force, hessian, error)
-    elif family == 1:
-        accumulate_triangle_term(
-            row, row[1], rigid_vertex_indices[row[2]], 1, body, data, i, j, energy, force, hessian, error
-        )
-    elif family == 2:
-        for side in range(2):
-            edge = row[1]
-            if side == 1:
-                edge = lists.soft_edge_count + row[2]
-            previous = int(-1)
-            for k in range(lists.starts[edge], lists.ends[edge]):
-                face = lists.keys[k]
-                matches = False
-                if side == 0:
-                    matches = data.rigid.face_mesh[face] == data.rigid.edge_mesh[row[2]]
-                else:
-                    matches = data.soft.face_mesh[face] == data.soft.edge_mesh[row[1]]
-                if face != previous and matches:
-                    accumulate_triangle_term(row, face, -1, side, body, data, i, j, energy, force, hessian, error)
-                previous = face
-    else:
-        wp.atomic_or(error, 0, 8)  # EE_DEPTH is recovery, not an ESP sample.
+    output[i] = wp.vec3d(wp.transform_point(body_q[i], body_com[i]))
 
 
 class EspVbdBlockEvaluator:
-    """Allocate reusable device buffers for the local contact derivatives.
+    """Diagnostic-only split quadratures using the production ESP kernels."""
 
-    energy[2] separates fixed-vertex and EE terms, each in both directions.
-    force[2, N+B, 6] is minus the gradient; hessian[2, N+B, 6, 6] is the raw
-    energy Hessian. For particle p, only [:,p,:3] / [:,p,:3,:3] are used.
-    Body b uses block N+b, with COM translation first and world rotation last:
-    force[:3] is force, force[3:] is torque; H[:3,:3], H[3:,:3], H[3:,3:]
-    map to VBD's ll, al, aa blocks. Static world shapes have no body block.
-    Kinematic bodies retain reaction blocks; the solver decides which to solve.
-
-    assemble() replaces outputs, without host reads or allocations. It does
-    not detect collisions or rebuild lists. Call check() outside CUDA capture
-    before trusting results; an integrated solver must honor device error.
-    """
-
-    def __init__(self, meshes, contacts, lists, *, support=0.03, near_cutoff=0.0015):
-        if not 0 < near_cutoff <= support:
-            raise ValueError("Require 0 < near_cutoff <= support")
-        self.meshes, self.contacts, self.lists = meshes, contacts, lists
-        self.model = meshes.model
-        self.data = data = EspBlockData()
-        data.soft, data.rigid = meshes.soft, meshes.rigid
-        data.support, data.near_cutoff = support, near_cutoff
+    def __init__(self, model, pipeline, state):
+        # Use the actual solver's topology, material parameters, transformed
+        # positions, and contact lists. Only the split diagnostic outputs differ.
+        self.solver = SolverVBD(model, collision_pipeline=pipeline, rigid_soft_contact_use_esp=True, iterations=1)
+        self.model, self.contacts = model, self.solver.contacts
+        self.state = state
+        self.data, self.lists = self.solver._esp_data, self.solver._esp_lists
+        pipeline.collide(state, self.contacts)
+        esp_contact.rebuild_edge_triangle_lists(self.contacts, self.data, self.lists, self.solver._esp_list_sort_values)
+        self.solver._prepare_esp_contact_inputs(state)
+        self.soft_rest_vertices = model.particle_q.numpy().astype(np.float64)
+        self.rigid_rest_vertices = self.data.rigid_local_vertices.numpy().astype(np.float64)
+        # The independent dense/Torch references below use one coefficient and
+        # support. Fail explicitly if a diagnostic fixture breaks that contract.
+        radii = np.unique(self.data.soft_mesh_radius.numpy())
+        mesh_shapes = self.data.rigid_face_offsets.numpy() >= 0
+        margins = np.unique(model.shape_margin.numpy()[mesh_shapes])
+        stiffness = np.unique(model.shape_material_ke.numpy()[mesh_shapes])
+        if (
+            len(radii) != 1
+            or len(margins) != 1
+            or len(stiffness) != 1
+            or stiffness[0] != 1
+            or model.soft_contact_ke != 1
+        ):
+            raise ValueError("These diagnostic references require uniform support and unit stiffness")
+        self.support = float(radii[0]) + float(margins[0])
+        self.near_cutoff = 0.05 * self.support
+        self._block_dim = 32
+        self._ee_partitions = 8 if self.model.device.is_cuda else 1
         count = self.model.particle_count + self.model.body_count
         with wp.ScopedDevice(self.model.device):
-            data.soft_positions = wp.empty(self.model.particle_count, dtype=wp.vec3d)
-            data.rigid_positions = wp.empty(meshes.rigid.vertices.shape[0], dtype=wp.vec3d)
-            data.rigid_vertex_body = wp.empty(meshes.rigid.vertices.shape[0], dtype=int)
-            data.body_com_world = wp.empty(self.model.body_count, dtype=wp.vec3d)
-            for name in ("soft_vertex_area", "rigid_vertex_area", "soft_edge_area", "rigid_edge_area"):
-                source = getattr(meshes, name)
-                source = source.numpy() if isinstance(source, wp.array) else source
-                setattr(data, name, wp.array(source, dtype=wp.float64))
-            wp.launch(
-                map_vertex_bodies,
-                dim=data.rigid_vertex_body.shape[0],
-                inputs=[meshes.rigid.vertex_mesh, self.model.shape_body, data.rigid_vertex_body],
-            )
             self.energy = wp.zeros(2, dtype=wp.float64)
-            self.force = wp.zeros((2, count, 6), dtype=wp.float64)
-            self.hessian = wp.zeros((2, count, 6, 6), dtype=wp.float64)
             self.error = wp.zeros(1, dtype=int)
+            result = esp_contact.create_esp_contact_output(2 * count, 6, self.energy, self.error)
+            self.force = result.force.reshape((2, count, 6))
+            self.hessian = result.hessian.reshape((2, count, 6, 6))
+            self.outputs = []
+            for term in (0, 1):
+                output = esp_contact.EspContactOutput()
+                output.force, output.hessian = result.force, result.hessian
+                output.energy, output.error = self.energy, self.error
+                output.block_offset, output.term = term * count, term
+                self.outputs.append(output)
+            self.body_com_world = wp.empty(self.model.body_count, dtype=wp.vec3d)
 
-    def assemble(self, state):
-        """Re-evaluate every contact term at the current particle/body state."""
+    def assemble(self, state, *, clear_error=True):
+        """Evaluate both quadratures separately for dense-reference comparison."""
+        self._assemble(state, esp_contact._ALL_BLOCKS, -1, clear_error)
+
+    def _assemble(self, state, block_kind, color, clear_error):
+        self.state = state
         with wp.ScopedDevice(self.model.device):
-            self.meshes.update(state)
+            self.solver._prepare_esp_contact_inputs(state)
             data = self.data
-            wp.launch(copy_positions, dim=data.soft_positions.shape[0], inputs=[state.particle_q, data.soft_positions])
-            wp.launch(
-                copy_positions,
-                dim=data.rigid_positions.shape[0],
-                inputs=[self.meshes.rigid.vertices, data.rigid_positions],
-            )
             if self.model.body_count:
                 wp.launch(
-                    update_body_centers,
+                    _body_centers,
                     dim=self.model.body_count,
-                    inputs=[state.body_q, self.model.body_com, data.body_com_world],
+                    inputs=[state.body_q, self.model.body_com, self.body_com_world],
                 )
             self.energy.zero_()
             self.force.zero_()
             self.hessian.zero_()
-            self.error.zero_()
-            wp.launch(
-                accumulate_contact_blocks,
-                dim=(self.contacts.soft_contact_max, 6, 6),
-                inputs=[
-                    *self.meshes.contact_inputs(self.contacts)[:5],
-                    self.model.shape_body,
-                    data,
-                    self.lists.data,
-                    self.energy,
-                    self.force,
-                    self.hessian,
-                    self.error,
-                ],
+            if clear_error:
+                self.error.zero_()
+            entries = 21 if self.model.body_count else 6
+            if block_kind == esp_contact._PARTICLE_BLOCKS:
+                entries = 6
+            elif block_kind == esp_contact._ENERGY_ONLY:
+                entries = 1
+            partitions = self._ee_partitions
+            sm_count = self.model.device.sm_count if self.model.device.is_cuda else 1
+            workers = max(
+                1,
+                min(
+                    self.contacts.soft_contact_max,
+                    (512 * sm_count + entries * partitions - 1) // (entries * partitions),
+                ),
             )
+            for output in self.outputs:
+                wp.launch(
+                    esp_contact.make_contact_block_kernel(block_kind),
+                    dim=(workers, entries, partitions),
+                    block_dim=self._block_dim,
+                    inputs=[
+                        self.contacts.soft_contact_count,
+                        self.contacts._soft_contact_mesh_features,
+                        self.contacts.soft_contact_shape,
+                        self.model.shape_body,
+                        data,
+                        state.particle_q,
+                        self.solver._esp_rigid_positions,
+                        state.body_q,
+                        self.model.body_com,
+                        self.model.particle_colors,
+                        self.model.body_colors,
+                        self.model.shape_margin,
+                        self.model.shape_material_ke,
+                        self.model.soft_contact_ke,
+                        self.lists,
+                        color,
+                        workers,
+                        partitions,
+                        output,
+                    ],
+                )
+
+    def check_against_solver(self, state):
+        """Compare with SolverVBD's separate, color-limited particle/body calls.
+
+        The diagnostic launch computes both quadratures separately for every
+        block. Production sums them and visits just the current solve color.
+        Compare raw blocks, BEFORE the solver projects Hessians to PSD.
+        """
+        expected_f = self.force.numpy().sum(axis=0)
+        expected_h = self.hessian.numpy().sum(axis=0)
+        solver = self.solver
+        solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+        np.testing.assert_allclose(solver._esp_energy.numpy(), self.energy.numpy(), rtol=2e-10, atol=1e-12)
+        errors = []
+        for kind, colors, output, offset, dimensions in (
+            (esp_contact._PARTICLE_BLOCKS, self.model.particle_colors, solver._esp_particle_output, 0, 3),
+            (esp_contact._BODY_BLOCKS, self.model.body_colors, solver._esp_body_output, self.model.particle_count, 6),
+        ):
+            if output.force.shape[0] == 0:
+                continue
+            color_ids = colors.numpy()
+            for color in np.unique(color_ids):
+                solver._accumulate_esp_contacts(state, kind, int(color))
+                active = color_ids == color
+                for actual, expected in (
+                    (output.force.numpy(), expected_f[offset : offset + len(color_ids), :dimensions]),
+                    (output.hessian.numpy(), expected_h[offset : offset + len(color_ids), :dimensions, :dimensions]),
+                ):
+                    reference = np.zeros_like(expected)
+                    reference[active] = expected[active]
+                    scale = max(np.max(np.abs(reference)), 1e-8)
+                    np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-10)
+                    errors.append(np.max(np.abs(actual - reference)) / scale)
+        solver.check_esp_contacts()
+        print(f"SolverVBD color assembly PASS; max scaled force/Hessian error={max(errors, default=0):.3g}")
 
     def check(self):
-        """Reject overflow, invalid lists, unsupported rows, and singular energy."""
+        """Reject incomplete queries, singular energies, or nonfinite derivatives."""
         error = int(self.error.numpy()[0])
-        if error:
-            raise ValueError(
-                f"Invalid ESP blocks (flags={error}: 1=contact overflow, 2=list error, 4=nonfinite, 8=family)"
-            )
-        if not all(np.all(np.isfinite(a.numpy())) for a in (self.energy, self.force, self.hessian)):
-            raise ValueError("Nonfinite ESP block accumulation")
+        if error or not all(np.isfinite(a.numpy()).all() for a in (self.energy, self.force, self.hessian)):
+            raise ValueError(f"Invalid ESP blocks (flags={error})")
 
     def check_against_dense(self, reference):
         """Check local blocks against full vertex derivatives (diagnostics only).
@@ -336,8 +216,8 @@ class EspVbdBlockEvaluator:
         expected_f[:, :count, :3] = force[:, :count]
         for p in range(count):
             expected_h[:, p, :3, :3] = hessian[:, 3 * p : 3 * p + 3, 3 * p : 3 * p + 3]
-        bodies = self.data.rigid_vertex_body.numpy()
-        centers = self.data.body_com_world.numpy()
+        bodies = self.model.shape_body.numpy()[self.data.rigid.vertex_mesh.numpy()]
+        centers = self.body_com_world.numpy()
         for body in range(self.model.body_count):
             ids = np.flatnonzero(bodies == body)
             if not len(ids):
@@ -363,3 +243,42 @@ class EspVbdBlockEvaluator:
                 np.testing.assert_allclose(actual[term] / scale, expected[term] / scale, rtol=0, atol=2e-10)
                 errors.append(np.max(np.abs(actual[term] - expected[term])) / scale)
         print(f"VBD blocks / dense reference PASS; max scaled force/Hessian error={max(errors):.3g}")
+
+
+def run_checks(blocks, state, *, check_derivatives=False, check_autodiff=False, check_torch_energy=False):
+    """Share the same production/NumPy/autodiff checks between both examples."""
+    blocks.assemble(state)
+    blocks.check()
+    blocks.check_against_solver(state)
+    _points, expected = numpy_mesh_pair_energies(blocks)
+    actual = blocks.energy.numpy()
+    np.testing.assert_allclose(actual, expected.sum(axis=1), rtol=2e-5, atol=1e-8)
+    count = int(blocks.contacts.soft_contact_count.numpy()[0])
+    features = blocks.contacts._soft_contact_mesh_features.numpy()[:count]
+    families = np.bincount(features[features[:, 0] >= 0, 0] & 7, minlength=4)
+    print(f"{blocks.model.device}: VT/TV/EE/depth rows = {families.tolist()}")
+    print(f"Support={blocks.support:g} m, near cutoff={blocks.near_cutoff:g} m, stiffness=1")
+    print(f"NumPy P_fixed / P_ee (soft->rigid, rigid->soft):\n{expected}")
+    print(f"Production P_fixed / P_ee (both directions summed): {actual}")
+    print(f"NumPy comparison PASS; max energy error={np.max(np.abs(actual - expected.sum(axis=1))):.3g}")
+    forces = blocks.force.numpy().sum(axis=0)
+    print(f"Particle contact force (fixed + EE):\n{forces[: blocks.model.particle_count, :3]}")
+    if blocks.model.body_count:
+        print(f"Body contact [force, torque] (fixed + EE):\n{forces[blocks.model.particle_count :]}")
+    if check_derivatives or check_autodiff or check_torch_energy:
+        evaluator = EspDerivativeEvaluator(blocks)
+        if check_derivatives or check_autodiff:
+            blocks.check_against_dense(evaluator)
+        if check_autodiff or check_torch_energy:
+            import esp_autodiff  # noqa: PLC0415 -- Optional PyTorch dependency.
+
+            esp_autodiff.check_energy(evaluator, actual)
+            if check_autodiff:
+                esp_autodiff.check_autodiff(evaluator)
+        if check_derivatives:
+
+            def numpy_energy(soft_positions, rigid_positions):
+                return numpy_mesh_pair_energies(blocks, soft_positions, rigid_positions)[1].sum(axis=1)
+
+            check_numerical(evaluator, numpy_energy)
+    return actual

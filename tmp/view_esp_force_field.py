@@ -16,7 +16,7 @@ arms, extruded in y and triangulated. The y=0 slice is far from the boundary.
 This is a discretized analogue, not the paper's original geometry asset.
 
 Every update runs CollisionPipeline and its actual OGC force filter. ESP uses
-all VT rows and triangle_potential from esp_derivatives.py. There is only one
+all VT rows and the production triangle_potential from esp_contact.py. There is only one
 source point per evaluation: this is pointwise P, not the integrated cloth
 energy or its EE quadrature. No simulation, damping, or friction is involved.
 
@@ -38,11 +38,18 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
-from esp_common import Surface, box_mesh, make_surface
-from esp_derivatives import barrier, triangle_closest, triangle_potential, vertex
+from esp_common import box_mesh
 
 import newton
 from newton._src.geometry.soft_contacts_mesh import filter_soft_mesh_contacts
+from newton._src.solvers.vbd.esp_contact import (
+    EspSurfaceData,
+    barrier,
+    build_esp_surface_data,
+    triangle_closest,
+    triangle_potential,
+    vertex,
+)
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
 
 wp.set_module_options({"enable_backward": False})
@@ -112,7 +119,7 @@ def evaluate_contacts(
     contact_points: wp.array[wp.vec3],
     normals: wp.array[wp.vec3],
     points: wp.array[wp.vec3d],
-    target: Surface,
+    target: EspSurfaceData,
     target_positions: wp.array[wp.vec3d],
     support: float,
     stiffness: float,
@@ -181,7 +188,7 @@ class ForceProbe:
         self.vertices, self.faces = scene_mesh(scene)
         edges = np.unique(np.sort(self.faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1), axis=0)
         with wp.ScopedDevice(self.device):
-            self.surface, _, _ = make_surface(self.vertices, self.faces, edges)
+            self.surface, _, _ = build_esp_surface_data(self.vertices, self.faces, edges)
             self.target_positions = wp.array(self.vertices, dtype=wp.vec3d)
             builder = newton.ModelBuilder(gravity=(0, 0, 0))
             cfg = builder.ShapeConfig(margin=0.0, kd=0.0, mu=0.0)
