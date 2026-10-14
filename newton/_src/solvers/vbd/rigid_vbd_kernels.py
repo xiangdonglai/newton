@@ -2064,6 +2064,22 @@ def _evaluate_rigid_soft_contact_force_norm(
 
 
 @wp.func
+def _contact_uses_esp(
+    shape: int,
+    particles: wp.vec3i,
+    esp_shape_mask: wp.array[bool],
+    esp_vertex_area: wp.array[wp.float64],
+) -> bool:
+    """Replace normal elasticity only for mesh rows covered by ESP surface energy."""
+    if not esp_shape_mask or not esp_shape_mask[shape]:
+        return False
+    for i in range(3):
+        if particles[i] >= 0 and esp_vertex_area[particles[i]] == wp.float64(0.0):
+            return False
+    return True
+
+
+@wp.func
 def _compute_body_particle_contact_force(
     distance: float,
     collision_radius: float,
@@ -5962,6 +5978,7 @@ def accumulate_body_particle_contacts_per_body(
     body_particle_contact_counts: wp.array[wp.int32],
     body_particle_contact_indices: wp.array[wp.int32],
     esp_shape_mask: wp.array[bool],
+    esp_vertex_area: wp.array[wp.float64],
     # Outputs
     body_forces: wp.array[wp.vec3],
     body_torques: wp.array[wp.vec3],
@@ -6018,9 +6035,9 @@ def accumulate_body_particle_contacts_per_body(
         if contact_idx >= max_contacts:
             continue
 
-        include_normal = True
-        if esp_shape_mask:
-            include_normal = not esp_shape_mask[body_particle_contact_shape[contact_idx]]
+        include_normal = not _contact_uses_esp(
+            body_particle_contact_shape[contact_idx], soft_contact_indices[contact_idx], esp_shape_mask, esp_vertex_area
+        )
         f_soft = wp.vec3(0.0)
         h_soft = wp.mat33(0.0)
         cp_world = wp.vec3(0.0)

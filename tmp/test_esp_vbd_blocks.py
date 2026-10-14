@@ -8,6 +8,7 @@ No PyTorch is needed. All available Warp devices are tested.
 """
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -47,42 +48,53 @@ def dense_reference(blocks):
 def compare_dense(test, blocks):
     """Map full vertex derivatives to particle xyz and coupled body coordinates."""
     reference = dense_reference(blocks)
-    energy, force, hessian = reference.evaluate()
-    actual_e, actual_f, actual_h = blocks.energy.numpy(), blocks.force.numpy(), blocks.hessian.numpy()
-    np.testing.assert_allclose(actual_e, energy, rtol=2e-10, atol=1e-12)
-    count = blocks.model.particle_count
-    expected_f, expected_h = np.zeros_like(actual_f), np.zeros_like(actual_h)
-    expected_f[:, :count, :3] = force[:, :count]
-    for p in range(count):
-        expected_h[:, p, :3, :3] = hessian[:, 3 * p : 3 * p + 3, 3 * p : 3 * p + 3]
-    bodies = blocks.model.shape_body.numpy()[blocks.data.rigid.vertex_mesh.numpy()]
-    centers = blocks.body_com_world.numpy()
-    omitted_curvature = 0.0
-    for body in range(blocks.model.body_count):
-        ids = np.flatnonzero(bodies == body)
-        offsets = reference.rigid_positions[ids] - centers[body]
-        dofs = (3 * (ids + count)[:, None] + np.arange(3)).ravel()
-        jacobian = np.concatenate([np.column_stack((np.eye(3), -skew(r))) for r in offsets])
-        for term in range(2):
-            expected_f[term, count + body] = jacobian.T @ force[term, count + ids].ravel()
-            expected_h[term, count + body] = jacobian.T @ hessian[term][np.ix_(dofs, dofs)] @ jacobian
-            for r, f in zip(offsets, force[term, count + ids], strict=True):
-                # Coordinate-map curvature, using g=-f. This also checks the
-                # body Hessian is NOT a sum of the vertex diagonal blocks.
-                correction = -0.5 * (np.outer(r, f) + np.outer(f, r)) + (r @ f) * np.eye(3)
-                omitted_curvature = max(omitted_curvature, np.max(np.abs(correction)))
-                expected_h[term, count + body, 3:, 3:] += correction
-    for term in range(2):
-        f_scale = max(np.max(np.abs(expected_f[term])), 1e-8)
-        h_scale = max(np.max(np.abs(expected_h[term])), 1e-8)
-        np.testing.assert_allclose(actual_f[term] / f_scale, expected_f[term] / f_scale, rtol=0, atol=2e-10)
-        np.testing.assert_allclose(actual_h[term] / h_scale, expected_h[term] / h_scale, rtol=0, atol=2e-10)
+    largest_rotation_correction = blocks.check_against_dense(reference)
     if blocks.model.body_count:
-        test.assertGreater(omitted_curvature, 1e-4, "This fixture must exercise rotational curvature")
-    return reference, actual_e, actual_f, actual_h
+        test.assertGreater(largest_rotation_correction, 1e-4, "This fixture must exercise rotational curvature")
+    return reference, blocks.energy.numpy(), blocks.force.numpy(), blocks.hessian.numpy()
 
 
 class TestEspVbdBlocks(unittest.TestCase):
+    def test_benchmark_box_distance_uses_body_pose(self):
+        """Check the diagnostic against known distances on a translated/rotated box."""
+        from benchmark_esp_vbd import box_vertex_distances, make_grid_case  # noqa: PLC0415
+
+        model, _pipeline, _solver = make_grid_case("cpu", resolution=2, dynamic=True)
+        state = model.state()
+        pose = wp.transform(wp.vec3(0.2, -0.1, 0.35), wp.quat_rpy(0.4, -0.2, 0.7))
+        local_points = [
+            [0, 0, -0.05],  # Box center: 50 mm inside.
+            [0.06, 0, -0.05],  # 10 mm outside a side.
+            [0.06, 0.06, -0.05],  # sqrt(2)*10 mm outside an edge.
+            [0.05, 0, -0.05],  # On a side.
+            [0, 0, 0.002],  # 2 mm above the top.
+            [0, 0, -0.102],  # 2 mm below the bottom.
+            [-0.051, 0, -0.05],  # 1 mm outside the other side.
+            [0, -0.05, -0.05],  # On another side.
+            [-0.06, 0, 0.01],  # sqrt(2)*10 mm outside a top edge.
+        ]
+        state.body_q.assign(np.array([list(pose)], dtype=np.float32))
+        state.particle_q.assign(
+            np.array([list(wp.transform_point(pose, wp.vec3(*p))) for p in local_points], dtype=np.float32)
+        )
+        expected = [-0.05, 0.01, np.sqrt(2) * 0.01, 0, 0.002, 0.002, 0.001, 0, np.sqrt(2) * 0.01]
+        np.testing.assert_allclose(box_vertex_distances(model, state), expected, rtol=0, atol=1e-7)
+
+    def test_cached_ee_samples(self):
+        """Check that sharing EE sample values preserves energy, force, and Hessian."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)):
+                state, blocks = make_case(device, shared_body=True)
+                blocks.assemble(state)
+                expected = [a.numpy().copy() for a in (blocks.energy, blocks.force, blocks.hessian)]
+                with patch.object(blocks.solver, "_esp_ee_samples", None):
+                    blocks.assemble(state)
+                    blocks.check()
+                    for actual, reference in zip((blocks.energy, blocks.force, blocks.hessian), expected, strict=True):
+                        scale = max(float(np.max(np.abs(reference))), 1e-8)
+                        np.testing.assert_allclose(actual.numpy() / scale, reference / scale, rtol=0, atol=2e-10)
+                    compare_dense(self, blocks)
+
     def test_blocks_match_dense(self):
         """Check both terms with static shapes, a dynamic body, and shared-body shapes."""
         for device in wp.get_devices():

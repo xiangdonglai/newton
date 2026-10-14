@@ -3,6 +3,7 @@
 
 """Focused tests for the experimental full-surface ESP VBD integration."""
 
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -14,17 +15,17 @@ import newton.solvers
 from newton._src.solvers.vbd import esp_contact
 from newton._src.solvers.vbd.esp_contact import (
     EdgeTriangleListData,
-    Matrix6,
     compact_sorted_edge_triangles,
-    positive_semidefinite_block,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
 
 
 @wp.kernel
 def _copy_raw_blocks(
-    source: esp_contact.EspContactOutput,
-    destination: esp_contact.EspContactOutput,
+    source_force: wp.array2d[wp.float64],
+    source_hessian: wp.array3d[wp.float64],
+    destination_force: wp.array2d[wp.float64],
+    destination_hessian: wp.array3d[wp.float64],
     count: int,
     source_start: int,
     destination_start: int,
@@ -33,9 +34,9 @@ def _copy_raw_blocks(
     p = wp.tid()
     if p < count:
         for i in range(dimensions):
-            destination.force[p + destination_start, i] = source.force[p + source_start, i]
+            destination_force[p + destination_start, i] = source_force[p + source_start, i]
             for j in range(dimensions):
-                destination.hessian[p + destination_start, i, j] = source.hessian[p + source_start, i, j]
+                destination_hessian[p + destination_start, i, j] = source_hessian[p + source_start, i, j]
 
 
 class _EspReference:
@@ -60,42 +61,42 @@ class _EspReference:
             self.shape_material_ke = wp.ones(self.model.shape_count, dtype=float, device=solver.device)
         self.energy = wp.zeros(2, dtype=wp.float64, device=solver.device)
         count = self.model.particle_count + self.model.body_count
-        self.output = esp_contact.create_esp_contact_output(count, 6, self.energy, solver._esp_error)
-        self.force = self.output.force.reshape((1, count, 6))
-        self.hessian = self.output.hessian.reshape((1, count, 6, 6))
+        self.raw_force = wp.zeros((count, 6), dtype=wp.float64, device=solver.device)
+        self.raw_hessian = wp.zeros((count, 6, 6), dtype=wp.float64, device=solver.device)
+        self.force = self.raw_force.reshape((1, count, 6))
+        self.hessian = self.raw_hessian.reshape((1, count, 6, 6))
+        self.reference_model = self.model
+        if support is not None:
+            self.reference_model = copy.copy(self.model)
+            self.reference_model.shape_margin = self.shape_margin
+            self.reference_model.shape_material_ke = self.shape_material_ke
+            self.reference_model.soft_contact_ke = 1.0
 
     def assemble(self, state):
         self.solver._prepare_esp_contact_inputs(state)
         self.force.zero_()
         self.hessian.zero_()
-        self.energy.zero_()
-        entries = 21 if self.model.body_count else 6
-        wp.launch(
-            esp_contact.make_contact_block_kernel(esp_contact._ALL_BLOCKS),
-            dim=(32, entries, 1),
-            inputs=[
-                self.contacts.soft_contact_count,
-                self.contacts._soft_contact_mesh_features,
-                self.contacts.soft_contact_shape,
-                self.model.shape_body,
+        count = self.model.particle_count
+        for kind, start, end in (
+            (esp_contact._PARTICLE_BLOCKS, 0, count),
+            (esp_contact._BODY_BLOCKS, count, count + self.model.body_count),
+            (esp_contact._ENERGY_ONLY, 0, count),
+        ):
+            if start == end and kind != esp_contact._ENERGY_ONLY:
+                continue
+            esp_contact.launch_contact_blocks(
+                self.reference_model,
+                state,
+                self.contacts,
                 self.data,
-                state.particle_q,
                 self.solver._esp_rigid_positions,
-                state.body_q,
-                self.model.body_com,
-                self.model.particle_colors,
-                self.model.body_colors,
-                self.shape_margin,
-                self.shape_material_ke,
-                self.model.soft_contact_ke if self.support is None else 1.0,
                 self.lists,
-                -1,
-                32,
-                1,
-                self.output,
-            ],
-            device=self.model.device,
-        )
+                kind,
+                self.raw_force[start:end],
+                self.raw_hessian[start:end],
+                self.energy,
+                self.solver._esp_error,
+            )
 
     def check(self):
         self.solver.check_esp_contacts()
@@ -103,14 +104,17 @@ class _EspReference:
     def _copy_from_solver(self, body):
         self.force.zero_()
         self.hessian.zero_()
-        source = self.solver._esp_body_output if body else self.solver._esp_particle_output
+        source_force = self.solver._esp_body_forces if body else self.solver._esp_particle_forces
+        source_hessian = self.solver._esp_body_hessians if body else self.solver._esp_particle_hessians
         wp.launch(
             _copy_raw_blocks,
-            dim=source.force.shape[0],
+            dim=source_force.shape[0],
             inputs=[
-                source,
-                self.output,
-                source.force.shape[0],
+                source_force,
+                source_hessian,
+                self.raw_force,
+                self.raw_hessian,
+                source_force.shape[0],
                 0,
                 self.model.particle_count if body else 0,
                 6 if body else 3,
@@ -129,12 +133,6 @@ class _EspReference:
     def validate_state(self, state):
         self.solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
         wp.copy(self.energy, self.solver._esp_energy)
-
-
-@wp.kernel
-def _psd_probe(raw: wp.array[Matrix6], result: wp.array[Matrix6]):
-    i = wp.tid()
-    result[i] = positive_semidefinite_block(raw[i], 6)
 
 
 @wp.kernel
@@ -169,6 +167,7 @@ def make_case(
     gap=0.003,
     dat=False,
     grid=False,
+    isolated_particle=False,
 ):
     """Place a tilted triangle over a closed box, with optional analytic ground."""
     with wp.ScopedDevice(device):
@@ -222,7 +221,7 @@ def make_case(
             for p in (0, 1, 3, 4):
                 soft_indices.extend([p, p + 1, p + 3, p + 1, p + 4, p + 3])
         builder.add_cloth_mesh(
-            pos=wp.vec3(),
+            pos=wp.vec3(0.3, 0, 0) if isolated_particle else wp.vec3(),
             rot=wp.quat_identity(),
             scale=1.0,
             vel=wp.vec3(),
@@ -234,6 +233,8 @@ def make_case(
             tri_ka=10.0,
             tri_kd=0.0,
         )
+        if isolated_particle:
+            builder.add_particle(pos=wp.vec3(0, 0, gap), vel=wp.vec3(), mass=0.01, radius=0.005)
         builder.color()
         model = builder.finalize()
         model.soft_contact_ke, model.soft_contact_kd, model.soft_contact_mu = 1000.0, 0.0, 0.0
@@ -257,6 +258,74 @@ def make_case(
 
 
 class TestVbdEsp(unittest.TestCase):
+    def test_ee_blocks_independent_of_list_partition(self):
+        """Summing triangle terms before differentiating w*S must be additive.
+
+        Keep only EE evaluation rows, but build target lists from all detected
+        rows first. The tilted grid has multiple target triangles in both
+        directions, including triangles containing source-edge vertices.
+        Compare complete particle/body blocks, not just total energy. More
+        partitions than list entries also exercises empty sums.
+        """
+        for device in wp.get_devices():
+            with wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device, grid=True, dynamic=True, gap=0.00012)
+                state = model.state()
+                pipeline.collide(state, solver.contacts)
+                esp_contact.rebuild_edge_triangle_lists(
+                    solver.contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
+                )
+                rows = solver.contacts._soft_contact_mesh_features.numpy().copy()
+                rows[(rows[:, 0] & 7) != 2, 0] = -1
+                solver.contacts._soft_contact_mesh_features.assign(rows)
+                solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+                solver.check_esp_contacts()
+                self.assertGreater(solver._esp_energy.numpy()[1], 0.0, "Exercise active EE, not a zero-weight case")
+                lengths = solver._esp_lists.ends.numpy() - solver._esp_lists.starts.numpy()
+                self.assertGreater(int(lengths.max()), 1)
+                for kind in (esp_contact._PARTICLE_BLOCKS, esp_contact._BODY_BLOCKS):
+                    reference = None
+                    for partitions in (1, 3, int(lengths.max()) + 1):
+                        solver._esp_ee_partitions = partitions
+                        solver._accumulate_esp_contacts(state, kind)
+                        solver.check_esp_contacts()
+                        arrays = (
+                            (solver._esp_particle_forces, solver._esp_particle_hessians)
+                            if kind == esp_contact._PARTICLE_BLOCKS
+                            else (solver._esp_body_forces, solver._esp_body_hessians)
+                        )
+                        actual = [array.numpy().copy() for array in arrays]
+                        if reference is None:
+                            reference = actual
+                            self.assertGreater(np.linalg.norm(actual[0]), 0.0)
+                        else:
+                            for value, expected in zip(actual, reference, strict=True):
+                                scale = max(float(np.max(np.abs(expected))), 1.0)
+                                with self.subTest(device=str(device), kind=kind, partitions=partitions):
+                                    np.testing.assert_allclose(value / scale, expected / scale, atol=2e-10, rtol=0)
+
+    def test_preserve_contact_for_particle_without_surface(self):
+        """Keep native mesh forces on a particle with no ESP quadrature area.
+
+        Move the cloth out of contact and put a separate particle above the
+        box. ESP must not disable its normal force just because this rigid
+        shape also supports cloth contact. Check the rigid reaction as well.
+        """
+        for device in wp.get_devices():
+            for dynamic in (False, True):
+                results = []
+                for enabled in (False, True):
+                    with self.subTest(device=str(device), dynamic=dynamic, enabled=enabled), wp.ScopedDevice(device):
+                        model, _pipeline, solver = make_case(
+                            device, enabled=enabled, dynamic=dynamic, iterations=1, isolated_particle=True
+                        )
+                        state, out = model.state(), model.state()
+                        solver.step(state, out, None, None, 0.001)
+                        results.append((out.particle_q.numpy(), out.body_q.numpy() if dynamic else np.empty(0)))
+                self.assertGreater(results[0][0][-1, 2], 0.0031)
+                for native, esp in zip(results[0], results[1], strict=True):
+                    np.testing.assert_allclose(esp, native, rtol=0, atol=1e-8)
+
     def test_reuse_model_topology_and_rest_areas(self):
         """Reuse soft topology and honor model rest areas, independently of current geometry.
 
@@ -528,18 +597,37 @@ class TestVbdEsp(unittest.TestCase):
                         )
 
     def test_psd_and_friction(self):
-        """Clip only negative curvature and retain native friction/damping exactly."""
+        """Check optional particle/body PSD projection and preserve native friction/damping."""
         rng = np.random.default_rng(73)
         raw = rng.normal(size=(8, 6, 6))
         raw += raw.transpose(0, 2, 1)
         for device in wp.get_devices():
             with self.subTest(device=str(device)), wp.ScopedDevice(device):
-                a = wp.array(raw, dtype=Matrix6)
-                result = wp.empty_like(a)
-                wp.launch(_psd_probe, dim=len(raw), inputs=[a, result])
-                values, vectors = np.linalg.eigh(raw)
-                expected = (vectors * np.maximum(values, 0)[:, None, :]) @ vectors.transpose(0, 2, 1)
-                np.testing.assert_allclose(result.numpy(), expected, atol=1e-11, rtol=1e-11)
+                selected = np.arange(0, len(raw), 2, dtype=np.int32)
+                ids = wp.array(selected, dtype=int)
+                source_hessian = wp.array(raw, dtype=wp.float64)
+                source_force = wp.zeros((len(raw), 6), dtype=wp.float64)
+                error = wp.zeros(1, dtype=int)
+                for size in (3, 6):
+                    forces = [wp.zeros(len(raw), dtype=wp.vec3) for _ in range(size // 3)]
+                    hessians = [wp.zeros(len(raw), dtype=wp.mat33) for _ in range(1 if size == 3 else 3)]
+                    wp.launch(
+                        esp_contact.add_particle_blocks if size == 3 else esp_contact.add_body_blocks,
+                        dim=len(selected),
+                        inputs=[ids, source_force, source_hessian, error],
+                        outputs=forces + hessians,
+                    )
+                    expected = np.zeros((len(raw), size, size))
+                    expected[selected] = raw[selected, :size, :size]
+                    if esp_contact._PROJECT_ESP_HESSIAN_TO_PSD:
+                        values, vectors = np.linalg.eigh(expected)
+                        expected = (vectors * np.maximum(values, 0)[:, None, :]) @ vectors.transpose(0, 2, 1)
+                    blocks = [expected[:, :3, :3]]
+                    if size == 6:
+                        blocks += [expected[:, 3:, :3], expected[:, 3:, 3:]]
+                    for actual, block in zip(hessians, blocks, strict=True):
+                        np.testing.assert_allclose(actual.numpy(), block, atol=1e-6, rtol=1e-6)
+                    self.assertEqual(int(error.numpy()[0]), 0)
                 f, h = wp.zeros(2, dtype=wp.vec3), wp.zeros(2, dtype=wp.mat33)
                 wp.launch(_friction_probe, dim=2, inputs=[f, h])
                 np.testing.assert_allclose(f.numpy()[0] - f.numpy()[1], [0, 0, 8], atol=1e-6)
@@ -702,11 +790,15 @@ class TestVbdEsp(unittest.TestCase):
                 np.testing.assert_allclose(solver.body_torques.numpy()[0], expected_force[3, 3:], rtol=2e-6, atol=1e-7)
                 np.testing.assert_allclose(expected_force[:, :3].sum(axis=0), 0, atol=1e-10)
                 for p in range(3):
-                    values, vectors = np.linalg.eigh(raw[p, :3, :3])
-                    expected = (vectors * np.maximum(values, 0)) @ vectors.T
+                    expected = raw[p, :3, :3]
+                    if esp_contact._PROJECT_ESP_HESSIAN_TO_PSD:
+                        values, vectors = np.linalg.eigh(expected)
+                        expected = (vectors * np.maximum(values, 0)) @ vectors.T
                     np.testing.assert_allclose(solver.particle_hessians.numpy()[p], expected, rtol=3e-6, atol=1e-4)
-                values, vectors = np.linalg.eigh(raw[3])
-                expected = (vectors * np.maximum(values, 0)) @ vectors.T
+                expected = raw[3]
+                if esp_contact._PROJECT_ESP_HESSIAN_TO_PSD:
+                    values, vectors = np.linalg.eigh(expected)
+                    expected = (vectors * np.maximum(values, 0)) @ vectors.T
                 for actual, sub in (
                     (solver.body_hessian_ll, expected[:3, :3]),
                     (solver.body_hessian_al, expected[3:, :3]),
@@ -796,14 +888,17 @@ class TestVbdEsp(unittest.TestCase):
                                 wp.copy(solver._esp_energy, reference.energy)
                                 return
                             body = block_kind == esp_contact._BODY_BLOCKS
-                            target = solver._esp_body_output if body else solver._esp_particle_output
+                            target_force = solver._esp_body_forces if body else solver._esp_particle_forces
+                            target_hessian = solver._esp_body_hessians if body else solver._esp_particle_hessians
                             wp.launch(
                                 _copy_raw_blocks,
-                                dim=target.force.shape[0],
+                                dim=target_force.shape[0],
                                 inputs=[
-                                    reference.output,
-                                    target,
-                                    target.force.shape[0],
+                                    reference.raw_force,
+                                    reference.raw_hessian,
+                                    target_force,
+                                    target_hessian,
+                                    target_force.shape[0],
                                     solver.model.particle_count if body else 0,
                                     0,
                                     6 if body else 3,

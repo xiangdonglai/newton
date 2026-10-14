@@ -18,7 +18,7 @@ vertex derivatives, independent PyTorch autodiff, and finite differences.
 The model uses radius=0.03 m, shape margin=0 and unit contact stiffness.
 This checks contact derivatives, not time stepping or penetration recovery.
 Use --cloth-tilt 0.003 for numerical Hessian checks away from feature switches.
-Raw Hessians can be indefinite; comparisons precede the solver's PSD projection.
+Raw Hessians can be indefinite; checks do not apply the optional PSD projection.
 
 The float64 version with integer coefficient cancellation is preserved in
 commit 2cb7a1566d5160413e8372a8b6fe34ad67421d07.
@@ -30,7 +30,7 @@ import argparse
 import numpy as np
 import warp as wp
 from esp_common import box_mesh, patch
-from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks
+from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks, use_contact_formulas
 
 import newton
 
@@ -85,6 +85,12 @@ def run_example(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="cpu", help="cpu, cuda:0, or all")
+    parser.add_argument(
+        "--esp-formulas",
+        choices=("direct", "chain", "direct-per-triangle"),
+        default="direct",
+        help="Integrated shared direct formulas (default), or saved chain/per-triangle references",
+    )
     parser.add_argument("--gap", type=float, default=0.0003, help="Positive cloth height above the box [m]")
     parser.add_argument(
         "--cloth-tilt", type=float, default=0.0, help="Cloth z slope; use 0.003 for smooth Hessian validation"
@@ -104,12 +110,13 @@ if __name__ == "__main__":
     if args.gap <= 0:
         parser.error("--gap must be positive; this script does not evaluate penetration recovery")
     devices = wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]
-    for device in devices:
-        run_example(
-            device,
-            args.gap,
-            check_derivatives=args.check_derivatives,
-            check_autodiff=args.check_autodiff,
-            check_torch_energy=args.check_torch_energy,
-            cloth_tilt=args.cloth_tilt,
-        )
+    with use_contact_formulas(args.esp_formulas):
+        for device in devices:
+            run_example(
+                device,
+                args.gap,
+                check_derivatives=args.check_derivatives,
+                check_autodiff=args.check_autodiff,
+                check_torch_energy=args.check_torch_energy,
+                cloth_tilt=args.cloth_tilt,
+            )

@@ -21,26 +21,196 @@ branches; a classical Hessian need not exist. Float64 makes checking meaningful.
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.vbd.esp_contact import (  # noqa: F401
-    BlockPositions,
-    EdgeTriangleListData,
-    EspSurfaceData,
-    Point,
-    barrier,
-    chain,
-    cross,
-    divide,
-    dot,
-    ee_sample,
-    mollifier,
-    multiply,
-    scale,
-    segment_closest,
-    triangle_closest,
-    vertex,
-)
+from newton._src.solvers.vbd.esp_contact import EdgeTriangleListData, EspSurfaceData
 
 wp.set_module_options({"enable_backward": False})
+
+# Independent scalar-operation forward-AD reference. Production uses explicit
+# local derivatives and forward chain rules for moving quadrature samples;
+# keep these arithmetic rules here so comparisons do not share those formulas.
+Point = wp.types.matrix(shape=(3, 4), dtype=wp.float64)
+
+
+@wp.func
+def multiply(a: wp.vec4d, b: wp.vec4d) -> wp.vec4d:
+    """Apply the product rule to two scalars with derivatives in coordinates i,j."""
+    return wp.vec4d(
+        a[0] * b[0],
+        a[1] * b[0] + a[0] * b[1],
+        a[2] * b[0] + a[0] * b[2],
+        a[3] * b[0] + a[1] * b[2] + a[2] * b[1] + a[0] * b[3],
+    )
+
+
+@wp.func
+def chain(a: wp.vec4d, value: wp.float64, first: wp.float64, second: wp.float64) -> wp.vec4d:
+    """Apply the chain rule for f(a), given f(a), f'(a), and f''(a)."""
+    return wp.vec4d(value, first * a[1], first * a[2], first * a[3] + second * a[1] * a[2])
+
+
+@wp.func
+def divide(a: wp.vec4d, b: wp.vec4d) -> wp.vec4d:
+    """Differentiate a/b by composing the reciprocal and applying the product rule."""
+    inv = wp.float64(1.0) / b[0]
+    return multiply(a, chain(b, inv, -inv * inv, wp.float64(2.0) * inv * inv * inv))
+
+
+@wp.func
+def dot(a: Point, b: Point) -> wp.vec4d:
+    return multiply(a[0], b[0]) + multiply(a[1], b[1]) + multiply(a[2], b[2])
+
+
+@wp.func
+def scale(a: Point, s: wp.vec4d) -> Point:
+    return wp.matrix_from_rows(multiply(a[0], s), multiply(a[1], s), multiply(a[2], s))
+
+
+@wp.func
+def cross(a: Point, b: Point) -> Point:
+    return wp.matrix_from_rows(
+        multiply(a[1], b[2]) - multiply(a[2], b[1]),
+        multiply(a[2], b[0]) - multiply(a[0], b[2]),
+        multiply(a[0], b[1]) - multiply(a[1], b[0]),
+    )
+
+
+@wp.func
+def segment_closest(p: Point, a: Point, b: Point) -> Point:
+    edge = b - a
+    t = divide(dot(p - a, edge), dot(edge, edge))
+    if t[0] <= wp.float64(0.0):
+        return a
+    if t[0] >= wp.float64(1.0):
+        return b
+    return a + scale(edge, t)
+
+
+@wp.func
+def barrier_from_squared_distance(
+    d_sq: wp.vec4d, support: wp.float64, near_cutoff: wp.float64, near_only: bool
+) -> wp.vec4d:
+    if d_sq[0] >= support * support or (near_only and d_sq[0] >= near_cutoff * near_cutoff):
+        return wp.vec4d()
+    if d_sq[0] <= wp.float64(0.0):
+        return wp.vec4d(wp.float64(wp.inf), wp.float64(wp.nan), wp.float64(wp.nan), wp.float64(wp.nan))
+    root = wp.sqrt(d_sq[0])
+    d = chain(d_sq, root, wp.float64(0.5) / root, -wp.float64(0.25) / (root * root * root))
+    ratio = d / support
+    gap = wp.vec4d(wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)) - ratio
+    log_ratio = chain(ratio, wp.log(ratio[0]), wp.float64(1.0) / ratio[0], -wp.float64(1.0) / (ratio[0] * ratio[0]))
+    total = -multiply(multiply(gap, gap), log_ratio)
+    if near_only:
+        x = d * (wp.float64(2.0) / near_cutoff) - wp.vec4d(
+            wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)
+        )
+        if x[0] >= wp.float64(1.0):
+            return wp.vec4d()
+        if x[0] > wp.float64(0.0):
+            t = x[0]
+            window = chain(
+                x,
+                (wp.float64(1.0) - t)
+                * (wp.float64(1.0) - t)
+                * (wp.float64(1.0) - t)
+                * (wp.float64(1.0) + wp.float64(3.0) * t + wp.float64(6.0) * t * t),
+                -wp.float64(30.0) * t * t * (wp.float64(1.0) - t) * (wp.float64(1.0) - t),
+                -wp.float64(60.0) * t * (wp.float64(1.0) - t) * (wp.float64(1.0) - wp.float64(2.0) * t),
+            )
+            total = multiply(total, window)
+    return total
+
+
+@wp.func
+def barrier(delta: Point, support: wp.float64, near_cutoff: wp.float64, near_only: bool) -> wp.vec4d:
+    return barrier_from_squared_distance(dot(delta, delta), support, near_cutoff, near_only)
+
+
+@wp.func
+def mollifier(excess: wp.vec4d, distance_sq: wp.vec4d) -> wp.vec4d:
+    x = divide(excess, wp.float64(0.01) * distance_sq)
+    if x[0] <= wp.float64(0.0):
+        return wp.vec4d()
+    if x[0] >= wp.float64(1.0):
+        return wp.vec4d(wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+    return chain(x, x[0] * (wp.float64(2.0) - x[0]), wp.float64(2.0) - wp.float64(2.0) * x[0], -wp.float64(2.0))
+
+
+@wp.func
+def ee_sample(
+    a: Point,
+    b: Point,
+    c: Point,
+    d: Point,
+    near_cutoff: wp.float64,
+) -> tuple[Point, Point, wp.vec4d]:
+    u, v = b - a, d - c
+    n = cross(u, v)
+    n_sq = dot(n, n)
+    q, q_bar, weight = a, c, wp.vec4d()
+    if n_sq[0] > wp.float64(0.0):
+        s = divide(dot(cross(c - a, v), n), n_sq)
+        t = divide(dot(cross(c - a, u), n), n_sq)
+        if s[0] > wp.float64(0.0) and s[0] < wp.float64(1.0) and t[0] > wp.float64(0.0) and t[0] < wp.float64(1.0):
+            q, q_bar = a + scale(u, s), c + scale(v, t)
+            d_sq = dot(q - q_bar, q - q_bar)
+            if d_sq[0] > wp.float64(0.0) and d_sq[0] < near_cutoff * near_cutoff:
+                root = wp.sqrt(d_sq[0])
+                distance = chain(d_sq, root, wp.float64(0.5) / root, -wp.float64(0.25) / (root * root * root))
+                ca, cb = segment_closest(a, c, d), segment_closest(b, c, d)
+                cc, cd = segment_closest(c, a, b), segment_closest(d, a, b)
+                mu = multiply(
+                    mollifier(dot(a - ca, a - ca) - d_sq, d_sq),
+                    mollifier(dot(b - cb, b - cb) - d_sq, d_sq),
+                )
+                mu = multiply(mu, mollifier(dot(c - cc, c - cc) - d_sq, d_sq))
+                mu = multiply(mu, mollifier(dot(d - cd, d - cd) - d_sq, d_sq))
+                x = distance * (wp.float64(2.0) / near_cutoff)
+                t0 = x[0]
+                remaining = wp.float64(2.0) - t0
+                step = chain(
+                    x,
+                    wp.float64(0.25) * remaining * remaining * remaining,
+                    -wp.float64(0.75) * remaining * remaining,
+                    wp.float64(1.5) * remaining,
+                )
+                if t0 < wp.float64(1.0):
+                    step = chain(
+                        x,
+                        wp.float64(1.0) - wp.float64(1.5) * t0 * t0 + wp.float64(0.75) * t0 * t0 * t0,
+                        -wp.float64(3.0) * t0 + wp.float64(2.25) * t0 * t0,
+                        -wp.float64(3.0) + wp.float64(4.5) * t0,
+                    )
+                weight = multiply(step, mu)
+    return q, q_bar, weight
+
+
+@wp.func
+def vertex(positions: wp.array[wp.vec3d], index: int, offset: int, i: int, j: int) -> Point:
+    result = Point()
+    for axis in range(3):
+        dof = 3 * (index + offset) + axis
+        result[axis] = wp.vec4d(positions[index][axis], wp.float64(dof == i), wp.float64(dof == j), wp.float64(0.0))
+    return result
+
+
+@wp.func
+def triangle_closest(p: Point, a: Point, b: Point, c: Point) -> Point:
+    ab, ac = b - a, c - a
+    n = cross(ab, ac)
+    n_sq = dot(n, n)
+    projected = p - scale(n, divide(dot(p - a, n), n_sq))
+    u = divide(dot(cross(projected - a, ac), n), n_sq)
+    v = divide(dot(cross(ab, projected - a), n), n_sq)
+    if u[0] > wp.float64(0.0) and v[0] > wp.float64(0.0) and u[0] + v[0] < wp.float64(1.0):
+        return projected
+    closest = segment_closest(p, a, b)
+    for k in range(2):
+        candidate = segment_closest(p, b, c)
+        if k == 1:
+            candidate = segment_closest(p, c, a)
+        if dot(p - candidate, p - candidate)[0] < dot(p - closest, p - closest)[0]:
+            closest = candidate
+    return closest
 
 
 @wp.func
@@ -98,12 +268,10 @@ def edge_potential(
     lists: EdgeTriangleListData,
 ):
     result = wp.vec4d()
-    previous = int(-1)
     for k in range(lists.starts[edge], lists.ends[edge]):
         face = lists.keys[k]
-        if face != previous and surface.vertex_mesh[surface.faces[face][0]] == target_mesh:
+        if surface.vertex_mesh[surface.faces[face][0]] == target_mesh:
             result += triangle_potential(p, positions, surface, face, offset, i, j, support, near_cutoff, True)
-        previous = face
     return result
 
 

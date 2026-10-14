@@ -16,7 +16,7 @@ arms, extruded in y and triangulated. The y=0 slice is far from the boundary.
 This is a discretized analogue, not the paper's original geometry asset.
 
 Every update runs CollisionPipeline and its actual OGC force filter. ESP uses
-all VT rows and the production triangle_potential from esp_contact.py. There is only one
+all VT rows and the production triangle derivatives from esp_contact.py. There is only one
 source point per evaluation: this is pointwise P, not the integrated cloth
 energy or its EE quadrature. No simulation, damping, or friction is involved.
 
@@ -38,17 +38,16 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
+from esp_chain_solver_reference import particle_point, particle_triangle_potential
 from esp_common import box_mesh
 
 import newton
 from newton._src.geometry.soft_contacts_mesh import filter_soft_mesh_contacts
 from newton._src.solvers.vbd.esp_contact import (
     EspSurfaceData,
-    barrier,
     build_esp_surface_data,
-    triangle_closest,
-    triangle_potential,
-    vertex,
+    particle_triangle,
+    triangle_feature_weights,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
 
@@ -123,10 +122,13 @@ def evaluate_contacts(
     target_positions: wp.array[wp.vec3d],
     support: float,
     stiffness: float,
+    compute_hessian: bool,
+    use_direct_formulas: bool,
     energy: wp.array2d[wp.float64],
     forces: wp.array2d[wp.vec3d],
     row_counts: wp.array2d[int],
     distances: wp.array[float],
+    hessians: wp.array[wp.mat33d],
 ):
     row = wp.tid()
     if row >= count[0]:
@@ -160,30 +162,61 @@ def evaluate_contacts(
     esp_force, ogc_force = wp.vec3d(), wp.vec3d()
     r = wp.float64(support)
     coefficient = wp.float64(stiffness) * r * r
-    for axis in range(3):
-        i = 3 * particle + axis
-        p = vertex(points, particle, 0, i, -1)
-        esp = triangle_potential(p, target_positions, target, face, points.shape[0], i, -1, r, r, False)
-        esp_force[axis] = -coefficient * esp[1]
-        if axis == 0:
-            wp.atomic_add(energy, 0, particle, coefficient * esp[0])
-        if force_mask[row]:
-            ids = target.faces[face]
-            a = vertex(target_positions, ids[0], points.shape[0], i, -1)
-            b = vertex(target_positions, ids[1], points.shape[0], i, -1)
-            c = vertex(target_positions, ids[2], points.shape[0], i, -1)
-            ogc = barrier(p - triangle_closest(p, a, b, c), r, r, False)
-            ogc_force[axis] = -coefficient * ogc[1]
-            if axis == 0:
-                wp.atomic_add(energy, 1, particle, coefficient * ogc[0])
+    ids = target.faces[face]
+    edge_weights, vertex_weights, reversed_edges = triangle_feature_weights(target, face)
+    if use_direct_formulas:
+        value, gradient, hessian = particle_triangle(
+            points[particle],
+            target_positions[ids[0]],
+            target_positions[ids[1]],
+            target_positions[ids[2]],
+            0,
+            edge_weights,
+            vertex_weights,
+            r,
+            r,
+            False,
+        )
+    else:
+        # Explicitly selected historical reference; the default above calls
+        # exactly the direct mathematical function used by SolverVBD.
+        a = particle_point(target_positions[ids[0]], False)
+        b = particle_point(target_positions[ids[1]], False)
+        c = particle_point(target_positions[ids[2]], False)
+        p = particle_point(points[particle], True)
+        value, gradient, hessian = particle_triangle_potential(
+            p, a, b, c, edge_weights, vertex_weights, r, r, False, reversed_edges
+        )
+    esp_force = -coefficient * gradient
+    hessian *= coefficient
+    wp.atomic_add(energy, 0, particle, coefficient * value)
+    if force_mask[row]:
+        # Zero feature weights leave only the existing triangle barrier law.
+        value, gradient, _h = particle_triangle(
+            points[particle],
+            target_positions[ids[0]],
+            target_positions[ids[1]],
+            target_positions[ids[2]],
+            0,
+            wp.vec3d(),
+            wp.vec3d(),
+            r,
+            r,
+            False,
+        )
+        ogc_force = -coefficient * gradient
+        wp.atomic_add(energy, 1, particle, coefficient * value)
     wp.atomic_add(forces, 0, particle, esp_force)
     wp.atomic_add(forces, 1, particle, ogc_force)
+    if compute_hessian:
+        wp.atomic_add(hessians, particle, hessian)
 
 
 class ForceProbe:
     """Keep topology/buffers fixed; redetect after every particle-position change."""
 
-    def __init__(self, scene, count, device):
+    def __init__(self, scene, count, device, *, esp_formulas="direct"):
+        self.use_direct_formulas = esp_formulas == "direct"
         self.scene, self.device = scene, wp.get_device(device)
         self.vertices, self.faces = scene_mesh(scene)
         edges = np.unique(np.sort(self.faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1), axis=0)
@@ -212,8 +245,9 @@ class ForceProbe:
             self.forces = wp.zeros((len(MODES), count), dtype=wp.vec3d)
             self.row_counts = wp.zeros((2, count), dtype=int)
             self.distances = wp.empty(count, dtype=float)
+            self.hessians = wp.zeros(count, dtype=wp.mat33d)
 
-    def evaluate(self, points, support, stiffness=100.0):
+    def evaluate(self, points, support, stiffness=100.0, *, compute_hessian=False):
         points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
         if len(points) != self.model.particle_count:
             raise ValueError("Keep the number of probe points fixed")
@@ -230,6 +264,8 @@ class ForceProbe:
             self.forces.zero_()
             self.row_counts.zero_()
             self.distances.fill_(np.inf)
+            if compute_hessian:
+                self.hessians.zero_()
             wp.launch(
                 evaluate_contacts,
                 dim=self.contacts.soft_contact_max,
@@ -244,11 +280,10 @@ class ForceProbe:
                     self.target_positions,
                     support,
                     stiffness,
-                    self.energy,
-                    self.forces,
-                    self.row_counts,
-                    self.distances,
+                    compute_hessian,
+                    self.use_direct_formulas,
                 ],
+                outputs=[self.energy, self.forces, self.row_counts, self.distances, self.hessians],
             )
         # CPU .numpy() can alias the reusable buffers. Keep each probe result
         # unchanged when the next frame (or finite-difference test) evaluates.
@@ -312,7 +347,7 @@ def newton_contact_law_probe(distances: wp.array[float], values: wp.array2d[wp.v
     values[i, mode] = wp.vec2d(newton_contact_energy(distance, 0.03, 100.0, mode == 1), wp.float64(force[2]))
 
 
-def test_probes(device):
+def test_probes(device, *, esp_formulas="direct"):
     """Check the real masked force, ESP gradient, and the Fig. 2 contrast."""
     # Check the display-only energy against the native force in every branch,
     # at their joins, at zero, and at negative signed distance.
@@ -331,7 +366,7 @@ def test_probes(device):
     np.testing.assert_allclose(center[7:, 0], center[7:, 1])
     assert center[5, 1, 1] > center[5, 0, 1], "The log-barrier option must change the near-contact force"
     for scene in range(2):
-        probe = ForceProbe(scene, 1, device)
+        probe = ForceProbe(scene, 1, device, esp_formulas=esp_formulas)
         radius = 0.03 if scene == 0 else 0.06
         for name, position in PRESETS[scene].items():
             x = np.asarray(position).reshape(1, 3)
@@ -368,6 +403,22 @@ def test_probes(device):
             assert counts[1, 0] >= 2
             assert energy[1, 0] > energy[0, 0], "ESP subtracts the maximum missed by minimum-only OGC"
             assert np.linalg.norm(force[0, 0] - force[1, 0]) > 0.1
+        # Differentiate the actual displayed ESP force, away from feature ties.
+        # Keep PSD off: a projected matrix is not the derivative of that force.
+        point = np.array([[0.039, 0.004, 0.008] if scene == 0 else [0.012, 0.007, 0.04]], dtype=np.float32)
+        probe.evaluate(point, radius, compute_hessian=True)
+        hessian = probe.hessians.numpy()[0].copy()
+        finite_hessian = np.empty((3, 3))
+        for axis in range(3):
+            plus, minus = point.copy(), point.copy()
+            plus[0, axis] += 2e-6
+            minus[0, axis] -= 2e-6
+            fp, fm = probe.evaluate(plus, radius)[1][0, 0], probe.evaluate(minus, radius)[1][0, 0]
+            finite_hessian[:, axis] = -(fp - fm) / float(plus[0, axis] - minus[0, axis])
+        np.testing.assert_allclose(hessian, finite_hessian, rtol=5e-4, atol=1e-3)
+        print(
+            f"{SCENES[scene]}: displayed ESP force / raw Hessian finite differences PASS; max error={np.max(abs(hessian - finite_hessian)):.3g}"
+        )
     print(f"Force-field numerical checks PASS on {device}", flush=True)
 
 
@@ -406,7 +457,7 @@ class Viewer:
         self.radius = 0.03 if self.scene == 0 else 0.06
         self.preset = 0
         self.gizmo.set_position(next(iter(PRESETS[self.scene].values())))
-        self.probe = ForceProbe(self.scene, 1, self.args.device)
+        self.probe = ForceProbe(self.scene, 1, self.args.device, esp_formulas=self.args.esp_formulas)
         self.field_probe = None
         self.last_key, self.last_field_key = None, None
         mesh = ps.register_surface_mesh(
@@ -475,7 +526,9 @@ class Viewer:
                     profile = self.probe.vertices[::2]
                     points = points[points[:, 2] > np.interp(points[:, 0], profile[:, 0], profile[:, 2]) + 0.0005]
                 if self.field_probe is None or self.field_probe.model.particle_count != len(points):
-                    self.field_probe = ForceProbe(self.scene, len(points), self.args.device)
+                    self.field_probe = ForceProbe(
+                        self.scene, len(points), self.args.device, esp_formulas=self.args.esp_formulas
+                    )
                 self.field_result = self.field_probe.evaluate(points, self.radius, self.stiffness)
                 self.field_points = points
                 self.last_field_key = field_key
@@ -506,6 +559,8 @@ class Viewer:
             self.load_scene()
         _, self.mode = ui.Combo("Method", self.mode, MODES)
         ui.TextUnformatted("Drag the particle's arrows / plane handles.")
+        formula_label = "integrated direct" if self.args.esp_formulas == "direct" else "saved chain reference"
+        ui.TextUnformatted(f"ESP derivatives: {formula_label}")
         changed, self.preset = ui.Combo("Position preset", self.preset, list(PRESETS[self.scene]))
         if changed:
             self.gizmo.set_position(list(PRESETS[self.scene].values())[self.preset])
@@ -546,6 +601,12 @@ def main():
     parser.add_argument("--device", default="cpu", help="Warp device: cpu or cuda:0")
     parser.add_argument("--scene", choices=("box", "figure2"), default="box")
     parser.add_argument(
+        "--esp-formulas",
+        choices=("chain", "direct"),
+        default="direct",
+        help="Integrated direct kernels (default) or saved chain reference; no EE in this point probe",
+    )
+    parser.add_argument(
         "--mode",
         type=int,
         choices=range(len(MODES)),
@@ -558,7 +619,7 @@ def main():
     parser.add_argument("--screenshot", type=Path, help="Save the requested scene/method and exit")
     args = parser.parse_args()
     if args.test:
-        test_probes(args.device)
+        test_probes(args.device, esp_formulas=args.esp_formulas)
         return
     if args.headless and not (args.screenshot or args.smoke_test):
         parser.error("--headless requires --screenshot or --smoke-test")

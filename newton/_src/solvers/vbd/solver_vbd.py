@@ -592,7 +592,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 nonintersecting manifold meshes, and complete query buffers. Analytical shapes retain their
                 existing force law. Mesh damping/friction retain the OGC force mask and existing penalty-based
                 normal load; only mesh normal elasticity is replaced, not added twice. Uses unnormalized
-                vertex and adaptive EE quadrature, float64 derivatives, and PSD local solve matrices.
+                vertex and adaptive EE quadrature with float64 derivatives. Each evaluation computes
+                a complete 3x3 particle or 6x6 body block. Hessians are exact selected-branch derivatives,
+                not PSD-projected by default; the local experimental projection switch is in esp_contact.py.
                 Particles use the model's existing VBD color groups. Additional ESP couplings within a
                 group use positions from before that group's parallel update. No mesh penetration recovery,
                 differentiable simulation, external rigid solver, deterministic assembly, or per-row
@@ -2461,15 +2463,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._esp_data.soft, self._esp_data.rigid, self._pipeline_contacts.soft_contact_max
             )
             self._esp_energy = wp.zeros(2, dtype=wp.float64)
+            self._esp_ee_samples = wp.empty((self._pipeline_contacts.soft_contact_max, 2), dtype=wp.vec4d)
             self._esp_error = wp.zeros(1, dtype=int)
-            self._esp_particle_output = esp_contact.create_esp_contact_output(
-                self.model.particle_count, 3, self._esp_energy, self._esp_error
-            )
-            self._esp_body_output = esp_contact.create_esp_contact_output(
-                self.model.body_count, 6, self._esp_energy, self._esp_error, block_offset=-self.model.particle_count
-            )
+            self._esp_particle_forces = wp.zeros((self.model.particle_count, 3), dtype=wp.float64)
+            self._esp_particle_hessians = wp.zeros((self.model.particle_count, 3, 3), dtype=wp.float64)
+            self._esp_body_forces = wp.zeros((self.model.body_count, 6), dtype=wp.float64)
+            self._esp_body_hessians = wp.zeros((self.model.body_count, 6, 6), dtype=wp.float64)
             self._esp_block_dim = 32
-            self._esp_ee_partitions = 8 if self.device.is_cuda else 1
+            # Whole-block derivatives share geometry across all Hessian entries.
+            # Start with one thread per contact row, including EE rows.
+            self._esp_ee_partitions = 1
             self._esp_static_positions_initialized = False
             self._esp_shape_mask = wp.array(self._esp_data.rigid_face_offsets.numpy() >= 0, dtype=bool)
 
@@ -2495,68 +2498,49 @@ class SolverVBD(SolverBase, CouplingInterface):
     def _accumulate_esp_contacts(self, state, block_kind, color=-1):
         """Accumulate one color's raw ESP blocks, or validate final-state energy."""
         self._prepare_esp_contact_inputs(state)
-        output = self._esp_body_output if block_kind == esp_contact._BODY_BLOCKS else self._esp_particle_output
-        self._esp_energy.zero_()
-        entries = 1
-        if block_kind != esp_contact._ENERGY_ONLY:
-            output.force.zero_()
-            output.hessian.zero_()
-            entries = 21 if block_kind == esp_contact._BODY_BLOCKS else 6
-        partitions = self._esp_ee_partitions
-        sm_count = self.device.sm_count if self.device.is_cuda else 1
-        work_per_row = entries * partitions
-        workers = max(1, min(self.contacts.soft_contact_max, (2 * 256 * sm_count + work_per_row - 1) // work_per_row))
-        wp.launch(
-            esp_contact.make_contact_block_kernel(block_kind),
-            dim=(workers, entries, partitions),
+        body = block_kind == esp_contact._BODY_BLOCKS
+        esp_contact.launch_contact_blocks(
+            self.model,
+            state,
+            self.contacts,
+            self._esp_data,
+            self._esp_rigid_positions,
+            self._esp_lists,
+            block_kind,
+            self._esp_body_forces if body else self._esp_particle_forces,
+            self._esp_body_hessians if body else self._esp_particle_hessians,
+            self._esp_energy,
+            self._esp_error,
+            color=color,
             block_dim=self._esp_block_dim,
-            inputs=[
-                self.contacts.soft_contact_count,
-                self.contacts._soft_contact_mesh_features,
-                self.contacts.soft_contact_shape,
-                self.model.shape_body,
-                self._esp_data,
-                state.particle_q,
-                self._esp_rigid_positions,
-                state.body_q,
-                self.model.body_com,
-                self.model.particle_colors,
-                self.model.body_colors,
-                self.model.shape_margin,
-                self.model.shape_material_ke,
-                self.model.soft_contact_ke,
-                self._esp_lists,
-                color,
-                workers,
-                partitions,
-                output,
-            ],
-            device=self.device,
+            partitions=self._esp_ee_partitions,
+            ee_samples=self._esp_ee_samples,
         )
 
     def _add_esp_particle_contacts(self, state, ids, *, color=-1):
-        """Sum signed ESP terms before projecting their particle Hessian to PSD."""
+        """Add summed ESP particle blocks, optionally projecting their Hessians to PSD."""
         self._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, color)
-        output = self._esp_particle_output
         wp.launch(
             esp_contact.add_particle_blocks,
             dim=ids.size,
-            inputs=[ids, output.force, output.hessian, self._esp_error, self.particle_forces, self.particle_hessians],
+            inputs=[ids, self._esp_particle_forces, self._esp_particle_hessians, self._esp_error],
+            outputs=[self.particle_forces, self.particle_hessians],
             device=self.device,
         )
 
     def _add_esp_body_contacts(self, state, ids, *, color=-1):
-        """Sum signed ESP terms before projecting their body Hessian to PSD."""
+        """Add summed ESP body blocks, optionally projecting their Hessians to PSD."""
         self._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS, color)
-        output = self._esp_body_output
         wp.launch(
             esp_contact.add_body_blocks,
             dim=ids.size,
             inputs=[
                 ids,
-                output.force,
-                output.hessian,
+                self._esp_body_forces,
+                self._esp_body_hessians,
                 self._esp_error,
+            ],
+            outputs=[
                 self.body_forces,
                 self.body_torques,
                 self.body_hessian_ll,
@@ -4036,6 +4020,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.shape_margin,
                     contacts.soft_contact_barycentric,
                     self._esp_shape_mask,
+                    self._esp_data.soft_vertex_area if self._esp_data is not None else None,
                 ]
                 if self._particle_contact_use_gather:
                     # Deterministic modes: one thread per colored particle, no output atomics.
@@ -4338,6 +4323,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_particle_contact_counts,
                         self.body_particle_contact_indices,
                         self._esp_shape_mask,
+                        self._esp_data.soft_vertex_area if self._esp_data is not None else None,
                     ],
                     outputs=[
                         self.body_forces,

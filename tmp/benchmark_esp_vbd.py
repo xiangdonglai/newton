@@ -14,12 +14,15 @@ compilation and graph capture are excluded. Serial coloring is a diagnostic
 control only, never an option exposed by SolverVBD. Separate trajectory checks
 must be used to assess convergence: a fast reset/replay is not such a check.
 All force laws use the same unfiltered full-surface query, with the native
-force mask applied by VBD. DAT, friction and damping are off in this timing
-fixture. These are whole-step timings, not isolated force-kernel timings.
+force mask applied by VBD. DAT is off unless --dat is given; friction and
+damping are off. These are whole-step timings, not isolated force-kernel
+timings. The final box-relative vertex distances are measured outside timing.
 """
 
 import argparse
+import importlib.util
 import json
+import sys
 import time
 from collections import defaultdict
 
@@ -28,6 +31,7 @@ import warp as wp
 
 import newton
 import newton.solvers
+from newton._src.solvers.vbd import esp_contact
 
 
 def make_grid_case(device, resolution=8, *, iterations=4, dynamic=False, gap=0.0003, dat=False, force_law="esp"):
@@ -95,6 +99,9 @@ def make_grid_case(device, resolution=8, *, iterations=4, dynamic=False, gap=0.0
         solver = newton.solvers.SolverVBD(
             model,
             collision_pipeline=pipeline,
+            # One body can receive every detected row in this one-box fixture.
+            # Use the same complete buffer for ESP and both native force laws.
+            rigid_body_particle_contact_buffer_size=pipeline.soft_contact_max,
             iterations=iterations,
             rigid_soft_contact_use_esp=force_law == "esp",
             rigid_soft_contact_use_log_barrier=force_law == "log-barrier",
@@ -112,7 +119,28 @@ def set_schedule(model, solver, schedule):
             model.particle_color_groups = [wp.array([p], dtype=int) for p in range(model.particle_count)]
 
 
-def measure(callback, device, samples, repeats):
+def box_vertex_distances(model, state):
+    """Measure this fixture's particle-to-box distances at the actual body pose.
+
+    This is outside timing. Negative world z alone is not penetration when
+    the box moves. The analytic box check does not cover triangle interiors.
+    """
+    shape_pose = model.shape_transform.numpy()[0]
+    shape_to_world = wp.transform(wp.vec3(*shape_pose[:3]), wp.quat(*shape_pose[3:]))
+    body = int(model.shape_body.numpy()[0])
+    if body >= 0:
+        body_pose = state.body_q.numpy()[body]
+        shape_to_world = wp.transform_multiply(
+            wp.transform(wp.vec3(*body_pose[:3]), wp.quat(*body_pose[3:])), shape_to_world
+        )
+    world_to_shape = wp.transform_inverse(shape_to_world)
+    local = np.array([list(wp.transform_point(world_to_shape, wp.vec3(*p))) for p in state.particle_q.numpy()])
+    # The authored mesh occupies [-.05,.05]^2 x [-.1,0].
+    outside = np.abs(local - [0.0, 0.0, -0.05]) - 0.05
+    return np.linalg.norm(np.maximum(outside, 0.0), axis=1) + np.minimum(outside.max(axis=1), 0.0)
+
+
+def measure(callback, device, samples, repeats, warmup_seconds=0.2):
     """Time warmed, identical graph replays; return each batch's milliseconds."""
     for _ in range(3):
         callback()
@@ -126,7 +154,7 @@ def measure(callback, device, samples, repeats):
 
         # Warm the captured workload too: tiny native-contact steps otherwise
         # finish a timing batch while the GPU is still raising its clock.
-        warm_until = time.perf_counter() + 0.2
+        warm_until = time.perf_counter() + warmup_seconds
         while time.perf_counter() < warm_until:
             for _ in range(10):
                 callback()
@@ -148,23 +176,54 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resolution", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=4)
+    parser.add_argument("--gap", type=float, default=0.0003, help="Cloth center height above the box [m]")
     parser.add_argument("--force-law", choices=("esp", "quadratic", "log-barrier"), default="esp")
     parser.add_argument("--schedule", choices=("grouped", "serial"), default="grouped")
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--dynamic", action="store_true")
+    parser.add_argument("--dat", action="store_true", help="Enable rigid-soft DAT and interval arithmetic")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--no-ee-cache", action="store_true", help="Repeat the EE activity/sample calculation per thread"
+    )
     parser.add_argument("--block-dim", type=int, default=32)
-    parser.add_argument("--ee-partitions", type=int, help="Override EE list slices; default is 8 on CUDA, 1 on CPU")
+    parser.add_argument(
+        "--reference-module",
+        help="Load a saved esp_contact.py for a before/after benchmark without editing solver files",
+    )
+    parser.add_argument(
+        "--ee-partitions", type=int, help="Override particle EE list slices (default: 1); body/energy use 1"
+    )
     args = parser.parse_args()
+    if args.reference_module:
+        # Keep relative imports working in a saved production module. Both the
+        # solver and this benchmark must use the same Warp structure types.
+        from newton._src.solvers.vbd import solver_vbd  # noqa: PLC0415
+
+        name = "newton._src.solvers.vbd.esp_benchmark_reference"
+        spec = importlib.util.spec_from_file_location(name, args.reference_module)
+        reference = importlib.util.module_from_spec(spec)
+        sys.modules[name] = reference
+        spec.loader.exec_module(reference)
+        globals()["esp_contact"] = reference
+        solver_vbd.esp_contact = reference
     if args.ee_partitions is not None and args.ee_partitions < 1:
         parser.error("--ee-partitions must be positive")
     device = wp.get_device(args.device)
     model, _pipeline, solver = make_grid_case(
-        device, args.resolution, iterations=args.iterations, dynamic=args.dynamic, force_law=args.force_law
+        device,
+        args.resolution,
+        iterations=args.iterations,
+        dynamic=args.dynamic,
+        force_law=args.force_law,
+        gap=args.gap,
+        dat=args.dat,
     )
     set_schedule(model, solver, args.schedule)
     if solver._esp_data is not None:
+        if args.no_ee_cache:
+            solver._esp_ee_samples = None
         solver._esp_block_dim = args.block_dim
         if args.ee_partitions is not None:
             solver._esp_ee_partitions = args.ee_partitions
@@ -176,6 +235,24 @@ def main():
         solver.step(state, out, None, None, 1e-4)
 
     timings = measure(step, device, args.samples, args.repeats)
+    assembly_timings = {}
+    if args.profile and solver._esp_data is not None:
+        # Compare derivatives at identical frozen geometry/contact rows. Time
+        # all colors together so this has the same launch granularity as VBD.
+        # VBD updates state in place; use fresh model-default positions here.
+        frozen_state = model.state()
+        for name, kind, groups in (
+            ("particles", esp_contact._PARTICLE_BLOCKS, model.particle_color_groups),
+            ("bodies", esp_contact._BODY_BLOCKS, model.body_color_groups),
+        ):
+            if not len(groups):
+                continue
+
+            def assemble(kind=kind, groups=groups):
+                for color in range(len(groups)):
+                    solver._accumulate_esp_contacts(frozen_state, kind, color)
+
+            assembly_timings[name] = measure(assemble, device, args.samples, args.repeats)
     if args.profile and device.is_cuda:
         with wp.ScopedTimer("Solver step", cuda_filter=wp.TIMING_KERNEL, print=False) as timer:
             step()
@@ -184,7 +261,14 @@ def main():
             totals[result.name] += result.elapsed
         print("Kernel milliseconds:", sorted(totals.items(), key=lambda row: -row[1])[:15], flush=True)
     solver.check_esp_contacts()
+    if model.body_count:
+        overflow = int(solver.body_particle_contact_overflow_max.numpy()[0])
+        if overflow > solver.body_particle_contact_buffer_pre_alloc:
+            raise RuntimeError(f"Native body-particle contact buffer overflow: {overflow}")
+    if int(solver.contacts.soft_contact_count.numpy()[0]) > solver.contacts.soft_contact_max:
+        raise RuntimeError("Collision contact buffer overflow")
     assert np.isfinite(out.particle_q.numpy()).all()
+    distances = box_vertex_distances(model, out)
     print(
         json.dumps(
             {
@@ -194,8 +278,11 @@ def main():
                 "colors": len(model.particle_color_groups),
                 "rows": int(solver.contacts.soft_contact_count.numpy()[0]),
                 "step_ms": timings,
+                "assembly_ms": assembly_timings,
                 "median_ms": float(np.median(timings)),
                 "min_z": float(out.particle_q.numpy()[:, 2].min()),
+                "min_box_vertex_signed_distance": float(distances.min()),
+                "max_box_vertex_penetration": float(np.maximum(-distances, 0.0).max()),
             }
         ),
         flush=True,

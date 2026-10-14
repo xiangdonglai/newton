@@ -74,7 +74,7 @@ def barrier(delta, support, near_cutoff, near_only):
         if x >= 1:
             return d_sq * 0
         if x > 0:
-            total = total * (1 - 10 * x**3 + 15 * x**4 - 6 * x**5)
+            total = total * (1 - x) ** 3 * (1 + 3 * x + 6 * x**2)
     return total
 
 

@@ -33,7 +33,7 @@ import argparse
 import numpy as np
 import warp as wp
 from esp_common import box_mesh, patch
-from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks
+from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks, use_contact_formulas
 
 import newton
 
@@ -119,6 +119,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="cpu", help="cpu, cuda:0, or all")
     parser.add_argument(
+        "--esp-formulas",
+        choices=("direct", "chain", "direct-per-triangle"),
+        default="direct",
+        help="Integrated shared direct formulas (default), or saved chain/per-triangle references",
+    )
+    parser.add_argument(
         "--cloth-tilt", type=float, default=0.0, help="Cloth z slope; use 0.003 for smooth Hessian validation"
     )
     parser.add_argument(
@@ -133,11 +139,12 @@ if __name__ == "__main__":
         help="Compare production Warp and PyTorch energies; skip derivatives",
     )
     args = parser.parse_args()
-    for device in wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]:
-        run_example(
-            device,
-            check_derivatives=args.check_derivatives,
-            check_autodiff=args.check_autodiff,
-            check_torch_energy=args.check_torch_energy,
-            cloth_tilt=args.cloth_tilt,
-        )
+    with use_contact_formulas(args.esp_formulas):
+        for device in wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]:
+            run_example(
+                device,
+                check_derivatives=args.check_derivatives,
+                check_autodiff=args.check_autodiff,
+                check_torch_energy=args.check_torch_energy,
+                cloth_tilt=args.cloth_tilt,
+            )

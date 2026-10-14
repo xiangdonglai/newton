@@ -18,6 +18,7 @@ import warp as wp
 
 from newton._src.math import orthonormal_basis
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
+    _contact_uses_esp,
     _eval_body_particle_contact,
     _eval_soft_ef_contact,
     _reset_world_selected,
@@ -2275,6 +2276,7 @@ def gather_particle_body_contact_force_and_hessian(
     shape_margin: wp.array[float],
     contact_barycentric: wp.array[wp.vec3],
     esp_shape_mask: wp.array[bool],
+    esp_vertex_area: wp.array[wp.float64],
     # outputs
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
@@ -2307,9 +2309,7 @@ def gather_particle_body_contact_force_and_hessian(
         contact_index = node // 3
         corner = node - 3 * contact_index
         corners = body_particle_contact_indices[contact_index]
-        include_normal = True
-        if esp_shape_mask:
-            include_normal = not esp_shape_mask[contact_shape[contact_index]]
+        include_normal = not _contact_uses_esp(contact_shape[contact_index], corners, esp_shape_mask, esp_vertex_area)
         contact_ke = body_particle_contact_penalty_k[contact_index]
         contact_kd = body_particle_contact_material_kd[contact_index]
         contact_mu = body_particle_contact_material_mu[contact_index]
@@ -2410,6 +2410,7 @@ def scatter_particle_body_contact_force_and_hessian(
     shape_margin: wp.array[float],
     contact_barycentric: wp.array[wp.vec3],
     esp_shape_mask: wp.array[bool],
+    esp_vertex_area: wp.array[wp.float64],
     # outputs
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
@@ -2432,9 +2433,7 @@ def scatter_particle_body_contact_force_and_hessian(
             contact_index += worker_count
             continue
         corners = body_particle_contact_indices[contact_index]
-        include_normal = True
-        if esp_shape_mask:
-            include_normal = not esp_shape_mask[contact_shape[contact_index]]
+        include_normal = not _contact_uses_esp(contact_shape[contact_index], corners, esp_shape_mask, esp_vertex_area)
         contact_ke = body_particle_contact_penalty_k[contact_index]
         contact_kd = body_particle_contact_material_kd[contact_index]
         contact_mu = body_particle_contact_material_mu[contact_index]

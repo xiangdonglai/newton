@@ -40,7 +40,7 @@ def reference_energies(
             return np.full(2, np.inf)
         total = -((1 - distance / support) ** 2) * np.log(distance / support)
         x = np.clip(2 * distance / near_cutoff - 1, 0, 1)
-        return np.array([total, (1 - 10 * x**3 + 15 * x**4 - 6 * x**5) * total])
+        return np.array([total, (1 - x) ** 3 * (1 + 3 * x + 6 * x**2) * total])
 
     def point_potential(point, vertices, faces):
         def term(closest):
