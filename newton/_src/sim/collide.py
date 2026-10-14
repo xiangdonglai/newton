@@ -1496,6 +1496,7 @@ class CollisionPipeline:
         soft_contact_gap: float | None = None,
         soft_contact_margin: float | None = None,
         enable_rigid_soft_full_surface_contact: bool = False,
+        full_surface_contact_return_unfiltered: bool = False,
         requires_grad: bool | None = None,
         broad_phase: Literal["nxn", "sap", "explicit"]
         | BroadPhaseAllPairs
@@ -1578,6 +1579,11 @@ class CollisionPipeline:
                 :class:`~newton.solvers.SolverVBD`; other solvers raise on such contacts. Records are
                 emitted into :attr:`Contacts.soft_contact_indices`. Defaults to False. Fixed at
                 construction because it sizes the soft-contact buffer headroom.
+            full_surface_contact_return_unfiltered: Retain all rigid mesh edges and
+                nearby VT/TV/EE pairs, including inactive soft features and pairs whose
+                mesh sign cannot be resolved. Requires full-surface contact. Enable
+                this experimental mode for complete mesh DAT queries; force selection
+                remains separate. Fixed at construction. Defaults to False.
             requires_grad: Whether pipeline-generated soft contacts and the
                 deprecated automatic rigid-contact outputs require gradients.
                 If None, uses ``model.requires_grad``. Explicit calls to
@@ -2143,7 +2149,10 @@ class CollisionPipeline:
             mesh_mask = is_mesh & ((model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_PARTICLES)) != 0)
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model, shape_ok=~mesh_mask)
         self._soft_contact_pair_count = len(self.soft_rigid_contact_pairs)
+        if full_surface_contact_return_unfiltered and not enable_rigid_soft_full_surface_contact:
+            raise ValueError("full_surface_contact_return_unfiltered requires full-surface contact")
         self.enable_rigid_soft_full_surface_contact = enable_rigid_soft_full_surface_contact
+        self.full_surface_contact_return_unfiltered = full_surface_contact_return_unfiltered
         self._soft_mesh_contact_data = None
         empty_pairs = wp.empty(0, dtype=wp.vec2i, device=model.device)
 
@@ -2161,7 +2170,13 @@ class CollisionPipeline:
             self._soft_heightfield_face_pairs = _build_soft_face_rigid_contact_pairs(model, heightfield_capable)
             mesh_vertex_pairs = _build_soft_particle_rigid_contact_pairs(model, shape_ok=mesh_mask)
             if len(mesh_vertex_pairs):
-                self._soft_mesh_contact_data = MeshContactData(model, mesh_mask, mesh_vertex_pairs, soft_contact_gap)
+                self._soft_mesh_contact_data = MeshContactData(
+                    model,
+                    mesh_mask,
+                    mesh_vertex_pairs,
+                    soft_contact_gap,
+                    return_unfiltered=full_surface_contact_return_unfiltered,
+                )
         else:
             self.soft_edge_rigid_pairs = empty_pairs
             self.soft_face_rigid_pairs = empty_pairs
@@ -2644,6 +2659,9 @@ class CollisionPipeline:
         # afterwards -- otherwise the generation would advance by 2 per collide() call.
         if contacts.clear_buffers:
             contacts.clear(bump_generation=False)
+        # Non-mesh emitters have no complete rigid primitive. Clear previous mesh
+        # identities before any pass can reuse their contact slots.
+        contacts.soft_contact_rigid_indices.fill_(wp.vec3i(-1, -1, -1))
 
         model = self.model
         # update any additional parameters

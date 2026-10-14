@@ -470,7 +470,7 @@ def _mesh_feature_data(
 
 
 def _build_rigid_features(
-    model: Model, meshes: dict[int, Mesh]
+    model: Model, meshes: dict[int, Mesh], *, return_unfiltered: bool = False
 ) -> tuple[wp.array[wp.vec2i], wp.array[wp.vec3], wp.array[wp.vec3i], wp.array[wp.vec3]]:
 
     device = model.device
@@ -486,7 +486,9 @@ def _build_rigid_features(
         start, count = (int(value) for value in edge_ranges[shape])
         # Finalized tables include SDF edges cooked by the builder, which need
         # not be attached to the source Mesh. Slices may differ for one source.
-        collision_edges = packed_edges[start : start + count] if start >= 0 else mesh._collision_edges
+        collision_edges = None
+        if not return_unfiltered:
+            collision_edges = packed_edges[start : start + count] if start >= 0 else mesh._collision_edges
         key = (_geometry_key(mesh), None if collision_edges is None else np.asarray(collision_edges).tobytes())
         data = cache.get(key)
         if data is None:
@@ -613,6 +615,7 @@ def _local_side(outward: bool, inward: bool, separation: wp.vec3, reference: wp.
 def _detect_mesh_vertex_contacts(
     vt_pairs: wp.array[wp.vec2i],
     partition_depth: int,
+    return_unfiltered: bool,
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -640,7 +643,7 @@ def _detect_mesh_vertex_contacts(
     pair = vt_pairs[tid]
     particle_index = pair[0]
     shape_index = pair[1]
-    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+    if not return_unfiltered and (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
         return
     if (shape_flags[shape_index] & ShapeFlags.COLLIDE_PARTICLES) == 0:
         return
@@ -671,24 +674,24 @@ def _detect_mesh_vertex_contacts(
     sign_method = resolve_mesh_sign_method(shape_mesh_properties[shape_index])
     vertex_sign = _mesh_partition_sign(mesh, x_mesh, r_mesh, partitions, sign_method == MeshSignMethod.PARITY)
     if vertex_sign == 0:
-        if lane != 0:
+        if lane == 0:
+            # A finite proximity band must not discard already penetrating points.
+            # The expanded shape bounds have already rejected distant particles.
+            recovery_radius = wp.length(upper_bound - lower_bound) / min_scale
+            recovery = mesh_query_point_sign(mesh, x_mesh, recovery_radius, sign_method)
+            if recovery.result and recovery.sign < 0.0:
+                _append_mesh_contact(
+                    _MESH_FEATURE_VT + _MESH_FEATURE_INSIDE + _MESH_FEATURE_RECOVERY,
+                    particle_index,
+                    shape_index,
+                    recovery.face,
+                    contact_max,
+                    contact_count,
+                    features,
+                    contact_shapes,
+                )
+        if not return_unfiltered:
             return
-        # A finite proximity band must not discard already penetrating points.
-        # The expanded shape bounds have already rejected distant particles.
-        recovery_radius = wp.length(upper_bound - lower_bound) / min_scale
-        recovery = mesh_query_point_sign(mesh, x_mesh, recovery_radius, sign_method)
-        if recovery.result and recovery.sign < 0.0:
-            _append_mesh_contact(
-                _MESH_FEATURE_VT + _MESH_FEATURE_INSIDE + _MESH_FEATURE_RECOVERY,
-                particle_index,
-                shape_index,
-                recovery.face,
-                contact_max,
-                contact_count,
-                features,
-                contact_shapes,
-            )
-        return
     root = _mesh_query_partition(mesh, lane, partition_depth)
     if root == -2:
         return
@@ -700,7 +703,7 @@ def _detect_mesh_vertex_contacts(
         c = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 2), scale)
         cp, _rigid_bary, _feature = triangle_closest_point(a, b, c, x_local)
         if wp.length(x_local - cp) < threshold:
-            if wp.length_sq(wp.cross(b - a, c - a)) == 0.0:
+            if not return_unfiltered and wp.length_sq(wp.cross(b - a, c - a)) == 0.0:
                 continue  # degenerate sliver: no meaningful normal, neighbors still report
             _append_mesh_contact(
                 _MESH_FEATURE_VT + wp.where(vertex_sign < 0, _MESH_FEATURE_INSIDE, 0),
@@ -717,6 +720,7 @@ def _detect_mesh_vertex_contacts(
 @wp.kernel(enable_backward=False)
 def _detect_mesh_face_contacts(
     rigid_vertex_table: wp.array[wp.vec2i],
+    return_unfiltered: bool,
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -799,7 +803,7 @@ def _detect_mesh_face_contacts(
                     | (particle_flags[t1] & ParticleFlags.ACTIVE)
                     | (particle_flags[t2] & ParticleFlags.ACTIVE)
                 )
-                if active == 0:
+                if not return_unfiltered and active == 0:
                     continue
 
                 cp, bary, _feature = triangle_closest_point(particle_q[t0], particle_q[t1], particle_q[t2], x_w)
@@ -822,7 +826,7 @@ def _detect_mesh_face_contacts(
                     if sign == 2:
                         reference = transform_normal_with_scale(X_ws, scale, vertex_outward[tid])
                         sign = _local_side(outward, inward, cp - x_w, reference)
-                    if sign != 0:
+                    if return_unfiltered or sign != 0:
                         _append_mesh_contact(
                             _MESH_FEATURE_TV + wp.where(sign < 0, _MESH_FEATURE_INSIDE, 0),
                             tri_index,
@@ -838,6 +842,7 @@ def _detect_mesh_face_contacts(
 @wp.kernel(enable_backward=False)
 def _detect_mesh_edge_contacts(
     rigid_edge_table: wp.array[wp.vec3i],
+    return_unfiltered: bool,
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -919,7 +924,7 @@ def _detect_mesh_edge_contacts(
                 sv0 = edge_indices[edge_index, 2]
                 sv1 = edge_indices[edge_index, 3]
                 active = (particle_flags[sv0] & ParticleFlags.ACTIVE) | (particle_flags[sv1] & ParticleFlags.ACTIVE)
-                if active == 0:
+                if not return_unfiltered and active == 0:
                     continue
 
                 std = wp.closest_point_edge_edge(
@@ -945,7 +950,7 @@ def _detect_mesh_edge_contacts(
                     if sign == 2:
                         reference = transform_normal_with_scale(X_ws, scale, edge_outward[tid])
                         sign = _local_side(outward, inward, soft_point - rigid_point, reference)
-                    if sign != 0:
+                    if return_unfiltered or sign != 0:
                         _append_mesh_contact(
                             _MESH_FEATURE_EE + wp.where(sign < 0, _MESH_FEATURE_INSIDE, 0),
                             edge_index,
@@ -1113,8 +1118,10 @@ def _evaluate_mesh_contacts(
     rigid_edge_table: wp.array[wp.vec3i],
     rigid_edge_outward_dirs: wp.array[wp.vec3],
     edge_edge_parallel_epsilon: float,
+    edge_normal_parallel_epsilon: float,
     soft_contact_particle: wp.array[wp.int32],
     soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
@@ -1144,6 +1151,7 @@ def _evaluate_mesh_contacts(
 
     particle = wp.int32(-1)
     corners = wp.vec3i(-1, -1, -1)
+    rigid_corners = wp.vec3i(-1, -1, -1)
     bary = wp.vec3(0.0)
     body_pos = wp.vec3(0.0)
     body_vel = wp.vec3(0.0)
@@ -1154,6 +1162,8 @@ def _evaluate_mesh_contacts(
         corners = wp.vec3i(particle, -1, -1)
         bary = wp.vec3(1.0, 0.0, 0.0)
         face = rigid_feature
+        if (feature[0] & _MESH_FEATURE_RECOVERY) == 0:
+            rigid_corners = wp.vec3i(3 * face, 3 * face + 1, 3 * face + 2)
         x_local = wp.transform_point(X_sw, particle_q[particle])
         a = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 0), scale)
         b = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 1), scale)
@@ -1180,6 +1190,7 @@ def _evaluate_mesh_contacts(
     elif family == _MESH_FEATURE_TV:
         vertex_entry = rigid_vertex_table[rigid_feature]
         index = vertex_entry[1]
+        rigid_corners = wp.vec3i(index, -1, -1)
         t0 = tri_indices[soft_feature, 0]
         t1 = tri_indices[soft_feature, 1]
         t2 = tri_indices[soft_feature, 2]
@@ -1197,6 +1208,7 @@ def _evaluate_mesh_contacts(
         edge_entry = rigid_edge_table[rigid_feature]
         index0 = edge_entry[1]
         index1 = edge_entry[2]
+        rigid_corners = wp.vec3i(index0, index1, -1)
         sv0 = edge_indices[soft_feature, 2]
         sv1 = edge_indices[soft_feature, 3]
         corners = wp.vec3i(sv0, sv1, -1)
@@ -1217,7 +1229,7 @@ def _evaluate_mesh_contacts(
         cr = wp.cross(e_rigid, e_soft)
         cr_len = wp.length(cr)
         outward_w = transform_normal_with_scale(X_ws, scale, rigid_edge_outward_dirs[rigid_feature])
-        if cr_len > edge_edge_parallel_epsilon * wp.length(e_rigid) * wp.length(e_soft):
+        if cr_len > edge_normal_parallel_epsilon * wp.length(e_rigid) * wp.length(e_soft):
             n_ref = cr / cr_len
             if wp.dot(n_ref, outward_w) < 0.0:
                 n_ref = -n_ref
@@ -1244,6 +1256,7 @@ def _evaluate_mesh_contacts(
 
     soft_contact_particle[tid] = particle
     soft_contact_indices[tid] = corners
+    soft_contact_rigid_indices[tid] = rigid_corners
     soft_contact_barycentric[tid] = bary
     soft_contact_body_pos[tid] = body_pos
     soft_contact_body_vel[tid] = body_vel
@@ -1307,6 +1320,7 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
             inputs=[
                 vt_pairs,
                 partition_depth,
+                data.return_unfiltered,
                 state.particle_q,
                 model.particle_radius,
                 model.particle_flags,
@@ -1335,6 +1349,7 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
             dim=n_tv,
             inputs=[
                 rigid_vertex_table,
+                data.return_unfiltered,
                 state.particle_q,
                 model.particle_radius,
                 model.particle_flags,
@@ -1362,6 +1377,7 @@ def launch_soft_mesh_contacts(*, model: Model, state: State, contacts: Contacts,
             dim=n_ee,
             inputs=[
                 rigid_edge_table,
+                data.return_unfiltered,
                 state.particle_q,
                 model.particle_radius,
                 model.particle_flags,
@@ -1448,10 +1464,12 @@ def _launch_evaluate_mesh_contacts(model: Model, state: State, contacts: Contact
             rigid_edge_table,
             rigid_edge_outward_dirs,
             data.edge_edge_parallel_epsilon,
+            data.edge_normal_parallel_epsilon,
         ],
         outputs=[
             contacts.soft_contact_particle,
             contacts.soft_contact_indices,
+            contacts.soft_contact_rigid_indices,
             contacts.soft_contact_barycentric,
             contacts.soft_contact_body_pos,
             contacts.soft_contact_body_vel,
@@ -1705,13 +1723,27 @@ class MeshContactData:
 
     @property
     def edge_edge_parallel_epsilon(self) -> float:
+        # Warp compares this with squared edge lengths, not an angle.
+        return 0.0 if self.return_unfiltered else self.edge_normal_parallel_epsilon
+
+    @property
+    def edge_normal_parallel_epsilon(self) -> float:
         return self.detector.edge_edge_parallel_epsilon if self.detector is not None else 1.0e-5
 
-    def __init__(self, model: Model, shape_mask: np.ndarray, vertex_pairs: wp.array[wp.vec2i], gap: float):
+    def __init__(
+        self,
+        model: Model,
+        shape_mask: np.ndarray,
+        vertex_pairs: wp.array[wp.vec2i],
+        gap: float,
+        *,
+        return_unfiltered: bool = False,
+    ):
         self.vertex_pairs = vertex_pairs
+        self.return_unfiltered = return_unfiltered
         meshes = _collision_meshes(model, shape_mask)
         if model.tri_count:
-            self.rigid_features = _build_rigid_features(model, meshes)
+            self.rigid_features = _build_rigid_features(model, meshes, return_unfiltered=return_unfiltered)
             if model.edge_count == 0:
                 self.rigid_features = (
                     *self.rigid_features[:2],
@@ -1749,7 +1781,7 @@ class MeshContactData:
         # remain capacity checked.
         max_faces = max(len(mesh.indices) // 3 for mesh in meshes.values())
         bound = (
-            len(vertex_pairs) * max_faces
+            len(vertex_pairs) * (max_faces + 1)
             + len(vertices) * model.tri_count
             + len(edges) * model.edge_count
             + 2 * len(self.rigid_faces) * model.edge_count

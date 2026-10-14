@@ -82,6 +82,7 @@ from .rigid_vbd_kernels import (
     compute_rigid_contact_forces,
     compute_rod_dahl_parameters,
     forward_step_rigid_bodies,
+    guard_rigid_soft_contact_overflow,
     init_body_body_contact_materials,
     init_body_body_contacts_alm,
     init_body_particle_contacts,
@@ -613,8 +614,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 Each rigid-soft contact reported by the owned collision pipeline defines a division
                 plane at its detection-time reference configuration; rigid pose updates and particle
                 displacements are jointly truncated so neither side crosses it. Rigid rotation makes
-                trajectories curved, so crossing times against the contact's stored surface point are
-                found by sampling and bisection.
+                trajectories curved, so crossing times are found by sampling and bisection,
+                optionally certified with interval arithmetic. Full-surface mesh contacts use
+                complete VT/TV/EE primitives through Contacts.soft_contact_rigid_indices;
+                every corner stays on its assigned side of a certified separating plane.
+                This requires full_surface_contact_return_unfiltered=True on the pipeline.
                 Requires a solver-owned pipeline (``collision_pipeline=``); each side's motion budget
                 between detections is 0.5 x ``dat_conservative_bound_relaxation`` x the minimum
                 rigid-soft query radius,
@@ -630,12 +634,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                 bounds the per-detection motion of every dynamic body and particle in the
                 model, not only those near soft geometry.
 
-                Truncation acts per reported contact against its own division plane; it does not
-                attempt dense primitive-pair coverage, so it does not by itself guarantee a globally
-                penetration-free rigid-soft state for general nonconvex geometry. If a soft-contact
-                overflow warning is reported, contacts were dropped and are not truncated on that pass.
-                Sampling and bisection alone can miss a rigid trajectory that crosses and returns
-                between samples; the optional interval path detects such cases but remains experimental.
+                Full-surface mesh coverage includes every mesh edge and nearby VT/TV/EE pair,
+                including rows rejected by the force mask. It requires initially separated
+                geometry; topology, nonzero mesh scales, radii, and motion bounds must remain unchanged. Analytic
+                and penetration-recovery contacts retain their point-anchor behavior; this
+                is not a general initial-penetration recovery method. When no separating
+                plane can be certified, the affected primitives freeze. Contact overflow
+                freezes all solver-controlled rigid and soft motion at the detection
+                reference until a complete detection succeeds (increase contact capacity).
+                Sampling and bisection alone can miss a rigid trajectory that crosses and
+                returns between samples; enable the experimental interval path to certify
+                the complete rigid trajectory.
             rigid_soft_dat_use_interval_arithmetic: Selector for rigid DAT trajectory
                 truncation. ``False`` uses sampling and bisection, plus an interval
                 derivative bound that releases rows starting inside the empty band only
@@ -2883,6 +2892,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                 "must be snapshotted at the exact detection instants the solver drives."
             )
         has_rigid_soft_queries = self.collision_pipeline._has_rigid_soft_queries
+        if (
+            self.collision_pipeline._soft_mesh_contact_data is not None
+            and not self.collision_pipeline.full_surface_contact_return_unfiltered
+        ):
+            raise ValueError(
+                "Full-surface mesh DAT requires full_surface_contact_return_unfiltered=True "
+                "on the collision pipeline so SDF edge selection cannot omit DAT constraints."
+            )
         if self.integrate_with_external_rigid_solver:
             raise ValueError("rigid_soft_enable_dat is not supported with an external rigid solver.")
 
@@ -3022,6 +3039,19 @@ class SolverVBD(SolverBase, CouplingInterface):
                 reset_particles=reset_particles,
             )
 
+    def _guard_rigid_soft_contact_overflow(self, contacts: Contacts):
+        """Freeze bounded updates if the current detection dropped any contact rows."""
+        # Rigid-only models have no soft queries or particle truncation storage.
+        if self.model.particle_count == 0:
+            return
+        wp.launch(
+            guard_rigid_soft_contact_overflow,
+            dim=max(self.model.particle_count, self.model.body_count),
+            inputs=[contacts.soft_contact_count, contacts.soft_contact_max],
+            outputs=[self.truncation_ts, self.body_truncation_ts],
+            device=self.device,
+        )
+
     def _rigid_penetration_free_truncation(self, state: State, contacts: Contacts | None):
         """Truncate accumulated rigid and particle updates against rigid-soft planes.
 
@@ -3049,7 +3079,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_body_pos,
                     contacts.soft_contact_normal,
                     contacts.soft_contact_barycentric,
+                    contacts.soft_contact_rigid_indices,
                     self.model.shape_body,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
                     self.body_q_prev_collision_detection,
@@ -3064,6 +3098,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ],
                 device=self.device,
             )
+
+        self._guard_rigid_soft_contact_overflow(contacts)
 
         if self.model.particle_count > 0:
             max_displacement = self._rigid_dat_particle_max_displacement
@@ -3163,7 +3199,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_body_pos,
                     contacts.soft_contact_normal,
                     contacts.soft_contact_barycentric,
+                    contacts.soft_contact_rigid_indices,
                     self.model.shape_body,
+                    self.model.shape_transform,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
                     self.pos_prev_collision_detection,
                     self.particle_displacements,
                     self.body_q_prev_collision_detection,
@@ -3178,6 +3218,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ],
                 device=self.device,
             )
+
+        if rigid_dat_active:
+            self._guard_rigid_soft_contact_overflow(contacts)
 
         wp.launch(
             kernel=apply_truncation_ts,
