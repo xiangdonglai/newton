@@ -644,6 +644,15 @@ def test_edge_probes(device):
             near_endpoint = original.copy()
             near_endpoint[0, 0] = 0.04998
             examples["endpoint mollifier transition"] = near_endpoint
+            # Reproduce the reported large sideways force near endpoint B.
+            # These differ only in B.x; the first is inside the narrow endpoint
+            # weight transition, and the second has saturated weight. Check the
+            # force against energy differences even when that force is large.
+            for name, b_x in (
+                ("B endpoint weight transition", 0.05004917085170746),
+                ("B endpoint weight saturated", 0.05015404149889946),
+            ):
+                examples[name] = np.array([[0.035, -0.002947, 0.0006], [b_x, -0.002825, 0.0008]], dtype=np.float32)
         for name, endpoints in examples.items():
             energy, force, info = probe.evaluate(endpoints, support, 1.0)
             assert energy > 0 and info["active"] > 0
