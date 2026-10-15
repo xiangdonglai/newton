@@ -392,6 +392,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_body_particle_contact_buffer_size: int = 256,  # Per-body soft-contact list capacity (particle + edge/face)
         rigid_soft_contact_use_log_barrier: bool = False,  # Use particle-style normal log barrier
         rigid_soft_contact_use_esp: bool = False,
+        rigid_soft_contact_esp_precision: str = "float64",
         # Rigid body - joints
         rigid_joint_linear_ke: float = 1.0e5,  # Structural linear joint stiffness
         rigid_joint_angular_ke: float = 1.0e5,  # Structural angular joint stiffness
@@ -592,11 +593,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                 nonintersecting manifold meshes, and complete query buffers. Analytical shapes retain their
                 existing force law. Mesh damping/friction retain the OGC force mask and existing penalty-based
                 normal load; only mesh normal elasticity is replaced, not added twice. Uses unnormalized
-                vertex and adaptive EE quadrature with float64 derivatives. Each evaluation computes
+                vertex and adaptive EE quadrature with the selected ESP precision. Each evaluation computes
                 a complete 3x3 particle or 6x6 body block. Hessians are exact selected-branch derivatives,
                 not PSD-projected by default; the local experimental projection switch is in esp_contact.py.
                 Particles use the model's existing VBD color groups. Additional ESP couplings within a
-                group use positions from before that group's parallel update. No mesh penetration recovery,
+                group use positions from before that group's parallel update. EE_DEPTH recovery rows
+                are skipped by ESP, not treated as errors or ordinary EE samples. No mesh penetration recovery,
                 differentiable simulation, external rigid solver, deterministic assembly, or per-row
                 contact wrench export is supported.
                 Call :meth:`check_esp_contacts` after CUDA graph replay; uncaptured steps check automatically.
@@ -611,6 +613,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ESP does not use per-row AVBD penalty ramping: different coefficients on neighboring
                 triangle rows would break cancellation of their shared feature terms. Native damping,
                 friction, and analytical contact retain their existing parameter/ramping behavior.
+            rigid_soft_contact_esp_precision: Arithmetic precision for ESP kernels and evaluation buffers:
+                ``"float32"`` or ``"float64"`` (default). State and collision geometry remain float32.
+                The native force-mask area buffer retains float64 storage in either mode.
             rigid_joint_linear_ke: Material stiffness for non-rod structural linear joint slots [N/m].
             rigid_joint_angular_ke: Material stiffness for non-rod structural angular joint slots [N·m/rad].
             rigid_joint_linear_k_start: Linear penalty seed for legacy AVBD ramping [N/m]. Used when
@@ -966,6 +971,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.friction_epsilon = friction_epsilon
         self.rigid_soft_contact_use_log_barrier = bool(rigid_soft_contact_use_log_barrier)
         self.rigid_soft_contact_use_esp = bool(rigid_soft_contact_use_esp)
+        if rigid_soft_contact_esp_precision not in ("float32", "float64"):
+            raise ValueError("rigid_soft_contact_esp_precision must be 'float32' or 'float64'")
+        self.rigid_soft_contact_esp_precision = rigid_soft_contact_esp_precision
         self._esp_data = None
         self._esp_shape_mask = None
         self._joint_mode_deprecation_warned = False
@@ -2456,22 +2464,26 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise ValueError("ESP does not yet support gradient taping")
         if not self.model.tri_count:
             raise ValueError("Full-surface ESP requires a soft triangle mesh")
+        scalar = wp.float32 if self.rigid_soft_contact_esp_precision == "float32" else wp.float64
+        self._esp_kernels = esp_contact.get_esp_kernels(scalar)
         with wp.ScopedDevice(self.device):
-            self._esp_data = esp_contact.create_esp_contact_data(self.model, self.collision_pipeline)
-            self._esp_rigid_positions = wp.empty(self._esp_data.rigid_local_vertices.shape[0], dtype=wp.vec3d)
-            self._esp_lists, self._esp_list_sort_values = esp_contact.create_edge_triangle_lists(
+            self._esp_data = self._esp_kernels.create_esp_contact_data(self.model, self.collision_pipeline)
+            self._esp_rigid_positions = wp.empty(
+                self._esp_data.rigid_local_vertices.shape[0], dtype=self._esp_kernels.Vec3
+            )
+            self._esp_lists, self._esp_list_sort_values = self._esp_kernels.create_edge_triangle_lists(
                 self._esp_data.soft, self._esp_data.rigid, self._pipeline_contacts.soft_contact_max
             )
-            self._esp_energy = wp.zeros(2, dtype=wp.float64)
-            self._esp_ee_samples = wp.empty((self._pipeline_contacts.soft_contact_max, 2), dtype=wp.vec4d)
+            self._esp_energy = wp.zeros(2, dtype=scalar)
+            self._esp_ee_samples = wp.empty((self._pipeline_contacts.soft_contact_max, 2), dtype=self._esp_kernels.Vec4)
             self._esp_error = wp.zeros(1, dtype=int)
-            self._esp_particle_forces = wp.zeros((self.model.particle_count, 3), dtype=wp.float64)
-            self._esp_particle_hessians = wp.zeros((self.model.particle_count, 3, 3), dtype=wp.float64)
-            self._esp_body_forces = wp.zeros((self.model.body_count, 6), dtype=wp.float64)
-            self._esp_body_hessians = wp.zeros((self.model.body_count, 6, 6), dtype=wp.float64)
+            self._esp_particle_forces = wp.zeros((self.model.particle_count, 3), dtype=scalar)
+            self._esp_particle_hessians = wp.zeros((self.model.particle_count, 3, 3), dtype=scalar)
+            self._esp_body_forces = wp.zeros((self.model.body_count, 6), dtype=scalar)
+            self._esp_body_hessians = wp.zeros((self.model.body_count, 6, 6), dtype=scalar)
             self._esp_block_dim = 32
             # Whole-block derivatives share geometry across all Hessian entries.
-            # Start with one thread per contact row, including EE rows.
+            # Each worker evaluates complete rows; no EE list subdivision by default.
             self._esp_ee_partitions = 1
             self._esp_static_positions_initialized = False
             self._esp_shape_mask = wp.array(self._esp_data.rigid_face_offsets.numpy() >= 0, dtype=bool)
@@ -2481,7 +2493,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         data = self._esp_data
         if self.model.body_count or not self._esp_static_positions_initialized:
             wp.launch(
-                esp_contact.update_rigid_vertices,
+                self._esp_kernels.update_rigid_vertices,
                 dim=self._esp_rigid_positions.shape[0],
                 inputs=[
                     data.rigid_local_vertices,
@@ -2495,11 +2507,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
             self._esp_static_positions_initialized = True
 
-    def _accumulate_esp_contacts(self, state, block_kind, color=-1):
+    def _accumulate_esp_contacts(self, state, block_kind, color=-1, *, refresh_rigid_positions=True):
         """Accumulate one color's raw ESP blocks, or validate final-state energy."""
-        self._prepare_esp_contact_inputs(state)
+        if refresh_rigid_positions:
+            self._prepare_esp_contact_inputs(state)
         body = block_kind == esp_contact._BODY_BLOCKS
-        esp_contact.launch_contact_blocks(
+        self._esp_kernels.launch_contact_blocks(
             self.model,
             state,
             self.contacts,
@@ -2517,11 +2530,13 @@ class SolverVBD(SolverBase, CouplingInterface):
             ee_samples=self._esp_ee_samples,
         )
 
-    def _add_esp_particle_contacts(self, state, ids, *, color=-1):
+    def _add_esp_particle_contacts(self, state, ids, *, color=-1, refresh_rigid_positions=True):
         """Add summed ESP particle blocks, optionally projecting their Hessians to PSD."""
-        self._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, color)
+        self._accumulate_esp_contacts(
+            state, esp_contact._PARTICLE_BLOCKS, color, refresh_rigid_positions=refresh_rigid_positions
+        )
         wp.launch(
-            esp_contact.add_particle_blocks,
+            self._esp_kernels.add_particle_blocks,
             dim=ids.size,
             inputs=[ids, self._esp_particle_forces, self._esp_particle_hessians, self._esp_error],
             outputs=[self.particle_forces, self.particle_hessians],
@@ -2532,7 +2547,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Add summed ESP body blocks, optionally projecting their Hessians to PSD."""
         self._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS, color)
         wp.launch(
-            esp_contact.add_body_blocks,
+            self._esp_kernels.add_body_blocks,
             dim=ids.size,
             inputs=[
                 ids,
@@ -3595,7 +3610,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             return
 
         if self._esp_data is not None:
-            esp_contact.rebuild_edge_triangle_lists(
+            self._esp_kernels.rebuild_edge_triangle_lists(
                 contacts, self._esp_data, self._esp_lists, self._esp_list_sort_values
             )
 
@@ -4077,7 +4092,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                     )
 
             if self._esp_data is not None:
-                self._add_esp_particle_contacts(state_in, model.particle_color_groups[color], color=color)
+                # Without rigid-soft DAT, particle colors leave body poses unchanged.
+                # With it, truncation below may move bodies after every color.
+                self._add_esp_particle_contacts(
+                    state_in,
+                    model.particle_color_groups[color],
+                    color=color,
+                    refresh_rigid_positions=color == 0 or self.rigid_soft_enable_dat,
+                )
 
             if model.spring_count:
                 wp.launch(

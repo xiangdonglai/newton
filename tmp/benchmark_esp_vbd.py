@@ -34,7 +34,17 @@ import newton.solvers
 from newton._src.solvers.vbd import esp_contact
 
 
-def make_grid_case(device, resolution=8, *, iterations=4, dynamic=False, gap=0.0003, dat=False, force_law="esp"):
+def make_grid_case(
+    device,
+    resolution=8,
+    *,
+    iterations=4,
+    dynamic=False,
+    gap=0.0003,
+    dat=False,
+    force_law="esp",
+    esp_precision="float64",
+):
     """Place a tilted cloth grid over a box, including its top edges."""
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
@@ -98,6 +108,7 @@ def make_grid_case(device, resolution=8, *, iterations=4, dynamic=False, gap=0.0
         )
         solver = newton.solvers.SolverVBD(
             model,
+            rigid_soft_contact_esp_precision=esp_precision,
             collision_pipeline=pipeline,
             # One body can receive every detected row in this one-box fixture.
             # Use the same complete buffer for ESP and both native force laws.

@@ -69,6 +69,19 @@ def fixtures() -> dict[str, np.ndarray]:
         "parallel": parallel,
         "outside": outside,
         "too_far": too_far,
+        # EE samples are interior (s=.01,t=.02), but endpoint c projects
+        # before a on the finite soft edge. Its clamping correction is active
+        # inside the endpoint mollifier, not hidden by a constant unit factor.
+        "clamped_endpoint": np.array(
+            [
+                [0, 0, 0.11],
+                [1, 0, 0.11],
+                [-0.006, -0.004, 0],
+                [0.794, 0.196, 0],
+                [0.2, 0.3, -0.05],
+                [0.3, 0.7, 0.13],
+            ]
+        ),
     }
     rng = np.random.default_rng(381)
     for i in range(8):
@@ -89,23 +102,23 @@ def fixtures() -> dict[str, np.ndarray]:
     return cases
 
 
-def torch_energy(positions: torch.Tensor) -> torch.Tensor:
+def torch_energy(positions: torch.Tensor, near: float = 0.15) -> torch.Tensor:
     """Evaluate the whole EE scalar expression without any explicit derivatives."""
     a, b, c, d, rt, st = positions
-    q, qb, weight = ee_sample(a, b, c, d, 0.15)
+    q, qb, weight = ee_sample(a, b, c, d, near)
     total = positions.sum() * 0
     if weight <= 0:
         return total
     for point, triangle, area in ((q, (c, d, rt), 0.018), (qb, (a, b, st), 0.024)):
-        value = barrier(point - triangle_closest(point, *triangle), 1, 0.15, True)
+        value = barrier(point - triangle_closest(point, *triangle), 1, near, True)
         for i in range(3):
-            value -= 0.5 * barrier(point - segment_closest(point, triangle[i], triangle[(i + 1) % 3]), 1, 0.15, True)
-            value += (0.2, 0.25, 0.2)[i] * barrier(point - triangle[i], 1, 0.15, True)
+            value -= 0.5 * barrier(point - segment_closest(point, triangle[i], triangle[(i + 1) % 3]), 1, near, True)
+            value += (0.2, 0.25, 0.2)[i] * barrier(point - triangle[i], 1, near, True)
         total += area * weight * value
     return total
 
 
-def torch_body_energy(motion: torch.Tensor, positions: np.ndarray) -> torch.Tensor:
+def torch_body_energy(motion: torch.Tensor, positions: np.ndarray, near: float = 0.15) -> torch.Tensor:
     """Move the three rigid vertices using a true matrix exponential."""
     x = torch.tensor(positions, dtype=torch.float64)
     com = torch.tensor([0.01, -0.02, -0.03], dtype=torch.float64)
@@ -114,7 +127,7 @@ def torch_body_energy(motion: torch.Tensor, positions: np.ndarray) -> torch.Tens
     cross_matrix = torch.stack((zero, -wz, wy, wz, zero, -wx, -wy, wx, zero)).reshape(3, 3)
     rotation = torch.linalg.matrix_exp(cross_matrix)
     moved = (x[2:5] - com) @ rotation.T + com + motion[:3]
-    return torch_energy(torch.cat((x[:2], moved, x[5:])))
+    return torch_energy(torch.cat((x[:2], moved, x[5:])), near)
 
 
 class TestEspEEImplicitFormulas(unittest.TestCase):

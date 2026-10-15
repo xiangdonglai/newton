@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Drag a particle and compare ESP with Newton's OGC-style mesh contact.
+"""Drag a particle, or two edge endpoints, and inspect ESP contact forces.
 
 Run from newton_4227 (no PyTorch required):
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --scene figure2
+    DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --probe ee --scene box
+    DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --probe ee --scene figure2
     uv run --no-sync python tmp/view_esp_force_field.py --test --device cpu
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --smoke-test --screenshot /tmp/esp-force.png
 
@@ -15,7 +17,7 @@ Here its analogue is a circular fillet (25 mm radius) between two 45-degree
 arms, extruded in y and triangulated. The y=0 slice is far from the boundary.
 This is a discretized analogue, not the paper's original geometry asset.
 
-Every update runs CollisionPipeline and its actual OGC force filter. ESP uses
+Particle mode: every update runs CollisionPipeline and its actual OGC force filter. ESP uses
 all VT rows and the production triangle derivatives from esp_contact.py. There is only one
 source point per evaluation: this is pointwise P, not the integrated cloth
 energy or its EE quadrature. No simulation, damping, or friction is involved.
@@ -31,9 +33,27 @@ logarithmic, and quadratic-continuation branches; it is finite at d=0.
 Thus k has units N/m, E is J and force is N.
 Changing the force law changes magnitudes; the same-barrier mode isolates
 the geometric filtering difference. Only rendered arrows are length-capped.
+
+EE mode: the orange edge A--B belongs to a beige source triangle with fixed
+third vertex C. Drag either endpoint's gizmo, or edit its coordinates in mm.
+The production VBD kernels evaluate the EE terms involving A--B and all
+queried rigid edges, in both directions. Complete VT/TV/EE neighborhoods are
+built before selecting those terms. Rest-area weights remain fixed; sample
+positions and weights are differentiated. Magenta arrows show endpoint forces
+(or gradients via the checkbox). Fixed vertex quadratures and EE terms from
+the other two source edges are deliberately omitted: this is not total mesh
+contact energy. OGC comparisons remain available in Particle mode.
+
+Target triangles are visible in both modes. EE mode always uses the current
+integrated FP64 derivatives, even if --esp-formulas=chain selects historical
+point-mode formulas. Collision positions are float32. There is no time step
+or collision prevention: dragging into intersecting/singular configurations
+is outside this ESP evaluation's domain. Reported errors hide the arrows,
+not a physical recovery force. The original figure geometry is unchanged.
 """
 
 import argparse
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +63,7 @@ from esp_common import box_mesh
 
 import newton
 from newton._src.geometry.soft_contacts_mesh import filter_soft_mesh_contacts
+from newton._src.solvers.vbd import esp_contact
 from newton._src.solvers.vbd.esp_contact import (
     EspSurfaceData,
     build_esp_surface_data,
@@ -50,6 +71,7 @@ from newton._src.solvers.vbd.esp_contact import (
     triangle_feature_weights,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
+from newton.solvers import SolverVBD
 
 wp.set_module_options({"enable_backward": False})
 
@@ -68,6 +90,14 @@ PRESETS = [
         "One minimum": (0.020, 0, 0.04),
         "Symmetric": (0, 0, 0.04),
     },
+]
+
+# Vertices A/B form the draggable edge; C supplies a real source triangle for
+# the production rest-area weights and the reverse-direction EE potential.
+# C and all rest areas stay fixed when A or B is dragged. Units: meters.
+EDGE_TRIANGLES = [
+    np.array([[0.035, -0.016, 0.0006], [0.065, 0.017, 0.0008], [0.036, 0.035, 0.020]], dtype=np.float32),
+    np.array([[-0.009, -0.016, 0.003], [0.011, 0.018, 0.0035], [-0.008, 0.037, 0.026]], dtype=np.float32),
 ]
 
 
@@ -163,7 +193,7 @@ def evaluate_contacts(
     r = wp.float64(support)
     coefficient = wp.float64(stiffness) * r * r
     ids = target.faces[face]
-    edge_weights, vertex_weights, reversed_edges = triangle_feature_weights(target, face)
+    edge_weights, vertex_weights = triangle_feature_weights(target, face)
     if use_direct_formulas:
         value, gradient, hessian = particle_triangle(
             points[particle],
@@ -180,6 +210,10 @@ def evaluate_contacts(
     else:
         # Explicitly selected historical reference; the default above calls
         # exactly the direct mathematical function used by SolverVBD.
+        reversed_edges = wp.vec3i()
+        for corner in range(3):
+            edge = target.adjacency.tri_edge_indices[face, corner]
+            reversed_edges[corner] = int(target.edges[edge][0] != ids[corner])
         a = particle_point(target_positions[ids[0]], False)
         b = particle_point(target_positions[ids[1]], False)
         c = particle_point(target_positions[ids[2]], False)
@@ -290,6 +324,179 @@ class ForceProbe:
         energy, forces = self.energy.numpy().copy(), self.forces.numpy().copy()
         forces[~np.isfinite(energy)] = np.nan
         return energy, forces, self.row_counts.numpy().copy(), self.distances.numpy().copy()
+
+
+@wp.kernel
+def select_edge_rows(
+    count: wp.array[int],
+    features: wp.array[wp.vec3i],
+    source_edge: int,
+    selected_features: wp.array[wp.vec3i],
+):
+    """Select EE energy terms, without removing rows used to build neighborhoods."""
+    row = wp.tid()
+    if row >= wp.min(count[0], features.shape[0]):
+        return
+    feature = features[row]
+    # Recovery rows must still reach the production error check. Ordinary rows
+    # keep their original indices, so the lists and sample cache remain aligned.
+    if feature[0] >= 0 and (feature[0] & 7) < 3:
+        if (feature[0] & 7) != 2 or feature[1] != source_edge:
+            feature[0] = -1
+    selected_features[row] = feature
+
+
+class EdgeForceProbe:
+    """EE terms involving edge A--B, evaluated by the actual VBD launch path.
+
+    Each selected rigid edge contributes both directions of the camera-ready
+    EE energy. All VT/TV/EE rows build the target-triangle lists first; selecting
+    EE terms afterward must not remove triangles needed to evaluate P_near.
+    The force includes derivatives of sample position, weight, and target
+    geometry. The source triangle's third vertex C stays fixed in the viewer.
+    This is the selected edge's EE contribution, not total mesh contact energy.
+    """
+
+    def __init__(self, scene, device):
+        self.vertices, self.faces = scene_mesh(scene)
+        self.rest_triangle = EDGE_TRIANGLES[scene].copy()
+        self.device = wp.get_device(device)
+        with wp.ScopedDevice(self.device):
+            builder = newton.ModelBuilder(gravity=(0, 0, 0))
+            builder.add_shape_mesh(
+                -1,
+                mesh=newton.Mesh(self.vertices, self.faces.ravel(), compute_inertia=False),
+                cfg=builder.ShapeConfig(ke=100.0, kd=0.0, mu=0.0, margin=0.0),
+            )
+            builder.add_cloth_mesh(
+                pos=wp.vec3(),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(),
+                vertices=self.rest_triangle.tolist(),
+                indices=[0, 1, 2],
+                density=1.0,
+                particle_radius=0.03 if scene == 0 else 0.06,
+            )
+            builder.color()
+            self.model = builder.finalize()
+            self.state = self.model.state()
+            # Capacity covers all source vertices/faces/edges against the target.
+            self.pipeline = newton.CollisionPipeline(
+                self.model,
+                enable_rigid_soft_full_surface_contact=True,
+                full_surface_contact_return_unfiltered=True,
+                soft_contact_gap=0.001,
+                soft_contact_max=16 * len(self.faces) + 64,
+            )
+            self.solver = SolverVBD(
+                self.model,
+                collision_pipeline=self.pipeline,
+                rigid_soft_contact_use_esp=True,
+                iterations=1,
+            )
+            self.contacts = self.solver.contacts
+            self.selected_contacts = copy.copy(self.contacts)
+            self.selected_contacts._soft_contact_mesh_features = wp.empty_like(
+                self.contacts._soft_contact_mesh_features
+            )
+            edges = self.solver._esp_data.soft.edges.numpy()
+            self.edge_index = int(np.flatnonzero(np.all(np.sort(edges, axis=1) == (0, 1), axis=1))[0])
+
+    def evaluate(self, endpoints, support, stiffness=100.0):
+        """Redetect at the dragged configuration; return E, all three forces, metadata."""
+        triangle = self.rest_triangle.copy()
+        triangle[:2] = np.asarray(endpoints, dtype=np.float32).reshape(2, 3)
+        if np.linalg.norm(np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])) < 1e-10:
+            raise ValueError("Degenerate source triangle: move an endpoint away from the A--B--C line")
+        solver = self.solver
+        with wp.ScopedDevice(self.device):
+            self.state.particle_q.assign(triangle)
+            self.model.particle_radius.fill_(support)
+            solver._esp_data.soft_mesh_radius.fill_(float(np.float32(support)))
+            self.model.shape_material_ke.fill_(stiffness)
+            self.model.soft_contact_ke = stiffness
+            self.pipeline.collide(self.state, self.contacts)
+            count = int(self.contacts.soft_contact_count.numpy()[0])
+            if count > self.contacts.soft_contact_max:
+                raise RuntimeError("Contact overflow: EE results would be incomplete")
+            esp_contact.rebuild_edge_triangle_lists(
+                self.contacts,
+                solver._esp_data,
+                solver._esp_lists,
+                solver._esp_list_sort_values,
+            )
+            solver._prepare_esp_contact_inputs(self.state)
+            wp.launch(
+                select_edge_rows,
+                dim=self.contacts.soft_contact_max,
+                inputs=[self.contacts.soft_contact_count, self.contacts._soft_contact_mesh_features, self.edge_index],
+                outputs=[self.selected_contacts._soft_contact_mesh_features],
+            )
+            solver._esp_error.zero_()
+            # The normal single-worker solve no longer stores EE sample values.
+            # Populate them explicitly here for the viewer's sample markers and
+            # active-row count, using the same production preparation kernel.
+            worker_count = esp_contact._contact_worker_count(self.contacts.soft_contact_max, self.device)
+            wp.launch(
+                esp_contact.prepare_contact_evaluation,
+                dim=worker_count,
+                inputs=[
+                    worker_count,
+                    self.selected_contacts.soft_contact_count,
+                    self.selected_contacts._soft_contact_mesh_features,
+                    self.selected_contacts.soft_contact_shape,
+                    solver._esp_data,
+                    self.state.particle_q,
+                    solver._esp_rigid_positions,
+                    self.model.shape_margin,
+                    self.model.shape_material_ke,
+                    self.model.soft_contact_ke,
+                    True,
+                ],
+                outputs=[
+                    solver._esp_ee_samples,
+                    solver._esp_particle_forces,
+                    solver._esp_particle_hessians,
+                    solver._esp_energy,
+                ],
+            )
+            for kind in (esp_contact._PARTICLE_BLOCKS, esp_contact._ENERGY_ONLY):
+                esp_contact.launch_contact_blocks(
+                    self.model,
+                    self.state,
+                    self.selected_contacts,
+                    solver._esp_data,
+                    solver._esp_rigid_positions,
+                    solver._esp_lists,
+                    kind,
+                    solver._esp_particle_forces,
+                    solver._esp_particle_hessians,
+                    solver._esp_energy,
+                    solver._esp_error,
+                    ee_samples=solver._esp_ee_samples,
+                )
+            error = int(solver._esp_error.numpy()[0])
+            if error:
+                raise ValueError(
+                    f"ESP cannot evaluate this state (error bits {error}); reset or move away from contact"
+                )
+            energy = float(solver._esp_energy.numpy()[1])
+            force = solver._esp_particle_forces.numpy().copy()
+            features = self.selected_contacts._soft_contact_mesh_features.numpy()[:count]
+            samples = solver._esp_ee_samples.numpy()[:count]
+            ee_rows = (features[:, 0] >= 0) & ((features[:, 0] & 7) == 2)
+            active = ee_rows & (samples[:, 0, 3] > 0)
+            return (
+                energy,
+                force,
+                {
+                    "rows": int(ee_rows.sum()),
+                    "active": int(active.sum()),
+                    "rigid_edges": features[active, 2].copy(),
+                    "samples": samples[active].copy(),
+                },
+            )
 
 
 def drawing_vectors(force, scale, cap):
@@ -422,6 +629,72 @@ def test_probes(device, *, esp_formulas="direct"):
     print(f"Force-field numerical checks PASS on {device}", flush=True)
 
 
+def test_edge_probes(device):
+    """Check both endpoint gradients after fresh collision detection each time."""
+    for scene in range(2):
+        probe = EdgeForceProbe(scene, device)
+        support = 0.03 if scene == 0 else 0.06
+        original = probe.rest_triangle[:2].copy()
+        examples = {
+            "original": original,
+            "both endpoints moved": original
+            + np.array([[0.0003, 0.0002, 0.00008], [-0.0002, 0.0004, 0.00012]], dtype=np.float32),
+        }
+        if scene == 0:
+            near_endpoint = original.copy()
+            near_endpoint[0, 0] = 0.04998
+            examples["endpoint mollifier transition"] = near_endpoint
+        for name, endpoints in examples.items():
+            energy, force, info = probe.evaluate(endpoints, support, 1.0)
+            assert energy > 0 and info["active"] > 0
+            assert np.all(np.linalg.norm(force[:2], axis=1) > 0)
+            finite_force = np.zeros((2, 3))
+            for endpoint in range(2):
+                for axis in range(3):
+                    plus, minus = endpoints.copy(), endpoints.copy()
+                    delta = 2e-8 if name == "endpoint mollifier transition" else 1e-7
+                    plus[endpoint, axis] += delta
+                    minus[endpoint, axis] -= delta
+                    ep = probe.evaluate(plus, support, 1.0)[0]
+                    em = probe.evaluate(minus, support, 1.0)[0]
+                    step = float(plus[endpoint, axis] - minus[endpoint, axis])
+                    finite_force[endpoint, axis] = -(ep - em) / step
+            np.testing.assert_allclose(force[:2], finite_force, rtol=3e-4, atol=2e-5)
+
+            # Check the production per-color entry point, not another force law.
+            probe.evaluate(endpoints, support, 1.0)
+            solver = probe.solver
+            original_contacts = solver.contacts
+            try:
+                solver.contacts = probe.selected_contacts
+                assembled = np.zeros_like(force)
+                colors = probe.model.particle_colors.numpy()
+                for color in np.unique(colors):
+                    solver._accumulate_esp_contacts(probe.state, esp_contact._PARTICLE_BLOCKS, color=int(color))
+                    assembled[colors == color] = solver._esp_particle_forces.numpy()[colors == color]
+                np.testing.assert_allclose(force, assembled, rtol=1e-12, atol=1e-12)
+            finally:
+                solver.contacts = original_contacts
+            print(
+                f"EE {SCENES[scene]} / {name}: E={energy:.9g}, F_A={force[0]}, F_B={force[1]}, "
+                f"active rows={info['active']}, max |F-FD|={np.max(abs(force[:2] - finite_force)):.3g}; per-color match PASS",
+                flush=True,
+            )
+        # Same endpoints/topology and rest weights, but a cutoff below the gap:
+        # no EE sample contributes. This also tests live support changes.
+        energy, force, info = probe.evaluate(probe.rest_triangle[:2], 0.002, 1.0)
+        assert info["active"] == 0 and energy == 0
+        np.testing.assert_array_equal(force, 0)
+        # A collapsed edge must not produce plausible-looking zero-force arrows.
+        try:
+            probe.evaluate(np.repeat(endpoints[:1], 2, axis=0), support, 1.0)
+        except ValueError as error:
+            assert "Degenerate" in str(error)
+        else:
+            raise AssertionError("Collapsed edge was not rejected")
+    print(f"EE endpoint force checks PASS on {device}", flush=True)
+
+
 class Viewer:
     def __init__(self, args):
         import polyscope as ps  # noqa: PLC0415
@@ -429,9 +702,11 @@ class Viewer:
 
         self.ps, self.ui, self.args = ps, ui, args
         self.scene = int(args.scene == "figure2")
+        self.probe_mode = int(args.probe == "ee")
         self.mode = args.mode
         self.show_field, self.lock_y = True, True
         self.stiffness, self.arrow_scale = 100.0, 0.005
+        self.show_gradient = False
         ps.set_program_name("ESP / OGC force field")
         ps.set_use_prefs_file(False)
         ps.set_build_default_gui_panels(False)
@@ -448,6 +723,13 @@ class Viewer:
         self.gizmo.set_allow_scaling(False)
         self.gizmo.set_interact_in_local_space(False)
         self.gizmo.set_gizmo_scale(0.7)
+        self.edge_gizmos = [ps.add_transformation_gizmo(f"Drag endpoint {name}") for name in ("A", "B")]
+        for gizmo in self.edge_gizmos:
+            gizmo.set_allow_translation(True)
+            gizmo.set_allow_rotation(False)
+            gizmo.set_allow_scaling(False)
+            gizmo.set_interact_in_local_space(False)
+            gizmo.set_gizmo_scale(0.35)
         self.load_scene()
         ps.set_user_callback(self.callback)
 
@@ -456,14 +738,26 @@ class Viewer:
         ps.remove_all_structures()
         self.radius = 0.03 if self.scene == 0 else 0.06
         self.preset = 0
+        self.gizmo.set_enabled(not self.probe_mode)
+        for gizmo in self.edge_gizmos:
+            gizmo.set_enabled(bool(self.probe_mode))
         self.gizmo.set_position(next(iter(PRESETS[self.scene].values())))
-        self.probe = ForceProbe(self.scene, 1, self.args.device, esp_formulas=self.args.esp_formulas)
+        if self.probe_mode:
+            self.probe = EdgeForceProbe(self.scene, self.args.device)
+            self.stiffness, self.arrow_scale = 1.0, 0.0005 if self.scene == 0 else 0.0015
+            for gizmo, position in zip(self.edge_gizmos, self.probe.rest_triangle[:2], strict=True):
+                gizmo.set_position(position)
+        else:
+            self.probe = ForceProbe(self.scene, 1, self.args.device, esp_formulas=self.args.esp_formulas)
+            self.stiffness, self.arrow_scale = 100.0, 0.005
         self.field_probe = None
         self.last_key, self.last_field_key = None, None
         mesh = ps.register_surface_mesh(
             "Rigid surface", self.probe.vertices, self.probe.faces, color=(0.55, 0.64, 0.72), smooth_shade=False
         )
-        mesh.set_edge_width(0.0)
+        # Render the actual collision triangles, including coplanar diagonals.
+        mesh.set_edge_width(1.0)
+        mesh.set_edge_color((0.16, 0.21, 0.26))
         if self.scene == 1:
             # A clear central profile keeps the analogy to the paper visible.
             profile = self.probe.vertices[::2].copy()
@@ -476,10 +770,36 @@ class Viewer:
                 radius=0.0006,
             )
             curve.set_radius(0.0006, relative=False)
-        self.particle = ps.register_point_cloud(
-            "Particle", np.asarray(self.gizmo.get_position())[None], color=(1.0, 0.48, 0.06), radius=0.0015
-        )
-        self.particle.set_radius(0.0015, relative=False)
+        if self.probe_mode:
+            triangle = self.probe.rest_triangle
+            self.source_triangle = ps.register_surface_mesh(
+                "Source triangle (C fixed)",
+                triangle,
+                np.array([[0, 1, 2]]),
+                color=(0.94, 0.79, 0.57),
+                smooth_shade=False,
+            )
+            self.source_triangle.set_transparency(0.35)
+            self.source_triangle.set_edge_width(0.8)
+            self.edge_curve = ps.register_curve_network(
+                "Draggable edge A--B",
+                triangle[:2],
+                np.array([[0, 1]]),
+                color=(0.95, 0.39, 0.03),
+            )
+            self.edge_curve.set_radius(0.0005, relative=False)
+            self.endpoint_clouds = []
+            for i, name in enumerate(("A", "B")):
+                cloud = ps.register_point_cloud(f"Endpoint {name}", triangle[i : i + 1], color=(1.0, 0.48, 0.06))
+                cloud.set_radius(0.001, relative=False)
+                self.endpoint_clouds.append(cloud)
+            fixed = ps.register_point_cloud("Fixed C", triangle[2:3], color=(0.35, 0.35, 0.35))
+            fixed.set_radius(0.0008, relative=False)
+        else:
+            self.particle = ps.register_point_cloud(
+                "Particle", np.asarray(self.gizmo.get_position())[None], color=(1.0, 0.48, 0.06), radius=0.0015
+            )
+            self.particle.set_radius(0.0015, relative=False)
         ps.set_length_scale(0.25)
         ps.set_bounding_box((-0.14, -0.13, -0.11), (0.15, 0.13, 0.14))
         self.reset_camera()
@@ -490,11 +810,18 @@ class Viewer:
         if self.scene == 0:
             self.ps.set_view_projection_mode("perspective")
             self.ps.look_at((0.095, -0.295, 0.1295), (-0.065, -0.039, -0.0185))
+        elif self.probe_mode:
+            # The point-mode cross-section view hides the surface triangles.
+            self.ps.set_view_projection_mode("perspective")
+            self.ps.look_at((0.15, -0.38, 0.288), (-0.08, 0, 0.03))
         else:
             self.ps.set_view_projection_mode("orthographic")
             self.ps.look_at((-0.06, -0.34, 0.055), (-0.06, 0, 0.055))
 
     def refresh(self):
+        if self.probe_mode:
+            self.refresh_edge()
+            return
         position = np.asarray(self.gizmo.get_position())
         if self.lock_y:
             position[1] = 0
@@ -548,15 +875,55 @@ class Viewer:
         elif self.ps.has_point_cloud("Force-field slice"):
             self.ps.get_point_cloud("Force-field slice").set_enabled(False)
 
+    def refresh_edge(self):
+        endpoints = np.array([gizmo.get_position() for gizmo in self.edge_gizmos])
+        key = (*endpoints.ravel(), self.radius, self.stiffness)
+        if key != self.last_key:
+            self.edge_error = ""
+            try:
+                self.edge_result = self.probe.evaluate(endpoints, self.radius, self.stiffness)
+            except (ValueError, RuntimeError) as error:
+                self.edge_error = str(error)
+                self.edge_result = (np.nan, np.full((3, 3), np.nan), {"rows": 0, "active": 0})
+            self.last_key = key
+        triangle = self.probe.rest_triangle.copy()
+        triangle[:2] = endpoints
+        self.source_triangle.update_vertex_positions(triangle)
+        self.edge_curve.update_node_positions(endpoints)
+        force = self.edge_result[1][:2]
+        self.displayed_edge_vectors = drawing_vectors(
+            -force if self.show_gradient else force,
+            self.arrow_scale,
+            0.035,
+        )
+        for i, cloud in enumerate(self.endpoint_clouds):
+            cloud.update_point_positions(endpoints[i : i + 1])
+            cloud.add_vector_quantity(
+                "Endpoint derivative",
+                self.displayed_edge_vectors[i : i + 1],
+                vectortype="ambient",
+                enabled=True,
+                color=(0.85, 0.08, 0.45),
+                radius=0.006,
+            )
+
     def callback(self):
         ui = self.ui
         ui.SetNextWindowPos((12, 12), ui.ImGuiCond_FirstUseEver)
         ui.SetNextWindowSize((410, 0), ui.ImGuiCond_FirstUseEver)
-        ui.Begin("Particle force probe")
+        ui.Begin("ESP / OGC force probe")
         ui.PushItemWidth(215)
         changed, self.scene = ui.Combo("Scene", self.scene, SCENES)
         if changed:
             self.load_scene()
+        changed, self.probe_mode = ui.Combo("Probe", self.probe_mode, ["Particle", "Edge--edge (ESP)"])
+        if changed:
+            self.load_scene()
+        if self.probe_mode:
+            self.edge_controls()
+            ui.PopItemWidth()
+            ui.End()
+            return
         _, self.mode = ui.Combo("Method", self.mode, MODES)
         ui.TextUnformatted("Drag the particle's arrows / plane handles.")
         formula_label = "integrated direct" if self.args.esp_formulas == "direct" else "saved chain reference"
@@ -595,16 +962,60 @@ class Viewer:
             self.reset_camera()
         ui.End()
 
+    def edge_controls(self):
+        ui = self.ui
+        ui.TextUnformatted("Drag A and B independently with their handles.")
+        ui.TextUnformatted("Orange: A--B. Beige: source triangle. Gray C: fixed.")
+        for name, gizmo in zip(("A", "B"), self.edge_gizmos, strict=True):
+            changed, mm = ui.DragFloat3(f"Endpoint {name} [mm]", np.asarray(gizmo.get_position()) * 1000, 0.01)
+            if changed:
+                gizmo.set_position(np.asarray(mm) / 1000)
+        if ui.Button("Reset endpoints"):
+            for gizmo, point in zip(self.edge_gizmos, self.probe.rest_triangle[:2], strict=True):
+                gizmo.set_position(point)
+        changed, mm = ui.SliderFloat("Support [mm]", self.radius * 1000, 2, 90, "%.1f")
+        if changed:
+            self.radius = mm / 1000
+        _, self.stiffness = ui.SliderFloat("Contact stiffness", self.stiffness, 0.01, 10.0, "%.3f")
+        changed, scale = ui.SliderFloat("Arrows [mm/N]", self.arrow_scale * 1000, 0.01, 3.0, "%.3f")
+        if changed:
+            self.arrow_scale = scale / 1000
+        _, self.show_gradient = ui.Checkbox("Show gradient instead of force", self.show_gradient)
+        self.refresh_edge()
+        energy, force, info = self.edge_result
+        ui.Separator()
+        ui.TextUnformatted("Integrated ESP kernels (FP64); EE terms only.")
+        ui.TextUnformatted("A--B versus all queried rigid edges, both directions.")
+        ui.TextWrapped("Fixed rest areas; sample and weight derivatives included.")
+        ui.TextUnformatted(f"EE support = 0.05 x support = {50 * self.radius:.3g} mm")
+        ui.TextUnformatted(f"EE rows: {info['rows']}; nonzero sample weights: {info['active']}")
+        ui.TextUnformatted(f"Selected EE energy: {energy:.7g} J")
+        values = -force if self.show_gradient else force
+        label = "Gradient" if self.show_gradient else "Force"
+        for i, name in enumerate(("A", "B")):
+            ui.TextUnformatted(f"{label} {name} [N]: ({values[i, 0]:.5g}, {values[i, 1]:.5g}, {values[i, 2]:.5g})")
+        ui.TextUnformatted("Force = -energy gradient. Arrow lengths capped at 35 mm.")
+        if self.edge_error:
+            ui.TextColored((0.85, 0.08, 0.05, 1), "Invalid state: arrows hidden; reset or move away.")
+            ui.TextWrapped(self.edge_error)
+        elif info["active"] == 0:
+            ui.TextUnformatted("No active EE sample; the EE contribution is zero.")
+        if ui.Button("Reset camera"):
+            self.reset_camera()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="cpu", help="Warp device: cpu or cuda:0")
     parser.add_argument("--scene", choices=("box", "figure2"), default="box")
     parser.add_argument(
+        "--probe", choices=("particle", "ee"), default="particle", help="Draggable point or edge endpoints"
+    )
+    parser.add_argument(
         "--esp-formulas",
         choices=("chain", "direct"),
         default="direct",
-        help="Integrated direct kernels (default) or saved chain reference; no EE in this point probe",
+        help="Point-mode formulas: integrated direct (default) or saved chain reference; EE always uses production",
     )
     parser.add_argument(
         "--mode",
@@ -620,6 +1031,7 @@ def main():
     args = parser.parse_args()
     if args.test:
         test_probes(args.device, esp_formulas=args.esp_formulas)
+        test_edge_probes(args.device)
         return
     if args.headless and not (args.screenshot or args.smoke_test):
         parser.error("--headless requires --screenshot or --smoke-test")
@@ -627,6 +1039,7 @@ def main():
     ps = viewer.ps
     if args.smoke_test:
         ps.set_frame_tick_limit_fps_mode("ignore_limits")
+        viewer.probe_mode = 0
         for scene in range(2):
             viewer.scene = scene
             viewer.load_scene()
@@ -639,7 +1052,44 @@ def main():
                     direct = viewer.probe.evaluate([point], viewer.radius, viewer.stiffness)
                     np.testing.assert_allclose(viewer.result[1], direct[1], rtol=2e-6, atol=1e-7)
             print(f"Gizmo, scene and method switches PASS: {SCENES[scene]}", flush=True)
+        viewer.probe_mode = 1
+        for scene in range(2):
+            viewer.scene = scene
+            viewer.load_scene()
+            assert not viewer.gizmo.get_enabled()
+            assert all(g.get_enabled() for g in viewer.edge_gizmos)
+            assert ps.get_surface_mesh("Rigid surface").get_edge_width() > 0
+            for endpoint in range(2):
+                other_position = np.array(viewer.edge_gizmos[1 - endpoint].get_position()).copy()
+                point = np.array(viewer.edge_gizmos[endpoint].get_position()) + np.array([0.0002, 0.0001, 0.0001])
+                viewer.edge_gizmos[endpoint].set_position(point)
+                ps.frame_tick()
+                np.testing.assert_allclose(viewer.edge_gizmos[endpoint].get_position(), point, atol=1e-8)
+                np.testing.assert_allclose(viewer.edge_gizmos[1 - endpoint].get_position(), other_position, atol=1e-9)
+                assert not viewer.edge_error, viewer.edge_error
+                endpoints = np.array([g.get_position() for g in viewer.edge_gizmos])
+                direct = viewer.probe.evaluate(endpoints, viewer.radius, viewer.stiffness)
+                np.testing.assert_allclose(viewer.edge_result[1], direct[1], rtol=2e-6, atol=1e-7)
+                assert np.all(np.linalg.norm(viewer.displayed_edge_vectors, axis=1) > 0)
+            force_vectors = viewer.displayed_edge_vectors.copy()
+            viewer.show_gradient = True
+            ps.frame_tick()
+            np.testing.assert_allclose(viewer.displayed_edge_vectors, -force_vectors, rtol=1e-12, atol=1e-12)
+            viewer.show_gradient = False
+            # An invalid drag must clear the previous valid arrows, and a reset
+            # must resume evaluation rather than leave the cached error visible.
+            viewer.edge_gizmos[1].set_position(viewer.edge_gizmos[0].get_position())
+            ps.frame_tick()
+            assert "Degenerate" in viewer.edge_error
+            np.testing.assert_array_equal(viewer.displayed_edge_vectors, 0)
+            for gizmo, point in zip(viewer.edge_gizmos, viewer.probe.rest_triangle[:2], strict=True):
+                gizmo.set_position(point)
+            ps.frame_tick()
+            assert not viewer.edge_error
+            np.testing.assert_array_equal(viewer.probe.state.particle_q.numpy()[2], viewer.probe.rest_triangle[2])
+            print(f"Independent EE gizmos and both endpoint forces/gradients PASS: {SCENES[scene]}", flush=True)
         viewer.scene = int(args.scene == "figure2")
+        viewer.probe_mode = int(args.probe == "ee")
         viewer.mode = args.mode
         viewer.load_scene()
     if args.screenshot:

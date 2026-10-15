@@ -8,6 +8,7 @@ derivative mathematics; its buffer types alias unchanged production structures
 so comparisons can use exactly the same state and contact data.
 """
 
+from copy import copy
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -22,6 +23,15 @@ if TYPE_CHECKING:
     from ...sim import CollisionPipeline, Contacts, Model, State
 
 wp.set_module_options({"enable_backward": False})
+
+
+def get_esp_kernels(scalar=wp.float64):
+    """Use current buffer types but run this saved FP64 derivative implementation."""
+    if scalar != wp.float64:
+        raise ValueError("The saved chain reference supports float64 only")
+    kernels = copy(_production.get_esp_kernels(scalar))
+    kernels.launch_contact_blocks = launch_contact_blocks
+    return kernels
 
 
 @wp.struct

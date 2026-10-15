@@ -15,10 +15,11 @@ import numpy as np
 import torch  # noqa: TID253 -- Optional independent test oracle.
 import warp as wp
 from esp_chain_solver_reference import make_esp_derivative_functions
-from esp_direct_ee import make_direct_ee_formulas
-from esp_direct_ee_shared import make_shared_direct_ee_formulas
+from esp_direct_ee_per_triangle_reference import make_direct_ee_formulas
 from esp_ee_implicit_formulas import ee_energy_derivatives, rigid_body_block
 from test_esp_ee_implicit_formulas import fixtures, torch_body_energy, torch_energy
+
+from newton._src.solvers.vbd.esp_contact import make_shared_direct_ee_formulas
 
 
 @cache
@@ -152,6 +153,48 @@ def evaluate_blocks(positions, selected, size, scalar, device, *, direct="shared
 
 
 class TestEspDirectEE(unittest.TestCase):
+    def test_captured_endpoint_cancellation(self):
+        """Retain the positive EE term lost by FP32 distance subtraction."""
+        # Exact saved FP32 state: closest rigid sample is 40.5 nm from c,
+        # while the edges are 135 micrometres apart. Extra triangle vertices
+        # only supply nondegenerate target faces for the two energy directions.
+        points = np.array(
+            [
+                [0.05999999865889549, -0.05999999865889549, 0.00013800000306218863],
+                [0.04500000178813934, -0.04500000178813934, 0.00013349999790079892],
+                [0.05000000074505806, -0.05000000074505806, 0.0],
+                [0.05000000074505806, 0.05000000074505806, 0.0],
+                [0.03, -0.03, -0.02],
+                [0.055, -0.035, 0.01],
+            ],
+            dtype=np.float32,
+        ).astype(np.float64)
+        x = torch.tensor(points, dtype=torch.float64, requires_grad=True)
+        energy = torch_energy(x, near=0.00025)
+        gradient = torch.autograd.grad(energy, x)[0].numpy().reshape(18)
+        hessian = torch.autograd.functional.hessian(lambda p: torch_energy(p, near=0.00025), x).numpy().reshape(18, 18)
+        motion = torch.zeros(6, dtype=torch.float64, requires_grad=True)
+        body_energy = torch_body_energy(motion, points, near=0.00025)
+        body_gradient = torch.autograd.grad(body_energy, motion)[0].numpy()
+        body_hessian = torch.autograd.functional.hessian(
+            lambda m: torch_body_energy(m, points, near=0.00025), motion
+        ).numpy()
+        for device in wp.get_devices():
+            for size in (3, 6):
+                for selected in (0, 1, 2, 3) if size == 3 else (-1,):
+                    with self.subTest(device=device, size=size, selected=selected):
+                        expected = evaluate_blocks(points[None], [selected], size, wp.float64, device, near=0.00025)
+                        actual = evaluate_blocks(points[None], [selected], size, wp.float32, device, near=0.00025)
+                        self.assertGreater(expected[0][0], 0)
+                        block = slice(3 * selected, 3 * selected + 3)
+                        independent = (energy.detach().numpy(), gradient[block], hessian[block, block])
+                        if size == 6:
+                            independent = (body_energy.detach().numpy(), body_gradient, body_hessian)
+                        for got, want in zip(expected, independent, strict=True):
+                            self.assert_close(got[0], want)
+                        for got, want in zip(actual, expected, strict=True):
+                            self.assert_close(got, want, 3e-4)
+
     def assert_close(self, actual, expected, tolerance=2e-8):
         """Compare blocks relative to the whole reference, not each entry."""
         scale = max(float(np.max(np.abs(expected))), 1e-8)
@@ -160,7 +203,7 @@ class TestEspDirectEE(unittest.TestCase):
     def test_cpu_cuda_blocks(self):
         """Check both precisions, every selected vertex, and the rigid block."""
         cases = fixtures()
-        for base in ("ordinary", "endpoint", "near_parallel_1e-08"):
+        for base in ("ordinary", "endpoint", "clamped_endpoint", "near_parallel_1e-08"):
             for reverse_soft, reverse_rigid in ((True, False), (False, True), (True, True)):
                 points = cases[base].copy()
                 if reverse_soft:
@@ -229,7 +272,7 @@ class TestEspDirectEE(unittest.TestCase):
 
     def test_independent_autodiff_and_differences(self):
         """Check full energy differentiation and finite differences independently."""
-        for name in ("ordinary", "endpoint", "window"):
+        for name in ("ordinary", "endpoint", "clamped_endpoint", "window"):
             positions = fixtures()[name]
             x = torch.tensor(positions, dtype=torch.float64, requires_grad=True)
             energy = torch_energy(x)

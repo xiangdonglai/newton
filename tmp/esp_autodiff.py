@@ -100,9 +100,19 @@ def ee_sample(a, b, c, d, near_cutoff):
             d_sq = dot(q - q_bar, q - q_bar)
             if 0 < d_sq < near_cutoff**2:
                 mu = d_sq * 0 + 1
-                for p, start, end in ((a, c, d), (b, c, d), (c, a, b), (d, a, b)):
-                    closest = segment_closest(p, start, end)
-                    mu = mu * mollifier(dot(p - closest, p - closest) - d_sq, d_sq)
+                # Evaluate the equivalent nonnegative endpoint excess. The
+                # original squared-distance subtraction can lose accuracy
+                # even in FP64 when a sample is very close to an endpoint.
+                # Autodiff still differentiates the complete scalar energy.
+                for own_axis, other_axis, own_t, other_t in ((u, v, s, t), (v, u, t, s)):
+                    length_sq = dot(other_axis, other_axis)
+                    normal = cross(own_axis, other_axis)
+                    for endpoint in (0, 1):
+                        h = endpoint - own_t
+                        projection = other_t + h * dot(own_axis, other_axis) / length_sq
+                        outside = projection - projection.clamp(0, 1)
+                        excess = h * h * dot(normal, normal) / length_sq + outside * outside * length_sq
+                        mu = mu * mollifier(excess, d_sq)
                 x = torch.sqrt(d_sq) * (2 / near_cutoff)
                 step = 1 - 1.5 * x**2 + 0.75 * x**3 if x < 1 else 0.25 * (2 - x) ** 3
                 weight = step * mu

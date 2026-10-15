@@ -1,47 +1,50 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the unchanged independent EE checks against one temporary candidate.
+"""Check production EE support and endpoint branches against the saved baseline.
 
-Run one variant per process, under compute.lock:
-    uv run --no-sync --with torch python tmp/test_esp_ee_ablations.py --variant all
+Run sequentially, under compute.lock:
+    uv run --no-sync --with torch python tmp/test_esp_ee_boundaries.py -v
 
-This reroutes only the shared-direct factory used by the existing local tests.
-The NumPy implicit formulas, Torch energy, finite differences, difficult cases,
-and original tolerances remain unchanged. No production solver switch is set.
+Preserve the cases and tolerances from the optimization experiments without
+keeping every experimental variant. The separate test_esp_direct_ee.py checks
+NumPy implicit derivatives, Torch autodiff, and finite differences.
 """
 
-import argparse
+import hashlib
+import importlib.util
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import test_esp_direct_ee as checks
+import torch  # noqa: TID253 -- Optional independent test oracle.
 import warp as wp
-from benchmark_esp_ee_ablations import load_variant
-from esp_ee_ablation_formulas import make_ablation_formulas
-from esp_ee_cached_axes import make_cached_axis_formulas
-from profile_esp_ee_stages import VARIANTS
 
-from newton._src.solvers.vbd.esp_contact import make_shared_direct_ee_formulas
+from newton._src.solvers.vbd.esp_contact import make_ee_endpoint_excess, make_shared_direct_ee_formulas
 
-baseline_formulas = load_variant("baseline").make_shared_direct_ee_formulas
+baseline_path = Path(__file__).with_name("esp_shared_direct_diagnosis_reference.py")
+if hashlib.sha256(baseline_path.read_bytes()).hexdigest() != (
+    "8ef301bc7fb4b165f9e74b397fc478c2ea17381000f1c4d806623b409e01c3ed"
+):
+    raise RuntimeError("The preserved unoptimized baseline changed")
+# Use its original package so relative imports work; do not rewrite its source.
+baseline_name = "newton._src.solvers.vbd.esp_unoptimized_test_reference"
+baseline_spec = importlib.util.spec_from_file_location(baseline_name, baseline_path)
+baseline_module = importlib.util.module_from_spec(baseline_spec)
+sys.modules[baseline_name] = baseline_module
+baseline_spec.loader.exec_module(baseline_module)
+baseline_formulas = baseline_module.make_shared_direct_ee_formulas
 
 
-def candidate_formulas(size, scalar, variant):
-    if variant == "production":
-        return make_shared_direct_ee_formulas(size, scalar)
-    if variant == "cached-axes":
-        return make_cached_axis_formulas(size, scalar)
-    return make_ablation_formulas(size, scalar, **VARIANTS[variant])[:3]
-
-
-def make_target_probe(size, scalar, variant, baseline):
+def make_target_probe(size, scalar, baseline):
     """Differentiate a nonincident triangle rather than a source-edge face."""
     if baseline:
         prepare, triangle, finish = baseline_formulas(size, scalar)
     else:
-        prepare, triangle, finish = candidate_formulas(size, scalar, variant)
+        prepare, triangle, finish = make_shared_direct_ee_formulas(size, scalar)
     vec3 = wp.types.vector(length=3, dtype=scalar)
 
     @wp.kernel(module="unique", enable_backward=False)
@@ -85,7 +88,7 @@ def make_target_probe(size, scalar, variant, baseline):
     return probe
 
 
-def check_nonincident_triangles(variant):
+def check_nonincident_triangles():
     """Exercise AABB hits whose actual triangle is inside/outside near support."""
     near, vertical = 0.15, 0.02
     # q=(0,0,z), target vertices=(0,L),(L,0),(L,L). The AABB includes q's
@@ -172,7 +175,7 @@ def check_nonincident_triangles(variant):
                             wp.empty((len(cases), size, size), dtype=wp.float64),
                         ]
                         wp.launch(
-                            make_target_probe(size, scalar, variant, baseline),
+                            make_target_probe(size, scalar, baseline),
                             len(cases),
                             inputs=inputs,
                             outputs=outputs,
@@ -194,12 +197,13 @@ def check_nonincident_triangles(variant):
 
 def make_endpoint_excess_probe(scalar):
     """Report the actual rounded endpoint factor used by the source geometry."""
-    prepare, _, _ = baseline_formulas(3, scalar)
+    prepare, _, _ = make_shared_direct_ee_formulas(3, scalar)
+    endpoint_excess = make_ee_endpoint_excess(scalar)
     vec3 = wp.types.vector(length=3, dtype=scalar)
     vec7 = wp.types.vector(length=7, dtype=scalar)
 
     @wp.kernel(module="unique", enable_backward=False)
-    def probe(points: wp.array2d[wp.vec3d], excesses: wp.array[wp.float64]):
+    def probe(points: wp.array2d[wp.vec3d], excesses: wp.array2d[wp.float64]):
         row = wp.tid()
         pair = prepare(
             vec3(points[row, 0]),
@@ -215,40 +219,33 @@ def make_endpoint_excess_probe(scalar):
         )
         delta = wp.transpose(pair.positions) * coefficients
         distance_sq = wp.dot(delta, delta)
-        smallest = scalar(1.0e10)
         for endpoint in range(4):
-            start = int(2) if endpoint < 2 else int(0)
-            edge = pair.positions[start + 1] - pair.positions[start]
-            parameter = wp.clamp(
-                wp.dot(pair.positions[endpoint] - pair.positions[start], edge) / wp.dot(edge, edge),
-                scalar(0.0),
-                scalar(1.0),
-            )
-            coefficients = vec7()
-            coefficients[endpoint] = scalar(1.0)
-            coefficients[start] -= scalar(1.0) - parameter
-            coefficients[start + 1] -= parameter
-            delta = wp.transpose(pair.positions) * coefficients
-            excess = scalar(100.0) * (wp.dot(delta, delta) - distance_sq) / distance_sq
-            smallest = wp.min(smallest, excess)
-        excesses[row] = wp.float64(smallest)
+            endpoint_parameter = scalar(0.0)
+            if endpoint == 1 or endpoint == 3:
+                endpoint_parameter = scalar(1.0)
+            h, other = endpoint_parameter - pair.s, scalar(pair.t)
+            own_axis, other_axis = vec3(pair.soft_axis), -pair.rigid_axis
+            if endpoint >= 2:
+                h, other = endpoint_parameter - pair.t, scalar(pair.s)
+                own_axis, other_axis = -pair.rigid_axis, vec3(pair.soft_axis)
+            value, _projection = endpoint_excess(h, other, own_axis, other_axis)
+            excesses[row, endpoint] = wp.float64(scalar(100.0) * value / distance_sq)
 
     return probe
 
 
-def check_endpoint_factor_boundary(variant):
-    """Keep the same one-sided Hessian at the endpoint factor's constant branch.
+def check_endpoint_factor_boundary():
+    """Check each one-sided Hessian at the endpoint factor's constant branch.
 
     The nearest endpoint is a=.002 from the crossing, at separation z=.02:
     100*a²/z²=1. Probe both sides after quantization and reverse both edges.
     Keep source lengths comparable to a: reversing a much longer edge can
     erase the small sweep when subtracting its new origin.
-    The Hessian jumps at this boundary, so compare the same rounded branch,
-    not a finite difference across it. Independent smooth-branch checks follow.
+    The Hessian jumps at this boundary. The stable expression can round to a
+    different branch from the old distance subtraction. Differentiate the
+    independent scalar energy on the branch selected by production, rather
+    than requiring it to reproduce the old rounding or relaxing tolerances.
     """
-
-    def factory(size, scalar):
-        return candidate_formulas(size, scalar, variant)
 
     for scalar, dtype in ((wp.float32, np.float32), (wp.float64, np.float64)):
         cases = []
@@ -266,7 +263,7 @@ def check_endpoint_factor_boundary(variant):
                 cases.append(points)
         points = np.array(cases, dtype=np.float64)
         for device in wp.get_devices():
-            excesses = wp.empty(len(points), dtype=wp.float64, device=device)
+            excesses = wp.empty((len(points), 4), dtype=wp.float64, device=device)
             wp.launch(
                 make_endpoint_excess_probe(scalar),
                 len(points),
@@ -274,19 +271,52 @@ def check_endpoint_factor_boundary(variant):
                 outputs=[excesses],
                 device=device,
             )
-            rounded = excesses.numpy()
+            factors = excesses.numpy()
+            rounded = factors.min(axis=1)
             assert np.all(np.abs(rounded - 1) < 1e-3), rounded
             # Require both branches for EACH reversal, not just across the batch.
             for group in rounded.reshape(4, -1):
                 assert np.any(group < 1) and np.any(group >= 1), group
+            references = []
+            for positions, endpoint_factors in zip(points, factors, strict=True):
+
+                def energy_on_selected_branches(
+                    x, *, body=False, endpoint_factors=endpoint_factors, positions=positions
+                ):
+                    branches = iter(endpoint_factors < 1)
+
+                    def mollifier(excess, distance_sq):
+                        fraction = excess / (0.01 * distance_sq)
+                        return fraction * (2 - fraction) if next(branches) else fraction * 0 + 1
+
+                    # Only the four discrete mollifier branch choices are fixed.
+                    # Closest points, distances, weights and all their motion
+                    # remain differentiated by Torch from the original energy.
+                    with patch("esp_autodiff.mollifier", mollifier):
+                        if body:
+                            return checks.torch_body_energy(x, positions)
+                        return checks.torch_energy(x)
+
+                x = torch.tensor(positions, dtype=torch.float64, requires_grad=True)
+                e = energy_on_selected_branches(x)
+                g = torch.autograd.grad(e, x)[0].numpy().reshape(18)
+                h = torch.autograd.functional.hessian(energy_on_selected_branches, x).numpy().reshape(18, 18)
+                motion = torch.zeros(6, dtype=torch.float64, requires_grad=True)
+                body_e = energy_on_selected_branches(motion, body=True)
+                body_g = torch.autograd.grad(body_e, motion)[0].numpy()
+                body_h = torch.autograd.functional.hessian(
+                    lambda m: energy_on_selected_branches(m, body=True), motion
+                ).numpy()
+                references.append((e.detach().numpy(), g, h, body_g, body_h))
             for size in (3, 6):
                 for selected in range(6) if size == 3 else (-1,):
-                    with patch.object(checks, "make_shared_direct_ee_formulas", baseline_formulas):
-                        checks.make_comparison_kernel.cache_clear()
-                        expected = checks.evaluate_blocks(points, np.full(len(points), selected), size, scalar, device)
-                    with patch.object(checks, "make_shared_direct_ee_formulas", factory):
-                        checks.make_comparison_kernel.cache_clear()
-                        actual = checks.evaluate_blocks(points, np.full(len(points), selected), size, scalar, device)
+                    block = slice(3 * selected, 3 * selected + 3)
+                    expected = [np.array([r[0] for r in references])]
+                    expected += [
+                        np.array([r[1][block] if size == 3 else r[3] for r in references]),
+                        np.array([r[2][block, block] if size == 3 else r[4] for r in references]),
+                    ]
+                    actual = checks.evaluate_blocks(points, np.full(len(points), selected), size, scalar, device)
                     for got, want in zip(actual, expected, strict=True):
                         scale = np.maximum(np.abs(want).reshape(len(points), -1).max(axis=1), 1e-8)
                         scale = scale.reshape((len(points),) + (1,) * (want.ndim - 1))
@@ -301,26 +331,91 @@ def check_endpoint_factor_boundary(variant):
     checks.make_comparison_kernel.cache_clear()
 
 
-def main():
-    """Reuse all independent tests rather than duplicating a weaker oracle."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=(*VARIANTS, "cached-axes", "production"), default="all")
-    args = parser.parse_args()
-    check_nonincident_triangles(args.variant)
-    check_endpoint_factor_boundary(args.variant)
+def make_predicate_probe(scalar):
+    """Compare populated-slot arithmetic with the early cached AABB test."""
+    prepare, _, _ = make_shared_direct_ee_formulas(3, scalar)
+    vec3 = wp.types.vector(length=3, dtype=scalar)
+    vec7 = wp.types.vector(length=7, dtype=scalar)
 
-    def factory(size, scalar):
-        return candidate_formulas(size, scalar, args.variant)
-
-    with patch.object(checks, "make_shared_direct_ee_formulas", factory):
-        checks.make_comparison_kernel.cache_clear()
-        result = unittest.TextTestRunner(verbosity=2).run(
-            unittest.defaultTestLoader.loadTestsFromTestCase(checks.TestEspDirectEE)
+    @wp.kernel(module="unique", enable_backward=False)
+    def probe(points: wp.array2d[wp.vec3d], result: wp.array2d[int]):
+        row = wp.tid()
+        pair = prepare(
+            vec3(points[row, 0]),
+            vec3(points[row, 1]),
+            vec3(points[row, 2]),
+            vec3(points[row, 3]),
+            1,
+            vec3(),
+            scalar(0.15),
         )
-    checks.make_comparison_kernel.cache_clear()
-    if not result.wasSuccessful():
-        raise SystemExit(1)
+        positions = pair.positions
+        positions[4] = vec3(points[row, 4]) - pair.origin
+        positions[5] = vec3(points[row, 5]) - pair.origin
+        positions[6] = vec3(points[row, 6]) - pair.origin
+        soft = vec7(scalar(1) - pair.s, pair.s, scalar(0), scalar(0), scalar(0), scalar(0), scalar(0))
+        rigid = vec7(scalar(0), scalar(0), scalar(1) - pair.t, pair.t, scalar(0), scalar(0), scalar(0))
+        for direction in range(2):
+            original_sample = wp.transpose(positions) * (soft if direction == 0 else rigid)
+            cached_sample = pair.soft_sample if direction == 0 else pair.rigid_sample
+            lower = wp.min(wp.min(positions[4], positions[5]), positions[6])
+            upper = wp.max(wp.max(positions[4], positions[5]), positions[6])
+            original_delta = wp.max(wp.max(lower - original_sample, original_sample - upper), vec3())
+            cached_delta = wp.max(wp.max(lower - cached_sample, cached_sample - upper), vec3())
+            result[row, 2 * direction] = int(wp.dot(original_delta, original_delta) > scalar(0.15) * scalar(0.15))
+            result[row, 2 * direction + 1] = int(wp.dot(cached_delta, cached_delta) > scalar(0.15) * scalar(0.15))
+        result[row, 4] = int(pair.weight > scalar(0))
+
+    return probe
+
+
+class TestEspEEBoundaries(unittest.TestCase):
+    def test_nonincident_triangles(self):
+        """Preserve derivatives when rejecting triangles outside near support."""
+        check_nonincident_triangles()
+
+    def test_endpoint_factor_boundary(self):
+        """Check both rounded branches against independent one-sided derivatives."""
+        self.addCleanup(checks.make_comparison_kernel.cache_clear)
+        check_endpoint_factor_boundary()
+
+    def test_cached_sample_predicates(self):
+        """Match AABB decisions near the rounded cutoff, including translations."""
+        for scalar, dtype in ((wp.float32, np.float32), (wp.float64, np.float64)):
+            distances = [dtype(0.15)]
+            below = above = dtype(0.15)
+            for _ in range(8):
+                below = np.nextafter(below, dtype(0))
+                above = np.nextafter(above, dtype(np.inf))
+                distances.extend((below, above))
+            distances.extend((dtype(0.1), dtype(0.2)))
+            inputs = []
+            for origin in ([0, 0, 0], [1, -2, 3], [1000, -1000, 500]):
+                for distance in distances:
+                    points = np.array(
+                        [
+                            [-0.5, 0, 0.02],
+                            [0.5, 0, 0.02],
+                            [0, -0.5, 0],
+                            [0, 0.5, 0],
+                            [distance, -0.2, -0.2],
+                            [distance, 0.2, -0.2],
+                            [distance, 0, 0.2],
+                        ],
+                        dtype=dtype,
+                    )
+                    inputs.append(points + np.array(origin, dtype=dtype))
+            for device in wp.get_devices():
+                with wp.ScopedDevice(device):
+                    points = wp.array(np.array(inputs, dtype=np.float64), dtype=wp.vec3d)
+                    results = wp.empty((len(inputs), 5), dtype=int)
+                    wp.launch(make_predicate_probe(scalar), len(inputs), inputs=[points], outputs=[results])
+                    values = results.numpy()
+                    np.testing.assert_array_equal(values[:, 0], values[:, 1])
+                    np.testing.assert_array_equal(values[:, 2], values[:, 3])
+                    np.testing.assert_array_equal(values[:, 4], 1)
+                    self.assertTrue(np.any(values[:, 0] == 0) and np.any(values[:, 0] == 1))
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

@@ -55,6 +55,38 @@ def compare_dense(test, blocks):
 
 
 class TestEspVbdBlocks(unittest.TestCase):
+    def test_recovery_rows_are_skipped(self):
+        """Skip recovery rows in lists, energy, and both derivative blocks on CPU/CUDA."""
+        from newton._src.solvers.vbd import esp_contact  # noqa: PLC0415
+
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)):
+                state, blocks = make_case(device)
+                features = blocks.contacts._soft_contact_mesh_features.numpy().copy()
+                count = int(blocks.contacts.soft_contact_count.numpy()[0])
+                ee_rows = np.flatnonzero((features[:count, 0] >= 0) & ((features[:count, 0] & 7) == 2))
+                self.assertGreater(len(ee_rows), 0)
+                selected = ee_rows[::2]
+                reference = None
+                for tag in (-1, 3, 27):  # Absent, EE_DEPTH, EE_DEPTH with packed flags.
+                    modified = features.copy()
+                    modified[selected, 0] = tag
+                    blocks.contacts._soft_contact_mesh_features.assign(modified)
+                    esp_contact.rebuild_edge_triangle_lists(
+                        blocks.contacts, blocks.data, blocks.lists, blocks.solver._esp_list_sort_values
+                    )
+                    self.assertEqual(int(blocks.lists.error.numpy()[0]), 0)
+                    blocks.assemble(state)
+                    blocks.check()
+                    outputs = [a.numpy().copy() for a in (blocks.energy, blocks.force, blocks.hessian)]
+                    if reference is None:
+                        reference = outputs
+                        self.assertGreater(np.linalg.norm(reference[1]), 0)
+                    else:
+                        for actual, expected in zip(outputs, reference, strict=True):
+                            scale = max(float(np.max(np.abs(expected))), 1e-8)
+                            np.testing.assert_allclose(actual / scale, expected / scale, rtol=0, atol=2e-10)
+
     def test_benchmark_box_distance_uses_body_pose(self):
         """Check the diagnostic against known distances on a translated/rotated box."""
         from benchmark_esp_vbd import box_vertex_distances, make_grid_case  # noqa: PLC0415
@@ -85,6 +117,9 @@ class TestEspVbdBlocks(unittest.TestCase):
         for device in wp.get_devices():
             with self.subTest(device=str(device)):
                 state, blocks = make_case(device, shared_body=True)
+                # A single worker now evaluates EE values in its row. Multiple
+                # workers still exercise the shared sample cache being tested.
+                blocks._ee_partitions = 3
                 blocks.assemble(state)
                 expected = [a.numpy().copy() for a in (blocks.energy, blocks.force, blocks.hessian)]
                 with patch.object(blocks.solver, "_esp_ee_samples", None):
@@ -215,7 +250,7 @@ class TestEspVbdBlocks(unittest.TestCase):
                 blocks.lists.error.zero_()
                 features = blocks.contacts._soft_contact_mesh_features.numpy().copy()
                 original = features.copy()
-                features[0, 0] = 3
+                features[0, 0] = 4  # Unknown family, not the supported EE_DEPTH skip.
                 blocks.contacts._soft_contact_mesh_features.assign(features)
                 assemble()
                 with self.assertRaisesRegex(ValueError, "flags=8"):

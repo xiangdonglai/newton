@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare actual assembled blocks and VBD updates, without changing defaults."""
+"""Compare assembled blocks and VBD updates, without changing defaults.
+
+Run with ``uv run --no-sync --with torch python tmp/test_esp_direct_solver.py``.
+"""
 
 import ast
 import inspect
@@ -45,6 +48,10 @@ class TestEspDirectSolver(unittest.TestCase):
             names |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
             self.assertFalse(forbidden & names, (name, forbidden & names))
         self.assertIsNot(direct.launch_contact_blocks, chain.launch_contact_blocks)
+        for implementation in (chain, per_triangle, direct):
+            self.assertIs(
+                implementation.get_esp_kernels(wp.float64).launch_contact_blocks, implementation.launch_contact_blocks
+            )
         launch_source = inspect.getsource(direct.launch_contact_blocks)
         self.assertIn("accumulate_particle_contact_derivatives,", launch_source)
         self.assertIn("accumulate_body_contact_derivatives,", launch_source)
@@ -76,7 +83,12 @@ class TestEspDirectSolver(unittest.TestCase):
                     for color in [-1, *range(len(groups))]:
                         results = []
                         for implementation in (chain, per_triangle, direct):
-                            with patch.object(solver_vbd, "esp_contact", implementation):
+                            # This solver already owns a precision-specific kernel
+                            # set. Changing the module alone would test the same
+                            # production kernels three times.
+                            with patch.object(
+                                solver._esp_kernels, "launch_contact_blocks", implementation.launch_contact_blocks
+                            ):
                                 solver._accumulate_esp_contacts(state, kind, color)
                                 solver.check_esp_contacts()
                                 if kind == chain._PARTICLE_BLOCKS:
@@ -87,13 +99,17 @@ class TestEspDirectSolver(unittest.TestCase):
                                 # baseline before the next method reuses it.
                                 results.append([a.numpy().copy() for a in outputs])
                         for reference, old_direct, actual in zip(*results, strict=True):
-                            np.testing.assert_allclose(actual, old_direct, rtol=2e-7, atol=1e-8)
                             axes = tuple(range(1, reference.ndim))
                             scale = np.maximum(np.max(np.abs(reference), axis=axes, keepdims=True), 1)
                             maximum_block_error = max(
                                 maximum_block_error, float(np.max(np.abs(actual - reference) / scale))
                             )
                             with self.subTest(device=str(device), kind=kind, color=color):
+                                # Both saved formulas subtract squared distances
+                                # in the endpoint weight. Compare whole blocks
+                                # consistently; the small-entry accuracy check
+                                # below instead uses independent stable energy.
+                                np.testing.assert_allclose(actual / scale, old_direct / scale, atol=2e-7, rtol=0)
                                 np.testing.assert_allclose(actual / scale, reference / scale, atol=2e-7, rtol=0)
                 print(
                     f"Direct assembly / chain, {device}: maximum per-block scaled error {maximum_block_error:.3g}",
@@ -110,6 +126,47 @@ class TestEspDirectSolver(unittest.TestCase):
                 for reference, old_direct, actual in zip(*results, strict=True):
                     np.testing.assert_allclose(actual, old_direct, rtol=0, atol=2e-6)
                     np.testing.assert_allclose(actual, reference, rtol=0, atol=2e-6)
+
+    def test_endpoint_sensitive_assembled_hessian(self):
+        """Check an endpoint-sensitive assembled block against scalar autodiff.
+
+        Scale by the complete block, not its small H_yz entry: an independent
+        80-digit calculation finds roughly 3.5e-5 absolute error in that entry
+        for both CPU/CUDA FP64, in a block with entries around 1.4e8. Retain
+        this diagnostic print; do not claim exact entrywise FP64 agreement.
+        The captured-pair test separately checks the small endpoint weight.
+        """
+        import torch  # Optional independent test oracle.
+        from esp_autodiff import TorchEspEnergy  # noqa: PLC0415
+        from esp_derivatives import EspDerivativeEvaluator  # noqa: PLC0415
+        from esp_vbd_blocks import EspVbdBlockEvaluator  # noqa: PLC0415
+
+        for device in wp.get_devices():
+            with wp.ScopedDevice(device):
+                model, pipeline, _solver = make_grid_case(device, 4, dynamic=True, gap=0.00012, dat=True)
+                model.soft_contact_ke = 1
+                model.shape_material_ke.fill_(1)
+                state = model.state()
+                blocks = EspVbdBlockEvaluator(model, pipeline, state)
+                blocks.assemble(state)
+                geometry = EspDerivativeEvaluator(blocks)
+                reference = TorchEspEnergy(geometry)
+                positions = torch.tensor(
+                    np.concatenate((geometry.soft_positions, geometry.rigid_positions)), dtype=torch.float64
+                )
+
+                def energy(position, positions=positions, reference=reference):
+                    moved = torch.cat((positions[:4], position[None], positions[5:]))
+                    return reference(moved, 0) + reference(moved, 1)
+
+                hessian = torch.autograd.functional.hessian(energy, positions[4]).numpy()
+                actual = blocks.hessian.numpy().sum(axis=0)[4, :3, :3]
+                print(
+                    f"Endpoint-sensitive H_yz on {device}: production={actual[1, 2]:.15g}, Torch={hessian[1, 2]:.15g}"
+                )
+                with self.subTest(device=str(device)):
+                    scale = max(np.max(np.abs(hessian)), 1)
+                    np.testing.assert_allclose(actual / scale, hessian / scale, rtol=0, atol=1e-12)
 
     def test_trajectory_and_graph(self):
         """Compare 20 actual steps; graph replay advances, rather than resets, time.

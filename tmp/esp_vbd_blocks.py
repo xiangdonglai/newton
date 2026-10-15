@@ -8,7 +8,7 @@ and adds a dense-reference comparison for the examples. Run:
     uv run --no-sync python tmp/test_esp_vbd_blocks.py -v
 
 Kernel threads process contact rows and produce complete 3x3 particle or 6x6
-body blocks. Unused capacity returns using the device contact count.
+body blocks. Bounded workers loop over the device contact count.
 VT/TV contribute one triangle potential. Each ordinary EE row visits the
 unique target triangles in its existing per-edge lists, in both directions.
 EE samples/weights are reused across target faces. For each term, evaluate
@@ -94,7 +94,7 @@ def _select_quadrature(
     if row < wp.min(count[0], features.shape[0]):
         feature = features[row]
         family = feature[0] & 7
-        # Preserve recovery rows so the production error check remains active.
+        # Preserve recovery/unknown rows to exercise production skip/error handling.
         if feature[0] >= 0 and family < 3 and int(family == 2) != term:
             feature[0] = -1
         selected[row] = feature

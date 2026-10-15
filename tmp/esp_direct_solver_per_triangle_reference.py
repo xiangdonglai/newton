@@ -11,6 +11,8 @@ production code; ONLY particle/body derivative kernels are replaced here.
 There are no derivative-point objects in these kernels or their math calls.
 """
 
+from copy import copy
+
 import warp as wp
 from esp_direct_ee_per_triangle_reference import make_direct_ee_formulas
 from esp_direct_formulas import make_direct_contact_formulas
@@ -23,6 +25,15 @@ particle_ee_triangle = make_direct_ee_formulas(3, wp.float64)
 body_ee_triangle = make_direct_ee_formulas(6, wp.float64)
 Vector6 = wp.types.vector(length=6, dtype=wp.float64)
 Matrix6 = wp.types.matrix(shape=(6, 6), dtype=wp.float64)
+
+
+def get_esp_kernels(scalar=wp.float64):
+    """Use current buffer types but run the saved per-triangle FP64 derivatives."""
+    if scalar != wp.float64:
+        raise ValueError("The saved per-triangle reference supports float64 only")
+    kernels = copy(shared.get_esp_kernels(scalar))
+    kernels.launch_contact_blocks = launch_contact_blocks
+    return kernels
 
 
 def __getattr__(name):
@@ -65,14 +76,14 @@ def ee_particle_source(
                     wp.vec3d(rigid_positions[ids[1]]),
                     wp.vec3d(rigid_positions[ids[2]]),
                 )
-                edges, vertices, _reversed = shared.triangle_feature_weights(data.rigid, face)
+                edges, vertices = shared.triangle_feature_weights(data.rigid, face)
                 area = wp.float64(data.soft_edge_area[row[1]])
             else:
                 ids = data.soft.faces[face]
                 if data.soft.vertex_mesh[ids[0]] != mesh:
                     continue
                 ta, tb, tc = wp.vec3d(particle_q[ids[0]]), wp.vec3d(particle_q[ids[1]]), wp.vec3d(particle_q[ids[2]])
-                edges, vertices, _reversed = shared.triangle_feature_weights(data.soft, face)
+                edges, vertices = shared.triangle_feature_weights(data.soft, face)
                 area = wp.float64(data.rigid_edge_area[row[2]])
                 for corner in range(3):
                     if ids[corner] == particle:
@@ -144,7 +155,7 @@ def accumulate_particle_contact_derivatives(
             return
         face = data.rigid_face_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
-        edges, vertices, _reversed = shared.triangle_feature_weights(data.rigid, face)
+        edges, vertices = shared.triangle_feature_weights(data.rigid, face)
         e, g, h = particle_triangle(
             wp.vec3d(particle_q[particle]),
             rigid_positions[ids[0]],
@@ -163,7 +174,7 @@ def accumulate_particle_contact_derivatives(
     elif family == 1:
         face = row[1]
         ids = data.soft.faces[face]
-        edges, vertices, _reversed = shared.triangle_feature_weights(data.soft, face)
+        edges, vertices = shared.triangle_feature_weights(data.soft, face)
         for corner in range(3):
             particle = ids[corner]
             if color >= 0 and particle_colors[particle] != color:
@@ -207,7 +218,7 @@ def accumulate_particle_contact_derivatives(
             ids = data.soft.faces[face]
             if data.soft.vertex_mesh[ids[0]] != soft_mesh:
                 continue
-            edges, vertices, _reversed = shared.triangle_feature_weights(data.soft, face)
+            edges, vertices = shared.triangle_feature_weights(data.soft, face)
             for corner in range(3):
                 particle = ids[corner]
                 if particle == soft_edge[0] or particle == soft_edge[1]:
@@ -262,14 +273,14 @@ def ee_body(
                     wp.vec3d(rigid_positions[ids[1]]),
                     wp.vec3d(rigid_positions[ids[2]]),
                 )
-                edges, vertices, _reversed = shared.triangle_feature_weights(data.rigid, face)
+                edges, vertices = shared.triangle_feature_weights(data.rigid, face)
                 area = wp.float64(data.soft_edge_area[row[1]])
             else:
                 ids = data.soft.faces[face]
                 if data.soft.vertex_mesh[ids[0]] != mesh:
                     continue
                 ta, tb, tc = wp.vec3d(particle_q[ids[0]]), wp.vec3d(particle_q[ids[1]]), wp.vec3d(particle_q[ids[2]])
-                edges, vertices, _reversed = shared.triangle_feature_weights(data.soft, face)
+                edges, vertices = shared.triangle_feature_weights(data.soft, face)
                 area = wp.float64(data.rigid_edge_area[row[2]])
             e, g, h = body_ee_triangle(a, b, c, d, ta, tb, tc, direction == 0, 0, com, edges, vertices, support, near)
             energy += area * e
@@ -324,7 +335,7 @@ def accumulate_body_contact_derivatives(
     if family == 0:
         face = data.rigid_face_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
-        edges, vertices, _reversed = shared.triangle_feature_weights(data.rigid, face)
+        edges, vertices = shared.triangle_feature_weights(data.rigid, face)
         e, g, h = body_triangle(
             wp.vec3d(particle_q[row[1]]),
             rigid_positions[ids[0]],
@@ -342,7 +353,7 @@ def accumulate_body_contact_derivatives(
     elif family == 1:
         face = row[1]
         ids = data.soft.faces[face]
-        edges, vertices, _reversed = shared.triangle_feature_weights(data.soft, face)
+        edges, vertices = shared.triangle_feature_weights(data.soft, face)
         e, g, h = body_triangle(
             rigid_positions[row[2]],
             wp.vec3d(particle_q[ids[0]]),
@@ -411,6 +422,7 @@ def launch_contact_blocks(
                 shared.prepare_contact_evaluation,
                 max(contacts.soft_contact_max, force.shape[0], energy.shape[0]),
                 inputs=[
+                    max(contacts.soft_contact_max, force.shape[0], energy.shape[0]),
                     contacts.soft_contact_count,
                     contacts._soft_contact_mesh_features,
                     contacts.soft_contact_shape,

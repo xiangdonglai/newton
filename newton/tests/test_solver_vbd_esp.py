@@ -168,6 +168,7 @@ def make_case(
     dat=False,
     grid=False,
     isolated_particle=False,
+    precision="float64",
 ):
     """Place a tilted triangle over a closed box, with optional analytic ground."""
     with wp.ScopedDevice(device):
@@ -251,6 +252,7 @@ def make_case(
             collision_pipeline=pipeline,
             iterations=iterations,
             rigid_soft_contact_use_esp=enabled,
+            rigid_soft_contact_esp_precision=precision,
             rigid_soft_enable_dat=dat,
             rigid_soft_dat_use_interval_arithmetic=dat,
         )
@@ -258,6 +260,135 @@ def make_case(
 
 
 class TestVbdEsp(unittest.TestCase):
+    def test_ee_preparation_only_for_shared_rows(self):
+        """Match cached and on-demand blocks after geometry/count changes and graph replay.
+
+        One particle worker per row evaluates its sample directly; three workers
+        share a freshly prepared sample. Body and energy rows have one consumer.
+        Dirty outputs and sample storage must not survive an empty contact set.
+        """
+        for device in wp.get_devices():
+            for precision in ("float64", "float32"):
+                with self.subTest(device=str(device), precision=precision), wp.ScopedDevice(device):
+                    model, pipeline, solver = make_case(
+                        device, dynamic=True, grid=True, gap=0.00012, precision=precision
+                    )
+                    state = model.state()
+                    pipeline.collide(state, solver.contacts)
+                    kernels, contacts = solver._esp_kernels, solver.contacts
+                    arrays = [
+                        getattr(solver, "_esp_" + name)
+                        for name in ("energy", "particle_forces", "particle_hessians", "body_forces", "body_hessians")
+                    ]
+
+                    def evaluate(solver=solver, kernels=kernels, state=state):
+                        kernels.rebuild_edge_triangle_lists(
+                            solver.contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
+                        )
+                        for kind in (kernels._PARTICLE_BLOCKS, kernels._BODY_BLOCKS, kernels._ENERGY_ONLY):
+                            solver._accumulate_esp_contacts(state, kind)
+
+                    # Check actual launches, separately from numerical equivalence.
+                    for partitions in (1, 3):
+                        solver._esp_ee_partitions = partitions
+                        with patch.object(wp, "launch", wraps=wp.launch) as launch:
+                            evaluate()
+                        preparation_calls = sum(
+                            bool(call.args) and call.args[0] is kernels.prepare_contact_evaluation
+                            for call in launch.call_args_list
+                        )
+                        self.assertEqual(preparation_calls, int(partitions > 1))
+                    solver._esp_ee_partitions = 1
+                    evaluate()
+                    self.assertGreater(solver._esp_energy.numpy()[1], 0, "Exercise active EE quadrature")
+                    initial_force = solver._esp_particle_forces.numpy().copy()
+                    graph = None
+                    if device.is_cuda:
+                        with wp.ScopedCapture(device=device) as capture:
+                            evaluate()
+                        graph = capture.graph
+
+                    for moved in (False, True):
+                        if moved:
+                            positions = state.particle_q.numpy().copy()
+                            positions[:, 2] += 2.5e-5
+                            state.particle_q.assign(positions)
+                            poses = state.body_q.numpy().copy()
+                            poses[0, 2] += 5e-6
+                            state.body_q.assign(poses)
+                        pipeline.collide(state, contacts)
+                        count = int(contacts.soft_contact_count.numpy()[0])
+                        for active in (count, 0, count):
+                            contacts.soft_contact_count.fill_(active)
+                            solver._esp_ee_partitions = 3
+                            evaluate()
+                            expected = [a.numpy().copy() for a in arrays]
+                            for a in arrays:
+                                a.fill_(123.0)
+                            solver._esp_ee_samples.fill_(kernels.Vec4(123.0))
+                            solver._esp_ee_partitions = 1
+                            if graph is None:
+                                evaluate()
+                            else:
+                                wp.capture_launch(graph)
+                            solver.check_esp_contacts()
+                            for a, want in zip(arrays, expected, strict=True):
+                                got = a.numpy()
+                                scale = max(float(np.max(np.abs(want), initial=0)), 1.0)
+                                np.testing.assert_allclose(
+                                    got / scale,
+                                    want / scale,
+                                    rtol=0,
+                                    atol=2e-5 if precision == "float32" else 2e-10,
+                                )
+                                if active == 0:
+                                    self.assertFalse(got.any())
+                    self.assertGreater(np.linalg.norm(solver._esp_particle_forces.numpy() - initial_force), 0)
+
+    def test_rigid_positions_refresh_during_particle_colors(self):
+        """Refresh once per particle iteration, except DAT must refresh every color.
+
+        Compare against unconditional fresh transforms at each color over actual
+        advancing steps. Also check the refresh count: equal outputs alone would
+        not show that the redundant work was removed or the DAT guard was kept.
+        """
+        for device in wp.get_devices():
+            for dat in (False, True):
+                with self.subTest(device=str(device), dat=dat), wp.ScopedDevice(device):
+                    trajectories = []
+                    for always_refresh in (False, True):
+                        model, _pipeline, solver = make_case(device, dynamic=True, grid=True, dat=dat)
+                        original_add = solver._add_esp_particle_contacts
+                        if always_refresh:
+
+                            def add_fresh(state, ids, *, color=-1, refresh_rigid_positions=True, original=original_add):
+                                return original(state, ids, color=color, refresh_rigid_positions=True)
+
+                            solver._add_esp_particle_contacts = add_fresh
+                        original_iteration = solver._solve_particle_iteration
+                        expected_refreshes = len(model.particle_color_groups) if dat or always_refresh else 1
+
+                        def check_iteration(
+                            *args, solver=solver, original=original_iteration, expected=expected_refreshes
+                        ):
+                            with patch.object(
+                                solver, "_prepare_esp_contact_inputs", wraps=solver._prepare_esp_contact_inputs
+                            ) as refresh:
+                                original(*args)
+                            self.assertEqual(refresh.call_count, expected)
+
+                        solver._solve_particle_iteration = check_iteration
+                        state, out = model.state(), model.state()
+                        positions = []
+                        for _ in range(8):
+                            solver.step(state, out, None, None, 1e-4)
+                            positions.append(
+                                np.concatenate((out.particle_q.numpy().ravel(), out.body_q.numpy().ravel()))
+                            )
+                            state, out = out, state
+                        trajectories.append(positions)
+                    np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0, atol=3e-8)
+
     def test_ee_blocks_independent_of_list_partition(self):
         """Summing triangle terms before differentiating w*S must be additive.
 
@@ -880,7 +1011,15 @@ class TestVbdEsp(unittest.TestCase):
                     if full_assembly:
                         reference = _EspReference(solver)
 
-                        def all_blocks(state, block_kind, color=-1, solver=solver, reference=reference):
+                        def all_blocks(
+                            state,
+                            block_kind,
+                            color=-1,
+                            *,
+                            refresh_rigid_positions=True,
+                            solver=solver,
+                            reference=reference,
+                        ):
                             # Recompute every block at the same iterate, then
                             # feed only the active side to the unchanged solve.
                             reference.assemble(state)
