@@ -170,7 +170,9 @@ class TestEspVbdBlocks(unittest.TestCase):
                 blocks.check()
                 reference, e, f, h = compare_dense(self, blocks)
                 body, n = 0, blocks.model.particle_count
-                ids = np.flatnonzero(blocks.model.shape_body.numpy()[blocks.data.rigid.vertex_mesh.numpy()] == body)
+                ids = np.flatnonzero(
+                    blocks.model.shape_body.numpy()[blocks.data.rigid_vertex_rows.numpy()[:, 0]] == body
+                )
                 center = blocks.body_com_world.numpy()[body]
                 r = reference.rigid_positions[ids] - center
 
@@ -258,9 +260,17 @@ class TestEspVbdBlocks(unittest.TestCase):
                 blocks.contacts._soft_contact_mesh_features.assign(original)
                 row_id = np.flatnonzero((original[:count, 0] >= 0) & ((original[:count, 0] & 7) == 0))[0]
                 shape = blocks.contacts.soft_contact_shape.numpy()[row_id]
-                face = blocks.data.rigid_face_offsets.numpy()[shape] + original[row_id, 2]
+                face = blocks.data.rigid_triangle_offsets.numpy()[shape] + original[row_id, 2]
                 target_vertex = blocks.data.rigid.faces.numpy()[face, 0]
                 moved[original[row_id, 1]] = blocks.solver._esp_rigid_positions.numpy()[target_vertex]
+                state.particle_q.assign(moved)
+                assemble()
+                blocks.check()  # Exact touching now uses finite continuation.
+                self.assertTrue(np.isfinite(blocks.force.numpy()).all())
+                self.assertTrue(np.isfinite(blocks.hessian.numpy()).all())
+                # Invalid numerical input must still be reported, not hidden by
+                # the continuation or the rigid solve's regularization.
+                moved[original[row_id, 1]] = np.nan
                 state.particle_q.assign(moved)
                 assemble()
                 with self.assertRaisesRegex(ValueError, "flags=4"):

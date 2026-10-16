@@ -14,8 +14,8 @@ compilation and graph capture are excluded. Serial coloring is a diagnostic
 control only, never an option exposed by SolverVBD. Separate trajectory checks
 must be used to assess convergence: a fast reset/replay is not such a check.
 All force laws use the same unfiltered full-surface query, with the native
-force mask applied by VBD. DAT is off unless --dat is given; friction and
-damping are off. These are whole-step timings, not isolated force-kernel
+force mask applied by VBD. DAT is off unless --dat is given; friction is off
+unless --friction is given, and damping is off. These are whole-step timings, not isolated force-kernel
 timings. The final box-relative vertex distances are measured outside timing.
 """
 
@@ -44,6 +44,7 @@ def make_grid_case(
     dat=False,
     force_law="esp",
     esp_precision="float64",
+    friction=0.0,
 ):
     """Place a tilted cloth grid over a box, including its top edges."""
     with wp.ScopedDevice(device):
@@ -73,7 +74,7 @@ def make_grid_case(
         builder.add_shape_mesh(
             body,
             mesh=newton.Mesh(vertices, faces.ravel()),
-            cfg=builder.ShapeConfig(ke=1000.0, kd=0.0, mu=0.0),
+            cfg=builder.ShapeConfig(ke=1000.0, kd=0.0, mu=friction),
         )
         axis = np.linspace(-0.06, 0.06, resolution + 1)
         cloth = [[x, y, gap + 0.001 * x + 0.0007 * y] for y in axis for x in axis]
@@ -86,7 +87,7 @@ def make_grid_case(
             pos=wp.vec3(),
             rot=wp.quat_identity(),
             scale=1.0,
-            vel=wp.vec3(),
+            vel=wp.vec3(0.1, 0.0, 0.0) if friction else wp.vec3(),
             vertices=cloth,
             indices=triangles,
             density=100.0,
@@ -97,7 +98,7 @@ def make_grid_case(
         )
         builder.color()
         model = builder.finalize()
-        model.soft_contact_ke, model.soft_contact_kd, model.soft_contact_mu = 1000.0, 0.0, 0.0
+        model.soft_contact_ke, model.soft_contact_kd, model.soft_contact_mu = 1000.0, 0.0, friction
         pipeline = newton.CollisionPipeline(
             model,
             enable_rigid_soft_full_surface_contact=True,
@@ -188,6 +189,10 @@ def main():
     parser.add_argument("--resolution", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--gap", type=float, default=0.0003, help="Cloth center height above the box [m]")
+    parser.add_argument("--precision", choices=("float32", "float64"), default="float64")
+    parser.add_argument(
+        "--friction", type=float, default=0.0, help="Mixed Coulomb coefficient; sets initial x velocity to 0.1 m/s"
+    )
     parser.add_argument("--force-law", choices=("esp", "quadratic", "log-barrier"), default="esp")
     parser.add_argument("--schedule", choices=("grouped", "serial"), default="grouped")
     parser.add_argument("--samples", type=int, default=5)
@@ -230,6 +235,8 @@ def main():
         force_law=args.force_law,
         gap=args.gap,
         dat=args.dat,
+        esp_precision=args.precision,
+        friction=args.friction,
     )
     set_schedule(model, solver, args.schedule)
     if solver._esp_data is not None:
@@ -261,7 +268,7 @@ def main():
 
             def assemble(kind=kind, groups=groups):
                 for color in range(len(groups)):
-                    solver._accumulate_esp_contacts(frozen_state, kind, color)
+                    solver._accumulate_esp_contacts(frozen_state, kind, color, dt=1e-4)
 
             assembly_timings[name] = measure(assemble, device, args.samples, args.repeats)
     if args.profile and device.is_cuda:
@@ -280,6 +287,20 @@ def main():
         raise RuntimeError("Collision contact buffer overflow")
     assert np.isfinite(out.particle_q.numpy()).all()
     distances = box_vertex_distances(model, out)
+    # The preserved summed-load implementation owns these buffers; the signed
+    # per-primitive version has none. Count only this friction workspace, not
+    # total GPU allocations or the conservative ESP buffers shared by both.
+    friction_workspace_bytes = 0
+    for name in (
+        "_esp_friction_keys",
+        "_esp_friction_row_sample",
+        "_esp_sample_force",
+        "_esp_friction_nearest_row",
+        "_esp_friction_load",
+    ):
+        array = getattr(solver, name, None)
+        if array is not None:
+            friction_workspace_bytes += array.size * wp.types.type_size_in_bytes(array.dtype)
     print(
         json.dumps(
             {
@@ -288,6 +309,8 @@ def main():
                 "particles": model.particle_count,
                 "colors": len(model.particle_color_groups),
                 "rows": int(solver.contacts.soft_contact_count.numpy()[0]),
+                "contact_capacity": solver.contacts.soft_contact_max,
+                "friction_workspace_bytes": friction_workspace_bytes,
                 "step_ms": timings,
                 "assembly_ms": assembly_timings,
                 "median_ms": float(np.median(timings)),

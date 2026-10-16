@@ -31,6 +31,11 @@ Hessians, potentially indefinite, NOT PSD-projected solve matrices. SolverVBD
 can optionally project these blocks before solving; this diagnostic compares
 the raw derivatives. The camera-ready EE sample and weight derivatives are
 included, not frozen. Error flags invalidate the entire result.
+
+These checks deliberately exclude friction: it freezes its own geometry/load
+and is not the gradient of the conservative ESP energy checked here. Run
+    uv run --no-sync python -m unittest -v newton.tests.test_solver_vbd_esp_friction
+for signed primitive loads, material slip, reactions, and their frozen potentials.
 """
 
 import copy
@@ -106,7 +111,14 @@ class EspVbdBlockEvaluator:
     def __init__(self, model, pipeline, state):
         # Use the actual solver's topology, material parameters, transformed
         # positions, and contact lists. Only the split diagnostic outputs differ.
-        self.solver = SolverVBD(model, collision_pipeline=pipeline, rigid_soft_contact_use_esp=True, iterations=1)
+        # This checks conservative energy derivatives, including saved historical
+        # formulas. Sample friction has its own frozen-load tests in the library.
+        self.solver = SolverVBD(
+            model,
+            collision_pipeline=pipeline,
+            rigid_soft_contact_use_esp=True,
+            iterations=1,
+        )
         self.model, self.contacts = model, self.solver.contacts
         self.state = state
         self.data, self.lists = self.solver._esp_data, self.solver._esp_lists
@@ -114,11 +126,11 @@ class EspVbdBlockEvaluator:
         esp_contact.rebuild_edge_triangle_lists(self.contacts, self.data, self.lists, self.solver._esp_list_sort_values)
         self.solver._prepare_esp_contact_inputs(state)
         self.soft_rest_vertices = model.particle_q.numpy().astype(np.float64)
-        self.rigid_rest_vertices = self.data.rigid_local_vertices.numpy().astype(np.float64)
+        self.rigid_rest_vertices = self.data.rigid_local_positions.numpy().astype(np.float64)
         # The independent dense/Torch references below use one coefficient and
         # support. Fail explicitly if a diagnostic fixture breaks that contract.
-        radii = np.unique(self.data.soft_mesh_radius.numpy())
-        mesh_shapes = self.data.rigid_face_offsets.numpy() >= 0
+        radii = np.unique(model.particle_radius.numpy())
+        mesh_shapes = self.data.rigid_triangle_offsets.numpy() >= 0
         margins = np.unique(model.shape_margin.numpy()[mesh_shapes])
         stiffness = np.unique(model.shape_material_ke.numpy()[mesh_shapes])
         if (
@@ -267,7 +279,7 @@ class EspVbdBlockEvaluator:
         expected_f[:, :count, :3] = force[:, :count]
         for p in range(count):
             expected_h[:, p, :3, :3] = hessian[:, 3 * p : 3 * p + 3, 3 * p : 3 * p + 3]
-        bodies = self.model.shape_body.numpy()[self.data.rigid.vertex_mesh.numpy()]
+        bodies = self.model.shape_body.numpy()[self.data.rigid_vertex_rows.numpy()[:, 0]]
         centers = self.body_com_world.numpy()
         largest_rotation_correction = 0.0
         for body in range(self.model.body_count):

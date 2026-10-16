@@ -87,8 +87,13 @@ def segment_closest(p: Point, a: Point, b: Point) -> Point:
 
 @wp.func
 def barrier_from_squared_distance(
-    d_sq: wp.vec4d, support: wp.float64, near_cutoff: wp.float64, near_only: bool
+    d_sq: wp.vec4d,
+    support: wp.float64,
+    near_cutoff: wp.float64,
+    near_only: bool,
+    use_continuation: bool = False,
 ) -> wp.vec4d:
+    """Retain the singular law for historical checks; current scene checks opt in."""
     if d_sq[0] >= support * support or (near_only and d_sq[0] >= near_cutoff * near_cutoff):
         return wp.vec4d()
     if d_sq[0] <= wp.float64(0.0):
@@ -99,6 +104,17 @@ def barrier_from_squared_distance(
     gap = wp.vec4d(wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)) - ratio
     log_ratio = chain(ratio, wp.log(ratio[0]), wp.float64(1.0) / ratio[0], -wp.float64(1.0) / (ratio[0] * ratio[0]))
     total = -multiply(multiply(gap, gap), log_ratio)
+    threshold = wp.min(wp.float64(1e-5), support / wp.float64(4.0))
+    if use_continuation and root < threshold:
+        ratio0 = threshold / support
+        gap0 = wp.float64(1.0) - ratio0
+        e0 = -gap0 * gap0 * wp.log(ratio0)
+        g0 = (wp.float64(2.0) * gap0 * wp.log(ratio0) - gap0 * gap0 / ratio0) / support
+        h0 = (-wp.float64(2.0) * wp.log(ratio0) + wp.float64(4.0) * gap0 / ratio0 + gap0 * gap0 / (ratio0 * ratio0)) / (
+            support * support
+        )
+        offset = root - threshold
+        total = chain(d, e0 + g0 * offset + wp.float64(0.5) * h0 * offset * offset, g0 + h0 * offset, h0)
     if near_only:
         x = d * (wp.float64(2.0) / near_cutoff) - wp.vec4d(
             wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)
@@ -122,7 +138,7 @@ def barrier_from_squared_distance(
 
 @wp.func
 def barrier(delta: Point, support: wp.float64, near_cutoff: wp.float64, near_only: bool) -> wp.vec4d:
-    return barrier_from_squared_distance(dot(delta, delta), support, near_cutoff, near_only)
+    return barrier_from_squared_distance(dot(delta, delta), support, near_cutoff, near_only, True)
 
 
 @wp.func
@@ -257,7 +273,6 @@ def triangle_potential(
 def edge_potential(
     p: Point,
     edge: int,
-    target_mesh: int,
     positions: wp.array[wp.vec3d],
     surface: EspSurfaceData,
     offset: int,
@@ -270,8 +285,7 @@ def edge_potential(
     result = wp.vec4d()
     for k in range(lists.starts[edge], lists.ends[edge]):
         face = lists.keys[k]
-        if surface.vertex_mesh[surface.faces[face][0]] == target_mesh:
-            result += triangle_potential(p, positions, surface, face, offset, i, j, support, near_cutoff, True)
+        result += triangle_potential(p, positions, surface, face, offset, i, j, support, near_cutoff, True)
     return result
 
 
@@ -280,12 +294,12 @@ def evaluate_energy_derivatives(
     contact_count: wp.array[int],
     features: wp.array[wp.vec3i],
     shapes: wp.array[int],
-    rigid_face_offsets: wp.array[int],
+    rigid_triangle_offsets: wp.array[int],
     soft: EspSurfaceData,
     rigid: EspSurfaceData,
     soft_positions: wp.array[wp.vec3d],
     rigid_positions: wp.array[wp.vec3d],
-    soft_vertex_area: wp.array[wp.float64],
+    soft_vertex_weight: wp.array[wp.float64],
     rigid_vertex_area: wp.array[wp.float64],
     soft_edge_area: wp.array[wp.float64],
     rigid_edge_area: wp.array[wp.float64],
@@ -306,13 +320,22 @@ def evaluate_energy_derivatives(
     for row_id in range(contact_count[0]):
         row = features[row_id]
         shape = shapes[row_id]
-        if row[0] < 0 or rigid_face_offsets[shape] < 0:
+        if row[0] < 0 or rigid_triangle_offsets[shape] < 0:
             continue
         family = row[0] & 7
         if family == 0:
             p = vertex(soft_positions, row[1], 0, i, j)
-            fixed += soft_vertex_area[row[1]] * triangle_potential(
-                p, rigid_positions, rigid, rigid_face_offsets[shape] + row[2], offset, i, j, support, near_cutoff, False
+            fixed += soft_vertex_weight[row[1]] * triangle_potential(
+                p,
+                rigid_positions,
+                rigid,
+                rigid_triangle_offsets[shape] + row[2],
+                offset,
+                i,
+                j,
+                support,
+                near_cutoff,
+                False,
             )
         elif family == 1:
             v_id = row[2]
@@ -329,7 +352,6 @@ def evaluate_energy_derivatives(
                 value = soft_edge_area[row[1]] * edge_potential(
                     q,
                     row[1],
-                    rigid.vertex_mesh[rigid.edges[row[2]][0]],
                     rigid_positions,
                     rigid,
                     offset,
@@ -342,7 +364,6 @@ def evaluate_energy_derivatives(
                 value += rigid_edge_area[row[2]] * edge_potential(
                     q_bar,
                     lists.soft_edge_count + row[2],
-                    soft.vertex_mesh[soft.edges[row[1]][0]],
                     soft_positions,
                     soft,
                     0,
@@ -381,7 +402,7 @@ class EspDerivativeEvaluator:
             contacts.soft_contact_count,
             contacts._soft_contact_mesh_features,
             contacts.soft_contact_shape,
-            data.rigid_face_offsets,
+            data.rigid_triangle_offsets,
             data.soft,
             data.rigid,
         )
@@ -389,7 +410,7 @@ class EspDerivativeEvaluator:
         self.device = blocks.model.device
         self.soft_positions = blocks.state.particle_q.numpy().astype(np.float64)
         self.rigid_positions = blocks.solver._esp_rigid_positions.numpy()
-        self.weights = [data.soft_vertex_area, data.rigid_vertex_area, data.soft_edge_area, data.rigid_edge_area]
+        self.weights = [data.soft_vertex_weight, data.rigid_vertex_area, data.soft_edge_area, data.rigid_edge_area]
         self.support, self.near_cutoff = blocks.support, blocks.near_cutoff
 
     def evaluate(self, soft_positions=None, rigid_positions=None, *, compute_hessian=True):

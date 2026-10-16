@@ -409,6 +409,52 @@ def ldlt6_solve(h_ll: wp.mat33, h_aa: wp.mat33, h_al: wp.mat33, rhs_lin: wp.vec3
 
 
 @wp.func
+def solve_esp_rigid_block(h_ll: wp.mat33, h_aa: wp.mat33, h_al: wp.mat33, rhs_lin: wp.vec3, rhs_ang: wp.vec3):
+    """Retry a failed ESP Newton step with a scaled positive-definite system.
+
+    ESP's exact Hessian need not be PSD. Keep a finite descent step unchanged;
+    otherwise bound the eigenvalues using row sums and shift the diagonal.
+    This changes the solve Hessian only, not the energy, force or raw Hessian.
+    Nonfinite inputs remain errors rather than being hidden by regularization.
+    """
+    linear, angular = ldlt6_solve(h_ll, h_aa, h_al, rhs_lin, rhs_ang)
+    descent = wp.dot(linear, rhs_lin) + wp.dot(angular, rhs_ang)
+    if wp.isfinite(linear) and wp.isfinite(angular) and wp.isfinite(descent) and descent >= 0.0:
+        return linear, angular
+    if not wp.isfinite(h_ll) or not wp.isfinite(h_aa) or not wp.isfinite(h_al):
+        return linear, angular
+    if not wp.isfinite(rhs_lin) or not wp.isfinite(rhs_ang):
+        return linear, angular
+
+    scale = float(0.0)
+    for i in range(3):
+        for j in range(3):
+            scale = wp.max(scale, wp.max(wp.abs(h_ll[i, j]), wp.max(wp.abs(h_aa[i, j]), wp.abs(h_al[i, j]))))
+    if scale <= 0.0:
+        return linear, angular
+    ll, aa, al = h_ll / scale, h_aa / scale, h_al / scale
+    ll = 0.5 * (ll + wp.transpose(ll))
+    aa = 0.5 * (aa + wp.transpose(aa))
+    lower_bound = float(0.0)
+    for i in range(3):
+        radius_l, radius_a = float(0.0), float(0.0)
+        for j in range(3):
+            if i != j:
+                radius_l += wp.abs(ll[i, j])
+                radius_a += wp.abs(aa[i, j])
+            radius_l += wp.abs(al[j, i])
+            radius_a += wp.abs(al[i, j])
+        lower_bound = wp.min(lower_bound, wp.min(ll[i, i] - radius_l, aa[i, i] - radius_a))
+    # Strict diagonal dominance after scaling makes the symmetric system SPD;
+    # leave a float32 rounding margin instead of shifting exactly to singularity.
+    shift = -lower_bound + 1.0e-5
+    for i in range(3):
+        ll[i, i] += shift
+        aa[i, i] += shift
+    return ldlt6_solve(ll, aa, al, rhs_lin / scale, rhs_ang / scale)
+
+
+@wp.func
 def compute_kappa(q_wp: wp.quat, q_wc: wp.quat, q_wp_rest: wp.quat, q_wc_rest: wp.quat) -> wp.vec3:
     """Compute rest-relative angular rotation vector kappa in the parent frame.
 
@@ -2064,22 +2110,6 @@ def _evaluate_rigid_soft_contact_force_norm(
 
 
 @wp.func
-def _contact_uses_esp(
-    shape: int,
-    particles: wp.vec3i,
-    esp_shape_mask: wp.array[bool],
-    esp_vertex_area: wp.array[wp.float64],
-) -> bool:
-    """Replace normal elasticity only for mesh rows covered by ESP surface energy."""
-    if not esp_shape_mask or not esp_shape_mask[shape]:
-        return False
-    for i in range(3):
-        if particles[i] >= 0 and esp_vertex_area[particles[i]] == wp.float64(0.0):
-            return False
-    return True
-
-
-@wp.func
 def _compute_body_particle_contact_force(
     distance: float,
     collision_radius: float,
@@ -2099,9 +2129,8 @@ def _compute_body_particle_contact_force(
     resolved by the caller.  This function only computes the contact force and
     Hessian from those scalar/vector inputs.
 
-    With ``include_normal_elasticity=False``, ESP supplies elasticity separately.
-    Damping and friction are unchanged, including the penalty-based normal load
-    used for the Coulomb limit. This is not an ESP-derived friction formulation.
+    ``include_normal_elasticity=False`` evaluates only damping and friction.
+    The ESP damping evaluation calls this law with zero ke and mu.
     """
     dE_dD, d2E_dDdD = _evaluate_rigid_soft_contact_force_norm(distance, collision_radius, ke, use_log_barrier)
     f_n = -dE_dD
@@ -5978,7 +6007,6 @@ def accumulate_body_particle_contacts_per_body(
     body_particle_contact_counts: wp.array[wp.int32],
     body_particle_contact_indices: wp.array[wp.int32],
     esp_shape_mask: wp.array[bool],
-    esp_vertex_area: wp.array[wp.float64],
     # Outputs
     body_forces: wp.array[wp.vec3],
     body_torques: wp.array[wp.vec3],
@@ -6035,9 +6063,9 @@ def accumulate_body_particle_contacts_per_body(
         if contact_idx >= max_contacts:
             continue
 
-        include_normal = not _contact_uses_esp(
-            body_particle_contact_shape[contact_idx], soft_contact_indices[contact_idx], esp_shape_mask, esp_vertex_area
-        )
+        if esp_shape_mask and esp_shape_mask[body_particle_contact_shape[contact_idx]]:
+            continue
+        contact_mu = body_particle_contact_material_mu[contact_idx]
         f_soft = wp.vec3(0.0)
         h_soft = wp.mat33(0.0)
         cp_world = wp.vec3(0.0)
@@ -6075,11 +6103,10 @@ def accumulate_body_particle_contacts_per_body(
                 relative_translation,
                 body_particle_contact_penalty_k[contact_idx],
                 body_particle_contact_material_kd[contact_idx],
-                body_particle_contact_material_mu[contact_idx],
+                contact_mu,
                 friction_epsilon,
                 dt,
                 rigid_body_particle_contact_use_log_barrier,
-                include_normal,
             )
         else:
             # Edge/face: barycentric contact point over the record's 2-3 soft particles. Uses the
@@ -6094,7 +6121,7 @@ def accumulate_body_particle_contacts_per_body(
                 particle_radius,
                 body_particle_contact_penalty_k[contact_idx],
                 body_particle_contact_material_kd[contact_idx],
-                body_particle_contact_material_mu[contact_idx],
+                contact_mu,
                 friction_epsilon,
                 shape_body,
                 body_q,
@@ -6108,7 +6135,6 @@ def accumulate_body_particle_contacts_per_body(
                 shape_margin,
                 dt,
                 rigid_body_particle_contact_use_log_barrier,
-                include_normal,
             )
 
         # Equal-and-opposite reaction on the body at the rigid contact point (shared by both kinds).
@@ -6316,6 +6342,7 @@ def solve_rigid_body(
     external_hessian_ll: wp.array[wp.mat33],
     external_hessian_al: wp.array[wp.mat33],
     external_hessian_aa: wp.array[wp.mat33],
+    use_esp: bool,
     # Output
     body_q_new: wp.array[wp.transform],
 ):
@@ -6503,7 +6530,11 @@ def solve_rigid_body(
     h_aa[2, 2] = h_aa[2, 2] + epsA
 
     # Solve 6x6 system via direct LDL^T
-    x_inc, w_world = ldlt6_solve(h_ll, h_aa, h_al, f_force, f_torque)
+    x_inc, w_world = wp.vec3(), wp.vec3()
+    if use_esp:
+        x_inc, w_world = solve_esp_rigid_block(h_ll, h_aa, h_al, f_force, f_torque)
+    else:
+        x_inc, w_world = ldlt6_solve(h_ll, h_aa, h_al, f_force, f_torque)
 
     # Update pose from increments
     # Convert angular increment to quaternion

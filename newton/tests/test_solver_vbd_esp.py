@@ -21,6 +21,20 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_con
 
 
 @wp.kernel
+def _primitive_supports(
+    rows: wp.array[wp.vec3i],
+    data: esp_contact.EspContactData,
+    radii: wp.array[float],
+    margins: wp.array[float],
+    stiffness: wp.array[float],
+    output: wp.array[wp.vec3d],
+):
+    i = wp.tid()
+    h, near, ke = esp_contact.contact_support_and_stiffness(rows[i], 0, data, radii, margins, stiffness, 0.0)
+    output[i] = wp.vec3d(h, near, ke)
+
+
+@wp.kernel
 def _copy_raw_blocks(
     source_force: wp.array2d[wp.float64],
     source_hessian: wp.array3d[wp.float64],
@@ -42,23 +56,10 @@ def _copy_raw_blocks(
 class _EspReference:
     """Full-block test reference; production owns only separate 3D/6D solve buffers."""
 
-    def __init__(self, solver, *, support=None):
+    def __init__(self, solver, *, unit_stiffness=False):
         self.solver, self.model = solver, solver.model
         self.lists, self.contacts = solver._esp_lists, solver.contacts
-        self.data = (
-            solver._esp_data
-            if support is None
-            else esp_contact.create_esp_contact_data(self.model, solver.collision_pipeline)
-        )
-        # Unit-material reference uses ordinary material inputs, not a second
-        # production force-law mode. The data copy keeps solver radii unchanged.
-        self.support = support
-        self.shape_margin = self.model.shape_margin
-        self.shape_material_ke = self.model.shape_material_ke
-        if support is not None:
-            self.data.soft_mesh_radius.fill_(support)
-            self.shape_margin = wp.zeros(self.model.shape_count, dtype=float, device=solver.device)
-            self.shape_material_ke = wp.ones(self.model.shape_count, dtype=float, device=solver.device)
+        self.data = solver._esp_data
         self.energy = wp.zeros(2, dtype=wp.float64, device=solver.device)
         count = self.model.particle_count + self.model.body_count
         self.raw_force = wp.zeros((count, 6), dtype=wp.float64, device=solver.device)
@@ -66,10 +67,9 @@ class _EspReference:
         self.force = self.raw_force.reshape((1, count, 6))
         self.hessian = self.raw_hessian.reshape((1, count, 6, 6))
         self.reference_model = self.model
-        if support is not None:
+        if unit_stiffness:
             self.reference_model = copy.copy(self.model)
-            self.reference_model.shape_margin = self.shape_margin
-            self.reference_model.shape_material_ke = self.shape_material_ke
+            self.reference_model.shape_material_ke = wp.ones(self.model.shape_count, dtype=float, device=solver.device)
             self.reference_model.soft_contact_ke = 1.0
 
     def assemble(self, state):
@@ -167,6 +167,7 @@ def make_case(
     gap=0.003,
     dat=False,
     grid=False,
+    grid_extent=0.04,
     isolated_particle=False,
     precision="float64",
 ):
@@ -217,7 +218,11 @@ def make_case(
         soft_vertices = [[-0.02, -0.02, gap], [0.02, -0.02, gap + 0.0001], [0, 0.02, gap + 0.0002]]
         soft_indices = [0, 1, 2]
         if grid:
-            soft_vertices = [[x, y, gap + 0.001 * x + 0.0007 * y] for y in (-0.04, 0, 0.04) for x in (-0.04, 0, 0.04)]
+            soft_vertices = [
+                [x, y, gap + 0.001 * x + 0.0007 * y]
+                for y in (-grid_extent, 0, grid_extent)
+                for x in (-grid_extent, 0, grid_extent)
+            ]
             soft_indices = []
             for p in (0, 1, 3, 4):
                 soft_indices.extend([p, p + 1, p + 3, p + 1, p + 4, p + 3])
@@ -259,7 +264,125 @@ def make_case(
         return model, pipeline, solver
 
 
+def make_point_contact_case(device, kind, *, precision="float64", floor=False):
+    """Put point samples or a tetrahedral interior vertex above a dynamic mesh box."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(gravity=wp.vec3())
+        body = builder.add_body(mass=1.0)
+        cfg = builder.ShapeConfig(ke=1000.0, kd=2.0, mu=0.25)
+        builder.add_shape_mesh(
+            body,
+            mesh=newton.Mesh.create_box(0.05, duplicate_vertices=False),
+            cfg=cfg,
+            xform=wp.transform(wp.vec3(2.0 if floor else 0.0, 0, -0.05), wp.quat_identity()),
+        )
+        if floor:
+            builder.add_ground_plane(cfg=cfg)
+        point = np.array([0.01, -0.015, 0.003], dtype=np.float32)
+        if kind == "interior":
+            # Four tetrahedra share vertex 0 at the outer tetrahedron's center.
+            # Only vertices 1..4 belong to the generated boundary triangles.
+            vertices = point + 0.008 * np.array(
+                [[0, 0, 0], [1, 1, 1], [-1, -1, 1], [-1, 1, -1], [1, -1, -1]], np.float32
+            )
+            tets = np.array([[0, 2, 3, 4], [0, 1, 3, 4], [0, 1, 2, 4], [0, 1, 2, 3]], np.int32)
+            for tet in tets:
+                if np.linalg.det(vertices[tet[1:]] - vertices[tet[0]]) < 0:
+                    tet[2], tet[3] = tet[3], tet[2]
+            builder.add_soft_mesh(
+                pos=wp.vec3(),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(),
+                vertices=vertices,
+                indices=tets.ravel(),
+                density=1000.0,
+                k_mu=0.0,
+                k_lambda=0.0,
+                k_damp=0.0,
+                particle_radius=0.005,
+            )
+        else:
+            builder.add_particle(pos=wp.vec3(*point), vel=wp.vec3(), mass=1.0, radius=0.005)
+            if kind in ("spring", "edge"):
+                builder.add_particle(
+                    pos=wp.vec3(*(point + np.array([0.01, 0, 0]))), vel=wp.vec3(), mass=1.0, radius=0.005
+                )
+                if kind == "spring":
+                    builder.add_spring(0, 1, ke=1.0, kd=0.0, control=0.0)
+                else:
+                    builder.add_edge(-1, -1, 0, 1, edge_ke=0.0, edge_kd=0.0)
+        builder.color()
+        model = builder.finalize()
+        model.soft_contact_ke, model.soft_contact_kd, model.soft_contact_mu = 1000.0, 2.0, 1.0
+        pipeline = newton.CollisionPipeline(
+            model,
+            soft_contact_gap=0.01,
+            soft_contact_max=512,
+            enable_rigid_soft_full_surface_contact=True,
+            full_surface_contact_return_unfiltered=True,
+        )
+        solver = newton.solvers.SolverVBD(
+            model,
+            collision_pipeline=pipeline,
+            iterations=1,
+            rigid_soft_contact_use_esp=True,
+            rigid_soft_contact_esp_precision=precision,
+        )
+        return model, pipeline, solver
+
+
 class TestVbdEsp(unittest.TestCase):
+    def test_local_primitive_radii(self):
+        """Read fixed vertex/edge/triangle radii, including device changes under graph replay."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device)
+                radii = np.array([0.002, 0.004, 0.008], dtype=np.float32)
+                self.assertEqual(model.particle_count, 3)
+                model.particle_radius.assign(radii)
+                with self.assertWarnsRegex(UserWarning, "cancellations") as warning:
+                    esp_contact.create_esp_contact_data(model, pipeline)
+                self.assertIn("mixed particle radii", str(warning.warning))
+                self.assertFalse(hasattr(solver._esp_data, "soft_radius"))
+                edges = solver._esp_data.soft.edges.numpy()
+                rows = wp.array(
+                    [[0, i, 0] for i in range(3)] + [[1, 0, 0]] + [[2, i, 0] for i in range(len(edges))],
+                    dtype=wp.vec3i,
+                )
+                output = wp.empty(len(rows), dtype=wp.vec3d)
+
+                def evaluate(rows=rows, solver=solver, model=model, output=output):
+                    wp.launch(
+                        _primitive_supports,
+                        dim=len(rows),
+                        inputs=[
+                            rows,
+                            solver._esp_data,
+                            model.particle_radius,
+                            model.shape_margin,
+                            model.shape_material_ke,
+                        ],
+                        outputs=[output],
+                    )
+
+                evaluate()
+                graph = None
+                if device.is_cuda:
+                    with wp.ScopedCapture(device=device) as capture:
+                        evaluate()
+                    graph = capture.graph
+                for values in (radii, radii[::-1].copy()):
+                    model.particle_radius.assign(values)
+                    if graph is None:
+                        evaluate()
+                    else:
+                        wp.capture_launch(graph)
+                    expected = np.r_[values, values.max(), values[edges].max(axis=1)].astype(float)
+                    expected += float(model.shape_margin.numpy()[0])
+                    np.testing.assert_allclose(output.numpy()[:, 0], expected, rtol=0, atol=1e-15)
+                    np.testing.assert_allclose(output.numpy()[:, 1], 0.05 * expected, rtol=0, atol=1e-15)
+
     def test_ee_preparation_only_for_shared_rows(self):
         """Match cached and on-demand blocks after geometry/count changes and graph replay.
 
@@ -361,8 +484,10 @@ class TestVbdEsp(unittest.TestCase):
                         original_add = solver._add_esp_particle_contacts
                         if always_refresh:
 
-                            def add_fresh(state, ids, *, color=-1, refresh_rigid_positions=True, original=original_add):
-                                return original(state, ids, color=color, refresh_rigid_positions=True)
+                            def add_fresh(
+                                state, ids, *, color=-1, refresh_rigid_positions=True, dt=0.0, original=original_add
+                            ):
+                                return original(state, ids, color=color, refresh_rigid_positions=True, dt=dt)
 
                             solver._add_esp_particle_contacts = add_fresh
                         original_iteration = solver._solve_particle_iteration
@@ -435,27 +560,155 @@ class TestVbdEsp(unittest.TestCase):
                                 with self.subTest(device=str(device), kind=kind, partitions=partitions):
                                     np.testing.assert_allclose(value / scale, expected / scale, atol=2e-10, rtol=0)
 
-    def test_preserve_contact_for_particle_without_surface(self):
-        """Keep native mesh forces on a particle with no ESP quadrature area.
+    def test_point_without_surface_uses_esp(self):
+        """Give an isolated particle unit ESP weight, not native mesh forces."""
+        for device in wp.get_devices():
+            for precision in ("float32", "float64"):
+                with self.subTest(device=str(device), precision=precision), wp.ScopedDevice(device):
+                    model, pipeline, solver = make_case(
+                        device, dynamic=True, isolated_particle=True, precision=precision
+                    )
+                    state = model.state()
+                    pipeline.collide(state, solver.contacts)
+                    solver._refresh_body_particle_contact_state(solver.contacts, True)
+                    solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+                    self.assertGreater(float(solver._esp_energy.numpy().sum()), 0.0)
+                    self.assertEqual(float(solver._esp_data.soft_vertex_weight.numpy()[-1]), 1.0)
+                    solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
+                    particle_force = solver._esp_particle_forces.numpy().copy()
+                    solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS)
+                    solver.check_esp_contacts()
+                    self.assertGreater(particle_force[-1, 2], 0.0)
+                    np.testing.assert_allclose(
+                        solver._esp_body_forces.numpy()[0, :3], -particle_force.sum(axis=0), rtol=2e-5, atol=1e-5
+                    )
 
-        Move the cloth out of contact and put a separate particle above the
-        box. ESP must not disable its normal force just because this rigid
-        shape also supports cloth contact. Check the rigid reaction as well.
+    def test_point_weights_and_interior_exclusion(self):
+        """Use unit point weights and exclude solid interiors, including friction/damping.
+
+        Point scenes have no soft triangles at all. A separate tetrahedral case
+        deliberately places an interior vertex near the box so detection emits
+        its row: zero force must follow from the policy, not from a missing row.
         """
         for device in wp.get_devices():
-            for dynamic in (False, True):
-                results = []
-                for enabled in (False, True):
-                    with self.subTest(device=str(device), dynamic=dynamic, enabled=enabled), wp.ScopedDevice(device):
-                        model, _pipeline, solver = make_case(
-                            device, enabled=enabled, dynamic=dynamic, iterations=1, isolated_particle=True
+            for precision in ("float32", "float64"):
+                for kind in ("particle", "spring", "edge", "interior"):
+                    with self.subTest(device=str(device), precision=precision, kind=kind), wp.ScopedDevice(device):
+                        model, pipeline, solver = make_point_contact_case(device, kind, precision=precision)
+                        state = model.state()
+                        pipeline.collide(state, solver.contacts)
+                        solver._refresh_body_particle_contact_state(solver.contacts, True)
+                        count = int(solver.contacts.soft_contact_count.numpy()[0])
+                        self.assertGreater(count, 0)
+                        self.assertLessEqual(count, solver.contacts.soft_contact_max)
+                        rows = solver.contacts._soft_contact_mesh_features.numpy().copy()
+                        point_rows = ((rows[:count, 0] & 7) == 0) & (rows[:count, 1] == 0)
+                        self.assertTrue(point_rows.any())
+                        weights = solver._esp_data.soft_vertex_weight.numpy()
+                        if kind == "interior":
+                            self.assertEqual(weights[0], 0.0)
+                            self.assertTrue(np.all(weights[1:] > 0.0))
+                            self.assertNotIn(0, model.tri_indices.numpy())
+                            # Isolate vertex 0's raw rows, including its native
+                            # damping rows, and check its rigid reaction too.
+                            rows[:count][~point_rows, 0] = -1
+                            solver.contacts._soft_contact_mesh_features.assign(rows)
+                            mask = solver.contacts.soft_contact_force_mask.numpy().copy()
+                            mask[:count] &= point_rows
+                            solver.contacts.soft_contact_force_mask.assign(mask)
+                        else:
+                            self.assertEqual(model.tri_count, 0)
+                            np.testing.assert_array_equal(weights, 1.0)
+                        solver.particle_q_prev.assign(
+                            state.particle_q.numpy() - np.array([0.001, 0, -0.001], np.float32)
                         )
+                        solver.body_q_prev.assign(state.body_q)
+
+                        def evaluate(solver=solver, state=state):
+                            solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+                            solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
+                            solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS, dt=0.01)
+
+                        evaluate()
+                        solver.check_esp_contacts()
+                        arrays = [
+                            solver._esp_energy,
+                            solver._esp_particle_forces,
+                            solver._esp_particle_hessians,
+                            solver._esp_body_forces,
+                            solver._esp_body_hessians,
+                        ]
+                        expected = [array.numpy().copy() for array in arrays]
+                        for value in expected:
+                            self.assertTrue(np.isfinite(value).all())
+                            if kind == "interior":
+                                np.testing.assert_array_equal(value, 0.0)
+                        if kind != "interior":
+                            self.assertGreater(expected[0].sum(), 0.0)
+                            self.assertTrue(np.all(expected[1][:, 2] > 0))
+                            self.assertTrue(np.all(expected[1][:, 0] < 0), "Point samples receive ESP friction")
+                            np.testing.assert_allclose(
+                                expected[3][0, :3], -expected[1].sum(axis=0), rtol=3e-5, atol=1e-4
+                            )
+                            # Inside one top face and outside every edge's support,
+                            # the unit-weight energy is exactly k*b(z/support).
+                            ratio = float(state.particle_q.numpy()[0, 2]) / float(model.particle_radius.numpy()[0])
+                            energy = model.particle_count * 1000.0 * -((1.0 - ratio) ** 2) * np.log(ratio)
+                            np.testing.assert_allclose(expected[0].sum(), energy, rtol=2e-5)
+                            support = float(model.particle_radius.numpy()[0])
+                            gap = 1.0 - ratio
+                            first = (2.0 * gap * np.log(ratio) - gap * gap / ratio) / support
+                            second = (-2.0 * np.log(ratio) + 4.0 * gap / ratio + gap * gap / ratio**2) / support**2
+                            solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
+                            normal_force = np.zeros((model.particle_count, 3))
+                            normal_force[:, 2] = -1000.0 * first
+                            normal_hessian = np.zeros((model.particle_count, 3, 3))
+                            normal_hessian[:, 2, 2] = 1000.0 * second
+                            np.testing.assert_allclose(
+                                solver._esp_particle_forces.numpy(), normal_force, rtol=2e-5, atol=1e-5
+                            )
+                            np.testing.assert_allclose(
+                                solver._esp_particle_hessians.numpy(), normal_hessian, rtol=2e-5, atol=1e-5
+                            )
+                        if device.is_cuda:
+                            with wp.ScopedCapture(device=device) as capture:
+                                evaluate()
+                            wp.capture_launch(capture.graph)
+                            solver.check_esp_contacts()
+                            for array, reference in zip(arrays, expected, strict=True):
+                                np.testing.assert_allclose(array.numpy(), reference, rtol=3e-5, atol=1e-4)
+                        if kind != "interior":
+                            initial_z = state.particle_q.numpy()[0, 2].copy()
+                            out = model.state()
+                            solver.step(state, out, None, None, 1e-4)
+                            solver.check_esp_contacts()
+                            self.assertTrue(np.isfinite(out.particle_q.numpy()).all())
+                            self.assertTrue(np.isfinite(out.body_q.numpy()).all())
+                            self.assertGreater(out.particle_q.numpy()[0, 2], initial_z)
+
+    def test_interior_vertex_keeps_analytical_contact(self):
+        """Exclude interior vertices from mesh forces without changing ground contact."""
+        for device in wp.get_devices():
+            for floor in (False, True):
+                for gather in (False, True):
+                    with self.subTest(device=str(device), floor=floor, gather=gather), wp.ScopedDevice(device):
+                        model, pipeline, solver = make_point_contact_case(device, "interior", floor=floor)
+                        solver._particle_contact_use_gather = gather
                         state, out = model.state(), model.state()
-                        solver.step(state, out, None, None, 0.001)
-                        results.append((out.particle_q.numpy(), out.body_q.numpy() if dynamic else np.empty(0)))
-                self.assertGreater(results[0][0][-1, 2], 0.0031)
-                for native, esp in zip(results[0], results[1], strict=True):
-                    np.testing.assert_allclose(esp, native, rtol=0, atol=1e-8)
+                        initial_position = state.particle_q.numpy()[0].copy()
+                        pipeline.collide(state, solver.contacts)
+                        self.assertGreater(int(solver.contacts.soft_contact_count.numpy()[0]), 0)
+                        # Suppress ESP assembly to expose any unintended native
+                        # force on an interior vertex. Zero tet stiffness isolates it.
+                        with (
+                            patch.object(solver, "_add_esp_particle_contacts"),
+                            patch.object(solver, "_add_esp_body_contacts"),
+                        ):
+                            solver.step(state, out, None, None, 1e-4)
+                        if floor:
+                            self.assertGreater(out.particle_q.numpy()[0, 2], initial_position[2])
+                        else:
+                            np.testing.assert_array_equal(out.particle_q.numpy()[0], initial_position)
 
     def test_reuse_model_topology_and_rest_areas(self):
         """Reuse soft topology and honor model rest areas, independently of current geometry.
@@ -472,6 +725,10 @@ class TestVbdEsp(unittest.TestCase):
                 model.tri_areas.assign(areas)
                 data = esp_contact.create_esp_contact_data(model, pipeline)
                 soft, adjacency = data.soft, model.soft_mesh_adjacency_device
+                self.assertFalse(hasattr(esp_contact, "soft_mesh_components"))
+                self.assertFalse(hasattr(soft, "vertex_mesh"))
+                self.assertFalse(hasattr(data, "soft_mesh_radius"))
+                self.assertEqual(data.rigid_vertex_rows.ptr, pipeline._soft_mesh_contact_data.rigid_features[0].ptr)
                 self.assertEqual(soft.faces.ptr, model.tri_indices.ptr)
                 self.assertEqual(soft.edges.ptr, model.edge_indices.ptr + 2 * np.dtype(np.int32).itemsize)
                 self.assertEqual(soft.edges.strides[0], model.edge_indices.strides[0])
@@ -487,16 +744,16 @@ class TestVbdEsp(unittest.TestCase):
                 expected_e = np.zeros(model.edge_count, dtype=np.float32)
                 np.add.at(expected_v, model.tri_indices.numpy().ravel(), np.repeat(areas / 3, 3))
                 np.add.at(expected_e, adjacency.tri_edge_indices.numpy().ravel(), np.repeat(2 * areas, 3))
-                np.testing.assert_array_equal(data.soft_vertex_area.numpy(), expected_v)
+                np.testing.assert_array_equal(data.soft_vertex_weight.numpy(), expected_v)
                 np.testing.assert_array_equal(data.soft_edge_area.numpy(), expected_e)
                 np.testing.assert_array_equal(model.tri_areas.numpy(), areas)
 
     def test_material_support_and_stiffness(self):
-        """Use each surface's radii/margin and each rigid shape's mixed material.
+        """Use local primitive radii and each rigid shape's margin and material.
 
         Two separated cloth/box pairs have different radii, margins, and ke.
-        Compare every raw force/Hessian block with independently assembled
-        unit-coefficient energies at the expected support, then scale by the
+        Compare every raw force/Hessian block with separately assembled
+        unit-coefficient energies using the same fixed radii, then scale by the
         expected material average. Each pair exercises VT, TV, and active EE.
         Changing a device material array must also work under graph replay.
         """
@@ -534,6 +791,12 @@ class TestVbdEsp(unittest.TestCase):
                     enable_rigid_soft_full_surface_contact=True,
                     full_surface_contact_return_unfiltered=True,
                 )
+                # The largest within-triangle spread is 2 mm, not the global
+                # 6 mm spread between these disconnected cloth pieces.
+                with self.assertRaisesRegex(ValueError, "soft_contact_gap"):
+                    esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.001)
+                with self.assertWarnsRegex(UserWarning, "cancellations"):
+                    esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.003)
                 solver = newton.solvers.SolverVBD(model, collision_pipeline=pipeline, rigid_soft_contact_use_esp=True)
                 state = model.state()
                 pipeline.collide(state, solver.contacts)
@@ -548,15 +811,14 @@ class TestVbdEsp(unittest.TestCase):
                 count = int(solver.contacts.soft_contact_count.numpy()[0])
                 features = solver.contacts._soft_contact_mesh_features.numpy().copy()
                 shapes = solver.contacts.soft_contact_shape.numpy()
-                radii, margins = model.particle_radius.numpy(), model.shape_margin.numpy()
+                radii = model.particle_radius.numpy()
                 for shape in (0, 1):
                     rows = shapes[:count] == shape
                     self.assertEqual(set(features[:count][rows, 0] & 7), {0, 1, 2})
                     selected = features.copy()
                     selected[np.flatnonzero(shapes != shape), 0] = -1
                     solver.contacts._soft_contact_mesh_features.assign(selected)
-                    support = float(radii[3 * shape : 3 * shape + 3].max()) + float(margins[shape])
-                    reference = _EspReference(solver, support=support)
+                    reference = _EspReference(solver, unit_stiffness=True)
                     reference.assemble(state)
                     reference.check()
                     self.assertTrue((reference.energy.numpy() > 0).all())
@@ -587,7 +849,8 @@ class TestVbdEsp(unittest.TestCase):
                     scale = max(np.abs(before).max(), 1e-12)
                     np.testing.assert_allclose(output.numpy() / scale, 2 * before / scale, rtol=0, atol=2e-10)
 
-                # At 7 mm, the 5 mm pair has no ESP force; the 10 mm pair does.
+                # At 7 mm, the first pair's maximum support is 5 mm; the second
+                # pair has contributing rows with supports up to 10 mm.
                 positions = state.particle_q.numpy()
                 positions[:, 2] += 0.007
                 state.particle_q.assign(positions)
@@ -613,8 +876,7 @@ class TestVbdEsp(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "soft_contact_gap"):
                     esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.03)
                 model.particle_radius.fill_(0.04)
-                uniform = esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.0)
-                np.testing.assert_array_equal(uniform.soft_mesh_radius.numpy(), np.float32(0.04))
+                esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.0)
 
     def test_edge_triangle_lists_from_contacts(self):
         """Check list construction against a host oracle and changing device counts.
@@ -633,7 +895,7 @@ class TestVbdEsp(unittest.TestCase):
                 count = int(contacts.soft_contact_count.numpy()[0])
                 rows = contacts._soft_contact_mesh_features.numpy()[:count]
                 shapes = contacts.soft_contact_shape.numpy()[:count]
-                offsets = data.rigid_face_offsets.numpy()
+                offsets = data.rigid_triangle_offsets.numpy()
                 soft_edges, rigid_edges = data.soft.edges.numpy(), data.rigid.edges.numpy()
                 soft_faces, rigid_faces = data.soft.faces.numpy(), data.rigid.faces.numpy()
                 self.assertEqual(set(rows[:, 0] & 7), {0, 1, 2})
@@ -1017,11 +1279,13 @@ class TestVbdEsp(unittest.TestCase):
                             color=-1,
                             *,
                             refresh_rigid_positions=True,
+                            dt=0.0,
                             solver=solver,
                             reference=reference,
                         ):
                             # Recompute every block at the same iterate, then
                             # feed only the active side to the unchanged solve.
+                            # This fixture has zero friction, so dt is unused.
                             reference.assemble(state)
                             if block_kind == esp_contact._ENERGY_ONLY:
                                 wp.copy(solver._esp_energy, reference.energy)

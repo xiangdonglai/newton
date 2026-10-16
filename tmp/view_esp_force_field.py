@@ -8,6 +8,7 @@ Run from newton_4227 (no PyTorch required):
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --scene figure2
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --probe ee --scene box
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --probe ee --scene figure2
+    DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --probe ee --sample-friction
     uv run --no-sync python tmp/view_esp_force_field.py --test --device cpu
     DISPLAY=:1 uv run --no-sync python tmp/view_esp_force_field.py --smoke-test --screenshot /tmp/esp-force.png
 
@@ -44,10 +45,18 @@ positions and weights are differentiated. Magenta arrows show endpoint forces
 the other two source edges are deliberately omitted: this is not total mesh
 contact energy. OGC comparisons remain available in Particle mode.
 
+EE mode can also show the solver's experimental sample friction separately.
+It uses an explicitly specified uniform x slip (not the speed of dragging),
+mu=0.5 and dt=0.01 s. Each primitive supplies its own normal, closest point,
+slip and distance-potential load; their friction forces sum with ESP's signs
+and fixed quadrature weights. The displayed energy and conservative
+arrows still include all weight derivatives. Friction arrows do not represent
+the gradient of that displayed conservative energy.
+
 Target triangles are visible in both modes. EE mode always uses the current
 integrated FP64 derivatives, even if --esp-formulas=chain selects historical
-point-mode formulas. Collision positions are float32. There is no time step
-or collision prevention: dragging into intersecting/singular configurations
+point-mode formulas. Collision positions are float32. No simulation is advanced
+and there is no collision prevention: dragging into intersecting/singular configurations
 is outside this ESP evaluation's domain. Reported errors hide the arrows,
 not a physical recovery force. The original figure geometry is unchanged.
 """
@@ -403,7 +412,7 @@ class EdgeForceProbe:
             edges = self.solver._esp_data.soft.edges.numpy()
             self.edge_index = int(np.flatnonzero(np.all(np.sort(edges, axis=1) == (0, 1), axis=1))[0])
 
-    def evaluate(self, endpoints, support, stiffness=100.0):
+    def evaluate(self, endpoints, support, stiffness=100.0, *, friction_slip=None):
         """Redetect at the dragged configuration; return E, all three forces, metadata."""
         triangle = self.rest_triangle.copy()
         triangle[:2] = np.asarray(endpoints, dtype=np.float32).reshape(2, 3)
@@ -413,7 +422,6 @@ class EdgeForceProbe:
         with wp.ScopedDevice(self.device):
             self.state.particle_q.assign(triangle)
             self.model.particle_radius.fill_(support)
-            solver._esp_data.soft_mesh_radius.fill_(float(np.float32(support)))
             self.model.shape_material_ke.fill_(stiffness)
             self.model.soft_contact_ke = stiffness
             self.pipeline.collide(self.state, self.contacts)
@@ -449,6 +457,7 @@ class EdgeForceProbe:
                     solver._esp_data,
                     self.state.particle_q,
                     solver._esp_rigid_positions,
+                    self.model.particle_radius,
                     self.model.shape_margin,
                     self.model.shape_material_ke,
                     self.model.soft_contact_ke,
@@ -483,6 +492,22 @@ class EdgeForceProbe:
                 )
             energy = float(solver._esp_energy.numpy()[1])
             force = solver._esp_particle_forces.numpy().copy()
+            friction_force = np.zeros_like(force)
+            if friction_slip is not None:
+                # Use the solver's friction path on these selected EE rows, after
+                # building neighborhoods from the full list above. Do not infer
+                # physical velocity from an interactive gizmo's refresh rate.
+                self.model.soft_contact_mu = 0.5
+                self.model.shape_material_mu.fill_(0.5)
+                solver.particle_q_prev.assign(triangle - np.asarray(friction_slip, dtype=np.float32))
+                saved_contacts = solver.contacts
+                solver.contacts = self.selected_contacts
+                try:
+                    solver._accumulate_esp_contacts(self.state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
+                    solver.check_esp_contacts()
+                    friction_force = solver._esp_particle_forces.numpy().copy() - force
+                finally:
+                    solver.contacts = saved_contacts
             features = self.selected_contacts._soft_contact_mesh_features.numpy()[:count]
             samples = solver._esp_ee_samples.numpy()[:count]
             ee_rows = (features[:, 0] >= 0) & ((features[:, 0] & 7) == 2)
@@ -495,6 +520,7 @@ class EdgeForceProbe:
                     "active": int(active.sum()),
                     "rigid_edges": features[active, 2].copy(),
                     "samples": samples[active].copy(),
+                    "friction_force": friction_force,
                 },
             )
 
@@ -689,6 +715,15 @@ def test_edge_probes(device):
                 f"active rows={info['active']}, max |F-FD|={np.max(abs(force[:2] - finite_force)):.3g}; per-color match PASS",
                 flush=True,
             )
+        # The friction overlay calls the actual solver on the same selected EE
+        # rows. Reversing the imposed slip reverses every primitive's friction.
+        ep, fp, plus = probe.evaluate(probe.rest_triangle[:2], support, 1.0, friction_slip=(0.001, 0, 0))
+        em, fm, minus = probe.evaluate(probe.rest_triangle[:2], support, 1.0, friction_slip=(-0.001, 0, 0))
+        np.testing.assert_allclose(ep, em)
+        np.testing.assert_allclose(fp, fm)
+        np.testing.assert_allclose(plus["friction_force"], -minus["friction_force"], rtol=2e-5, atol=1e-6)
+        assert np.sum(plus["friction_force"][:, 0]) < 0
+        print(f"EE {SCENES[scene]}: signed per-primitive opposing-slip friction PASS", flush=True)
         # Same endpoints/topology and rest weights, but a cutoff below the gap:
         # no EE sample contributes. This also tests live support changes.
         energy, force, info = probe.evaluate(probe.rest_triangle[:2], 0.002, 1.0)
@@ -716,6 +751,8 @@ class Viewer:
         self.show_field, self.lock_y = True, True
         self.stiffness, self.arrow_scale = 100.0, 0.005
         self.show_gradient = False
+        self.show_edge_friction = args.sample_friction
+        self.friction_slip_mm = 1.0
         ps.set_program_name("ESP / OGC force field")
         ps.set_use_prefs_file(False)
         ps.set_build_default_gui_panels(False)
@@ -886,11 +923,16 @@ class Viewer:
 
     def refresh_edge(self):
         endpoints = np.array([gizmo.get_position() for gizmo in self.edge_gizmos])
-        key = (*endpoints.ravel(), self.radius, self.stiffness)
+        key = (*endpoints.ravel(), self.radius, self.stiffness, self.show_edge_friction, self.friction_slip_mm)
         if key != self.last_key:
             self.edge_error = ""
             try:
-                self.edge_result = self.probe.evaluate(endpoints, self.radius, self.stiffness)
+                self.edge_result = self.probe.evaluate(
+                    endpoints,
+                    self.radius,
+                    self.stiffness,
+                    friction_slip=(self.friction_slip_mm / 1000, 0, 0) if self.show_edge_friction else None,
+                )
             except (ValueError, RuntimeError) as error:
                 self.edge_error = str(error)
                 self.edge_result = (np.nan, np.full((3, 3), np.nan), {"rows": 0, "active": 0})
@@ -900,6 +942,8 @@ class Viewer:
         self.source_triangle.update_vertex_positions(triangle)
         self.edge_curve.update_node_positions(endpoints)
         force = self.edge_result[1][:2]
+        if self.show_edge_friction and not self.edge_error:
+            force = self.edge_result[2]["friction_force"][:2]
         self.displayed_edge_vectors = drawing_vectors(
             -force if self.show_gradient else force,
             self.arrow_scale,
@@ -990,6 +1034,11 @@ class Viewer:
         if changed:
             self.arrow_scale = scale / 1000
         _, self.show_gradient = ui.Checkbox("Show gradient instead of force", self.show_gradient)
+        _, self.show_edge_friction = ui.Checkbox("Show sample friction instead", self.show_edge_friction)
+        if self.show_edge_friction:
+            self.show_gradient = False
+            _, self.friction_slip_mm = ui.SliderFloat("Uniform x slip [mm]", self.friction_slip_mm, -2.0, 2.0)
+            ui.TextWrapped("mu=0.5, dt=0.01 s. Prescribed slip, not dragging speed. Energy below is conservative only.")
         self.refresh_edge()
         energy, force, info = self.edge_result
         ui.Separator()
@@ -1001,9 +1050,15 @@ class Viewer:
         ui.TextUnformatted(f"Selected EE energy: {energy:.7g} J")
         values = -force if self.show_gradient else force
         label = "Gradient" if self.show_gradient else "Force"
+        if self.show_edge_friction and not self.edge_error:
+            values = info["friction_force"]
+            label = "Friction"
+            ui.TextUnformatted("Signed friction sum; each primitive uses its own normal and slip.")
         for i, name in enumerate(("A", "B")):
             ui.TextUnformatted(f"{label} {name} [N]: ({values[i, 0]:.5g}, {values[i, 1]:.5g}, {values[i, 2]:.5g})")
-        ui.TextUnformatted("Force = -energy gradient. Arrow lengths capped at 35 mm.")
+        ui.TextUnformatted("Arrow lengths capped at 35 mm.")
+        if not self.show_edge_friction:
+            ui.TextUnformatted("Conservative force = -energy gradient.")
         if self.edge_error:
             ui.TextColored((0.85, 0.08, 0.05, 1), "Invalid state: arrows hidden; reset or move away.")
             ui.TextWrapped(self.edge_error)
@@ -1034,6 +1089,9 @@ def main():
         help="0=ESP, 1=OGC same barrier, 2=Newton quadratic, 3=Newton log barrier",
     )
     parser.add_argument("--test", action="store_true", help="Check forces numerically without opening a viewer")
+    parser.add_argument(
+        "--sample-friction", action="store_true", help="Initially show EE friction for prescribed x slip"
+    )
     parser.add_argument("--headless", action="store_true", help="Use EGL; requires --screenshot or --smoke-test")
     parser.add_argument("--smoke-test", action="store_true", help="Move the gizmo through both scenes/methods and exit")
     parser.add_argument("--screenshot", type=Path, help="Save the requested scene/method and exit")
@@ -1047,6 +1105,7 @@ def main():
     viewer = Viewer(args)
     ps = viewer.ps
     if args.smoke_test:
+        viewer.show_edge_friction = False
         ps.set_frame_tick_limit_fps_mode("ignore_limits")
         viewer.probe_mode = 0
         for scene in range(2):
@@ -1096,10 +1155,18 @@ def main():
             ps.frame_tick()
             assert not viewer.edge_error
             np.testing.assert_array_equal(viewer.probe.state.particle_q.numpy()[2], viewer.probe.rest_triangle[2])
+            viewer.show_edge_friction = True
+            ps.frame_tick()
+            assert not viewer.edge_error
+            expected = drawing_vectors(viewer.edge_result[2]["friction_force"][:2], viewer.arrow_scale, 0.035)
+            np.testing.assert_allclose(viewer.displayed_edge_vectors, expected)
+            assert np.linalg.norm(viewer.edge_result[2]["friction_force"]) > 0
+            viewer.show_edge_friction = False
             print(f"Independent EE gizmos and both endpoint forces/gradients PASS: {SCENES[scene]}", flush=True)
         viewer.scene = int(args.scene == "figure2")
         viewer.probe_mode = int(args.probe == "ee")
         viewer.mode = args.mode
+        viewer.show_edge_friction = args.sample_friction
         viewer.load_scene()
     if args.screenshot:
         args.screenshot.parent.mkdir(parents=True, exist_ok=True)

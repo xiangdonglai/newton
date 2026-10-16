@@ -67,8 +67,17 @@ def barrier(delta, support, near_cutoff, near_only):
     if d_sq <= 0:
         raise ValueError("Touching/intersecting ESP sample")
     d = torch.sqrt(d_sq)
-    ratio = d / support
-    total = -((1 - ratio) ** 2) * torch.log(ratio)
+    threshold = min(1e-5, support / 4)
+    if d < threshold:
+        ratio = threshold / support
+        gap = 1 - ratio
+        first = (2 * gap * np.log(ratio) - gap**2 / ratio) / support
+        second = (-2 * np.log(ratio) + 4 * gap / ratio + gap**2 / ratio**2) / support**2
+        offset = d - threshold
+        total = -(gap**2) * np.log(ratio) + first * offset + 0.5 * second * offset**2
+    else:
+        ratio = d / support
+        total = -((1 - ratio) ** 2) * torch.log(ratio)
     if near_only:
         x = d * (2 / near_cutoff) - 1
         if x >= 1:
@@ -144,14 +153,13 @@ class TorchEspEnergy:
     """Read the same fixed contact/topology arrays; rebuild only scalar energies."""
 
     def __init__(self, evaluator):
-        count, features, shapes, face_offsets, soft, rigid = evaluator.inputs
+        count, features, shapes, rigid_triangle_offsets, soft, rigid = evaluator.inputs
         self.features = features.numpy()[: int(count.numpy()[0])]
         self.shapes = shapes.numpy()
-        self.face_offsets = face_offsets.numpy()
+        self.rigid_triangle_offsets = rigid_triangle_offsets.numpy()
         self.surfaces = []
         for surface in (soft, rigid):
             faces, edges = surface.faces.numpy(), surface.edges.numpy()
-            owners = surface.vertex_mesh.numpy()
             self.surfaces.append(
                 {
                     "faces": faces,
@@ -160,8 +168,6 @@ class TorchEspEnergy:
                     "interior_edges": np.all(surface.adjacency.edge_tri_indices.numpy() >= 0, axis=1),
                     "interior_vertices": surface.vertex_term_weight.numpy() > 0,
                     "vertex_face_count": np.diff(surface.adjacency.v_adj_tris_offsets.numpy()) // 2,
-                    "edge_mesh": owners[edges[:, 0]],
-                    "face_mesh": owners[faces[:, 0]],
                 }
             )
         self.weights = [a.numpy() for a in evaluator.weights]
@@ -191,11 +197,10 @@ class TorchEspEnergy:
                 )
         return value
 
-    def edge_potential(self, p, edge, target_mesh, positions, surface):
+    def edge_potential(self, p, edge, positions, surface):
         value = (p * p).sum() * 0
         for face in self.edge_faces[edge]:
-            if surface["face_mesh"][face] == target_mesh:
-                value = value + self.triangle_potential(p, positions, surface, face, True)
+            value = value + self.triangle_potential(p, positions, surface, face, True)
         return value
 
     def __call__(self, positions, term):
@@ -204,12 +209,12 @@ class TorchEspEnergy:
         sv, rv, se_area, re_area = self.weights
         total = (positions * positions).sum() * 0
         for row, shape in zip(self.features, self.shapes, strict=False):
-            if row[0] < 0 or self.face_offsets[shape] < 0:
+            if row[0] < 0 or self.rigid_triangle_offsets[shape] < 0:
                 continue
             family = row[0] & 7
             if term == 0 and family == 0:
                 total = total + sv[row[1]] * self.triangle_potential(
-                    soft_positions[row[1]], rigid_positions, rigid, self.face_offsets[shape] + row[2], False
+                    soft_positions[row[1]], rigid_positions, rigid, self.rigid_triangle_offsets[shape] + row[2], False
                 )
             elif term == 0 and family == 1:
                 v = row[2]
@@ -219,11 +224,9 @@ class TorchEspEnergy:
                 c, d = rigid_positions[rigid["edges"][row[2]]]
                 q, q_bar, weight = ee_sample(a, b, c, d, self.near_cutoff)
                 if weight > 0:
-                    value = se_area[row[1]] * self.edge_potential(
-                        q, row[1], rigid["edge_mesh"][row[2]], rigid_positions, rigid
-                    )
+                    value = se_area[row[1]] * self.edge_potential(q, row[1], rigid_positions, rigid)
                     value = value + re_area[row[2]] * self.edge_potential(
-                        q_bar, self.soft_edge_count + row[2], soft["edge_mesh"][row[1]], soft_positions, soft
+                        q_bar, self.soft_edge_count + row[2], soft_positions, soft
                     )
                     total = total + weight * value
         return total

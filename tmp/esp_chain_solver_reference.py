@@ -129,7 +129,7 @@ def collect_edge_triangles(
     contact_count: wp.array[int],
     mesh_features: wp.array[wp.vec3i],
     contact_shapes: wp.array[int],
-    rigid_face_offsets: wp.array[int],
+    rigid_triangle_offsets: wp.array[int],
     soft_vertex_edge_offsets: wp.array[int],
     soft_vertex_edges: wp.array[int],
     soft_edge_faces: wp.array2d[int],
@@ -154,7 +154,7 @@ def collect_edge_triangles(
     if contact_count[0] > mesh_features.shape[0]:
         wp.atomic_or(error, 0, 1)
         return
-    if i >= contact_count[0] or rigid_face_offsets[contact_shapes[i]] < 0:
+    if i >= contact_count[0] or rigid_triangle_offsets[contact_shapes[i]] < 0:
         return
     row = mesh_features[i]
     if row[0] < 0:
@@ -162,7 +162,7 @@ def collect_edge_triangles(
     family = row[0] & 7
     if family == 0:
         vertex = row[1]
-        face = rigid_face_offsets[contact_shapes[i]] + row[2]
+        face = rigid_triangle_offsets[contact_shapes[i]] + row[2]
         for j in range(soft_vertex_edge_offsets[vertex], soft_vertex_edge_offsets[vertex + 1], 2):
             # VBD's shared bending adjacency includes opposite vertices (slots 0/1).
             # ESP needs only edges ending at this vertex (slots 2/3).
@@ -314,7 +314,7 @@ def rebuild_edge_triangle_lists(
         contacts.soft_contact_count,
         contacts._soft_contact_mesh_features,
         contacts.soft_contact_shape,
-        contact_data.rigid_face_offsets,
+        contact_data.rigid_triangle_offsets,
         contact_data.soft.adjacency.v_adj_edges_offsets,
         contact_data.soft.adjacency.v_adj_edges,
         contact_data.soft.adjacency.edge_tri_indices,
@@ -448,7 +448,7 @@ def build_esp_surface_data(
 
 
 @wp.kernel
-def update_rigid_vertices(
+def update_rigid_positions(
     local_vertices: wp.array[wp.vec3],
     vertex_shape: wp.array[int],
     shape_transform: wp.array[wp.transform],
@@ -1207,8 +1207,8 @@ class _SavedEspContactData:
     kernel arguments; SolverVBD owns the world-position cache separately.
     """
 
-    rigid_local_vertices: wp.array[wp.vec3]
-    rigid_face_offsets: wp.array[int]
+    rigid_local_positions: wp.array[wp.vec3]
+    rigid_triangle_offsets: wp.array[int]
     soft: EspSurfaceData
     rigid: EspSurfaceData
     soft_vertex_area: wp.array[wp.float64]
@@ -1258,7 +1258,7 @@ def checked_contact_parameters(
     Zero support skips rows that retain native forces. Invalid recovery rows
     or materials set the persistent error flag before being skipped.
     """
-    if row[0] < 0 or data.rigid_face_offsets[shape] < 0:
+    if row[0] < 0 or data.rigid_triangle_offsets[shape] < 0:
         return wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)
     family = row[0] & 7
     if family > 2:
@@ -1344,7 +1344,7 @@ def prepare_contact_evaluation(
     samples[row_id, 0] = wp.vec4d()
     samples[row_id, 1] = wp.vec4d()
     row, shape = features[row_id], shapes[row_id]
-    if row[0] < 0 or (row[0] & 7) != 2 or data.rigid_face_offsets[shape] < 0:
+    if row[0] < 0 or (row[0] & 7) != 2 or data.rigid_triangle_offsets[shape] < 0:
         return
     if data.soft_edge_area[row[1]] == wp.float64(0.0):
         return
@@ -1444,7 +1444,7 @@ def evaluate_contact_energy(
     value = wp.float64(0.0)
     if family == 0:
         # VT: soft vertex against a rigid triangle.
-        face = data.rigid_face_offsets[shape] + row[2]
+        face = data.rigid_triangle_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
         value = data.soft_vertex_area[row[1]] * triangle_energy(
             wp.vec3d(particle_q[row[1]]),
@@ -1659,7 +1659,7 @@ def accumulate_particle_contact_derivatives(
         particle = row[1]
         if color >= 0 and particle_colors[particle] != color:
             return
-        face = data.rigid_face_offsets[shape] + row[2]
+        face = data.rigid_triangle_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
         edge_weights, vertex_weights, reversed_edges = triangle_feature_weights(data.rigid, face)
         e, g, h = particle_triangle_potential(
@@ -1888,7 +1888,7 @@ def accumulate_body_contact_derivatives(
     family = row[0] & 7
     if family == 0:
         # VT: a fixed soft point and three jointly moving rigid vertices.
-        face = data.rigid_face_offsets[shape] + row[2]
+        face = data.rigid_triangle_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
         edge_weights, vertex_weights, reversed_edges = triangle_feature_weights(data.rigid, face)
         e, g, h = body_triangle_potential(
@@ -2010,8 +2010,8 @@ def create_esp_contact_data(
             local_positions, np.concatenate(rigid_faces), rigid_edges, vertex_mesh=vertices[:, 0]
         )
         # Area weights use scaled rest geometry, never deformed geometry.
-        data.rigid_local_vertices = wp.array(local_positions, dtype=wp.vec3)
-        data.rigid_face_offsets = wp.array(face_offsets, dtype=int)
+        data.rigid_local_positions = wp.array(local_positions, dtype=wp.vec3)
+        data.rigid_triangle_offsets = wp.array(face_offsets, dtype=int)
 
     radii = model.particle_radius.numpy()
     surface_radii = np.zeros(int(owners.max()) + 1, dtype=np.float64)

@@ -153,7 +153,7 @@ def accumulate_particle_contact_derivatives(
         particle = row[1]
         if color >= 0 and particle_colors[particle] != color:
             return
-        face = data.rigid_face_offsets[shape] + row[2]
+        face = data.rigid_triangle_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
         edges, vertices = shared.triangle_feature_weights(data.rigid, face)
         e, g, h = particle_triangle(
@@ -169,7 +169,7 @@ def accumulate_particle_contact_derivatives(
             False,
         )
         shared.accumulate_particle_block(
-            force, hessian, particle, stiffness * data.soft_vertex_area[particle], e, g, h, error
+            force, hessian, particle, stiffness * data.soft_vertex_weight[particle], e, g, h, error
         )
     elif family == 1:
         face = row[1]
@@ -333,7 +333,7 @@ def accumulate_body_contact_derivatives(
     com = wp.vec3d(wp.transform_point(body_q[body], body_com[body]))
     family = row[0] & 7
     if family == 0:
-        face = data.rigid_face_offsets[shape] + row[2]
+        face = data.rigid_triangle_offsets[shape] + row[2]
         ids = data.rigid.faces[face]
         edges, vertices = shared.triangle_feature_weights(data.rigid, face)
         e, g, h = body_triangle(
@@ -349,7 +349,7 @@ def accumulate_body_contact_derivatives(
             near,
             False,
         )
-        scale = data.soft_vertex_area[row[1]]
+        scale = data.soft_vertex_weight[row[1]]
     elif family == 1:
         face = row[1]
         ids = data.soft.faces[face]

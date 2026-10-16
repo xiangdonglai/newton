@@ -11,8 +11,8 @@ Run from newton_4227:
 
 Use SolverVBD's current ESP kernels and native radius/material settings. All contact
 rows are processed together, not with a separate launch per mesh pair. Geometry
-is flattened, but each feature retains its mesh owner. An EE sample evaluates
-P_near only on the target mesh in that EE pair. Every run assembles particle
+is flattened, but rigid features retain their actual shape/body ownership. An EE
+sample evaluates P_near over all eligible target faces in its support. Every run assembles particle
 forces/3x3 Hessians and body forces, torques/6x6 Hessians using reusable device
 buffers. Each run checks the production per-color assembly and a full-feature NumPy sum.
 Optional checks compare these blocks against dense derivatives and PyTorch.
@@ -25,7 +25,7 @@ Use a nonzero cloth tilt for second-derivative checks away from feature switches
 The demo has two boxes with a narrow space between them and two cloth patches
 at different heights. Both patches query both boxes, deliberately exercising
 overlapping query neighborhoods. The boxes share one source Mesh object.
-NumPy independently sums all four mesh-pair energies for comparison.
+NumPy independently visits all eligible target features at every sample for comparison.
 """
 
 import argparse

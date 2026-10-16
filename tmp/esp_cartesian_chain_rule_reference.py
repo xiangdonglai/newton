@@ -256,7 +256,6 @@ class CartesianChainRuleEvaluator:
         self.surfaces = []
         for surface in (soft, rigid):
             faces, edges = surface.faces.numpy(), surface.edges.numpy()
-            owners = surface.vertex_mesh.numpy()
             self.surfaces.append(
                 {
                     "faces": faces,
@@ -264,7 +263,6 @@ class CartesianChainRuleEvaluator:
                     "face_edges": surface.adjacency.tri_edge_indices.numpy(),
                     "interior_edges": np.all(surface.adjacency.edge_tri_indices.numpy() >= 0, axis=1),
                     "vertex_weight": surface.vertex_term_weight.numpy(),
-                    "owners": owners,
                 }
             )
         lists = reference.lists
@@ -318,12 +316,8 @@ class CartesianChainRuleEvaluator:
                     surface = surfaces[side]
                     area = se[row[1]] if direction == 0 else re[row[2]]
                     edge_list = row[1] if direction == 0 else self.soft_edge_count + row[2]
-                    target_edge = edge1 - ns if side else edge0
-                    owner = surface["owners"][target_edge[0]]
                     for face in self.edge_faces[edge_list]:
                         target_ids = surface["faces"][face]
-                        if surface["owners"][target_ids[0]] != owner:
-                            continue
                         target_ids = target_ids + offset
                         e, g, h = triangle_potential(
                             np.vstack((q, positions[target_ids])), surface, face, self.support, self.near, True

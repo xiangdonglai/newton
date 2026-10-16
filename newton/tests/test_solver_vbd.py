@@ -2221,7 +2221,6 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 wp.zeros(0, dtype=float, device=device),
                 wp.zeros(4, dtype=wp.vec3, device=device),  # barycentric (unused on the particle path)
                 None,  # ESP shape mask disabled
-                None,  # ESP vertex areas disabled
             ],
             outputs=[forces, hessians],
             device=device,
@@ -2347,7 +2346,6 @@ def _launch_particle_contact_gather(data, contact_count, contact_head, contact_n
                 contact_next,
                 *_particle_contact_gather_material_inputs(data),
                 None,  # ESP shape mask disabled
-                None,  # ESP vertex areas disabled
             ],
             outputs=[forces, hessians],
             device=device,
@@ -2410,7 +2408,6 @@ def _particle_contact_gather_order_pinned(test, device):
                     rev_next_wp,
                     *_particle_contact_gather_material_inputs(data),
                     None,  # ESP shape mask disabled
-                    None,  # ESP vertex areas disabled
                 ],
                 outputs=[forces_rev, hessians_rev],
                 device=device,
@@ -2655,7 +2652,6 @@ def _launch_particle_contact_scatter(data, contact_count, worker_count, forces, 
                 worker_count,
                 *_particle_contact_gather_material_inputs(data),
                 None,  # ESP shape mask disabled
-                None,  # ESP vertex areas disabled
             ],
             outputs=[forces, hessians],
             device=device,
@@ -6658,7 +6654,6 @@ def _run_face_section2(device, shape_margin):
             shape_margin,
             contacts.soft_contact_barycentric,
             None,  # ESP shape mask disabled
-            None,  # ESP vertex areas disabled
         ],
         outputs=[forces, hessians],
         device=device,
