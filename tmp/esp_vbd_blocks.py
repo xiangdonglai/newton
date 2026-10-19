@@ -83,26 +83,26 @@ def use_contact_formulas(method):
 
 
 @wp.kernel
-def _body_centers(body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3], output: wp.array[wp.vec3d]):
+def _body_centers(body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3], body_com_world: wp.array[wp.vec3d]):
     i = wp.tid()
-    output[i] = wp.vec3d(wp.transform_point(body_q[i], body_com[i]))
+    body_com_world[i] = wp.vec3d(wp.transform_point(body_q[i], body_com[i]))
 
 
 @wp.kernel
 def _select_quadrature(
-    count: wp.array[int],
-    features: wp.array[wp.vec3i],
+    soft_contact_count: wp.array[int],
+    soft_contact_mesh_features: wp.array[wp.vec3i],
     term: int,
-    selected: wp.array[wp.vec3i],
+    selected_soft_contact_mesh_features: wp.array[wp.vec3i],
 ):
     row = wp.tid()
-    if row < wp.min(count[0], features.shape[0]):
-        feature = features[row]
+    if row < wp.min(soft_contact_count[0], soft_contact_mesh_features.shape[0]):
+        feature = soft_contact_mesh_features[row]
         family = feature[0] & 7
         # Preserve recovery/unknown rows to exercise production skip/error handling.
         if feature[0] >= 0 and family < 3 and int(family == 2) != term:
             feature[0] = -1
-        selected[row] = feature
+        selected_soft_contact_mesh_features[row] = feature
 
 
 class EspVbdBlockEvaluator:
@@ -125,8 +125,8 @@ class EspVbdBlockEvaluator:
         pipeline.collide(state, self.contacts)
         esp_contact.rebuild_edge_triangle_lists(self.contacts, self.data, self.lists, self.solver._esp_list_sort_values)
         self.solver._prepare_esp_contact_inputs(state)
-        self.soft_rest_vertices = model.particle_q.numpy().astype(np.float64)
-        self.rigid_rest_vertices = self.data.rigid_local_positions.numpy().astype(np.float64)
+        self.soft_rest_vertices_np = model.particle_q.numpy().astype(np.float64)
+        self.rigid_rest_vertices_np = self.data.rigid_local_positions.numpy().astype(np.float64)
         # The independent dense/Torch references below use one coefficient and
         # support. Fail explicitly if a diagnostic fixture breaks that contract.
         radii = np.unique(model.particle_radius.numpy())
@@ -242,16 +242,16 @@ class EspVbdBlockEvaluator:
         ):
             if force.shape[0] == 0:
                 continue
-            color_ids = colors.numpy()
-            for color in np.unique(color_ids):
+            color_ids_np = colors.numpy()
+            for color in np.unique(color_ids_np):
                 solver._accumulate_esp_contacts(state, kind, int(color))
-                active = color_ids == color
+                active_color_mask_np = color_ids_np == color
                 for actual, expected in (
-                    (force.numpy(), expected_f[offset : offset + len(color_ids), :dimensions]),
-                    (hessian.numpy(), expected_h[offset : offset + len(color_ids), :dimensions, :dimensions]),
+                    (force.numpy(), expected_f[offset : offset + len(color_ids_np), :dimensions]),
+                    (hessian.numpy(), expected_h[offset : offset + len(color_ids_np), :dimensions, :dimensions]),
                 ):
                     reference = np.zeros_like(expected)
-                    reference[active] = expected[active]
+                    reference[active_color_mask_np] = expected[active_color_mask_np]
                     scale = max(np.max(np.abs(reference)), 1e-8)
                     np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-10)
                     errors.append(np.max(np.abs(actual - reference)) / scale)
@@ -279,24 +279,28 @@ class EspVbdBlockEvaluator:
         expected_f[:, :count, :3] = force[:, :count]
         for p in range(count):
             expected_h[:, p, :3, :3] = hessian[:, 3 * p : 3 * p + 3, 3 * p : 3 * p + 3]
-        bodies = self.model.shape_body.numpy()[self.data.rigid_vertex_rows.numpy()[:, 0]]
-        centers = self.body_com_world.numpy()
+        shape_body_np = self.model.shape_body.numpy()[self.data.rigid_vertex_rows.numpy()[:, 0]]
+        body_com_world_np = self.body_com_world.numpy()
         largest_rotation_correction = 0.0
         for body in range(self.model.body_count):
-            ids = np.flatnonzero(bodies == body)
-            if not len(ids):
+            body_vertex_row_indices_np = np.flatnonzero(shape_body_np == body)
+            if not len(body_vertex_row_indices_np):
                 continue
-            offsets = reference.rigid_positions[ids] - centers[body]
-            dofs = (3 * (ids + count)[:, None] + np.arange(3)).ravel()
-            jacobian = np.empty((3 * len(ids), 6))
+            offsets = reference.rigid_positions_np[body_vertex_row_indices_np] - body_com_world_np[body]
+            body_vertex_dof_indices_np = (3 * (body_vertex_row_indices_np + count)[:, None] + np.arange(3)).ravel()
+            jacobian = np.empty((3 * len(body_vertex_row_indices_np), 6))
             for k, (x, y, z) in enumerate(offsets):
                 jacobian[3 * k : 3 * k + 3] = np.column_stack(
                     (np.eye(3), np.array([[0, z, -y], [-z, 0, x], [y, -x, 0]]))
                 )
             for term in range(2):
-                expected_f[term, count + body] = jacobian.T @ force[term, count + ids].ravel()
-                expected_h[term, count + body] = jacobian.T @ hessian[term][np.ix_(dofs, dofs)] @ jacobian
-                for r, f in zip(offsets, force[term, count + ids], strict=True):
+                expected_f[term, count + body] = jacobian.T @ force[term, count + body_vertex_row_indices_np].ravel()
+                expected_h[term, count + body] = (
+                    jacobian.T
+                    @ hessian[term][np.ix_(body_vertex_dof_indices_np, body_vertex_dof_indices_np)]
+                    @ jacobian
+                )
+                for r, f in zip(offsets, force[term, count + body_vertex_row_indices_np], strict=True):
                     correction = -0.5 * (np.outer(r, f) + np.outer(f, r)) + (r @ f) * np.eye(3)
                     largest_rotation_correction = max(largest_rotation_correction, float(np.max(np.abs(correction))))
                     expected_h[term, count + body, 3:, 3:] += correction
@@ -319,9 +323,9 @@ def run_checks(blocks, state, *, check_derivatives=False, check_autodiff=False, 
     _points, expected = numpy_mesh_pair_energies(blocks)
     actual = blocks.energy.numpy()
     np.testing.assert_allclose(actual, expected.sum(axis=1), rtol=2e-5, atol=1e-8)
-    count = int(blocks.contacts.soft_contact_count.numpy()[0])
-    features = blocks.contacts._soft_contact_mesh_features.numpy()[:count]
-    families = np.bincount(features[features[:, 0] >= 0, 0] & 7, minlength=4)
+    soft_contact_count = int(blocks.contacts.soft_contact_count.numpy()[0])
+    soft_contact_mesh_features_np = blocks.contacts._soft_contact_mesh_features.numpy()[:soft_contact_count]
+    families = np.bincount(soft_contact_mesh_features_np[soft_contact_mesh_features_np[:, 0] >= 0, 0] & 7, minlength=4)
     print(f"{blocks.model.device}: VT/TV/EE/depth rows = {families.tolist()}")
     print(f"Support={blocks.support:g} m, near cutoff={blocks.near_cutoff:g} m, stiffness=1")
     print(f"NumPy P_fixed / P_ee (soft->rigid, rigid->soft):\n{expected}")

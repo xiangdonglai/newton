@@ -50,11 +50,11 @@ def make_grid_case(
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
         body = builder.add_body(mass=1.0) if dynamic else -1
-        vertices = np.array(
+        box_vertices_np = np.array(
             [[x, y, z] for z in (-0.1, 0.0) for y in (-0.05, 0.05) for x in (-0.05, 0.05)],
             dtype=np.float32,
         )
-        faces = np.array(
+        box_triangle_indices_np = np.array(
             [
                 [0, 2, 1],
                 [1, 2, 3],
@@ -73,23 +73,25 @@ def make_grid_case(
         )
         builder.add_shape_mesh(
             body,
-            mesh=newton.Mesh(vertices, faces.ravel()),
+            mesh=newton.Mesh(box_vertices_np, box_triangle_indices_np.ravel()),
             cfg=builder.ShapeConfig(ke=1000.0, kd=0.0, mu=friction),
         )
         axis = np.linspace(-0.06, 0.06, resolution + 1)
-        cloth = [[x, y, gap + 0.001 * x + 0.0007 * y] for y in axis for x in axis]
-        triangles = []
+        cloth_vertices = [[x, y, gap + 0.001 * x + 0.0007 * y] for y in axis for x in axis]
+        cloth_triangle_indices = []
         for y in range(resolution):
             for x in range(resolution):
                 p = y * (resolution + 1) + x
-                triangles.extend([p, p + 1, p + resolution + 1, p + 1, p + resolution + 2, p + resolution + 1])
+                cloth_triangle_indices.extend(
+                    [p, p + 1, p + resolution + 1, p + 1, p + resolution + 2, p + resolution + 1]
+                )
         builder.add_cloth_mesh(
             pos=wp.vec3(),
             rot=wp.quat_identity(),
             scale=1.0,
             vel=wp.vec3(0.1, 0.0, 0.0) if friction else wp.vec3(),
-            vertices=cloth,
-            indices=triangles,
+            vertices=cloth_vertices,
+            indices=cloth_triangle_indices,
             density=100.0,
             particle_radius=0.005,
             tri_ke=1000.0,
@@ -104,7 +106,7 @@ def make_grid_case(
             enable_rigid_soft_full_surface_contact=True,
             full_surface_contact_return_unfiltered=True,
             soft_contact_gap=0.02,
-            soft_contact_max=max(512, len(cloth) * 32),
+            soft_contact_max=max(512, len(cloth_vertices) * 32),
             contact_matching="latest",
         )
         solver = newton.solvers.SolverVBD(
@@ -137,18 +139,20 @@ def box_vertex_distances(model, state):
     This is outside timing. Negative world z alone is not penetration when
     the box moves. The analytic box check does not cover triangle interiors.
     """
-    shape_pose = model.shape_transform.numpy()[0]
-    shape_to_world = wp.transform(wp.vec3(*shape_pose[:3]), wp.quat(*shape_pose[3:]))
+    shape_transform_np = model.shape_transform.numpy()[0]
+    shape_to_world = wp.transform(wp.vec3(*shape_transform_np[:3]), wp.quat(*shape_transform_np[3:]))
     body = int(model.shape_body.numpy()[0])
     if body >= 0:
-        body_pose = state.body_q.numpy()[body]
+        body_q_np = state.body_q.numpy()[body]
         shape_to_world = wp.transform_multiply(
-            wp.transform(wp.vec3(*body_pose[:3]), wp.quat(*body_pose[3:])), shape_to_world
+            wp.transform(wp.vec3(*body_q_np[:3]), wp.quat(*body_q_np[3:])), shape_to_world
         )
     world_to_shape = wp.transform_inverse(shape_to_world)
-    local = np.array([list(wp.transform_point(world_to_shape, wp.vec3(*p))) for p in state.particle_q.numpy()])
+    particle_positions_shape_np = np.array(
+        [list(wp.transform_point(world_to_shape, wp.vec3(*p))) for p in state.particle_q.numpy()]
+    )
     # The authored mesh occupies [-.05,.05]^2 x [-.1,0].
-    outside = np.abs(local - [0.0, 0.0, -0.05]) - 0.05
+    outside = np.abs(particle_positions_shape_np - [0.0, 0.0, -0.05]) - 0.05
     return np.linalg.norm(np.maximum(outside, 0.0), axis=1) + np.minimum(outside.max(axis=1), 0.0)
 
 

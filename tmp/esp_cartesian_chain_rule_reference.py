@@ -245,8 +245,8 @@ class CartesianChainRuleEvaluator:
         self.weights = reference.weights
         self.lists = reference.lists
         self.near_cutoff = reference.near_cutoff
-        self.soft_positions = reference.soft_positions
-        self.rigid_positions = reference.rigid_positions
+        self.soft_positions_np = reference.soft_positions_np
+        self.rigid_positions_np = reference.rigid_positions_np
         self.support, self.near = reference.support, reference.near_cutoff
         count, features, shapes, offsets, soft, rigid = reference.inputs
         self.features = features.numpy()[: int(count.numpy()[0])]
@@ -271,8 +271,8 @@ class CartesianChainRuleEvaluator:
         self.soft_edge_count = lists.soft_edge_count
 
     def evaluate(self, soft_positions=None, rigid_positions=None, *, compute_hessian=True):
-        soft = self.soft_positions if soft_positions is None else soft_positions
-        rigid = self.rigid_positions if rigid_positions is None else rigid_positions
+        soft = self.soft_positions_np if soft_positions is None else soft_positions
+        rigid = self.rigid_positions_np if rigid_positions is None else rigid_positions
         positions = np.concatenate((soft, rigid))
         count = len(positions)
         ns = len(soft)

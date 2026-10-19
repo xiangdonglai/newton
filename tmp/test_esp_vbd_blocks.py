@@ -174,7 +174,7 @@ class TestEspVbdBlocks(unittest.TestCase):
                     blocks.model.shape_body.numpy()[blocks.data.rigid_vertex_rows.numpy()[:, 0]] == body
                 )
                 center = blocks.body_com_world.numpy()[body]
-                r = reference.rigid_positions[ids] - center
+                r = reference.rigid_positions_np[ids] - center
 
                 def pose_energy(delta, reference=reference, ids=ids, center=center, r=r):
                     w = delta[3:]
@@ -183,7 +183,7 @@ class TestEspVbdBlocks(unittest.TestCase):
                     if angle > 0:
                         axis = skew(w / angle)
                         rotation += np.sin(angle) * axis + (1 - np.cos(angle)) * (axis @ axis)
-                    moved = reference.rigid_positions.copy()
+                    moved = reference.rigid_positions_np.copy()
                     moved[ids] = center + delta[:3] + r @ rotation.T
                     return reference.evaluate(rigid_positions=moved, compute_hessian=False)[0]
 

@@ -44,45 +44,49 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False,
     # An unrelated shape makes rigid mesh shape IDs differ from mesh indices.
     sphere_pos = wp.vec3(0.05, 0.0, 0.02) if analytic_contact else wp.vec3(2.0)
     builder.add_shape_sphere(body=-1, xform=wp.transform(sphere_pos, wp.quat_identity()), radius=0.005)
-    rv, rf = box_mesh()
+    box_vertices_np, box_triangle_indices_np = box_mesh()
     if seamed:
-        rv = rv[rf.ravel()]
-        rf = np.arange(len(rv), dtype=np.int32).reshape(-1, 3)
-    mesh = newton.Mesh(rv, rf.ravel(), compute_inertia=False)
-    shapes = []
+        box_vertices_np = box_vertices_np[box_triangle_indices_np.ravel()]
+        box_triangle_indices_np = np.arange(len(box_vertices_np), dtype=np.int32).reshape(-1, 3)
+    mesh = newton.Mesh(box_vertices_np, box_triangle_indices_np.ravel(), compute_inertia=False)
+    rigid_shape_indices = []
     for i in range(2):
         if separate_worlds:
             builder.begin_world(label=f"world_{i}")
         if i == 0 or separate_worlds:
             body = -1
-            shape_tf = wp.transform_identity()
+            shape_transform = wp.transform_identity()
             scale = (1.0, 1.0, 1.0)
         else:
             body = builder.add_body(
                 xform=wp.transform(wp.vec3(0.0818, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.17)),
                 mass=1.0,
             )
-            shape_tf = wp.transform(wp.vec3(0.002, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.145))
+            shape_transform = wp.transform(
+                wp.vec3(0.002, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.145)
+            )
             scale = (0.65, 0.8, 1.2)
-        shapes.append(
+        rigid_shape_indices.append(
             builder.add_shape_mesh(
                 body=body,
                 mesh=mesh,
-                xform=shape_tf,
+                xform=shape_transform,
                 scale=scale,
                 cfg=builder.ShapeConfig(ke=1.0, kd=0.0, mu=0.0, margin=0.0),
             )
         )
-        sv, sf = patch(gap=0.0003 if separate_worlds else 0.0003 + i * 0.0006, tilt=cloth_tilt)
-        if np.min(sv[:, 2]) <= 0:
+        cloth_vertices_np, cloth_triangle_indices_np = patch(
+            gap=0.0003 if separate_worlds else 0.0003 + i * 0.0006, tilt=cloth_tilt
+        )
+        if np.min(cloth_vertices_np[:, 2]) <= 0:
             raise ValueError("The cloth tilt must leave all vertices above the box")
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0),
             rot=wp.quat_identity(),
             scale=1.0,
             vel=wp.vec3(0.0),
-            vertices=sv.tolist(),
-            indices=sf.ravel().tolist(),
+            vertices=cloth_vertices_np.tolist(),
+            indices=cloth_triangle_indices_np.ravel().tolist(),
             density=1.0,
             particle_radius=0.03,
         )
@@ -99,7 +103,7 @@ def make_example(*, separate_worlds=False, seamed=False, analytic_contact=False,
         soft_contact_gap=0.03,
         soft_contact_max=4096,
     )
-    return model, state, pipeline, shapes
+    return model, state, pipeline, rigid_shape_indices
 
 
 def run_example(device, *, check_derivatives=False, check_autodiff=False, check_torch_energy=False, cloth_tilt=0.0):

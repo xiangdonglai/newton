@@ -2528,7 +2528,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Accumulate one color's raw ESP blocks, or validate final-state energy."""
         if refresh_rigid_positions:
             self._prepare_esp_contact_inputs(state)
-        body = block_kind == esp_contact._BODY_BLOCKS
+        body_blocks = block_kind == esp_contact._BODY_BLOCKS
         self._esp_kernels.launch_contact_blocks(
             self.model,
             state,
@@ -2537,8 +2537,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._esp_rigid_positions,
             self._esp_lists,
             block_kind,
-            self._esp_body_forces if body else self._esp_particle_forces,
-            self._esp_body_hessians if body else self._esp_particle_hessians,
+            self._esp_body_forces if body_blocks else self._esp_particle_forces,
+            self._esp_body_hessians if body_blocks else self._esp_particle_hessians,
             self._esp_energy,
             self._esp_error,
             color=color,
@@ -2546,34 +2546,36 @@ class SolverVBD(SolverBase, CouplingInterface):
             partitions=self._esp_ee_partitions,
             ee_samples=self._esp_ee_samples,
             use_friction=self.model.soft_contact_mu > 0.0 and dt > 0.0,
-            contact_kd=self.body_particle_contact_material_kd,
+            body_particle_contact_material_kd=self.body_particle_contact_material_kd,
             particle_q_prev=self.particle_q_prev,
             body_q_prev=self.body_q_prev if self.model.body_count else None,
             dt=dt,
             friction_epsilon=self.friction_epsilon,
         )
 
-    def _add_esp_particle_contacts(self, state, ids, *, color=-1, refresh_rigid_positions=True, dt=0.0):
+    def _add_esp_particle_contacts(
+        self, state, particle_ids_in_color, *, color=-1, refresh_rigid_positions=True, dt=0.0
+    ):
         """Add summed ESP particle blocks, optionally projecting their Hessians to PSD."""
         self._accumulate_esp_contacts(
             state, esp_contact._PARTICLE_BLOCKS, color, refresh_rigid_positions=refresh_rigid_positions, dt=dt
         )
         wp.launch(
             self._esp_kernels.add_particle_blocks,
-            dim=ids.size,
-            inputs=[ids, self._esp_particle_forces, self._esp_particle_hessians, self._esp_error],
+            dim=particle_ids_in_color.size,
+            inputs=[particle_ids_in_color, self._esp_particle_forces, self._esp_particle_hessians, self._esp_error],
             outputs=[self.particle_forces, self.particle_hessians],
             device=self.device,
         )
 
-    def _add_esp_body_contacts(self, state, ids, *, color=-1, dt=0.0):
+    def _add_esp_body_contacts(self, state, body_ids_in_color, *, color=-1, dt=0.0):
         """Add summed ESP body blocks, optionally projecting their Hessians to PSD."""
         self._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS, color, dt=dt)
         wp.launch(
             self._esp_kernels.add_body_blocks,
-            dim=ids.size,
+            dim=body_ids_in_color.size,
             inputs=[
-                ids,
+                body_ids_in_color,
                 self._esp_body_forces,
                 self._esp_body_hessians,
                 self._esp_error,

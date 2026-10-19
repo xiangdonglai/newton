@@ -152,7 +152,7 @@ class TestEspDirectSolver(unittest.TestCase):
                 geometry = EspDerivativeEvaluator(blocks)
                 reference = TorchEspEnergy(geometry)
                 positions = torch.tensor(
-                    np.concatenate((geometry.soft_positions, geometry.rigid_positions)), dtype=torch.float64
+                    np.concatenate((geometry.soft_positions_np, geometry.rigid_positions_np)), dtype=torch.float64
                 )
 
                 def energy(position, positions=positions, reference=reference):

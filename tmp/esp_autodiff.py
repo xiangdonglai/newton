@@ -153,17 +153,19 @@ class TorchEspEnergy:
     """Read the same fixed contact/topology arrays; rebuild only scalar energies."""
 
     def __init__(self, evaluator):
-        count, features, shapes, rigid_triangle_offsets, soft, rigid = evaluator.inputs
-        self.features = features.numpy()[: int(count.numpy()[0])]
-        self.shapes = shapes.numpy()
-        self.rigid_triangle_offsets = rigid_triangle_offsets.numpy()
+        soft_contact_count, soft_contact_mesh_features, soft_contact_shape, rigid_triangle_offsets, soft, rigid = (
+            evaluator.inputs
+        )
+        self.soft_contact_mesh_features_np = soft_contact_mesh_features.numpy()[: int(soft_contact_count.numpy()[0])]
+        self.soft_contact_shape_np = soft_contact_shape.numpy()
+        self.rigid_triangle_offsets_np = rigid_triangle_offsets.numpy()
         self.surfaces = []
         for surface in (soft, rigid):
-            faces, edges = surface.faces.numpy(), surface.edges.numpy()
+            triangle_indices_np, edge_vertex_indices_np = surface.faces.numpy(), surface.edges.numpy()
             self.surfaces.append(
                 {
-                    "faces": faces,
-                    "edges": edges,
+                    "faces": triangle_indices_np,
+                    "edges": edge_vertex_indices_np,
                     "face_edges": surface.adjacency.tri_edge_indices.numpy(),
                     "interior_edges": np.all(surface.adjacency.edge_tri_indices.numpy() >= 0, axis=1),
                     "interior_vertices": surface.vertex_term_weight.numpy() > 0,
@@ -171,7 +173,7 @@ class TorchEspEnergy:
                 }
             )
         self.weights = [a.numpy() for a in evaluator.weights]
-        self.soft_count = len(evaluator.soft_positions)
+        self.soft_count = len(evaluator.soft_positions_np)
         self.support, self.near_cutoff = evaluator.support, evaluator.near_cutoff
         data = evaluator.lists
         keys = data.keys.numpy()
@@ -181,19 +183,19 @@ class TorchEspEnergy:
         self.soft_edge_count = data.soft_edge_count
 
     def triangle_potential(self, p, positions, surface, face, near_only):
-        ids = surface["faces"][face]
-        a, b, c = positions[ids]
+        triangle_vertex_indices = surface["faces"][face]
+        a, b, c = positions[triangle_vertex_indices]
         value = barrier(p - triangle_closest(p, a, b, c), self.support, self.near_cutoff, near_only)
         for k in range(3):
             edge_id = surface["face_edges"][face, k]
             if surface["interior_edges"][edge_id]:
                 ea, eb = positions[surface["edges"][edge_id]]
                 value = value - 0.5 * barrier(p - segment_closest(p, ea, eb), self.support, self.near_cutoff, near_only)
-            if surface["interior_vertices"][ids[k]]:
+            if surface["interior_vertices"][triangle_vertex_indices[k]]:
                 value = (
                     value
-                    + barrier(p - positions[ids[k]], self.support, self.near_cutoff, near_only)
-                    / surface["vertex_face_count"][ids[k]]
+                    + barrier(p - positions[triangle_vertex_indices[k]], self.support, self.near_cutoff, near_only)
+                    / surface["vertex_face_count"][triangle_vertex_indices[k]]
                 )
         return value
 
@@ -206,26 +208,32 @@ class TorchEspEnergy:
     def __call__(self, positions, term):
         soft_positions, rigid_positions = positions[: self.soft_count], positions[self.soft_count :]
         soft, rigid = self.surfaces
-        sv, rv, se_area, re_area = self.weights
+        soft_vertex_weight, rigid_vertex_area, soft_edge_area, rigid_edge_area = self.weights
         total = (positions * positions).sum() * 0
-        for row, shape in zip(self.features, self.shapes, strict=False):
-            if row[0] < 0 or self.rigid_triangle_offsets[shape] < 0:
+        for row, shape in zip(self.soft_contact_mesh_features_np, self.soft_contact_shape_np, strict=False):
+            if row[0] < 0 or self.rigid_triangle_offsets_np[shape] < 0:
                 continue
             family = row[0] & 7
             if term == 0 and family == 0:
-                total = total + sv[row[1]] * self.triangle_potential(
-                    soft_positions[row[1]], rigid_positions, rigid, self.rigid_triangle_offsets[shape] + row[2], False
+                total = total + soft_vertex_weight[row[1]] * self.triangle_potential(
+                    soft_positions[row[1]],
+                    rigid_positions,
+                    rigid,
+                    self.rigid_triangle_offsets_np[shape] + row[2],
+                    False,
                 )
             elif term == 0 and family == 1:
                 v = row[2]
-                total = total + rv[v] * self.triangle_potential(rigid_positions[v], soft_positions, soft, row[1], False)
+                total = total + rigid_vertex_area[v] * self.triangle_potential(
+                    rigid_positions[v], soft_positions, soft, row[1], False
+                )
             elif term == 1 and family == 2:
                 a, b = soft_positions[soft["edges"][row[1]]]
                 c, d = rigid_positions[rigid["edges"][row[2]]]
                 q, q_bar, weight = ee_sample(a, b, c, d, self.near_cutoff)
                 if weight > 0:
-                    value = se_area[row[1]] * self.edge_potential(q, row[1], rigid_positions, rigid)
-                    value = value + re_area[row[2]] * self.edge_potential(
+                    value = soft_edge_area[row[1]] * self.edge_potential(q, row[1], rigid_positions, rigid)
+                    value = value + rigid_edge_area[row[2]] * self.edge_potential(
                         q_bar, self.soft_edge_count + row[2], soft_positions, soft
                     )
                     total = total + weight * value
@@ -241,7 +249,9 @@ def check_energy(evaluator, warp_energy):
     in one term from being hidden by the other.
     """
     reference = TorchEspEnergy(evaluator)
-    positions = torch.tensor(np.concatenate((evaluator.soft_positions, evaluator.rigid_positions)), dtype=torch.float64)
+    positions = torch.tensor(
+        np.concatenate((evaluator.soft_positions_np, evaluator.rigid_positions_np)), dtype=torch.float64
+    )
     torch_energy = np.array([reference(positions, term).item() for term in range(2)])
     warp_energy = np.asarray(warp_energy)
     warp64_energy = evaluator.evaluate(compute_hessian=False)[0]
@@ -265,7 +275,7 @@ def check_energy(evaluator, warp_energy):
 def check_autodiff(evaluator):
     """Compare the two terms separately; do not let their errors cancel."""
     reference = TorchEspEnergy(evaluator)
-    positions = np.concatenate((evaluator.soft_positions, evaluator.rigid_positions))
+    positions = np.concatenate((evaluator.soft_positions_np, evaluator.rigid_positions_np))
     energy, force, hessian = evaluator.evaluate()
     results = []
     for term, name in enumerate(("fixed vertices", "EE")):

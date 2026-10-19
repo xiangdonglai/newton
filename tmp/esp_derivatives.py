@@ -291,9 +291,9 @@ def edge_potential(
 
 @wp.kernel
 def evaluate_energy_derivatives(
-    contact_count: wp.array[int],
-    features: wp.array[wp.vec3i],
-    shapes: wp.array[int],
+    soft_contact_count: wp.array[int],
+    soft_contact_mesh_features: wp.array[wp.vec3i],
+    soft_contact_shape: wp.array[int],
     rigid_triangle_offsets: wp.array[int],
     soft: EspSurfaceData,
     rigid: EspSurfaceData,
@@ -317,9 +317,9 @@ def evaluate_energy_derivatives(
         j = column
     offset = soft_positions.shape[0]
     fixed, ee = wp.vec4d(), wp.vec4d()
-    for row_id in range(contact_count[0]):
-        row = features[row_id]
-        shape = shapes[row_id]
+    for row_id in range(soft_contact_count[0]):
+        row = soft_contact_mesh_features[row_id]
+        shape = soft_contact_shape[row_id]
         if row[0] < 0 or rigid_triangle_offsets[shape] < 0:
             continue
         family = row[0] & 7
@@ -408,8 +408,8 @@ class EspDerivativeEvaluator:
         )
         self.lists = blocks.lists
         self.device = blocks.model.device
-        self.soft_positions = blocks.state.particle_q.numpy().astype(np.float64)
-        self.rigid_positions = blocks.solver._esp_rigid_positions.numpy()
+        self.soft_positions_np = blocks.state.particle_q.numpy().astype(np.float64)
+        self.rigid_positions_np = blocks.solver._esp_rigid_positions.numpy()
         self.weights = [data.soft_vertex_weight, data.rigid_vertex_area, data.soft_edge_area, data.rigid_edge_area]
         self.support, self.near_cutoff = blocks.support, blocks.near_cutoff
 
@@ -420,9 +420,12 @@ class EspDerivativeEvaluator:
         directions. Hessian is the raw energy Hessian, not a PSD projection.
         Forces are minus the energy gradient on *both* surfaces.
         """
-        soft_positions = self.soft_positions if soft_positions is None else np.asarray(soft_positions)
-        rigid_positions = self.rigid_positions if rigid_positions is None else np.asarray(rigid_positions)
-        if soft_positions.shape != self.soft_positions.shape or rigid_positions.shape != self.rigid_positions.shape:
+        soft_positions = self.soft_positions_np if soft_positions is None else np.asarray(soft_positions)
+        rigid_positions = self.rigid_positions_np if rigid_positions is None else np.asarray(rigid_positions)
+        if (
+            soft_positions.shape != self.soft_positions_np.shape
+            or rigid_positions.shape != self.rigid_positions_np.shape
+        ):
             raise ValueError("Coordinate arrays must match the original topology")
         dofs = 3 * (len(soft_positions) + len(rigid_positions))
         with wp.ScopedDevice(self.device):
@@ -460,8 +463,8 @@ def check_derivatives(evaluator, numpy_energy, *, steps=(3e-7, 1e-7, 3e-8)):
     Hessian symmetrization is applied before comparison.
     """
     energy, force, hessian = evaluator.evaluate()
-    positions = np.concatenate((evaluator.soft_positions, evaluator.rigid_positions))
-    soft_count = len(evaluator.soft_positions)
+    positions = np.concatenate((evaluator.soft_positions_np, evaluator.rigid_positions_np))
+    soft_count = len(evaluator.soft_positions_np)
     np.testing.assert_allclose(energy, numpy_energy(*np.split(positions, [soft_count])), rtol=2e-6, atol=1e-10)
     gradient = -force.reshape(2, -1)
     gradient_scale = np.maximum(np.max(np.abs(gradient), axis=1), 1e-8)

@@ -12,10 +12,10 @@ import numpy as np
 
 
 def reference_energies(
-    cloth_vertices,
-    cloth_faces,
-    box_vertices,
-    box_faces,
+    cloth_vertices_np,
+    cloth_triangle_indices_np,
+    box_vertices_np,
+    box_triangle_indices_np,
     support,
     near_cutoff,
     *,
@@ -51,12 +51,12 @@ def reference_energies(
         x = np.clip(2 * distance / near_cutoff - 1, 0, 1)
         return np.array([total, (1 - x) ** 3 * (1 + 3 * x + 6 * x**2) * total])
 
-    def point_potential(point, vertices, faces):
+    def point_potential(point, vertices_np, triangle_indices_np):
         def term(closest):
             return barrier_parts(np.linalg.norm(point - closest))
 
         result = np.zeros(2)
-        for a, b, c in vertices[faces]:
+        for a, b, c in vertices_np[triangle_indices_np]:
             uv = np.linalg.lstsq(np.column_stack((b - a, c - a)), point - a, rcond=None)[0]
             if np.all(uv >= 0) and uv.sum() <= 1:
                 closest = a + uv[0] * (b - a) + uv[1] * (c - a)
@@ -64,13 +64,15 @@ def reference_energies(
                 candidates = [segment_closest(point, a, b), segment_closest(point, b, c), segment_closest(point, c, a)]
                 closest = min(candidates, key=lambda q: np.dot(point - q, point - q))
             result += term(closest)
-        raw_edges = faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
-        edges, incidence = np.unique(np.sort(raw_edges, axis=1), axis=0, return_counts=True)
-        for a, b in vertices[edges[incidence == 2]]:
+        triangle_edge_vertex_indices_np = triangle_indices_np[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
+        edge_vertex_indices_np, edge_incident_triangle_count_np = np.unique(
+            np.sort(triangle_edge_vertex_indices_np, axis=1), axis=0, return_counts=True
+        )
+        for a, b in vertices_np[edge_vertex_indices_np[edge_incident_triangle_count_np == 2]]:
             result -= term(segment_closest(point, a, b))
-        boundary_vertices = np.unique(edges[incidence == 1])
-        for i in np.setdiff1d(np.unique(faces), boundary_vertices):
-            result += term(vertices[i])
+        boundary_vertices = np.unique(edge_vertex_indices_np[edge_incident_triangle_count_np == 1])
+        for i in np.setdiff1d(np.unique(triangle_indices_np), boundary_vertices):
+            result += term(vertices_np[i])
         return result
 
     def ee_sample(a, b, c, d):
@@ -91,45 +93,49 @@ def reference_energies(
         step = 1 - 1.5 * x**2 + 0.75 * x**3 if x < 1 else 0.25 * (2 - x) ** 3
         return q, q_bar, step * mu
 
-    def weights(vertices, faces):
-        vertices = np.asarray(vertices, dtype=np.float64)
-        triangles = vertices[faces]
-        areas = 0.5 * np.linalg.norm(
-            np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
+    def weights(vertices_np, triangle_indices_np):
+        vertices_np = np.asarray(vertices_np, dtype=np.float64)
+        triangle_positions_np = vertices_np[triangle_indices_np]
+        tri_areas_np = 0.5 * np.linalg.norm(
+            np.cross(
+                triangle_positions_np[:, 1] - triangle_positions_np[:, 0],
+                triangle_positions_np[:, 2] - triangle_positions_np[:, 0],
+            ),
+            axis=1,
         )
-        vertex_area, edge_area = np.zeros(len(vertices)), {}
-        for face, area in zip(faces, areas, strict=True):
+        vertex_area, edge_area = np.zeros(len(vertices_np)), {}
+        for face, area in zip(triangle_indices_np, tri_areas_np, strict=True):
             vertex_area[face] += area / 3
             for a, b in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])]:
                 edge = tuple(sorted((a, b)))
                 edge_area[edge] = edge_area.get(edge, 0.0) + 2 * area
         return vertex_area, edge_area
 
-    cloth_vertices = np.asarray(cloth_vertices, dtype=np.float64)
-    box_vertices = np.asarray(box_vertices, dtype=np.float64)
-    cloth_worlds = np.full(len(cloth_vertices), -1) if cloth_worlds is None else cloth_worlds
-    box_worlds = np.full(len(box_vertices), -1) if box_worlds is None else box_worlds
+    cloth_vertices_np = np.asarray(cloth_vertices_np, dtype=np.float64)
+    box_vertices_np = np.asarray(box_vertices_np, dtype=np.float64)
+    cloth_worlds = np.full(len(cloth_vertices_np), -1) if cloth_worlds is None else cloth_worlds
+    box_worlds = np.full(len(box_vertices_np), -1) if box_worlds is None else box_worlds
 
     def eligible_faces(source_world, target_worlds, faces):
         target_world = target_worlds[faces[:, 0]]
         return faces[(source_world < 0) | (target_world < 0) | (source_world == target_world)]
 
     cloth_vertex_area, cloth_edge_area = weights(
-        cloth_vertices if cloth_rest_vertices is None else cloth_rest_vertices, cloth_faces
+        cloth_vertices_np if cloth_rest_vertices is None else cloth_rest_vertices, cloth_triangle_indices_np
     )
     box_vertex_area, box_edge_area = weights(
-        box_vertices if box_rest_vertices is None else box_rest_vertices, box_faces
+        box_vertices_np if box_rest_vertices is None else box_rest_vertices, box_triangle_indices_np
     )
     cloth_point_values = np.array(
         [
-            point_potential(q, box_vertices, eligible_faces(world, box_worlds, box_faces))
-            for q, world in zip(cloth_vertices, cloth_worlds, strict=True)
+            point_potential(q, box_vertices_np, eligible_faces(world, box_worlds, box_triangle_indices_np))
+            for q, world in zip(cloth_vertices_np, cloth_worlds, strict=True)
         ]
     )
     box_point_values = np.array(
         [
-            point_potential(q, cloth_vertices, eligible_faces(world, cloth_worlds, cloth_faces))
-            for q, world in zip(box_vertices, box_worlds, strict=True)
+            point_potential(q, cloth_vertices_np, eligible_faces(world, cloth_worlds, cloth_triangle_indices_np))
+            for q, world in zip(box_vertices_np, box_worlds, strict=True)
         ]
     )
     fixed = np.array([cloth_vertex_area @ cloth_point_values[:, 0], box_vertex_area @ box_point_values[:, 0]])
@@ -139,17 +145,23 @@ def reference_energies(
             soft_world, rigid_world = cloth_worlds[soft_edge[0]], box_worlds[rigid_edge[0]]
             if soft_world >= 0 and rigid_world >= 0 and soft_world != rigid_world:
                 continue
-            q, q_bar, weight = ee_sample(*cloth_vertices[list(soft_edge)], *box_vertices[list(rigid_edge)])
+            q, q_bar, weight = ee_sample(*cloth_vertices_np[list(soft_edge)], *box_vertices_np[list(rigid_edge)])
             if weight > 0:
                 ee[0] += (
                     soft_area
                     * weight
-                    * point_potential(q, box_vertices, eligible_faces(soft_world, box_worlds, box_faces))[1]
+                    * point_potential(
+                        q, box_vertices_np, eligible_faces(soft_world, box_worlds, box_triangle_indices_np)
+                    )[1]
                 )
                 ee[1] += (
                     rigid_area
                     * weight
-                    * point_potential(q_bar, cloth_vertices, eligible_faces(rigid_world, cloth_worlds, cloth_faces))[1]
+                    * point_potential(
+                        q_bar,
+                        cloth_vertices_np,
+                        eligible_faces(rigid_world, cloth_worlds, cloth_triangle_indices_np),
+                    )[1]
                 )
     return (cloth_point_values, box_point_values), np.array([fixed, ee])
 
@@ -192,17 +204,17 @@ def numpy_mesh_pair_energies(blocks, soft_positions=None, rigid_positions=None):
     in float32. Small differences from those fixed weights are expected.
     """
     data, model = blocks.data, blocks.model
-    sv = blocks.state.particle_q.numpy() if soft_positions is None else soft_positions
-    rv = blocks.solver._esp_rigid_positions.numpy() if rigid_positions is None else rigid_positions
+    particle_q_np = blocks.state.particle_q.numpy() if soft_positions is None else soft_positions
+    rigid_positions_np = blocks.solver._esp_rigid_positions.numpy() if rigid_positions is None else rigid_positions
     return reference_energies(
-        sv,
+        particle_q_np,
         data.soft.faces.numpy(),
-        rv,
+        rigid_positions_np,
         data.rigid.faces.numpy(),
         blocks.support,
         blocks.near_cutoff,
-        cloth_rest_vertices=blocks.soft_rest_vertices,
-        box_rest_vertices=blocks.rigid_rest_vertices,
+        cloth_rest_vertices=blocks.soft_rest_vertices_np,
+        box_rest_vertices=blocks.rigid_rest_vertices_np,
         cloth_worlds=model.particle_world.numpy(),
         box_worlds=model.shape_world.numpy()[data.rigid_vertex_rows.numpy()[:, 0]],
     )

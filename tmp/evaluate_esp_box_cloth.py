@@ -40,15 +40,15 @@ def run_example(
 ):
     with wp.ScopedDevice(device):
         # Shared-vertex box: x=+/-50 mm, y=+/-40 mm, top z=0, bottom z=-100 mm.
-        box_vertices, box_faces = box_mesh()
-        cloth_vertices, cloth_faces = patch(gap, tilt=cloth_tilt)
-        if np.min(cloth_vertices[:, 2]) <= 0:
+        box_vertices_np, box_triangle_indices_np = box_mesh()
+        cloth_vertices_np, cloth_triangle_indices_np = patch(gap, tilt=cloth_tilt)
+        if np.min(cloth_vertices_np[:, 2]) <= 0:
             raise ValueError("The cloth tilt must leave all vertices above the box")
 
         builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
         builder.add_shape_mesh(
             body=-1,
-            mesh=newton.Mesh(box_vertices, box_faces.ravel(), compute_inertia=False),
+            mesh=newton.Mesh(box_vertices_np, box_triangle_indices_np.ravel(), compute_inertia=False),
             cfg=builder.ShapeConfig(ke=1.0, kd=0.0, mu=0.0, margin=0.0),
         )
         builder.add_cloth_mesh(
@@ -56,8 +56,8 @@ def run_example(
             rot=wp.quat_identity(),
             scale=1.0,
             vel=wp.vec3(0.0),
-            vertices=cloth_vertices.tolist(),
-            indices=cloth_faces.ravel().tolist(),
+            vertices=cloth_vertices_np.tolist(),
+            indices=cloth_triangle_indices_np.ravel().tolist(),
             density=1.0,
             particle_radius=0.03,
         )
