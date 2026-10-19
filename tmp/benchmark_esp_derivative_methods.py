@@ -21,14 +21,13 @@ from benchmark_esp_vbd import measure
 from esp_derivatives import barrier, multiply, segment_closest, triangle_closest
 from esp_derivatives import ee_sample as ad_sample
 from esp_entry_reference import (
+    EspSurfaceData,
     body_vertex_derivatives,
     ee_sample_derivatives,
     fixed_position,
     triangle_potential_derivatives,
 )
 from esp_geometric_chain_rule import make_formulas
-
-from newton._src.solvers.vbd.esp_contact import EspSurfaceData
 
 
 def make_kernel(size, kind, method, scalar=wp.float64):

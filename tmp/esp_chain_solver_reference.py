@@ -4,8 +4,9 @@
 """Saved chain-based ESP implementation for numerical and timing comparisons.
 
 Production now uses shared direct formulas. This reference retains the old
-derivative mathematics; its buffer types alias unchanged production structures
-so comparisons can use exactly the same state and contact data.
+derivative mathematics and saved surface/contact layouts. Production now uses
+flat EspData; these historical solver launches require their saved data layout.
+The local derivative functions remain usable independently of those launches.
 """
 
 from copy import copy
@@ -52,7 +53,7 @@ class _SavedEspSurfaceData:
     vertex_mesh: wp.array[int]  # Mesh ownership within this combined geometry.
 
 
-EspSurfaceData = _production.EspSurfaceData
+EspSurfaceData = _SavedEspSurfaceData
 
 
 @wp.struct
@@ -1218,7 +1219,7 @@ class _SavedEspContactData:
     soft_mesh_radius: wp.array[wp.float64]
 
 
-EspContactData = _production.EspContactData
+EspContactData = _SavedEspContactData
 
 
 @wp.func

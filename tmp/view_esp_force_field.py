@@ -68,14 +68,12 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 from esp_chain_solver_reference import particle_point, particle_triangle_potential
-from esp_common import box_mesh
+from esp_common import box_mesh, contact_primitive_indices_np
 
 import newton
 from newton._src.geometry.soft_contacts_mesh import filter_soft_mesh_contacts
 from newton._src.solvers.vbd import esp_contact
 from newton._src.solvers.vbd.esp_contact import (
-    EspSurfaceData,
-    build_esp_surface_data,
     particle_triangle,
     triangle_feature_weights,
 )
@@ -152,12 +150,17 @@ def newton_contact_energy(distance: float, radius: float, stiffness: float, use_
 @wp.kernel
 def evaluate_contacts(
     soft_contact_count: wp.array[int],
-    soft_contact_mesh_features: wp.array[wp.vec3i],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
     soft_contact_force_mask: wp.array[bool],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
     particle_q64: wp.array[wp.vec3d],
-    target: EspSurfaceData,
+    tri_indices: wp.array[wp.vec3i],
+    edge_vertex_indices: wp.array[wp.vec2i],
+    tri_edge_indices: wp.array2d[int],
+    edge_tri_indices: wp.array2d[int],
+    vertex_term_weight: wp.array[wp.float64],
     target_positions: wp.array[wp.vec3d],
     support: float,
     stiffness: float,
@@ -172,10 +175,11 @@ def evaluate_contacts(
     row = wp.tid()
     if row >= soft_contact_count[0]:
         return
-    feature = soft_contact_mesh_features[row]
-    if feature[0] < 0 or (feature[0] & 7) != 0:
+    soft = soft_contact_indices[row]
+    rigid = soft_contact_rigid_indices[row]
+    if soft[1] >= 0 or rigid[2] < 0:
         return
-    particle, face = feature[1], feature[2]
+    particle, face = soft[0], rigid[0] // 3
     point = wp.vec3(particle_q64[particle])
     distance = wp.dot(soft_contact_normal[row], point - soft_contact_body_pos[row])
     wp.atomic_min(distances, particle, wp.abs(distance))
@@ -210,8 +214,10 @@ def evaluate_contacts(
     esp_force, ogc_force = wp.vec3d(), wp.vec3d()
     r = wp.float64(support)
     coefficient = wp.float64(stiffness) * r * r
-    triangle_vertex_indices = target.faces[face]
-    edge_weights, vertex_weights = triangle_feature_weights(target, face)
+    triangle_vertex_indices = tri_indices[face]
+    edge_weights, vertex_weights = triangle_feature_weights(
+        tri_indices, tri_edge_indices, edge_tri_indices, vertex_term_weight, face
+    )
     if use_direct_formulas:
         value, gradient, hessian = particle_triangle(
             particle_q64[particle],
@@ -230,8 +236,8 @@ def evaluate_contacts(
         # exactly the direct mathematical function used by SolverVBD.
         reversed_edges = wp.vec3i()
         for corner in range(3):
-            edge = target.adjacency.tri_edge_indices[face, corner]
-            reversed_edges[corner] = int(target.edges[edge][0] != triangle_vertex_indices[corner])
+            edge = tri_edge_indices[face, corner]
+            reversed_edges[corner] = int(edge_vertex_indices[edge][0] != triangle_vertex_indices[corner])
         a = particle_point(target_positions[triangle_vertex_indices[0]], False)
         b = particle_point(target_positions[triangle_vertex_indices[1]], False)
         c = particle_point(target_positions[triangle_vertex_indices[2]], False)
@@ -271,14 +277,7 @@ class ForceProbe:
         self.use_direct_formulas = esp_formulas == "direct"
         self.scene, self.device = scene, wp.get_device(device)
         self.vertices_np, self.triangle_indices_np = scene_mesh(scene)
-        edge_vertex_indices_np = np.unique(
-            np.sort(self.triangle_indices_np[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2), axis=1), axis=0
-        )
         with wp.ScopedDevice(self.device):
-            self.surface, _, _ = build_esp_surface_data(
-                self.vertices_np, self.triangle_indices_np, edge_vertex_indices_np
-            )
-            self.target_positions = wp.array(self.vertices_np, dtype=wp.vec3d)
             builder = newton.ModelBuilder(gravity=(0, 0, 0))
             cfg = builder.ShapeConfig(margin=0.0, kd=0.0, mu=0.0)
             builder.add_shape_mesh(
@@ -297,6 +296,9 @@ class ForceProbe:
                 soft_contact_gap=0.001,
                 soft_contact_max=particle_count * len(self.triangle_indices_np) + 16,
             )
+            self.data = esp_contact.create_esp_data(self.model, self.pipeline)
+            # The static mesh's local/world positions coincide; use ESP's compact vertex order.
+            self.target_positions = wp.array(self.data.rigid_local_positions.numpy(), dtype=wp.vec3d)
             self.contacts = self.pipeline.contacts()
             self.particle_q64 = wp.empty(particle_count, dtype=wp.vec3d)
             self.energy = wp.zeros((len(MODES), particle_count), dtype=wp.float64)
@@ -329,12 +331,17 @@ class ForceProbe:
                 dim=self.contacts.soft_contact_max,
                 inputs=[
                     self.contacts.soft_contact_count,
-                    self.contacts._soft_contact_mesh_features,
+                    self.contacts.soft_contact_indices,
+                    self.contacts.soft_contact_rigid_indices,
                     self.contacts.soft_contact_force_mask,
                     self.contacts.soft_contact_body_pos,
                     self.contacts.soft_contact_normal,
                     self.particle_q64,
-                    self.surface,
+                    self.data.rigid_tri_indices,
+                    self.data.rigid_edge_vertex_indices,
+                    self.data.rigid_adjacency.tri_edge_indices,
+                    self.data.rigid_adjacency.edge_tri_indices,
+                    self.data.rigid_vertex_term_weight,
                     self.target_positions,
                     support,
                     stiffness,
@@ -353,21 +360,23 @@ class ForceProbe:
 @wp.kernel
 def select_edge_rows(
     soft_contact_count: wp.array[int],
-    soft_contact_mesh_features: wp.array[wp.vec3i],
-    source_edge: int,
-    selected_soft_contact_mesh_features: wp.array[wp.vec3i],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    source_edge: wp.vec2i,
+    selected_rigid_indices: wp.array[wp.vec3i],
 ):
-    """Select EE energy terms, without removing rows used to build neighborhoods."""
+    """Select one source edge's EE terms without changing neighborhood lists."""
     row = wp.tid()
-    if row >= wp.min(soft_contact_count[0], soft_contact_mesh_features.shape[0]):
+    if row >= wp.min(soft_contact_count[0], soft_contact_rigid_indices.shape[0]):
         return
-    feature = soft_contact_mesh_features[row]
-    # Preserve recovery/unknown rows for production's skip/error handling.
-    # Keep row indices unchanged so the lists and sample cache remain aligned.
-    if feature[0] >= 0 and (feature[0] & 7) < 3:
-        if (feature[0] & 7) != 2 or feature[1] != source_edge:
-            feature[0] = -1
-    selected_soft_contact_mesh_features[row] = feature
+    soft = soft_contact_indices[row]
+    rigid = soft_contact_rigid_indices[row]
+    same_edge = (soft[0] == source_edge[0] and soft[1] == source_edge[1]) or (
+        soft[0] == source_edge[1] and soft[1] == source_edge[0]
+    )
+    if not same_edge or soft[2] >= 0 or rigid[1] < 0 or rigid[2] >= 0:
+        rigid = wp.vec3i(-1)
+    selected_rigid_indices[row] = rigid
 
 
 class EdgeForceProbe:
@@ -404,6 +413,9 @@ class EdgeForceProbe:
             )
             builder.color()
             self.model = builder.finalize()
+            # This viewer compares conservative force and prescribed friction,
+            # without a simulated velocity or normal damping.
+            self.model.soft_contact_kd = 0.0
             self.state = self.model.state()
             # Capacity covers all source vertices/faces/edges against the target.
             self.pipeline = newton.CollisionPipeline(
@@ -421,10 +433,8 @@ class EdgeForceProbe:
             )
             self.contacts = self.solver.contacts
             self.selected_contacts = copy.copy(self.contacts)
-            self.selected_contacts._soft_contact_mesh_features = wp.empty_like(
-                self.contacts._soft_contact_mesh_features
-            )
-            edge_vertex_indices_np = self.solver._esp_data.soft.edges.numpy()
+            self.selected_contacts.soft_contact_rigid_indices = wp.empty_like(self.contacts.soft_contact_rigid_indices)
+            edge_vertex_indices_np = self.solver._esp_data.soft_edge_vertex_indices.numpy()
             self.edge_index = int(np.flatnonzero(np.all(np.sort(edge_vertex_indices_np, axis=1) == (0, 1), axis=1))[0])
 
     def evaluate(self, endpoints, support, stiffness=100.0, *, friction_slip=None):
@@ -451,18 +461,21 @@ class EdgeForceProbe:
             soft_contact_count = int(self.contacts.soft_contact_count.numpy()[0])
             if soft_contact_count > self.contacts.soft_contact_max:
                 raise RuntimeError("Contact overflow: EE results would be incomplete")
-            esp_contact.rebuild_edge_triangle_lists(
-                self.contacts,
-                solver._esp_data,
-                solver._esp_lists,
-                solver._esp_list_sort_values,
-            )
+            # As in solver.step(), refresh both the ESP lists and per-row
+            # materials. Detection can return more rows than the solver's
+            # initial material allocation, even with only three particles.
+            solver._refresh_body_particle_contact_state(self.contacts, refresh=True)
             solver._prepare_esp_contact_inputs(self.state)
             wp.launch(
                 select_edge_rows,
                 dim=self.contacts.soft_contact_max,
-                inputs=[self.contacts.soft_contact_count, self.contacts._soft_contact_mesh_features, self.edge_index],
-                outputs=[self.selected_contacts._soft_contact_mesh_features],
+                inputs=[
+                    self.contacts.soft_contact_count,
+                    self.contacts.soft_contact_indices,
+                    self.contacts.soft_contact_rigid_indices,
+                    wp.vec2i(*self.model.edge_indices.numpy()[self.edge_index, 2:]),
+                ],
+                outputs=[self.selected_contacts.soft_contact_rigid_indices],
             )
             solver._esp_error.zero_()
             # The normal single-worker solve no longer stores EE sample values.
@@ -475,7 +488,8 @@ class EdgeForceProbe:
                 inputs=[
                     worker_count,
                     self.selected_contacts.soft_contact_count,
-                    self.selected_contacts._soft_contact_mesh_features,
+                    self.selected_contacts.soft_contact_indices,
+                    self.selected_contacts.soft_contact_rigid_indices,
                     self.selected_contacts.soft_contact_shape,
                     solver._esp_data,
                     self.state.particle_q,
@@ -531,11 +545,9 @@ class EdgeForceProbe:
                     friction_force = solver._esp_particle_forces.numpy().copy() - force
                 finally:
                     solver.contacts = saved_contacts
-            soft_contact_mesh_features_np = self.selected_contacts._soft_contact_mesh_features.numpy()[
-                :soft_contact_count
-            ]
+            primitive_indices_np = contact_primitive_indices_np(self.selected_contacts, solver._esp_data)
             ee_samples_np = solver._esp_ee_samples.numpy()[:soft_contact_count]
-            ee_rows = (soft_contact_mesh_features_np[:, 0] >= 0) & ((soft_contact_mesh_features_np[:, 0] & 7) == 2)
+            ee_rows = (primitive_indices_np[:, 0] >= 0) & ((primitive_indices_np[:, 0] & 7) == 2)
             active = ee_rows & (ee_samples_np[:, 0, 3] > 0)
             return (
                 energy,
@@ -543,7 +555,7 @@ class EdgeForceProbe:
                 {
                     "rows": int(ee_rows.sum()),
                     "active": int(active.sum()),
-                    "rigid_edges": soft_contact_mesh_features_np[active, 2].copy(),
+                    "rigid_edges": primitive_indices_np[active, 2].copy(),
                     "samples": ee_samples_np[active].copy(),
                     "friction_force": friction_force,
                 },
@@ -744,6 +756,8 @@ def test_edge_probes(device):
         # rows. Reversing the imposed slip reverses every primitive's friction.
         ep, fp, plus = probe.evaluate(probe.rest_triangle_np[:2], support, 1.0, friction_slip=(0.001, 0, 0))
         em, fm, minus = probe.evaluate(probe.rest_triangle_np[:2], support, 1.0, friction_slip=(-0.001, 0, 0))
+        assert probe.solver.body_particle_contact_material_kd.shape[0] >= probe.contacts.soft_contact_max
+        np.testing.assert_array_equal(probe.solver.body_particle_contact_material_kd.numpy(), 0)
         np.testing.assert_allclose(ep, em)
         np.testing.assert_allclose(fp, fm)
         np.testing.assert_allclose(plus["friction_force"], -minus["friction_force"], rtol=2e-5, atol=1e-6)
@@ -1182,11 +1196,17 @@ def main():
             for gizmo, point in zip(viewer.edge_gizmos, viewer.probe.rest_triangle_np[:2], strict=True):
                 gizmo.set_position(point)
             ps.frame_tick()
-            assert not viewer.edge_error
+            assert not viewer.edge_error, viewer.edge_error
             np.testing.assert_array_equal(viewer.probe.state.particle_q.numpy()[2], viewer.probe.rest_triangle_np[2])
             viewer.show_edge_friction = True
             ps.frame_tick()
-            assert not viewer.edge_error
+            assert not viewer.edge_error, (
+                viewer.edge_error,
+                [g.get_position() for g in viewer.edge_gizmos],
+                viewer.radius,
+                viewer.stiffness,
+                viewer.friction_slip_mm,
+            )
             expected = drawing_vectors(viewer.edge_result[2]["friction_force"][:2], viewer.arrow_scale, 0.035)
             np.testing.assert_allclose(viewer.displayed_edge_vectors, expected)
             assert np.linalg.norm(viewer.edge_result[2]["friction_force"]) > 0

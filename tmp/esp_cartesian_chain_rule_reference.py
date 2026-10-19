@@ -248,21 +248,23 @@ class CartesianChainRuleEvaluator:
         self.soft_positions_np = reference.soft_positions_np
         self.rigid_positions_np = reference.rigid_positions_np
         self.support, self.near = reference.support, reference.near_cutoff
-        count, features, shapes, offsets, soft, rigid = reference.inputs
+        count, features, shapes, offsets = reference.inputs[:4]
         self.features = features.numpy()[: int(count.numpy()[0])]
         self.shapes = shapes.numpy()
         self.offsets = offsets.numpy()
         self.area_weights = [a.numpy() for a in reference.weights]
         self.surfaces = []
-        for surface in (soft, rigid):
-            faces, edges = surface.faces.numpy(), surface.edges.numpy()
+        for start in (4, 9):
+            tri_indices, edge_vertex_indices, tri_edge_indices, edge_tri_indices, vertex_term_weight = reference.inputs[
+                start : start + 5
+            ]
             self.surfaces.append(
                 {
-                    "faces": faces,
-                    "edges": edges,
-                    "face_edges": surface.adjacency.tri_edge_indices.numpy(),
-                    "interior_edges": np.all(surface.adjacency.edge_tri_indices.numpy() >= 0, axis=1),
-                    "vertex_weight": surface.vertex_term_weight.numpy(),
+                    "faces": tri_indices.numpy(),
+                    "edges": edge_vertex_indices.numpy(),
+                    "face_edges": tri_edge_indices.numpy(),
+                    "interior_edges": np.all(edge_tri_indices.numpy() >= 0, axis=1),
+                    "vertex_weight": vertex_term_weight.numpy(),
                 }
             )
         lists = reference.lists

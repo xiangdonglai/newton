@@ -2161,6 +2161,7 @@ class CollisionPipeline:
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model, shape_ok=~mesh_mask)
         self._soft_contact_pair_count = len(self.soft_rigid_contact_pairs)
         self.enable_rigid_soft_full_surface_contact = enable_rigid_soft_full_surface_contact
+        self.full_surface_contact_return_unfiltered = full_surface_contact_return_unfiltered
         self._soft_mesh_contact_data = None
         empty_pairs = wp.empty(0, dtype=wp.vec2i, device=model.device)
 
@@ -3108,6 +3109,7 @@ class CollisionPipeline:
                     contacts.soft_contact_count,
                     contacts.soft_contact_particle,
                     contacts.soft_contact_indices,
+                    contacts.soft_contact_rigid_indices,
                     contacts.soft_contact_barycentric,
                     contacts.soft_contact_shape,
                     contacts.soft_contact_body_pos,

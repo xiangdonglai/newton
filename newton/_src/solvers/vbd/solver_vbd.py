@@ -2484,12 +2484,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         scalar = wp.float32 if self.rigid_soft_contact_esp_precision == "float32" else wp.float64
         self._esp_kernels = esp_contact.get_esp_kernels(scalar)
         with wp.ScopedDevice(self.device):
-            self._esp_data = self._esp_kernels.create_esp_contact_data(self.model, self.collision_pipeline)
+            self._esp_data = self._esp_kernels.create_esp_data(self.model, self.collision_pipeline)
             self._esp_rigid_positions = wp.empty(
                 self._esp_data.rigid_local_positions.shape[0], dtype=self._esp_kernels.Vec3
             )
             self._esp_lists, self._esp_list_sort_values = self._esp_kernels.create_edge_triangle_lists(
-                self._esp_data.soft, self._esp_data.rigid, self._pipeline_contacts.soft_contact_max
+                self._esp_data.soft_edge_vertex_indices,
+                self._esp_data.rigid_edge_vertex_indices,
+                self._pipeline_contacts.soft_contact_max,
             )
             self._esp_energy = wp.zeros(2, dtype=scalar)
             self._esp_ee_samples = wp.empty((self._pipeline_contacts.soft_contact_max, 2), dtype=self._esp_kernels.Vec4)
@@ -2514,7 +2516,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 dim=self._esp_rigid_positions.shape[0],
                 inputs=[
                     data.rigid_local_positions,
-                    data.rigid_vertex_rows,
+                    data.rigid_vertex_shapes,
                     self.model.shape_transform,
                     self.model.shape_body,
                     state.body_q,

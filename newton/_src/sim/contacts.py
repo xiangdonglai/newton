@@ -436,6 +436,22 @@ class Contacts:
             self.soft_contact_barycentric = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Barycentric weights of the contact point on the soft feature's particles [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_shape = wp.full(soft_contact_max, -1, dtype=int)
+            self.soft_contact_rigid_indices = wp.full(soft_contact_max, wp.vec3i(-1), dtype=wp.vec3i)
+            """Rigid collision-mesh corner indices per contact, shape (soft_contact_max,), dtype :class:`vec3i`.
+
+            Triangle ``(3*f, 3*f+1, 3*f+2)``, edge ``(c0, c1, -1)``, or vertex
+            ``(c, -1, -1)``, in the collision mesh identified by :attr:`soft_contact_shape`.
+            Each nonnegative entry is an index-buffer slot, not a vertex-array index
+            or a BVH query-table row. Use ``wp.mesh_get_point(mesh, c)`` for its position
+            or ``wp.mesh_get_index(mesh, c)`` for its mesh vertex index.
+            Mesh positions are unscaled shape-local coordinates; apply the shape's scale and transforms.
+            Analytical/SDF contacts and edge-penetration recovery probes contain
+            ``(-1, -1, -1)``: they do not identify a complete rigid mesh primitive.
+
+            .. experimental::
+
+                Rigid primitive metadata may change without prior notice.
+            """
             self.soft_contact_body_pos = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact position on body [m], shape (soft_contact_max,), dtype :class:`vec3`.
 
@@ -572,6 +588,7 @@ class Contacts:
                 self.rigid_contact_match_generation.fill_(GENERATION_SENTINEL)
 
             self.soft_contact_indices.fill_(wp.vec3i(-1, -1, -1))
+            self.soft_contact_rigid_indices.fill_(wp.vec3i(-1, -1, -1))
             self.soft_contact_particle.fill_(-1)
             self.soft_contact_shape.fill_(-1)
             self.soft_contact_tids.fill_(-1)

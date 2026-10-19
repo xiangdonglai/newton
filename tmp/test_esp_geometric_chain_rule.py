@@ -11,8 +11,7 @@ import unittest
 import numpy as np
 import warp as wp
 from benchmark_esp_derivative_methods import make_kernel
-
-from newton._src.solvers.vbd.esp_contact import EspSurfaceData
+from esp_entry_reference import EspSurfaceData
 
 
 class TestEspGeometricChainRule(unittest.TestCase):

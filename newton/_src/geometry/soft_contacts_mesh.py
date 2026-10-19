@@ -1133,6 +1133,7 @@ def _evaluate_mesh_contacts(
     edge_edge_parallel_epsilon: float,
     soft_contact_particle: wp.array[wp.int32],
     soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
@@ -1162,6 +1163,7 @@ def _evaluate_mesh_contacts(
 
     particle = wp.int32(-1)
     corners = wp.vec3i(-1, -1, -1)
+    rigid_indices = wp.vec3i(-1)
     bary = wp.vec3(0.0)
     body_pos = wp.vec3(0.0)
     body_vel = wp.vec3(0.0)
@@ -1172,6 +1174,7 @@ def _evaluate_mesh_contacts(
         corners = wp.vec3i(particle, -1, -1)
         bary = wp.vec3(1.0, 0.0, 0.0)
         face = rigid_feature
+        rigid_indices = wp.vec3i(3 * face, 3 * face + 1, 3 * face + 2)
         x_local = wp.transform_point(X_sw, particle_q[particle])
         a = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 0), scale)
         b = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 1), scale)
@@ -1198,6 +1201,7 @@ def _evaluate_mesh_contacts(
     elif family == _MESH_FEATURE_TV:
         vertex_entry = rigid_vertex_table[rigid_feature]
         index = vertex_entry[1]
+        rigid_indices = wp.vec3i(index, -1, -1)
         t0 = tri_indices[soft_feature, 0]
         t1 = tri_indices[soft_feature, 1]
         t2 = tri_indices[soft_feature, 2]
@@ -1215,6 +1219,7 @@ def _evaluate_mesh_contacts(
         edge_entry = rigid_edge_table[rigid_feature]
         index0 = edge_entry[1]
         index1 = edge_entry[2]
+        rigid_indices = wp.vec3i(index0, index1, -1)
         sv0 = edge_indices[soft_feature, 2]
         sv1 = edge_indices[soft_feature, 3]
         corners = wp.vec3i(sv0, sv1, -1)
@@ -1262,6 +1267,7 @@ def _evaluate_mesh_contacts(
 
     soft_contact_particle[tid] = particle
     soft_contact_indices[tid] = corners
+    soft_contact_rigid_indices[tid] = rigid_indices
     soft_contact_barycentric[tid] = bary
     soft_contact_body_pos[tid] = body_pos
     soft_contact_body_vel[tid] = body_vel
@@ -1473,6 +1479,7 @@ def _launch_evaluate_mesh_contacts(model: Model, state: State, contacts: Contact
         outputs=[
             contacts.soft_contact_particle,
             contacts.soft_contact_indices,
+            contacts.soft_contact_rigid_indices,
             contacts.soft_contact_barycentric,
             contacts.soft_contact_body_pos,
             contacts.soft_contact_body_vel,

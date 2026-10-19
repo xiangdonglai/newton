@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.vbd import esp_contact
 from newton.solvers import SolverVBD
-from newton.tests.test_solver_vbd_esp import make_case
+from newton.tests.test_solver_vbd_esp import contact_primitive_indices_np, make_case
 
 
 def prepare_case(device, precision, *, dynamic=False, grid=False):
@@ -83,14 +83,16 @@ def make_primitive_friction_probe(kernels):
 def make_row_friction_probe(kernels):
     """Call production friction directly, avoiding subtraction of large normal blocks."""
     scalar, Vec3, Vec4 = kernels.scalar, kernels.Vec3, kernels.Vec4
-    Data, Lists = kernels.EspContactData, kernels.EdgeTriangleListData
+    Data, Lists = kernels.EspData, kernels.EdgeTriangleListData
     parameters = kernels.checked_contact_parameters
     friction = kernels.accumulate_contact_friction
+    primitive_indices = kernels.contact_primitive_indices
 
     @wp.kernel
     def probe(
         count: wp.array[int],
-        features: wp.array[wp.vec3i],
+        soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_rigid_indices: wp.array[wp.vec3i],
         shapes: wp.array[int],
         data: Data,
         lists: Lists,
@@ -121,7 +123,22 @@ def make_row_friction_probe(kernels):
     ):
         row_id = wp.tid()
         if row_id < count[0]:
-            row, shape = features[row_id], shapes[row_id]
+            shape = shapes[row_id]
+            row = primitive_indices(
+                soft_contact_indices[row_id],
+                soft_contact_rigid_indices[row_id],
+                data.rigid_triangle_offsets[shape],
+                data.soft_tri_indices,
+                data.soft_edge_vertex_indices,
+                data.soft_adjacency.v_adj_tris_offsets,
+                data.soft_adjacency.v_adj_tris,
+                data.soft_adjacency.v_adj_edges_offsets,
+                data.soft_adjacency.v_adj_edges,
+                data.rigid_tri_indices,
+                data.rigid_edge_vertex_indices,
+                data.rigid_adjacency.v_adj_edges_offsets,
+                data.rigid_adjacency.v_adj_edges,
+            )
             support, near, stiffness = parameters(
                 row, shape, data, particle_radius, shape_margin, shape_ke, soft_ke, error
             )
@@ -596,7 +613,8 @@ class TestVbdEspFriction(unittest.TestCase):
                             dim=solver.contacts.soft_contact_max,
                             inputs=[
                                 solver.contacts.soft_contact_count,
-                                solver.contacts._soft_contact_mesh_features,
+                                solver.contacts.soft_contact_indices,
+                                solver.contacts.soft_contact_rigid_indices,
                                 solver.contacts.soft_contact_shape,
                                 solver._esp_data,
                                 solver._esp_lists,
@@ -644,8 +662,7 @@ class TestVbdEspFriction(unittest.TestCase):
             for precision in ("float32", "float64"):
                 with self.subTest(device=str(device), precision=precision), wp.ScopedDevice(device):
                     model, _pipeline, solver, state = prepare_case(device, precision, dynamic=True)
-                    count = int(solver.contacts.soft_contact_count.numpy()[0])
-                    features = solver.contacts._soft_contact_mesh_features.numpy()[:count]
+                    features = contact_primitive_indices_np(solver.contacts, solver._esp_data)
                     # EE candidates may include the box face's diagonal, but
                     # this 1 mm gap exceeds their 0.25 mm near support.
                     self.assertFalse(np.any((features[:, 0] & 7) == 1), features)
@@ -685,8 +702,7 @@ class TestVbdEspFriction(unittest.TestCase):
                 # Include distant rigid-vertex samples so several target triangles
                 # and colors contribute to one sample. No geometry is changed.
                 model.particle_radius.fill_(0.1)
-                count = int(solver.contacts.soft_contact_count.numpy()[0])
-                features = solver.contacts._soft_contact_mesh_features.numpy()[:count]
+                features = contact_primitive_indices_np(solver.contacts, solver._esp_data)
                 self.assertTrue(np.any((features[:, 0] & 7) == 1))
                 all_force, all_hessian = friction_blocks(solver, state)
                 color_force, color_hessian = np.zeros_like(all_force), np.zeros_like(all_hessian)

@@ -11,6 +11,37 @@ The old float32 energy kernels remain in Git history (761ea8f1e).
 import numpy as np
 
 
+def contact_primitive_indices_np(contacts, data):
+    """Resolve public contact geometry independently for the NumPy/dense oracles."""
+    soft_tri_indices_np = data.soft_tri_indices.numpy()
+    rigid_tri_indices_np = data.rigid_tri_indices.numpy()
+    triangle_ids = {tuple(t): i for i, t in enumerate(soft_tri_indices_np)}
+    soft_edge_ids = {tuple(sorted(e)): i for i, e in enumerate(data.soft_edge_vertex_indices.numpy())}
+    rigid_edge_ids = {tuple(sorted(e)): i for i, e in enumerate(data.rigid_edge_vertex_indices.numpy())}
+    offsets_np = data.rigid_triangle_offsets.numpy()
+    count = int(contacts.soft_contact_count.numpy()[0])
+    result_np = np.full((count, 3), -1, dtype=np.int32)
+    for i, (soft, rigid, shape) in enumerate(
+        zip(
+            contacts.soft_contact_indices.numpy()[:count],
+            contacts.soft_contact_rigid_indices.numpy()[:count],
+            contacts.soft_contact_shape.numpy()[:count],
+            strict=True,
+        )
+    ):
+        if rigid[0] < 0 or offsets_np[shape] < 0:
+            continue
+        if rigid[2] >= 0:
+            result_np[i] = (0, soft[0], rigid[0] // 3)
+        elif rigid[1] < 0:
+            vertex = rigid_tri_indices_np[offsets_np[shape] + rigid[0] // 3, rigid[0] % 3]
+            result_np[i] = (1, triangle_ids[tuple(soft)], vertex)
+        else:
+            vertices = rigid_tri_indices_np[offsets_np[shape] + rigid[:2] // 3, rigid[:2] % 3]
+            result_np[i] = (2, soft_edge_ids[tuple(sorted(soft[:2]))], rigid_edge_ids[tuple(sorted(vertices))])
+    return result_np
+
+
 def reference_energies(
     cloth_vertices_np,
     cloth_triangle_indices_np,
@@ -208,13 +239,13 @@ def numpy_mesh_pair_energies(blocks, soft_positions=None, rigid_positions=None):
     rigid_positions_np = blocks.solver._esp_rigid_positions.numpy() if rigid_positions is None else rigid_positions
     return reference_energies(
         particle_q_np,
-        data.soft.faces.numpy(),
+        data.soft_tri_indices.numpy(),
         rigid_positions_np,
-        data.rigid.faces.numpy(),
+        data.rigid_tri_indices.numpy(),
         blocks.support,
         blocks.near_cutoff,
         cloth_rest_vertices=blocks.soft_rest_vertices_np,
         box_rest_vertices=blocks.rigid_rest_vertices_np,
         cloth_worlds=model.particle_world.numpy(),
-        box_worlds=model.shape_world.numpy()[data.rigid_vertex_rows.numpy()[:, 0]],
+        box_worlds=model.shape_world.numpy()[data.rigid_vertex_shapes.numpy()],
     )

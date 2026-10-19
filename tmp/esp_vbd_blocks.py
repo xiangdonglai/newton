@@ -43,7 +43,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import warp as wp
-from esp_common import numpy_mesh_pair_energies
+from esp_common import contact_primitive_indices_np, numpy_mesh_pair_energies
 from esp_derivatives import EspDerivativeEvaluator
 from esp_derivatives import check_derivatives as check_numerical
 
@@ -91,18 +91,17 @@ def _body_centers(body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3], b
 @wp.kernel
 def _select_quadrature(
     soft_contact_count: wp.array[int],
-    soft_contact_mesh_features: wp.array[wp.vec3i],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
     term: int,
-    selected_soft_contact_mesh_features: wp.array[wp.vec3i],
+    selected_rigid_indices: wp.array[wp.vec3i],
 ):
     row = wp.tid()
-    if row < wp.min(soft_contact_count[0], soft_contact_mesh_features.shape[0]):
-        feature = soft_contact_mesh_features[row]
-        family = feature[0] & 7
-        # Preserve recovery/unknown rows to exercise production skip/error handling.
-        if feature[0] >= 0 and family < 3 and int(family == 2) != term:
-            feature[0] = -1
-        selected_soft_contact_mesh_features[row] = feature
+    if row < wp.min(soft_contact_count[0], soft_contact_rigid_indices.shape[0]):
+        indices = soft_contact_rigid_indices[row]
+        is_ee = indices[1] >= 0 and indices[2] < 0
+        if indices[0] >= 0 and int(is_ee) != term:
+            indices = wp.vec3i(-1)
+        selected_rigid_indices[row] = indices
 
 
 class EspVbdBlockEvaluator:
@@ -155,7 +154,7 @@ class EspVbdBlockEvaluator:
             self._term_contacts = []
             for _term in (0, 1):
                 contacts = copy.copy(self.contacts)
-                contacts._soft_contact_mesh_features = wp.empty_like(self.contacts._soft_contact_mesh_features)
+                contacts.soft_contact_rigid_indices = wp.empty_like(self.contacts.soft_contact_rigid_indices)
                 self._term_contacts.append(contacts)
             self.body_com_world = wp.empty(self.model.body_count, dtype=wp.vec3d)
 
@@ -181,8 +180,8 @@ class EspVbdBlockEvaluator:
                 wp.launch(
                     _select_quadrature,
                     dim=contacts.soft_contact_max,
-                    inputs=[self.contacts.soft_contact_count, self.contacts._soft_contact_mesh_features, term],
-                    outputs=[contacts._soft_contact_mesh_features],
+                    inputs=[self.contacts.soft_contact_count, self.contacts.soft_contact_rigid_indices, term],
+                    outputs=[contacts.soft_contact_rigid_indices],
                 )
                 for kind, start, end in (
                     (esp_contact._PARTICLE_BLOCKS, 0, particle_count),
@@ -279,7 +278,7 @@ class EspVbdBlockEvaluator:
         expected_f[:, :count, :3] = force[:, :count]
         for p in range(count):
             expected_h[:, p, :3, :3] = hessian[:, 3 * p : 3 * p + 3, 3 * p : 3 * p + 3]
-        shape_body_np = self.model.shape_body.numpy()[self.data.rigid_vertex_rows.numpy()[:, 0]]
+        shape_body_np = self.model.shape_body.numpy()[self.data.rigid_vertex_shapes.numpy()]
         body_com_world_np = self.body_com_world.numpy()
         largest_rotation_correction = 0.0
         for body in range(self.model.body_count):
@@ -323,9 +322,8 @@ def run_checks(blocks, state, *, check_derivatives=False, check_autodiff=False, 
     _points, expected = numpy_mesh_pair_energies(blocks)
     actual = blocks.energy.numpy()
     np.testing.assert_allclose(actual, expected.sum(axis=1), rtol=2e-5, atol=1e-8)
-    soft_contact_count = int(blocks.contacts.soft_contact_count.numpy()[0])
-    soft_contact_mesh_features_np = blocks.contacts._soft_contact_mesh_features.numpy()[:soft_contact_count]
-    families = np.bincount(soft_contact_mesh_features_np[soft_contact_mesh_features_np[:, 0] >= 0, 0] & 7, minlength=4)
+    primitive_indices_np = contact_primitive_indices_np(blocks.contacts, blocks.data)
+    families = np.bincount(primitive_indices_np[primitive_indices_np[:, 0] >= 0, 0] & 7, minlength=4)
     print(f"{blocks.model.device}: VT/TV/EE/depth rows = {families.tolist()}")
     print(f"Support={blocks.support:g} m, near cutoff={blocks.near_cutoff:g} m, stiffness=1")
     print(f"NumPy P_fixed / P_ee (soft->rigid, rigid->soft):\n{expected}")

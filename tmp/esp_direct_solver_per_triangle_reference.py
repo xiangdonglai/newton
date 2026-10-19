@@ -14,11 +14,12 @@ There are no derivative-point objects in these kernels or their math calls.
 from copy import copy
 
 import warp as wp
+from esp_chain_solver_reference import EspContactData
 from esp_direct_ee_per_triangle_reference import make_direct_ee_formulas
 from esp_direct_formulas import make_direct_contact_formulas
 
 from newton._src.solvers.vbd import esp_contact as shared
-from newton._src.solvers.vbd.esp_contact import EdgeTriangleListData, EspContactData
+from newton._src.solvers.vbd.esp_contact import EdgeTriangleListData
 
 particle_triangle, body_triangle = make_direct_contact_formulas(wp.float64)
 particle_ee_triangle = make_direct_ee_formulas(3, wp.float64)

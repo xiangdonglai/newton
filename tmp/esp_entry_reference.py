@@ -9,7 +9,19 @@ whole-block integration so comparisons do not test a function against itself.
 
 import warp as wp
 
-from newton._src.solvers.vbd.esp_contact import EspSurfaceData, segment_distance_squared_value
+from newton._src.solvers.vbd.esp_contact import segment_distance_squared_value
+from newton._src.utils.mesh import MeshAdjacencyData
+
+
+@wp.struct
+class EspSurfaceData:
+    """Saved layout for the frozen derivative tests; production uses flat EspData."""
+
+    faces: wp.array[wp.vec3i]
+    edges: wp.array[wp.vec2i]
+    adjacency: MeshAdjacencyData
+    vertex_term_weight: wp.array[wp.float64]
+
 
 # Position kinematics for two selected solve coordinates i,j.
 # Columns are position, dx/dq_i, dx/dq_j and d2x/dq_i dq_j. They represent

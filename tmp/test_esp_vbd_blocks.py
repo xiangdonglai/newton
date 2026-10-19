@@ -62,16 +62,29 @@ class TestEspVbdBlocks(unittest.TestCase):
         for device in wp.get_devices():
             with self.subTest(device=str(device)):
                 state, blocks = make_case(device)
-                features = blocks.contacts._soft_contact_mesh_features.numpy().copy()
                 count = int(blocks.contacts.soft_contact_count.numpy()[0])
-                ee_rows = np.flatnonzero((features[:count, 0] >= 0) & ((features[:count, 0] & 7) == 2))
+                rigid_indices_np = blocks.contacts.soft_contact_rigid_indices.numpy()
+                ee_rows = np.flatnonzero((rigid_indices_np[:count, 1] >= 0) & (rigid_indices_np[:count, 2] < 0))
                 self.assertGreater(len(ee_rows), 0)
                 selected = ee_rows[::2]
+                retained = np.setdiff1d(np.arange(count), selected)
+                # Put the rows to skip last, so reducing the live count gives
+                # an independent reference without those rows at all.
+                order = np.concatenate((retained, selected))
+                for field in (
+                    blocks.contacts.soft_contact_indices,
+                    blocks.contacts.soft_contact_rigid_indices,
+                    blocks.contacts.soft_contact_shape,
+                ):
+                    values_np = field.numpy()
+                    values_np[:count] = values_np[order]
+                    field.assign(values_np)
+                rigid_indices_np = blocks.contacts.soft_contact_rigid_indices.numpy()
+                rigid_indices_np[len(retained) : count] = -1  # Public EE_DEPTH encoding.
+                blocks.contacts.soft_contact_rigid_indices.assign(rigid_indices_np)
                 reference = None
-                for tag in (-1, 3, 27):  # Absent, EE_DEPTH, EE_DEPTH with packed flags.
-                    modified = features.copy()
-                    modified[selected, 0] = tag
-                    blocks.contacts._soft_contact_mesh_features.assign(modified)
+                for live_count in (len(retained), count):
+                    blocks.contacts.soft_contact_count.fill_(live_count)
                     esp_contact.rebuild_edge_triangle_lists(
                         blocks.contacts, blocks.data, blocks.lists, blocks.solver._esp_list_sort_values
                     )
@@ -170,9 +183,7 @@ class TestEspVbdBlocks(unittest.TestCase):
                 blocks.check()
                 reference, e, f, h = compare_dense(self, blocks)
                 body, n = 0, blocks.model.particle_count
-                ids = np.flatnonzero(
-                    blocks.model.shape_body.numpy()[blocks.data.rigid_vertex_rows.numpy()[:, 0]] == body
-                )
+                ids = np.flatnonzero(blocks.model.shape_body.numpy()[blocks.data.rigid_vertex_shapes.numpy()] == body)
                 center = blocks.body_com_world.numpy()[body]
                 r = reference.rigid_positions_np[ids] - center
 
@@ -250,19 +261,22 @@ class TestEspVbdBlocks(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "flags=2"):
                     blocks.check()
                 blocks.lists.error.zero_()
-                features = blocks.contacts._soft_contact_mesh_features.numpy().copy()
-                original = features.copy()
-                features[0, 0] = 4  # Unknown family, not the supported EE_DEPTH skip.
-                blocks.contacts._soft_contact_mesh_features.assign(features)
+                original = blocks.contacts.soft_contact_rigid_indices.numpy().copy()
+                row_id = np.flatnonzero(original[:count, 2] >= 0)[0]
+                rigid_indices_np = original.copy()
+                # A soft vertex against a rigid vertex is not a supported
+                # primitive pair. Keep the corner valid; corrupt only arity.
+                rigid_indices_np[row_id, 1:] = -1
+                blocks.contacts.soft_contact_rigid_indices.assign(rigid_indices_np)
                 assemble()
                 with self.assertRaisesRegex(ValueError, "flags=8"):
                     blocks.check()
-                blocks.contacts._soft_contact_mesh_features.assign(original)
-                row_id = np.flatnonzero((original[:count, 0] >= 0) & ((original[:count, 0] & 7) == 0))[0]
+                blocks.contacts.soft_contact_rigid_indices.assign(original)
                 shape = blocks.contacts.soft_contact_shape.numpy()[row_id]
-                face = blocks.data.rigid_triangle_offsets.numpy()[shape] + original[row_id, 2]
-                target_vertex = blocks.data.rigid.faces.numpy()[face, 0]
-                moved[original[row_id, 1]] = blocks.solver._esp_rigid_positions.numpy()[target_vertex]
+                particle = blocks.contacts.soft_contact_indices.numpy()[row_id, 0]
+                face = blocks.data.rigid_triangle_offsets.numpy()[shape] + original[row_id, 0] // 3
+                target_vertex = blocks.data.rigid_tri_indices.numpy()[face, 0]
+                moved[particle] = blocks.solver._esp_rigid_positions.numpy()[target_vertex]
                 state.particle_q.assign(moved)
                 assemble()
                 blocks.check()  # Exact touching now uses finite continuation.
@@ -270,7 +284,7 @@ class TestEspVbdBlocks(unittest.TestCase):
                 self.assertTrue(np.isfinite(blocks.hessian.numpy()).all())
                 # Invalid numerical input must still be reported, not hidden by
                 # the continuation or the rigid solve's regularization.
-                moved[original[row_id, 1]] = np.nan
+                moved[particle] = np.nan
                 state.particle_q.assign(moved)
                 assemble()
                 with self.assertRaisesRegex(ValueError, "flags=4"):

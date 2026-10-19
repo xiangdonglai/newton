@@ -153,23 +153,29 @@ class TorchEspEnergy:
     """Read the same fixed contact/topology arrays; rebuild only scalar energies."""
 
     def __init__(self, evaluator):
-        soft_contact_count, soft_contact_mesh_features, soft_contact_shape, rigid_triangle_offsets, soft, rigid = (
-            evaluator.inputs
-        )
+        soft_contact_count, soft_contact_mesh_features, soft_contact_shape, rigid_triangle_offsets = evaluator.inputs[
+            :4
+        ]
         self.soft_contact_mesh_features_np = soft_contact_mesh_features.numpy()[: int(soft_contact_count.numpy()[0])]
         self.soft_contact_shape_np = soft_contact_shape.numpy()
         self.rigid_triangle_offsets_np = rigid_triangle_offsets.numpy()
         self.surfaces = []
-        for surface in (soft, rigid):
-            triangle_indices_np, edge_vertex_indices_np = surface.faces.numpy(), surface.edges.numpy()
+        # Each side supplies its five topology/weight arrays directly.
+        for start in (4, 9):
+            tri_indices, edge_vertex_indices, tri_edge_indices, edge_tri_indices, vertex_term_weight = evaluator.inputs[
+                start : start + 5
+            ]
+            triangle_indices_np, edge_vertex_indices_np = tri_indices.numpy(), edge_vertex_indices.numpy()
             self.surfaces.append(
                 {
                     "faces": triangle_indices_np,
                     "edges": edge_vertex_indices_np,
-                    "face_edges": surface.adjacency.tri_edge_indices.numpy(),
-                    "interior_edges": np.all(surface.adjacency.edge_tri_indices.numpy() >= 0, axis=1),
-                    "interior_vertices": surface.vertex_term_weight.numpy() > 0,
-                    "vertex_face_count": np.diff(surface.adjacency.v_adj_tris_offsets.numpy()) // 2,
+                    "face_edges": tri_edge_indices.numpy(),
+                    "interior_edges": np.all(edge_tri_indices.numpy() >= 0, axis=1),
+                    "interior_vertices": vertex_term_weight.numpy() > 0,
+                    "vertex_face_count": np.bincount(
+                        triangle_indices_np.ravel(), minlength=vertex_term_weight.shape[0]
+                    ),
                 }
             )
         self.weights = [a.numpy() for a in evaluator.weights]

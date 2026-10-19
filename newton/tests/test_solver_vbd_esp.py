@@ -18,12 +18,51 @@ from newton._src.solvers.vbd.esp_contact import (
     compact_sorted_edge_triangles,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
+from newton._src.utils.mesh import MeshAdjacency
+
+
+def contact_primitive_indices_np(contacts, data):
+    """Resolve public contact geometry independently for the NumPy/dense oracles."""
+    soft_tri_indices_np = data.soft_tri_indices.numpy()
+    rigid_tri_indices_np = data.rigid_tri_indices.numpy()
+    triangle_ids = {tuple(t): i for i, t in enumerate(soft_tri_indices_np)}
+    soft_edge_ids = {tuple(sorted(e)): i for i, e in enumerate(data.soft_edge_vertex_indices.numpy())}
+    rigid_edge_ids = {tuple(sorted(e)): i for i, e in enumerate(data.rigid_edge_vertex_indices.numpy())}
+    offsets_np = data.rigid_triangle_offsets.numpy()
+    count = int(contacts.soft_contact_count.numpy()[0])
+    result_np = np.full((count, 3), -1, dtype=np.int32)
+    for i, (soft, rigid, shape) in enumerate(
+        zip(
+            contacts.soft_contact_indices.numpy()[:count],
+            contacts.soft_contact_rigid_indices.numpy()[:count],
+            contacts.soft_contact_shape.numpy()[:count],
+            strict=True,
+        )
+    ):
+        if rigid[0] < 0 or offsets_np[shape] < 0:
+            continue
+        if rigid[2] >= 0:
+            result_np[i] = (0, soft[0], rigid[0] // 3)
+        elif rigid[1] < 0:
+            vertex = rigid_tri_indices_np[offsets_np[shape] + rigid[0] // 3, rigid[0] % 3]
+            result_np[i] = (1, triangle_ids[tuple(soft)], vertex)
+        else:
+            vertices = rigid_tri_indices_np[offsets_np[shape] + rigid[:2] // 3, rigid[:2] % 3]
+            result_np[i] = (2, soft_edge_ids[tuple(sorted(soft[:2]))], rigid_edge_ids[tuple(sorted(vertices))])
+    return result_np
+
+
+@wp.kernel
+def _collision_mesh_corner_positions(mesh: wp.uint64, scale: wp.vec3, positions: wp.array[wp.vec3]):
+    """Read the finalized collision mesh, independently of ESP's host reconstruction."""
+    corner = wp.tid()
+    positions[corner] = wp.cw_mul(wp.mesh_get_point(mesh, corner), scale)
 
 
 @wp.kernel
 def _primitive_supports(
     rows: wp.array[wp.vec3i],
-    data: esp_contact.EspContactData,
+    data: esp_contact.EspData,
     radii: wp.array[float],
     margins: wp.array[float],
     stiffness: wp.array[float],
@@ -342,10 +381,10 @@ class TestVbdEsp(unittest.TestCase):
                 self.assertEqual(model.particle_count, 3)
                 model.particle_radius.assign(radii)
                 with self.assertWarnsRegex(UserWarning, "cancellations") as warning:
-                    esp_contact.create_esp_contact_data(model, pipeline)
+                    esp_contact.create_esp_data(model, pipeline)
                 self.assertIn("mixed particle radii", str(warning.warning))
                 self.assertFalse(hasattr(solver._esp_data, "soft_radius"))
-                edges = solver._esp_data.soft.edges.numpy()
+                edges = solver._esp_data.soft_edge_vertex_indices.numpy()
                 rows = wp.array(
                     [[0, i, 0] for i in range(3)] + [[1, 0, 0]] + [[2, i, 0] for i in range(len(edges))],
                     dtype=wp.vec3i,
@@ -531,9 +570,9 @@ class TestVbdEsp(unittest.TestCase):
                 esp_contact.rebuild_edge_triangle_lists(
                     solver.contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
                 )
-                rows = solver.contacts._soft_contact_mesh_features.numpy().copy()
-                rows[(rows[:, 0] & 7) != 2, 0] = -1
-                solver.contacts._soft_contact_mesh_features.assign(rows)
+                indices_np = solver.contacts.soft_contact_rigid_indices.numpy().copy()
+                indices_np[(indices_np[:, 1] < 0) | (indices_np[:, 2] >= 0)] = -1
+                solver.contacts.soft_contact_rigid_indices.assign(indices_np)
                 solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
                 solver.check_esp_contacts()
                 self.assertGreater(solver._esp_energy.numpy()[1], 0.0, "Exercise active EE, not a zero-weight case")
@@ -601,8 +640,9 @@ class TestVbdEsp(unittest.TestCase):
                         count = int(solver.contacts.soft_contact_count.numpy()[0])
                         self.assertGreater(count, 0)
                         self.assertLessEqual(count, solver.contacts.soft_contact_max)
-                        rows = solver.contacts._soft_contact_mesh_features.numpy().copy()
-                        point_rows = ((rows[:count, 0] & 7) == 0) & (rows[:count, 1] == 0)
+                        indices_np = solver.contacts.soft_contact_rigid_indices.numpy().copy()
+                        soft_indices_np = solver.contacts.soft_contact_indices.numpy()
+                        point_rows = (indices_np[:count, 2] >= 0) & (soft_indices_np[:count, 0] == 0)
                         self.assertTrue(point_rows.any())
                         weights = solver._esp_data.soft_vertex_weight.numpy()
                         if kind == "interior":
@@ -611,8 +651,8 @@ class TestVbdEsp(unittest.TestCase):
                             self.assertNotIn(0, model.tri_indices.numpy())
                             # Isolate vertex 0's raw rows, including its native
                             # damping rows, and check its rigid reaction too.
-                            rows[:count][~point_rows, 0] = -1
-                            solver.contacts._soft_contact_mesh_features.assign(rows)
+                            indices_np[:count][~point_rows] = -1
+                            solver.contacts.soft_contact_rigid_indices.assign(indices_np)
                             mask = solver.contacts.soft_contact_force_mask.numpy().copy()
                             mask[:count] &= point_rows
                             solver.contacts.soft_contact_force_mask.assign(mask)
@@ -723,15 +763,20 @@ class TestVbdEsp(unittest.TestCase):
                 model, pipeline, _solver = make_case(device, grid=True)
                 areas = model.tri_areas.numpy() * np.linspace(1.1, 1.8, model.tri_count, dtype=np.float32)
                 model.tri_areas.assign(areas)
-                data = esp_contact.create_esp_contact_data(model, pipeline)
-                soft, adjacency = data.soft, model.soft_mesh_adjacency_device
+                data = esp_contact.create_esp_data(model, pipeline)
+                adjacency = model.soft_mesh_adjacency_device
                 self.assertFalse(hasattr(esp_contact, "soft_mesh_components"))
-                self.assertFalse(hasattr(soft, "vertex_mesh"))
+                self.assertFalse(hasattr(esp_contact, "EspSurfaceData"))
+                self.assertFalse(hasattr(esp_contact, "EspContactData"))
+                self.assertFalse(hasattr(data, "soft"))
+                self.assertFalse(hasattr(data, "rigid"))
                 self.assertFalse(hasattr(data, "soft_mesh_radius"))
-                self.assertEqual(data.rigid_vertex_rows.ptr, pipeline._soft_mesh_contact_data.rigid_features[0].ptr)
-                self.assertEqual(soft.faces.ptr, model.tri_indices.ptr)
-                self.assertEqual(soft.edges.ptr, model.edge_indices.ptr + 2 * np.dtype(np.int32).itemsize)
-                self.assertEqual(soft.edges.strides[0], model.edge_indices.strides[0])
+                self.assertFalse(hasattr(data, "rigid_vertex_rows"))
+                self.assertEqual(data.soft_tri_indices.ptr, model.tri_indices.ptr)
+                self.assertEqual(
+                    data.soft_edge_vertex_indices.ptr, model.edge_indices.ptr + 2 * np.dtype(np.int32).itemsize
+                )
+                self.assertEqual(data.soft_edge_vertex_indices.strides[0], model.edge_indices.strides[0])
                 for name in (
                     "tri_edge_indices",
                     "edge_tri_indices",
@@ -739,7 +784,7 @@ class TestVbdEsp(unittest.TestCase):
                     "v_adj_edges_offsets",
                     "v_adj_tris_offsets",
                 ):
-                    self.assertEqual(getattr(soft.adjacency, name).ptr, getattr(adjacency, name).ptr)
+                    self.assertEqual(getattr(data.soft_adjacency, name).ptr, getattr(adjacency, name).ptr)
                 expected_v = np.zeros(model.particle_count, dtype=np.float32)
                 expected_e = np.zeros(model.edge_count, dtype=np.float32)
                 np.add.at(expected_v, model.tri_indices.numpy().ravel(), np.repeat(areas / 3, 3))
@@ -747,6 +792,119 @@ class TestVbdEsp(unittest.TestCase):
                 np.testing.assert_array_equal(data.soft_vertex_weight.numpy(), expected_v)
                 np.testing.assert_array_equal(data.soft_edge_area.numpy(), expected_e)
                 np.testing.assert_array_equal(model.tri_areas.numpy(), areas)
+
+    def test_geometry_without_private_pipeline_data(self):
+        """Build mesh/convex ESP geometry from the model, with private pipeline data inaccessible."""
+        for device in wp.get_devices():
+            for with_triangles in (False, True):
+                with self.subTest(device=str(device), with_triangles=with_triangles), wp.ScopedDevice(device):
+                    builder = newton.ModelBuilder()
+                    mesh = newton.Mesh.create_box(0.05, duplicate_vertices=True)
+                    builder.add_shape_mesh(-1, mesh=mesh, cfg=builder.ShapeConfig(has_particle_collision=False))
+                    mesh_shape = builder.add_shape_mesh(-1, mesh=mesh, scale=wp.vec3(-1.0, 2.0, 0.5))
+                    builder.add_ground_plane()
+                    convex_shape = builder.add_shape_convex_hull(-1, mesh=mesh, scale=wp.vec3(0.5, 2.0, 1.0))
+                    for position in ((0, 0, 0.06), (0.01, 0, 0.06), (0, 0.01, 0.06)):
+                        builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(), mass=1.0, radius=0.005)
+                    if with_triangles:
+                        builder.add_triangle(0, 1, 2)
+                        for a, b, c in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+                            builder.add_edge(c, -1, a, b)
+                    model = builder.finalize()
+                    pipeline = newton.CollisionPipeline(
+                        model,
+                        enable_rigid_soft_full_surface_contact=True,
+                        full_surface_contact_return_unfiltered=True,
+                    )
+                    with patch.object(pipeline, "_soft_mesh_contact_data", None):
+                        data = esp_contact.create_esp_data(model, pipeline)
+                    rigid_tri_indices_np = data.rigid_tri_indices.numpy()
+                    rigid_local_positions_np = data.rigid_local_positions.numpy()
+                    offsets_np = data.rigid_triangle_offsets.numpy()
+                    for shape in range(model.shape_count):
+                        if shape not in (mesh_shape, convex_shape):
+                            self.assertEqual(offsets_np[shape], -1)
+                            continue
+                        collision_mesh = model.shape_source[shape]
+                        start = offsets_np[shape]
+                        end = start + len(collision_mesh.indices) // 3
+                        positions = wp.empty(len(collision_mesh.indices), dtype=wp.vec3)
+                        wp.launch(
+                            _collision_mesh_corner_positions,
+                            dim=len(positions),
+                            inputs=[
+                                wp.uint64(model.shape_source_ptr.numpy()[shape]),
+                                wp.vec3(*model.shape_scale.numpy()[shape]),
+                            ],
+                            outputs=[positions],
+                        )
+                        np.testing.assert_array_equal(
+                            rigid_local_positions_np[rigid_tri_indices_np[start:end]],
+                            positions.numpy().reshape(-1, 3, 3),
+                        )
+
+    def test_rigid_adjacency_matches_standard_builder(self):
+        """Match the standard adjacency tables and keep them on the requested device.
+
+        Include a closed box and an open two-triangle patch, on both devices/precisions.
+        The soft topology-sharing test separately checks model-owned aliases.
+        """
+        box = newton.Mesh.create_box(0.05, duplicate_vertices=False)
+        meshes = (
+            (box.vertices, box.indices.reshape(-1, 3)),
+            (
+                np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float32),
+                np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+            ),
+        )
+        for device in wp.get_devices():
+            for scalar in (wp.float32, wp.float64):
+                for vertices_np, tri_indices_np in meshes:
+                    with (
+                        self.subTest(device=str(device), scalar=scalar, triangles=len(tri_indices_np)),
+                        wp.ScopedDevice(device),
+                    ):
+                        builder = newton.ModelBuilder()
+                        builder.add_shape_mesh(
+                            -1,
+                            mesh=newton.Mesh(vertices_np, tri_indices_np.ravel(), compute_inertia=False),
+                        )
+                        builder.add_particle(pos=wp.vec3(0, 0, 0.06), vel=wp.vec3(), mass=1.0, radius=0.005)
+                        model = builder.finalize()
+                        pipeline = newton.CollisionPipeline(
+                            model,
+                            enable_rigid_soft_full_surface_contact=True,
+                            full_surface_contact_return_unfiltered=True,
+                        )
+                        kernels = esp_contact.get_esp_kernels(scalar)
+                        data = kernels.create_esp_data(model, pipeline)
+                        rigid_tri_indices_np = data.rigid_tri_indices.numpy()
+                        rigid_local_positions_np = data.rigid_local_positions.numpy()
+                        # Compact vertex numbering may differ; triangle corner positions must not.
+                        np.testing.assert_array_equal(
+                            rigid_local_positions_np[rigid_tri_indices_np], vertices_np[tri_indices_np]
+                        )
+                        reference = MeshAdjacency(rigid_tri_indices_np)
+                        reference.init_vertex_adjacency(len(rigid_local_positions_np))
+                        np.testing.assert_array_equal(
+                            data.rigid_edge_vertex_indices.numpy(), reference.edge_indices[:, 2:4]
+                        )
+                        for name in (
+                            "tri_edge_indices",
+                            "edge_tri_indices",
+                            "v_adj_edges",
+                            "v_adj_edges_offsets",
+                            "v_adj_tris",
+                            "v_adj_tris_offsets",
+                            "v_adj_springs",
+                            "v_adj_springs_offsets",
+                            "v_adj_tets",
+                            "v_adj_tets_offsets",
+                        ):
+                            actual = getattr(data.rigid_adjacency, name)
+                            self.assertIsNotNone(actual, name)
+                            self.assertEqual(actual.device, device)
+                            np.testing.assert_array_equal(actual.numpy(), getattr(reference, name))
 
     def test_material_support_and_stiffness(self):
         """Use local primitive radii and each rigid shape's margin and material.
@@ -794,9 +952,9 @@ class TestVbdEsp(unittest.TestCase):
                 # The largest within-triangle spread is 2 mm, not the global
                 # 6 mm spread between these disconnected cloth pieces.
                 with self.assertRaisesRegex(ValueError, "soft_contact_gap"):
-                    esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.001)
+                    esp_contact.create_esp_data(model, pipeline, query_gap=0.001)
                 with self.assertWarnsRegex(UserWarning, "cancellations"):
-                    esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.003)
+                    esp_contact.create_esp_data(model, pipeline, query_gap=0.003)
                 solver = newton.solvers.SolverVBD(model, collision_pipeline=pipeline, rigid_soft_contact_use_esp=True)
                 state = model.state()
                 pipeline.collide(state, solver.contacts)
@@ -809,15 +967,16 @@ class TestVbdEsp(unittest.TestCase):
                 actual = [a.numpy().copy() for a in (esp.energy, esp.force, esp.hessian)]
                 expected = [np.zeros_like(a) for a in actual]
                 count = int(solver.contacts.soft_contact_count.numpy()[0])
-                features = solver.contacts._soft_contact_mesh_features.numpy().copy()
+                features = contact_primitive_indices_np(solver.contacts, solver._esp_data)
+                rigid_indices_np = solver.contacts.soft_contact_rigid_indices.numpy().copy()
                 shapes = solver.contacts.soft_contact_shape.numpy()
                 radii = model.particle_radius.numpy()
                 for shape in (0, 1):
                     rows = shapes[:count] == shape
                     self.assertEqual(set(features[:count][rows, 0] & 7), {0, 1, 2})
-                    selected = features.copy()
-                    selected[np.flatnonzero(shapes != shape), 0] = -1
-                    solver.contacts._soft_contact_mesh_features.assign(selected)
+                    selected = rigid_indices_np.copy()
+                    selected[shapes != shape] = -1
+                    solver.contacts.soft_contact_rigid_indices.assign(selected)
                     reference = _EspReference(solver, unit_stiffness=True)
                     reference.assemble(state)
                     reference.check()
@@ -827,7 +986,7 @@ class TestVbdEsp(unittest.TestCase):
                         (reference.energy, reference.force, reference.hessian), expected, strict=True
                     ):
                         want[:] += k * output.numpy()
-                solver.contacts._soft_contact_mesh_features.assign(features)
+                solver.contacts.soft_contact_rigid_indices.assign(rigid_indices_np)
                 for got, want in zip(actual, expected, strict=True):
                     scale = max(np.abs(want).max(), 1e-12)
                     np.testing.assert_allclose(got / scale, want / scale, rtol=0, atol=2e-10)
@@ -874,9 +1033,9 @@ class TestVbdEsp(unittest.TestCase):
                 radii[0] = 0.04
                 model.particle_radius.assign(radii)
                 with self.assertRaisesRegex(ValueError, "soft_contact_gap"):
-                    esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.03)
+                    esp_contact.create_esp_data(model, pipeline, query_gap=0.03)
                 model.particle_radius.fill_(0.04)
-                esp_contact.create_esp_contact_data(model, pipeline, query_gap=0.0)
+                esp_contact.create_esp_data(model, pipeline, query_gap=0.0)
 
     def test_edge_triangle_lists_from_contacts(self):
         """Check list construction against a host oracle and changing device counts.
@@ -893,11 +1052,11 @@ class TestVbdEsp(unittest.TestCase):
                 pipeline.collide(state, solver.contacts)
                 contacts, data, lists = solver.contacts, solver._esp_data, solver._esp_lists
                 count = int(contacts.soft_contact_count.numpy()[0])
-                rows = contacts._soft_contact_mesh_features.numpy()[:count]
+                rows = contact_primitive_indices_np(contacts, data)
                 shapes = contacts.soft_contact_shape.numpy()[:count]
                 offsets = data.rigid_triangle_offsets.numpy()
-                soft_edges, rigid_edges = data.soft.edges.numpy(), data.rigid.edges.numpy()
-                soft_faces, rigid_faces = data.soft.faces.numpy(), data.rigid.faces.numpy()
+                soft_edges, rigid_edges = data.soft_edge_vertex_indices.numpy(), data.rigid_edge_vertex_indices.numpy()
+                soft_faces, rigid_faces = data.soft_tri_indices.numpy(), data.rigid_tri_indices.numpy()
                 self.assertEqual(set(rows[:, 0] & 7), {0, 1, 2})
 
                 def rebuild(contacts=contacts, data=data, lists=lists, sort_values=solver._esp_list_sort_values):

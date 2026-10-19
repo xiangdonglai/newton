@@ -44,12 +44,12 @@ class TestEspWorkers(unittest.TestCase):
                     count = int(contacts.soft_contact_count.numpy()[0])
                     self.assertGreater(count, 9)
                     self.assertGreater(model.particle_count, 3)
-                    features = contacts._soft_contact_mesh_features.numpy().copy()
-                    self.assertEqual(set(features[:count, 0] & 7), {0, 1, 2})
+                    rigid_indices_np = contacts.soft_contact_rigid_indices.numpy().copy()
+                    self.assertEqual(set(np.sum(rigid_indices_np[:count] >= 0, axis=1)), {1, 2, 3})
                     # Each of the three striding workers first encounters a
                     # skipped row, and must continue to its later valid rows.
-                    features[:3, 0] = [-1, 3, 27]
-                    contacts._soft_contact_mesh_features.assign(features)
+                    rigid_indices_np[:3] = -1
+                    contacts.soft_contact_rigid_indices.assign(rigid_indices_np)
 
                     def evaluate(kernels=kernels, contacts=contacts, solver=solver, state=state):
                         kernels.rebuild_edge_triangle_lists(

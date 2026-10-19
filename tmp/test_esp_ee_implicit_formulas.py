@@ -20,8 +20,7 @@ import warp as wp
 from benchmark_esp_derivative_methods import make_kernel
 from esp_autodiff import barrier, ee_sample, segment_closest, triangle_closest
 from esp_ee_implicit_formulas import ee_energy_derivatives, rigid_body_block
-
-from newton._src.solvers.vbd.esp_contact import EspSurfaceData
+from esp_entry_reference import EspSurfaceData
 
 
 def fixtures() -> dict[str, np.ndarray]:

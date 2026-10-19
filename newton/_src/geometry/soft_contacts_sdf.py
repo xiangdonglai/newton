@@ -501,6 +501,7 @@ def _emit_soft_ef_contact(
     soft_contact_tids: wp.array[wp.int32],
     soft_contact_particle: wp.array[wp.int32],
     soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_shape: wp.array[wp.int32],
     soft_contact_body_pos: wp.array[wp.vec3],
@@ -528,6 +529,7 @@ def _emit_soft_ef_contact(
     if idx >= 0:
         soft_contact_particle[idx] = -1  # edge/face record: no single particle id
         soft_contact_indices[idx] = corners
+        soft_contact_rigid_indices[idx] = wp.vec3i(-1)
         soft_contact_barycentric[idx] = bary
         soft_contact_shape[idx] = shape_index
         soft_contact_body_pos[idx] = body_pos
@@ -565,6 +567,7 @@ def _create_soft_face_contact_kernel(compact_sdf: bool):
         soft_contact_tids: wp.array[wp.int32],
         soft_contact_particle: wp.array[wp.int32],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_barycentric: wp.array[wp.vec3],
         soft_contact_shape: wp.array[wp.int32],
         soft_contact_body_pos: wp.array[wp.vec3],
@@ -680,6 +683,7 @@ def _create_soft_face_contact_kernel(compact_sdf: bool):
                 soft_contact_tids,
                 soft_contact_particle,
                 soft_contact_indices,
+                soft_contact_rigid_indices,
                 soft_contact_barycentric,
                 soft_contact_shape,
                 soft_contact_body_pos,
@@ -727,6 +731,7 @@ def _create_soft_sdf_contact_kernel(geo_filter: int, *, edge: bool = False):
         soft_contact_tids: wp.array[wp.int32],
         soft_contact_particle: wp.array[wp.int32],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_barycentric: wp.array[wp.vec3],
         soft_contact_shape: wp.array[wp.int32],
         soft_contact_body_pos: wp.array[wp.vec3],
@@ -784,6 +789,7 @@ def _create_soft_sdf_contact_kernel(geo_filter: int, *, edge: bool = False):
                     soft_contact_tids,
                     soft_contact_particle,
                     soft_contact_indices,
+                    soft_contact_rigid_indices,
                     soft_contact_barycentric,
                     soft_contact_shape,
                     soft_contact_body_pos,
@@ -844,6 +850,7 @@ def _create_soft_edge_contact_kernel(compact_sdf: bool):
         soft_contact_tids: wp.array[wp.int32],
         soft_contact_particle: wp.array[wp.int32],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_barycentric: wp.array[wp.vec3],
         soft_contact_shape: wp.array[wp.int32],
         soft_contact_body_pos: wp.array[wp.vec3],
@@ -940,6 +947,7 @@ def _create_soft_edge_contact_kernel(compact_sdf: bool):
                 soft_contact_tids,
                 soft_contact_particle,
                 soft_contact_indices,
+                soft_contact_rigid_indices,
                 soft_contact_barycentric,
                 soft_contact_shape,
                 soft_contact_body_pos,
@@ -1030,6 +1038,7 @@ def launch_soft_ef_contacts(
         contacts.soft_contact_tids,
         contacts.soft_contact_particle,
         contacts.soft_contact_indices,
+        contacts.soft_contact_rigid_indices,
         contacts.soft_contact_barycentric,
         contacts.soft_contact_shape,
         contacts.soft_contact_body_pos,

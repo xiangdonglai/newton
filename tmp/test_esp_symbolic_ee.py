@@ -15,9 +15,8 @@ import unittest
 import numpy as np
 import warp as wp
 from benchmark_esp_derivative_methods import make_kernel
+from esp_entry_reference import EspSurfaceData
 from esp_symbolic_ee_reference import symbolic_ee_derivatives
-
-from newton._src.solvers.vbd.esp_contact import EspSurfaceData
 
 
 class TestEspSymbolicEE(unittest.TestCase):

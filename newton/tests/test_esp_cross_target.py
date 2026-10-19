@@ -11,6 +11,7 @@ import warp as wp
 import newton
 from newton._src.solvers.vbd import esp_contact
 from newton.solvers import SolverVBD
+from newton.tests.test_solver_vbd_esp import contact_primitive_indices_np
 from newton.tests.test_solver_vbd_esp_friction import friction_blocks, numpy_closest_points
 
 
@@ -68,21 +69,24 @@ def make_cross_target_case(device, *, shared_body=False, precision="float64", mi
     solver.particle_q_prev.assign(state.particle_q)
     solver.body_q_prev.assign(state.body_q)
     data = solver._esp_data
-    se = np.flatnonzero(np.all(np.sort(data.soft.edges.numpy(), axis=1) == [0, 1], axis=1))[0]
+    se = np.flatnonzero(np.all(np.sort(data.soft_edge_vertex_indices.numpy(), axis=1) == [0, 1], axis=1))[0]
     rigid_positions = solver._esp_rigid_positions.numpy()
     re = next(
         i
-        for i, edge in enumerate(data.rigid.edges.numpy())
+        for i, edge in enumerate(data.rigid_edge_vertex_indices.numpy())
         if np.allclose(np.sort(rigid_positions[edge], axis=0), [[0, -0.1, 0], [0, 0.1, 0]])
     )
     count = int(solver.contacts.soft_contact_count.numpy()[0])
-    rows = solver.contacts._soft_contact_mesh_features.numpy().copy()
+    rows = contact_primitive_indices_np(solver.contacts, data)
     shapes = solver.contacts.soft_contact_shape.numpy().copy()
     candidates = np.flatnonzero(((rows[:count, 0] & 7) == 2) & (rows[:count, 1] == se) & (rows[:count, 2] == re))
     if len(candidates) != 1:
         raise AssertionError(f"Expected the real collision query to return one generating EE pair; got {candidates}")
     rows[0], shapes[0] = rows[candidates[0]], shapes[candidates[0]]
-    solver.contacts._soft_contact_mesh_features.assign(rows)
+    for field in ("soft_contact_indices", "soft_contact_rigid_indices"):
+        indices_np = getattr(solver.contacts, field).numpy().copy()
+        indices_np[0] = indices_np[candidates[0]]
+        getattr(solver.contacts, field).assign(indices_np)
     solver.contacts.soft_contact_shape.assign(shapes)
     solver.contacts.soft_contact_count.fill_(1)
     # Keep the complete lists built from detection, but evaluate only this one
@@ -98,8 +102,8 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
     """
     data = solver._esp_data
     se, re = row[1:]
-    a, b = soft[data.soft.edges.numpy()[se]]
-    c, d = rigid[data.rigid.edges.numpy()[re]]
+    a, b = soft[data.soft_edge_vertex_indices.numpy()[se]]
+    c, d = rigid[data.rigid_edge_vertex_indices.numpy()[re]]
     u, v = b - a, d - c
     s, t = np.linalg.lstsq(np.column_stack((u, -v)), c - a, rcond=None)[0]
     if not (0 < s < 1 and 0 < t < 1):
@@ -107,7 +111,7 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
     q, qb = a + s * u, c + t * v
     distance_sq = np.dot(q - qb, q - qb)
     radii = model.particle_radius.numpy()
-    radius = float(radii[data.soft.edges.numpy()[se]].max())
+    radius = float(radii[data.soft_edge_vertex_indices.numpy()[se]].max())
     margins, ke = model.shape_margin.numpy(), model.shape_material_ke.numpy()
     near = 0.05 * (radius + float(margins[shape]))
     ratio = 2 * np.sqrt(distance_sq) / near
@@ -133,15 +137,15 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
         value *= (1 - x) ** 3 * (1 + 3 * x + 6 * x * x)
         return value * 0.5 * (model.soft_contact_ke + float(ke[target_shape]))
 
-    rigid_shapes = data.rigid_vertex_rows.numpy()[:, 0]
+    rigid_shapes = data.rigid_vertex_shapes.numpy()
     on_rigid = sum(
         potential(q, rigid[ids], int(rigid_shapes[ids[0]]), radius)
-        for ids in data.rigid.faces.numpy()
+        for ids in data.rigid_tri_indices.numpy()
         if not omit_extra or rigid_shapes[ids[0]] == shape
     )
     on_soft = sum(
         potential(qb, soft[ids], shape, float(radii[ids].max()))
-        for ids in data.soft.faces.numpy()
+        for ids in data.soft_tri_indices.numpy()
         if not omit_extra or ids[0] < 3
     )
     return weight * (
@@ -235,7 +239,7 @@ class TestEspCrossTarget(unittest.TestCase):
                     solver.check_esp_contacts()
                     fp, hp = solver._esp_particle_forces.numpy().copy(), solver._esp_particle_hessians.numpy().copy()
                     fb, hb = solver._esp_body_forces.numpy().copy(), solver._esp_body_hessians.numpy().copy()
-                    owners = model.shape_body.numpy()[solver._esp_data.rigid_vertex_rows.numpy()[:, 0]]
+                    owners = model.shape_body.numpy()[solver._esp_data.rigid_vertex_shapes.numpy()]
                     for particle in (0, 1, 3, 4, 5):
                         direction = rng.normal(size=3)
                         direction /= np.linalg.norm(direction)

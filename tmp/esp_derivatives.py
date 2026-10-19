@@ -21,7 +21,7 @@ branches; a classical Hessian need not exist. Float64 makes checking meaningful.
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.vbd.esp_contact import EdgeTriangleListData, EspSurfaceData
+from newton._src.solvers.vbd.esp_contact import EdgeTriangleListData
 
 wp.set_module_options({"enable_backward": False})
 
@@ -233,7 +233,11 @@ def triangle_closest(p: Point, a: Point, b: Point, c: Point) -> Point:
 def triangle_potential(
     p: Point,
     positions: wp.array[wp.vec3d],
-    surface: EspSurfaceData,
+    tri_indices: wp.array[wp.vec3i],
+    edge_vertex_indices: wp.array[wp.vec2i],
+    tri_edge_indices: wp.array2d[int],
+    edge_tri_indices: wp.array2d[int],
+    vertex_term_weight: wp.array[wp.float64],
     face: int,
     offset: int,
     i: int,
@@ -244,7 +248,7 @@ def triangle_potential(
 ):
     # Keep the original differentiated closest-point calculation as an oracle
     # for the solver's faster analytical distance derivatives.
-    ids = surface.faces[face]
+    ids = tri_indices[face]
     a, b, c = (
         vertex(positions, ids[0], offset, i, j),
         vertex(positions, ids[1], offset, i, j),
@@ -258,14 +262,14 @@ def triangle_potential(
         return wp.vec4d()
     value = barrier(delta, support, near_cutoff, near_only)
     for k in range(3):
-        edge_id = surface.adjacency.tri_edge_indices[face, k]
-        if surface.adjacency.edge_tri_indices[edge_id, 0] >= 0 and surface.adjacency.edge_tri_indices[edge_id, 1] >= 0:
-            edge = surface.edges[edge_id]
+        edge_id = tri_edge_indices[face, k]
+        if edge_tri_indices[edge_id, 0] >= 0 and edge_tri_indices[edge_id, 1] >= 0:
+            edge = edge_vertex_indices[edge_id]
             ea, eb = vertex(positions, edge[0], offset, i, j), vertex(positions, edge[1], offset, i, j)
             value -= wp.float64(0.5) * barrier(p - segment_closest(p, ea, eb), support, near_cutoff, near_only)
-        if surface.vertex_term_weight[ids[k]] != wp.float64(0.0):
+        if vertex_term_weight[ids[k]] != wp.float64(0.0):
             v = vertex(positions, ids[k], offset, i, j)
-            value += barrier(p - v, support, near_cutoff, near_only) * surface.vertex_term_weight[ids[k]]
+            value += barrier(p - v, support, near_cutoff, near_only) * vertex_term_weight[ids[k]]
     return value
 
 
@@ -274,7 +278,11 @@ def edge_potential(
     p: Point,
     edge: int,
     positions: wp.array[wp.vec3d],
-    surface: EspSurfaceData,
+    tri_indices: wp.array[wp.vec3i],
+    edge_vertex_indices: wp.array[wp.vec2i],
+    tri_edge_indices: wp.array2d[int],
+    edge_tri_indices: wp.array2d[int],
+    vertex_term_weight: wp.array[wp.float64],
     offset: int,
     i: int,
     j: int,
@@ -285,18 +293,41 @@ def edge_potential(
     result = wp.vec4d()
     for k in range(lists.starts[edge], lists.ends[edge]):
         face = lists.keys[k]
-        result += triangle_potential(p, positions, surface, face, offset, i, j, support, near_cutoff, True)
+        result += triangle_potential(
+            p,
+            positions,
+            tri_indices,
+            edge_vertex_indices,
+            tri_edge_indices,
+            edge_tri_indices,
+            vertex_term_weight,
+            face,
+            offset,
+            i,
+            j,
+            support,
+            near_cutoff,
+            True,
+        )
     return result
 
 
 @wp.kernel
 def evaluate_energy_derivatives(
     soft_contact_count: wp.array[int],
-    soft_contact_mesh_features: wp.array[wp.vec3i],
+    primitive_indices: wp.array[wp.vec3i],
     soft_contact_shape: wp.array[int],
     rigid_triangle_offsets: wp.array[int],
-    soft: EspSurfaceData,
-    rigid: EspSurfaceData,
+    soft_tri_indices: wp.array[wp.vec3i],
+    soft_edge_vertex_indices: wp.array[wp.vec2i],
+    soft_tri_edge_indices: wp.array2d[int],
+    soft_edge_tri_indices: wp.array2d[int],
+    soft_vertex_term_weight: wp.array[wp.float64],
+    rigid_tri_indices: wp.array[wp.vec3i],
+    rigid_edge_vertex_indices: wp.array[wp.vec2i],
+    rigid_tri_edge_indices: wp.array2d[int],
+    rigid_edge_tri_indices: wp.array2d[int],
+    rigid_vertex_term_weight: wp.array[wp.float64],
     soft_positions: wp.array[wp.vec3d],
     rigid_positions: wp.array[wp.vec3d],
     soft_vertex_weight: wp.array[wp.float64],
@@ -318,7 +349,7 @@ def evaluate_energy_derivatives(
     offset = soft_positions.shape[0]
     fixed, ee = wp.vec4d(), wp.vec4d()
     for row_id in range(soft_contact_count[0]):
-        row = soft_contact_mesh_features[row_id]
+        row = primitive_indices[row_id]
         shape = soft_contact_shape[row_id]
         if row[0] < 0 or rigid_triangle_offsets[shape] < 0:
             continue
@@ -328,7 +359,11 @@ def evaluate_energy_derivatives(
             fixed += soft_vertex_weight[row[1]] * triangle_potential(
                 p,
                 rigid_positions,
-                rigid,
+                rigid_tri_indices,
+                rigid_edge_vertex_indices,
+                rigid_tri_edge_indices,
+                rigid_edge_tri_indices,
+                rigid_vertex_term_weight,
                 rigid_triangle_offsets[shape] + row[2],
                 offset,
                 i,
@@ -341,10 +376,23 @@ def evaluate_energy_derivatives(
             v_id = row[2]
             p = vertex(rigid_positions, v_id, offset, i, j)
             fixed += rigid_vertex_area[v_id] * triangle_potential(
-                p, soft_positions, soft, row[1], 0, i, j, support, near_cutoff, False
+                p,
+                soft_positions,
+                soft_tri_indices,
+                soft_edge_vertex_indices,
+                soft_tri_edge_indices,
+                soft_edge_tri_indices,
+                soft_vertex_term_weight,
+                row[1],
+                0,
+                i,
+                j,
+                support,
+                near_cutoff,
+                False,
             )
         elif family == 2:
-            se, re = soft.edges[row[1]], rigid.edges[row[2]]
+            se, re = soft_edge_vertex_indices[row[1]], rigid_edge_vertex_indices[row[2]]
             a, b = vertex(soft_positions, se[0], 0, i, j), vertex(soft_positions, se[1], 0, i, j)
             c, d = vertex(rigid_positions, re[0], offset, i, j), vertex(rigid_positions, re[1], offset, i, j)
             q, q_bar, weight = ee_sample(a, b, c, d, near_cutoff)
@@ -353,7 +401,11 @@ def evaluate_energy_derivatives(
                     q,
                     row[1],
                     rigid_positions,
-                    rigid,
+                    rigid_tri_indices,
+                    rigid_edge_vertex_indices,
+                    rigid_tri_edge_indices,
+                    rigid_edge_tri_indices,
+                    rigid_vertex_term_weight,
                     offset,
                     i,
                     j,
@@ -365,7 +417,11 @@ def evaluate_energy_derivatives(
                     q_bar,
                     lists.soft_edge_count + row[2],
                     soft_positions,
-                    soft,
+                    soft_tri_indices,
+                    soft_edge_vertex_indices,
+                    soft_tri_edge_indices,
+                    soft_edge_tri_indices,
+                    soft_vertex_term_weight,
                     0,
                     i,
                     j,
@@ -393,6 +449,8 @@ class EspDerivativeEvaluator:
     """
 
     def __init__(self, blocks):
+        from esp_common import contact_primitive_indices_np  # noqa: PLC0415
+
         contacts, data = blocks.contacts, blocks.data
         if int(blocks.lists.error.numpy()[0]):
             raise ValueError("Incomplete per-edge triangle lists")
@@ -400,11 +458,19 @@ class EspDerivativeEvaluator:
             raise ValueError("Incomplete contact rows")
         self.inputs = (
             contacts.soft_contact_count,
-            contacts._soft_contact_mesh_features,
+            wp.array(contact_primitive_indices_np(contacts, data), dtype=wp.vec3i, device=blocks.model.device),
             contacts.soft_contact_shape,
             data.rigid_triangle_offsets,
-            data.soft,
-            data.rigid,
+            data.soft_tri_indices,
+            data.soft_edge_vertex_indices,
+            data.soft_adjacency.tri_edge_indices,
+            data.soft_adjacency.edge_tri_indices,
+            data.soft_vertex_term_weight,
+            data.rigid_tri_indices,
+            data.rigid_edge_vertex_indices,
+            data.rigid_adjacency.tri_edge_indices,
+            data.rigid_adjacency.edge_tri_indices,
+            data.rigid_vertex_term_weight,
         )
         self.lists = blocks.lists
         self.device = blocks.model.device
