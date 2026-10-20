@@ -30,7 +30,7 @@ def run(args):
     with wp.ScopedDevice(args.device):
         positions = wp.array(host_positions, dtype=wp.vec3d)
         selected = wp.zeros(args.count, dtype=int)
-        for scalar in (wp.float32, wp.float64):
+        for scalar in (wp.float32,):
             for size in (3, 6):
                 reference = None
                 for direct in ("shared", True, False) if args.direct_first else (False, True, "shared"):

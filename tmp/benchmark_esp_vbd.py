@@ -43,7 +43,6 @@ def make_grid_case(
     gap=0.0003,
     dat=False,
     force_law="esp",
-    esp_precision="float64",
     friction=0.0,
 ):
     """Place a tilted cloth grid over a box, including its top edges."""
@@ -111,7 +110,6 @@ def make_grid_case(
         )
         solver = newton.solvers.SolverVBD(
             model,
-            rigid_soft_contact_esp_precision=esp_precision,
             collision_pipeline=pipeline,
             # One body can receive every detected row in this one-box fixture.
             # Use the same complete buffer for ESP and both native force laws.
@@ -193,7 +191,6 @@ def main():
     parser.add_argument("--resolution", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--gap", type=float, default=0.0003, help="Cloth center height above the box [m]")
-    parser.add_argument("--precision", choices=("float32", "float64"), default="float64")
     parser.add_argument(
         "--friction", type=float, default=0.0, help="Mixed Coulomb coefficient; sets initial x velocity to 0.1 m/s"
     )
@@ -204,16 +201,15 @@ def main():
     parser.add_argument("--dynamic", action="store_true")
     parser.add_argument("--dat", action="store_true", help="Enable rigid-soft DAT and interval arithmetic")
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument(
-        "--no-ee-cache", action="store_true", help="Repeat the EE activity/sample calculation per thread"
-    )
     parser.add_argument("--block-dim", type=int, default=32)
     parser.add_argument(
         "--reference-module",
         help="Load a saved esp_contact.py for a before/after benchmark without editing solver files",
     )
     parser.add_argument(
-        "--ee-partitions", type=int, help="Override particle EE list slices (default: 1); body/energy use 1"
+        "--ee-partitions",
+        type=int,
+        help="Override particle EE list slices (default: 8 on CUDA, 1 on CPU); body/energy use 1",
     )
     args = parser.parse_args()
     if args.reference_module:
@@ -226,6 +222,9 @@ def main():
         reference = importlib.util.module_from_spec(spec)
         sys.modules[name] = reference
         spec.loader.exec_module(reference)
+        if hasattr(reference, "get_esp_kernels"):
+            # Historical snapshot only; current production has no precision factory.
+            reference = reference.get_esp_kernels(wp.float32)
         globals()["esp_contact"] = reference
         solver_vbd.esp_contact = reference
     if args.ee_partitions is not None and args.ee_partitions < 1:
@@ -239,17 +238,22 @@ def main():
         force_law=args.force_law,
         gap=args.gap,
         dat=args.dat,
-        esp_precision=args.precision,
         friction=args.friction,
     )
     set_schedule(model, solver, args.schedule)
     if solver._esp_data is not None:
-        if args.no_ee_cache:
-            solver._esp_ee_samples = None
         solver._esp_block_dim = args.block_dim
         if args.ee_partitions is not None:
-            solver._esp_ee_partitions = args.ee_partitions
-        args.ee_partitions = solver._esp_ee_partitions
+            launch = esp_contact.launch_contact_blocks
+
+            def launch_with_partitions(*inputs, **kwargs):
+                if inputs[6] == esp_contact._PARTICLE_BLOCKS:
+                    kwargs["partitions"] = args.ee_partitions
+                return launch(*inputs, **kwargs)
+
+            esp_contact.launch_contact_blocks = launch_with_partitions
+        else:
+            args.ee_partitions = 8 if device.is_cuda else 1
     state, out = model.state(), model.state()
 
     def step():
@@ -272,7 +276,13 @@ def main():
 
             def assemble(kind=kind, groups=groups):
                 for color in range(len(groups)):
-                    solver._accumulate_esp_contacts(frozen_state, kind, color, dt=1e-4)
+                    solver._accumulate_esp_contacts(
+                        frozen_state,
+                        kind,
+                        color,
+                        partitions=args.ee_partitions if kind == esp_contact._PARTICLE_BLOCKS else 1,
+                        dt=1e-4,
+                    )
 
             assembly_timings[name] = measure(assemble, device, args.samples, args.repeats)
     if args.profile and device.is_cuda:

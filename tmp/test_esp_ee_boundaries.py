@@ -23,7 +23,8 @@ import test_esp_direct_ee as checks
 import torch  # noqa: TID253 -- Optional independent test oracle.
 import warp as wp
 
-from newton._src.solvers.vbd.esp_contact import make_ee_endpoint_excess, make_shared_direct_ee_formulas
+from newton._src.solvers.vbd import esp_contact
+from newton._src.solvers.vbd.esp_contact import ee_endpoint_excess
 
 baseline_path = Path(__file__).with_name("esp_shared_direct_diagnosis_reference.py")
 if hashlib.sha256(baseline_path.read_bytes()).hexdigest() != (
@@ -43,8 +44,14 @@ def make_target_probe(size, scalar, baseline):
     """Differentiate a nonincident triangle rather than a source-edge face."""
     if baseline:
         prepare, triangle, finish = baseline_formulas(size, scalar)
+    elif size == 3:
+        prepare = esp_contact.prepare_particle_ee_pair
+        triangle = esp_contact.particle_ee_triangle_contribution
+        finish = esp_contact.finish_particle_ee_pair
     else:
-        prepare, triangle, finish = make_shared_direct_ee_formulas(size, scalar)
+        prepare = esp_contact.prepare_body_ee_pair
+        triangle = esp_contact.body_ee_triangle_contribution
+        finish = esp_contact.finish_body_ee_pair
     vec3 = wp.types.vector(length=3, dtype=scalar)
 
     @wp.kernel(module="unique", enable_backward=False)
@@ -66,18 +73,33 @@ def make_target_probe(size, scalar, baseline):
             vec3(scalar(0.01), scalar(-0.02), scalar(-0.03)),
             scalar(0.15),
         )
-        e, g, z, h = triangle(
-            pair,
-            vec3(points[row, 4]),
-            vec3(points[row, 5]),
-            vec3(points[row, 6]),
-            directions[row] == 0,
-            masks[row],
-            vec3(scalar(0.5)),
-            vec3(scalar(0.25)),
-            scalar(1.0),
-            scalar(0.15),
-        )
+        if wp.static(baseline):
+            e, g, z, h = triangle(
+                pair,
+                vec3(points[row, 4]),
+                vec3(points[row, 5]),
+                vec3(points[row, 6]),
+                directions[row] == 0,
+                masks[row],
+                vec3(scalar(0.5)),
+                vec3(scalar(0.25)),
+                scalar(1.0),
+                scalar(0.15),
+            )
+        else:
+            e, g, z, h = triangle(
+                pair,
+                vec3(points[row, 4]),
+                vec3(points[row, 5]),
+                vec3(points[row, 6]),
+                directions[row] == 0,
+                directions[row] == 0,
+                masks[row],
+                vec3(scalar(0.5)),
+                vec3(scalar(0.25)),
+                scalar(1.0),
+                scalar(0.15),
+            )
         value, gradient, hessian = finish(pair, e, g, z, h)
         energies[row] = wp.float64(value)
         for i in range(size):
@@ -94,7 +116,7 @@ def check_nonincident_triangles():
     # q=(0,0,z), target vertices=(0,L),(L,0),(L,L). The AABB includes q's
     # xy projection, but distance to the triangle is sqrt(L²/2+vertical²).
     # Include values neighboring the cutoff in each arithmetic precision.
-    for scalar, dtype in ((wp.float32, np.float32), (wp.float64, np.float64)):
+    for scalar, dtype in ((wp.float32, np.float32),):
         cutoff = dtype(near)
         lengths = [
             dtype(0.9 * near),
@@ -197,8 +219,8 @@ def check_nonincident_triangles():
 
 def make_endpoint_excess_probe(scalar):
     """Report the actual rounded endpoint factor used by the source geometry."""
-    prepare, _, _ = make_shared_direct_ee_formulas(3, scalar)
-    endpoint_excess = make_ee_endpoint_excess(scalar)
+    prepare = esp_contact.prepare_particle_ee_pair
+    endpoint_excess = ee_endpoint_excess
     vec3 = wp.types.vector(length=3, dtype=scalar)
     vec7 = wp.types.vector(length=7, dtype=scalar)
 
@@ -220,13 +242,19 @@ def make_endpoint_excess_probe(scalar):
         delta = wp.transpose(pair.positions) * coefficients
         distance_sq = wp.dot(delta, delta)
         for endpoint in range(4):
-            endpoint_parameter = scalar(0.0)
-            if endpoint == 1 or endpoint == 3:
-                endpoint_parameter = scalar(1.0)
-            h, other = endpoint_parameter - pair.s, scalar(pair.t)
+            # Match production's stable offset formula, not 1-s / 1-t:
+            # their FP32 rounding can choose different sides of this branch.
+            h = esp_contact.ee_endpoint_parameter_offset(
+                endpoint,
+                vec3(points[row, 0]),
+                vec3(points[row, 1]),
+                vec3(points[row, 2]),
+                vec3(points[row, 3]),
+            )
+            other = pair.t
             own_axis, other_axis = vec3(pair.soft_axis), -pair.rigid_axis
             if endpoint >= 2:
-                h, other = endpoint_parameter - pair.t, scalar(pair.s)
+                other = pair.s
                 own_axis, other_axis = -pair.rigid_axis, vec3(pair.soft_axis)
             value, _projection = endpoint_excess(h, other, own_axis, other_axis)
             excesses[row, endpoint] = wp.float64(scalar(100.0) * value / distance_sq)
@@ -247,7 +275,7 @@ def check_endpoint_factor_boundary():
     than requiring it to reproduce the old rounding or relaxing tolerances.
     """
 
-    for scalar, dtype in ((wp.float32, np.float32), (wp.float64, np.float64)):
+    for scalar, dtype in ((wp.float32, np.float32),):
         cases = []
         for reverse_soft, reverse_rigid in ((False, False), (True, False), (False, True), (True, True)):
             for offset in (-128, -32, -8, -2, 0, 2, 8, 32, 128):
@@ -333,7 +361,7 @@ def check_endpoint_factor_boundary():
 
 def make_predicate_probe(scalar):
     """Compare populated-slot arithmetic with the early cached AABB test."""
-    prepare, _, _ = make_shared_direct_ee_formulas(3, scalar)
+    prepare = esp_contact.prepare_particle_ee_pair
     vec3 = wp.types.vector(length=3, dtype=scalar)
     vec7 = wp.types.vector(length=7, dtype=scalar)
 
@@ -381,7 +409,7 @@ class TestEspEEBoundaries(unittest.TestCase):
 
     def test_cached_sample_predicates(self):
         """Match AABB decisions near the rounded cutoff, including translations."""
-        for scalar, dtype in ((wp.float32, np.float32), (wp.float64, np.float64)):
+        for scalar, dtype in ((wp.float32, np.float32),):
             distances = [dtype(0.15)]
             below = above = dtype(0.15)
             for _ in range(8):

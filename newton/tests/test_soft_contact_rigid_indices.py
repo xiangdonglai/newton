@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.vbd import esp_contact
 from newton.tests.test_solver_vbd_esp import make_case
 
 
@@ -107,6 +108,21 @@ class TestSoftContactRigidIndices(unittest.TestCase):
                     np.testing.assert_array_equal(rigid_ids_np[~mesh_rows_np], -1)
                     rigid_indices_np = contacts.soft_contact_rigid_indices.numpy()[:count]
                     shapes_np = contacts.soft_contact_shape.numpy()[:count]
+                    # ESP can trust ordinary mesh rows to address the shared topology;
+                    # analytical/recovery rows instead carry negative rigid IDs.
+                    offsets_np = pipeline.rigid_mesh_triangle_offsets_np
+                    vertex_shapes_np = pipeline.rigid_mesh_vertex_shapes.numpy()
+                    for shape, primitive, corners in zip(
+                        shapes_np[mesh_rows_np], rigid_ids_np[mesh_rows_np], rigid_indices_np[mesh_rows_np], strict=True
+                    ):
+                        self.assertGreaterEqual(offsets_np[shape], 0)
+                        if corners[2] >= 0:
+                            vertices = pipeline.rigid_mesh_tri_indices_np[primitive]
+                        elif corners[1] >= 0:
+                            vertices = pipeline.rigid_mesh_edge_vertex_indices_np[primitive]
+                        else:
+                            vertices = [primitive]
+                        np.testing.assert_array_equal(vertex_shapes_np[vertices], shape)
                     records_np = contacts._soft_contact_mesh_features.numpy()[:count]
                     if displacement:
                         self.assertEqual(count, 0)
@@ -175,71 +191,68 @@ class TestSoftContactRigidIndices(unittest.TestCase):
 
         Private fields are used here only to perturb the detector and verify the
         interface. Production ESP must use neither their order nor their contents.
-        Include active EE energy and particle/body derivatives in both precisions.
+        Include active EE energy and particle/body derivatives on both devices.
         """
         for device in wp.get_devices():
-            for precision in ("float32", "float64"):
-                with self.subTest(device=str(device), precision=precision), wp.ScopedDevice(device):
-                    model, pipeline, solver = make_case(
-                        device, grid=True, dynamic=True, gap=0.00012, precision=precision
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device, grid=True, dynamic=True, gap=0.00012)
+                state, contacts = model.state(), solver.contacts
+                mesh_data = pipeline._soft_mesh_contact_data
+                kernels = esp_contact
+
+                def evaluate(kernels=kernels, contacts=contacts, solver=solver, state=state):
+                    kernels.rebuild_edge_triangle_lists(
+                        contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
                     )
-                    state, contacts = model.state(), solver.contacts
-                    mesh_data = pipeline._soft_mesh_contact_data
-                    kernels = solver._esp_kernels
-
-                    def evaluate(kernels=kernels, contacts=contacts, solver=solver, state=state):
-                        kernels.rebuild_edge_triangle_lists(
-                            contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
+                    for kind in (kernels._ENERGY_ONLY, kernels._PARTICLE_BLOCKS, kernels._BODY_BLOCKS):
+                        solver._accumulate_esp_contacts(state, kind)
+                    solver.check_esp_contacts()
+                    return [
+                        getattr(solver, "_esp_" + name).numpy().copy()
+                        for name in (
+                            "energy",
+                            "particle_forces",
+                            "particle_hessians",
+                            "body_forces",
+                            "body_hessians",
                         )
-                        for kind in (kernels._ENERGY_ONLY, kernels._PARTICLE_BLOCKS, kernels._BODY_BLOCKS):
-                            solver._accumulate_esp_contacts(state, kind)
-                        solver.check_esp_contacts()
-                        return [
-                            getattr(solver, "_esp_" + name).numpy().copy()
-                            for name in (
-                                "energy",
-                                "particle_forces",
-                                "particle_hessians",
-                                "body_forces",
-                                "body_hessians",
-                            )
-                        ]
+                    ]
 
-                    def geometry_rows(contacts=contacts):
-                        count = int(contacts.soft_contact_count.numpy()[0])
-                        self.assertLessEqual(count, contacts.soft_contact_max)
-                        rows_np = np.column_stack(
-                            (
-                                contacts.soft_contact_shape.numpy()[:count],
-                                contacts.soft_contact_indices.numpy()[:count],
-                                contacts.soft_contact_primitive_index.numpy()[:count],
-                                contacts.soft_contact_rigid_indices.numpy()[:count],
-                            )
+                def geometry_rows(contacts=contacts):
+                    count = int(contacts.soft_contact_count.numpy()[0])
+                    self.assertLessEqual(count, contacts.soft_contact_max)
+                    rows_np = np.column_stack(
+                        (
+                            contacts.soft_contact_shape.numpy()[:count],
+                            contacts.soft_contact_indices.numpy()[:count],
+                            contacts.soft_contact_primitive_index.numpy()[:count],
+                            contacts.soft_contact_rigid_indices.numpy()[:count],
                         )
-                        return sorted(map(tuple, rows_np))
+                    )
+                    return sorted(map(tuple, rows_np))
 
-                    pipeline.collide(state, contacts)
-                    baseline_rows = geometry_rows()
-                    baseline = evaluate()
-                    self.assertTrue(np.all(baseline[0] > 0), "Exercise both vertex and EE energies")
-                    # The detector's edge slots and normals are indexed by table row too.
-                    for array in (
-                        *mesh_data.rigid_features,
-                        mesh_data.adjacency[3],
-                        mesh_data.rigid_vertex_primitive_indices,
-                        mesh_data.rigid_edge_primitive_indices,
-                    ):
-                        array.assign(array.numpy()[::-1].copy())
-                    pipeline.collide(state, contacts)
-                    self.assertEqual(geometry_rows(), baseline_rows)
-                    contacts._soft_contact_mesh_features.fill_(wp.vec3i(-99))
-                    with patch.object(pipeline, "_soft_mesh_contact_data", None):
-                        solver._esp_data = kernels.create_esp_data(model, pipeline)
-                        actual = evaluate()
-                    tolerance = 2e-5 if precision == "float32" else 2e-12
-                    for got, expected in zip(actual, baseline, strict=True):
-                        scale = max(float(np.abs(expected).max()), 1e-12)
-                        np.testing.assert_allclose(got / scale, expected / scale, atol=tolerance, rtol=0)
+                pipeline.collide(state, contacts)
+                baseline_rows = geometry_rows()
+                baseline = evaluate()
+                self.assertTrue(np.all(baseline[0] > 0), "Exercise both vertex and EE energies")
+                # The detector's edge slots and normals are indexed by table row too.
+                for array in (
+                    *mesh_data.rigid_features,
+                    mesh_data.adjacency[3],
+                    mesh_data.rigid_vertex_primitive_indices,
+                    mesh_data.rigid_edge_primitive_indices,
+                ):
+                    array.assign(array.numpy()[::-1].copy())
+                pipeline.collide(state, contacts)
+                self.assertEqual(geometry_rows(), baseline_rows)
+                contacts._soft_contact_mesh_features.fill_(wp.vec3i(-99))
+                with patch.object(pipeline, "_soft_mesh_contact_data", None):
+                    solver._esp_data = kernels.create_esp_data(model, pipeline)
+                    actual = evaluate()
+                tolerance = 2e-5
+                for got, expected in zip(actual, baseline, strict=True):
+                    scale = max(float(np.abs(expected).max()), 1e-12)
+                    np.testing.assert_allclose(got / scale, expected / scale, atol=tolerance, rtol=0)
 
 
 if __name__ == "__main__":

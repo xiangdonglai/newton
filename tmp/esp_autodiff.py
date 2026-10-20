@@ -166,16 +166,25 @@ class TorchEspEnergy:
                 evaluator.inputs[start : start + 5]
             )
             triangle_indices_np, edge_vertex_indices_np = tri_indices.numpy(), edge_vertex_indices.numpy()
+            vertex_coefficients_np = vertex_term_coefficient.numpy()
+            incident_counts_np = np.bincount(triangle_indices_np.ravel(), minlength=len(vertex_coefficients_np))
+            interior = vertex_coefficients_np > 0
+            np.testing.assert_allclose(
+                vertex_coefficients_np[interior],
+                1 / incident_counts_np[interior],
+                rtol=np.finfo(np.float32).eps,
+                atol=0,
+            )
             self.surfaces.append(
                 {
                     "faces": triangle_indices_np,
                     "edges": edge_vertex_indices_np,
                     "face_edges": tri_edge_indices.numpy(),
                     "interior_edges": np.all(edge_tri_indices.numpy() >= 0, axis=1),
-                    "interior_vertices": vertex_term_coefficient.numpy() > 0,
-                    "vertex_face_count": np.bincount(
-                        triangle_indices_np.ravel(), minlength=vertex_term_coefficient.shape[0]
-                    ),
+                    "interior_vertices": interior,
+                    # These are fixed parameters, not differentiable geometry.
+                    # Match their stored FP32 values while evaluating in FP64.
+                    "vertex_term_coefficient": vertex_coefficients_np,
                 }
             )
         self.weights = [a.numpy() for a in evaluator.weights]
@@ -201,7 +210,7 @@ class TorchEspEnergy:
                 value = (
                     value
                     + barrier(p - positions[triangle_vertex_indices[k]], self.support, self.near_cutoff, near_only)
-                    / surface["vertex_face_count"][triangle_vertex_indices[k]]
+                    * surface["vertex_term_coefficient"][triangle_vertex_indices[k]]
                 )
         return value
 
@@ -263,7 +272,7 @@ def check_energy(evaluator, warp_energy):
     warp64_energy = evaluator.evaluate(compute_hessian=False)[0]
     if warp_energy.shape != (2,):
         raise ValueError("Expected production Warp energies [fixed-vertex, EE]")
-    print("Energy comparison (both directions summed; float64):")
+    print("Energy comparison (both directions summed; production FP32, reference FP64):")
     print(f"{'term':<15} {'Warp production':>20} {'PyTorch float64':>20} {'absolute difference':>20}")
     for term, name in enumerate(("fixed vertices", "EE")):
         print(
@@ -271,7 +280,8 @@ def check_energy(evaluator, warp_energy):
             f"{abs(warp_energy[term] - torch_energy[term]):20.6g}",
             flush=True,
         )
-    np.testing.assert_allclose(warp_energy, torch_energy, rtol=1e-12, atol=1e-14)
+    # Production is FP32; the separate FP64 Warp/Torch comparison below remains strict.
+    np.testing.assert_allclose(warp_energy, torch_energy, rtol=2e-5, atol=1e-8)
     np.testing.assert_allclose(warp64_energy, torch_energy, rtol=1e-12, atol=1e-14)
     print(f"Float64 Warp reference vs. PyTorch: absolute differences [fixed, EE]={abs(warp64_energy - torch_energy)}")
     print("Direct Warp/PyTorch energy comparison PASS", flush=True)

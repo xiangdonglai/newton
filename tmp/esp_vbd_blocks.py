@@ -26,7 +26,8 @@ The caller must maintain complete support coverage and rebuild the lists
 after detection. Re-evaluate after positions change, e.g. between VBD colors;
 these contact terms can couple particles beyond the original cloth coloring.
 
-Outputs retain float64 for validation. They are exact selected-branch energy
+Outputs use production float32; independent dense references use float64.
+They are selected-branch energy
 Hessians, potentially indefinite, NOT PSD-projected solve matrices. SolverVBD
 can optionally project these blocks before solving; this diagnostic compares
 the raw derivatives. The camera-ready EE sample and weight derivatives are
@@ -39,7 +40,6 @@ for signed primitive loads, material slip, reactions, and their frozen potential
 """
 
 import copy
-from contextlib import contextmanager
 
 import numpy as np
 import warp as wp
@@ -47,39 +47,8 @@ from esp_common import contact_primitive_indices_np, numpy_mesh_pair_energies
 from esp_derivatives import EspDerivativeEvaluator
 from esp_derivatives import check_derivatives as check_numerical
 
-from newton._src.solvers.vbd import esp_contact, solver_vbd
+from newton._src.solvers.vbd import esp_contact
 from newton.solvers import SolverVBD
-
-
-@contextmanager
-def use_contact_formulas(method):
-    """Select a comparison implementation only inside a standalone run.
-
-    Both diagnostic assembly and the actual SolverVBD calls use the same
-    module. Restore the normal implementation on exit, including exceptions.
-    This process-local diagnostic switch is not a production solver option.
-    """
-    global esp_contact  # noqa: PLW0603 -- Deliberate, scoped diagnostic switch.
-    if method not in ("chain", "direct", "direct-per-triangle"):
-        raise ValueError("Expected direct, direct-per-triangle, or chain ESP formulas")
-    old_diagnostic, old_solver = esp_contact, solver_vbd.esp_contact
-    if method == "direct":
-        from newton._src.solvers.vbd import esp_contact as integrated  # noqa: PLC0415
-
-        esp_contact = integrated
-    elif method == "direct-per-triangle":
-        import esp_direct_solver_per_triangle_reference  # noqa: PLC0415
-
-        esp_contact = esp_direct_solver_per_triangle_reference
-    else:
-        import esp_chain_solver_reference  # noqa: PLC0415
-
-        esp_contact = esp_chain_solver_reference
-    solver_vbd.esp_contact = esp_contact
-    try:
-        yield
-    finally:
-        esp_contact, solver_vbd.esp_contact = old_diagnostic, old_solver
 
 
 @wp.kernel
@@ -142,14 +111,13 @@ class EspVbdBlockEvaluator:
         self.support = float(radii[0]) + float(margins[0])
         self.near_cutoff = 0.05 * self.support
         self._block_dim = 32
-        self._ee_partitions = self.solver._esp_ee_partitions
         count = self.model.particle_count + self.model.body_count
         with wp.ScopedDevice(self.model.device):
-            self.energy = wp.zeros(2, dtype=wp.float64)
+            self.energy = wp.zeros(2, dtype=float)
             self.error = wp.zeros(1, dtype=int)
-            self.force = wp.zeros((2, count, 6), dtype=wp.float64)
-            self.hessian = wp.zeros((2, count, 6, 6), dtype=wp.float64)
-            self._energy_scratch = wp.zeros(2, dtype=wp.float64)
+            self.force = wp.zeros((2, count, 6), dtype=float)
+            self.hessian = wp.zeros((2, count, 6, 6), dtype=float)
+            self._energy_scratch = wp.zeros(2, dtype=float)
             self._term_contacts = []
             for _term in (0, 1):
                 contacts = copy.copy(self.contacts)
@@ -162,7 +130,7 @@ class EspVbdBlockEvaluator:
         self.state = state
         with wp.ScopedDevice(self.model.device):
             wp.launch(
-                self.solver._esp_kernels.update_rigid_positions,
+                esp_contact.update_rigid_positions,
                 dim=self.solver._esp_rigid_positions.shape[0],
                 inputs=[
                     self.data.rigid_local_positions,
@@ -212,8 +180,7 @@ class EspVbdBlockEvaluator:
                         self._energy_scratch,
                         self.error,
                         block_dim=self._block_dim,
-                        partitions=self._ee_partitions,
-                        ee_samples=self.solver._esp_ee_samples,
+                        partitions=8 if kind == esp_contact._PARTICLE_BLOCKS and self.model.device.is_cuda else 1,
                     )
                 wp.copy(self.energy, self._energy_scratch, dest_offset=term, src_offset=term, count=1)
 
@@ -228,7 +195,7 @@ class EspVbdBlockEvaluator:
         expected_h = self.hessian.numpy().sum(axis=0)
         solver = self.solver
         solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
-        np.testing.assert_allclose(solver._esp_energy.numpy(), self.energy.numpy(), rtol=2e-10, atol=1e-12)
+        np.testing.assert_allclose(solver._esp_energy.numpy(), self.energy.numpy(), rtol=2e-5, atol=1e-8)
         errors = []
         for kind, colors, force, hessian, offset, dimensions in (
             (
@@ -252,7 +219,12 @@ class EspVbdBlockEvaluator:
                 continue
             color_ids_np = colors.numpy()
             for color in np.unique(color_ids_np):
-                solver._accumulate_esp_contacts(state, kind, int(color))
+                solver._accumulate_esp_contacts(
+                    state,
+                    kind,
+                    int(color),
+                    partitions=8 if kind == esp_contact._PARTICLE_BLOCKS and self.model.device.is_cuda else 1,
+                )
                 active_color_mask_np = color_ids_np == color
                 for actual, expected in (
                     (force.numpy(), expected_f[offset : offset + len(color_ids_np), :dimensions]),
@@ -261,7 +233,7 @@ class EspVbdBlockEvaluator:
                     reference = np.zeros_like(expected)
                     reference[active_color_mask_np] = expected[active_color_mask_np]
                     scale = max(np.max(np.abs(reference)), 1e-8)
-                    np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-10)
+                    np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-5)
                     errors.append(np.max(np.abs(actual - reference)) / scale)
         solver.check_esp_contacts()
         print(f"SolverVBD color assembly PASS; max scaled force/Hessian error={max(errors, default=0):.3g}")
@@ -281,7 +253,7 @@ class EspVbdBlockEvaluator:
         """
         energy, force, hessian = reference.evaluate()
         actual_f, actual_h = self.force.numpy(), self.hessian.numpy()
-        np.testing.assert_allclose(self.energy.numpy(), energy, rtol=2e-10, atol=1e-12)
+        np.testing.assert_allclose(self.energy.numpy(), energy, rtol=2e-5, atol=1e-8)
         count = self.model.particle_count
         expected_f, expected_h = np.zeros_like(actual_f), np.zeros_like(actual_h)
         expected_f[:, :count, :3] = force[:, :count]
@@ -316,7 +288,9 @@ class EspVbdBlockEvaluator:
         for actual, expected in ((actual_f, expected_f), (actual_h, expected_h)):
             for term in range(2):
                 scale = max(np.max(np.abs(expected[term])), 1e-8)
-                np.testing.assert_allclose(actual[term] / scale, expected[term] / scale, rtol=0, atol=2e-10)
+                # Production uses FP32; the dense oracle remains FP64.
+                # Keep the previously tested mixed-precision block tolerance.
+                np.testing.assert_allclose(actual[term] / scale, expected[term] / scale, rtol=0, atol=2e-3)
                 errors.append(np.max(np.abs(actual[term] - expected[term])) / scale)
         print(f"VBD blocks / dense reference PASS; max scaled force/Hessian error={max(errors):.3g}")
         return largest_rotation_correction

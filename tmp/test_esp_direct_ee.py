@@ -19,20 +19,29 @@ from esp_direct_ee_per_triangle_reference import make_direct_ee_formulas
 from esp_ee_implicit_formulas import ee_energy_derivatives, rigid_body_block
 from test_esp_ee_implicit_formulas import fixtures, torch_body_energy, torch_energy
 
-from newton._src.solvers.vbd.esp_contact import make_shared_direct_ee_formulas
+from newton._src.solvers.vbd import esp_contact
 
 
 @cache
 def make_comparison_kernel(size, scalar, direct=True, near=0.15):
     """Evaluate identical two-direction EE terms with either implementation."""
     use_shared = direct == "shared"
+    if use_shared and scalar != wp.float32:
+        raise ValueError("Production shared EE formulas are float32 only")
     use_direct = bool(direct)
     vec3 = wp.types.vector(length=3, dtype=scalar)
     vec2 = wp.types.vector(length=2, dtype=scalar)
     vector = wp.types.vector(length=size, dtype=scalar)
     matrix = wp.types.matrix(shape=(size, size), dtype=scalar)
     evaluate_direct = make_direct_ee_formulas(size, scalar)
-    prepare_pair, triangle_contribution, finish_pair = make_shared_direct_ee_formulas(size, scalar)
+    if size == 3:
+        prepare_pair = esp_contact.prepare_particle_ee_pair
+        triangle_contribution = esp_contact.particle_ee_triangle_contribution
+        finish_pair = esp_contact.finish_particle_ee_pair
+    else:
+        prepare_pair = esp_contact.prepare_body_ee_pair
+        triangle_contribution = esp_contact.body_ee_triangle_contribution
+        finish_pair = esp_contact.finish_body_ee_pair
     create_point, triangle, samples, *_ = make_esp_derivative_functions(size, scalar)
 
     @wp.kernel(module="unique", enable_backward=False)
@@ -68,7 +77,17 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
                         if ids[corner] == selected_vertex:
                             particle_mask |= 1 << (corner + 4)
                     e, g, parameter_gradient, h = triangle_contribution(
-                        pair, ta, tb, tc, direction == 0, particle_mask, edges, vertices, scalar(1.0), scalar(near)
+                        pair,
+                        ta,
+                        tb,
+                        tc,
+                        direction == 0,
+                        direction == 0,
+                        particle_mask,
+                        edges,
+                        vertices,
+                        scalar(1.0),
+                        scalar(near),
                     )
                     potential += area * e
                     gp += area * g
@@ -135,7 +154,10 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
     return evaluate
 
 
-def evaluate_blocks(positions, selected, size, scalar, device, *, direct="shared", near=0.15):
+def evaluate_blocks(positions, selected, size, scalar, device, *, direct=None, near=0.15):
+    """Default to FP32 production or the independent FP64 chain reference."""
+    if direct is None:
+        direct = "shared" if scalar == wp.float32 else False
     """Launch one contact row per thread and copy results for testing only."""
     with wp.ScopedDevice(device):
         outputs = [
@@ -218,7 +240,19 @@ class TestEspDirectEE(unittest.TestCase):
             points = np.array(list(cases.values()), dtype=np.float32 if scalar == wp.float32 else np.float64).astype(
                 np.float64
             )
-            reference = [ee_energy_derivatives(p) for p in points]
+            reference = []
+            for name, p in zip(cases, points, strict=True):
+                if scalar == wp.float32 and name.startswith("near_parallel"):
+                    # These gaps are below 10 um. Production has a Taylor
+                    # continuation, but the saved NumPy/FP64 chain predates it.
+                    # Use the current independent Torch energy for these cases.
+                    x = torch.tensor(p, dtype=torch.float64, requires_grad=True)
+                    energy = torch_energy(x)
+                    gradient = torch.autograd.grad(energy, x)[0].numpy().reshape(18)
+                    hessian = torch.autograd.functional.hessian(torch_energy, x).numpy().reshape(18, 18)
+                    reference.append((float(energy.detach()), gradient, hessian))
+                else:
+                    reference.append(ee_energy_derivatives(p))
             for device in devices:
                 for size in (3, 6):
                     for selected in range(6) if size == 3 else (-1,):

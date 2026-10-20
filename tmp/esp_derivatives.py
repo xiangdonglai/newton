@@ -452,6 +452,11 @@ class EspDerivativeEvaluator:
         from esp_common import contact_primitive_indices_np  # noqa: PLC0415
 
         contacts, data = blocks.contacts, blocks.data
+
+        def reference_array(array):
+            """Convert production coefficients to the independent FP64 oracle."""
+            return wp.array(array.numpy(), dtype=wp.float64, device=blocks.model.device)
+
         if int(blocks.lists.error.numpy()[0]):
             raise ValueError("Incomplete per-edge triangle lists")
         if int(contacts.soft_contact_count.numpy()[0]) > contacts.soft_contact_max:
@@ -465,22 +470,22 @@ class EspDerivativeEvaluator:
             data.soft_edge_vertex_indices,
             data.soft_adjacency.tri_edge_indices,
             data.soft_adjacency.edge_tri_indices,
-            data.soft_vertex_term_coefficient,
+            reference_array(data.soft_vertex_term_coefficient),
             data.rigid_tri_indices,
             data.rigid_edge_vertex_indices,
             data.rigid_adjacency.tri_edge_indices,
             data.rigid_adjacency.edge_tri_indices,
-            data.rigid_vertex_term_coefficient,
+            reference_array(data.rigid_vertex_term_coefficient),
         )
         self.lists = blocks.lists
         self.device = blocks.model.device
         self.soft_positions_np = blocks.state.particle_q.numpy().astype(np.float64)
-        self.rigid_positions_np = blocks.solver._esp_rigid_positions.numpy()
+        self.rigid_positions_np = blocks.solver._esp_rigid_positions.numpy().astype(np.float64)
         self.weights = [
-            data.soft_vertex_quadrature_weight,
-            data.rigid_vertex_quadrature_weight,
-            data.soft_edge_area,
-            data.rigid_edge_area,
+            reference_array(data.soft_vertex_quadrature_weight),
+            reference_array(data.rigid_vertex_quadrature_weight),
+            reference_array(data.soft_edge_area),
+            reference_array(data.rigid_edge_area),
         ]
         self.support, self.near_cutoff = blocks.support, blocks.near_cutoff
 

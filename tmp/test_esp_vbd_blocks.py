@@ -8,13 +8,14 @@ No PyTorch is needed. All available Warp devices are tested.
 """
 
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 from esp_derivatives import EspDerivativeEvaluator
 from esp_vbd_blocks import EspVbdBlockEvaluator
 from evaluate_esp_multiple_meshes import make_example
+
+from newton.tests.test_solver_vbd_esp import particle_ee_partitions
 
 
 def skew(r):
@@ -100,7 +101,7 @@ class TestEspVbdBlocks(unittest.TestCase):
                     else:
                         for actual, expected in zip(outputs, reference, strict=True):
                             scale = max(float(np.max(np.abs(expected))), 1e-8)
-                            np.testing.assert_allclose(actual / scale, expected / scale, rtol=0, atol=2e-10)
+                            np.testing.assert_allclose(actual / scale, expected / scale, rtol=0, atol=2e-5)
 
     def test_benchmark_box_distance_uses_body_pose(self):
         """Check the diagnostic against known distances on a translated/rotated box."""
@@ -127,24 +128,6 @@ class TestEspVbdBlocks(unittest.TestCase):
         expected = [-0.05, 0.01, np.sqrt(2) * 0.01, 0, 0.002, 0.002, 0.001, 0, np.sqrt(2) * 0.01]
         np.testing.assert_allclose(box_vertex_distances(model, state), expected, rtol=0, atol=1e-7)
 
-    def test_cached_ee_samples(self):
-        """Check that sharing EE sample values preserves energy, force, and Hessian."""
-        for device in wp.get_devices():
-            with self.subTest(device=str(device)):
-                state, blocks = make_case(device, shared_body=True)
-                # A single worker now evaluates EE values in its row. Multiple
-                # workers still exercise the shared sample cache being tested.
-                blocks._ee_partitions = 3
-                blocks.assemble(state)
-                expected = [a.numpy().copy() for a in (blocks.energy, blocks.force, blocks.hessian)]
-                with patch.object(blocks.solver, "_esp_ee_samples", None):
-                    blocks.assemble(state)
-                    blocks.check()
-                    for actual, reference in zip((blocks.energy, blocks.force, blocks.hessian), expected, strict=True):
-                        scale = max(float(np.max(np.abs(reference))), 1e-8)
-                        np.testing.assert_allclose(actual.numpy() / scale, reference / scale, rtol=0, atol=2e-10)
-                    compare_dense(self, blocks)
-
     def test_blocks_match_dense(self):
         """Check both terms with static shapes, a dynamic body, and shared-body shapes."""
         for device in wp.get_devices():
@@ -163,18 +146,20 @@ class TestEspVbdBlocks(unittest.TestCase):
                         blocks.hessian.numpy().copy(),
                     )
                     for partitions in (1, 4, 8):
-                        blocks._ee_partitions = partitions
-                        blocks.assemble(state)
+                        with particle_ee_partitions(partitions):
+                            blocks.assemble(state)
                         blocks.check()
                         for output, expected in zip(
                             (blocks.energy, blocks.force, blocks.hessian), reference, strict=True
                         ):
-                            np.testing.assert_allclose(output.numpy(), expected, rtol=1e-9, atol=1e-8)
+                            scale = max(float(np.max(np.abs(expected))), 1.0)
+                            np.testing.assert_allclose(output.numpy() / scale, expected / scale, rtol=0, atol=2e-5)
                     # Repeated assembly replaces, rather than doubles, values.
                     before = blocks.force.numpy().copy()
                     blocks.assemble(state)
                     blocks.check()
-                    np.testing.assert_allclose(blocks.force.numpy(), before, rtol=1e-10, atol=1e-10)
+                    scale = max(float(np.max(np.abs(before))), 1.0)
+                    np.testing.assert_allclose(blocks.force.numpy() / scale, before / scale, rtol=0, atol=2e-5)
 
     def test_body_pose_derivatives(self):
         """Check body force and Hessian against energy changes under rigid motion."""
@@ -183,7 +168,10 @@ class TestEspVbdBlocks(unittest.TestCase):
                 state, blocks = make_case(device, shared_body=True)
                 blocks.assemble(state)
                 blocks.check()
-                reference, e, f, h = compare_dense(self, blocks)
+                reference, _production_energy, f, h = compare_dense(self, blocks)
+                # Keep all three finite-difference energies in FP64; mixing the
+                # FP32 center value with FP64 endpoints amplifies rounding by 1/h².
+                e, reference_force, _ = reference.evaluate(compute_hessian=False)
                 body, n = 0, blocks.model.particle_count
                 ids = np.flatnonzero(blocks.model.shape_body.numpy()[blocks.data.rigid_vertex_shapes.numpy()] == body)
                 center = blocks.body_com_world.numpy()[body]
@@ -207,8 +195,20 @@ class TestEspVbdBlocks(unittest.TestCase):
                     direction[:3] *= 0.01
                     step = 2e-6
                     ep, em = pose_energy(step * direction), pose_energy(-step * direction)
+                    point_velocities = direction[:3] + np.cross(direction[3:], r)
+                    reference_directional_force = np.einsum("kij,ij->k", reference_force[:, n + ids], point_velocities)
                     np.testing.assert_allclose(
-                        -(ep - em) / (2 * step), f[:, n + body] @ direction, rtol=3e-5, atol=2e-7
+                        -(ep - em) / (2 * step), reference_directional_force, rtol=3e-5, atol=2e-7
+                    )
+                    # The FP32 translation/rotation contributions can nearly
+                    # cancel in this projection. Scale its error by the terms
+                    # being added, not their much smaller signed sum.
+                    force_scale = np.maximum(np.sum(np.abs(f[:, n + body] * direction), axis=1), 1e-8)
+                    np.testing.assert_allclose(
+                        (f[:, n + body] @ direction) / force_scale,
+                        reference_directional_force / force_scale,
+                        rtol=0,
+                        atol=3e-5,
                     )
                     expected = np.einsum("i,kij,j->k", direction, h[:, n + body], direction)
                     np.testing.assert_allclose((ep - 2 * e + em) / step**2, expected, rtol=2e-3, atol=0.02)

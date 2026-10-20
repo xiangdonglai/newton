@@ -15,7 +15,7 @@ from newton.tests.test_solver_vbd_esp import contact_primitive_indices_np
 from newton.tests.test_solver_vbd_esp_friction import friction_blocks, numpy_closest_points
 
 
-def make_cross_target_case(device, *, shared_body=False, precision="float64", mixed_radii=False):
+def make_cross_target_case(device, *, shared_body=False, mixed_radii=False):
     """A crossing pair of finite edges, another rigid face, and another soft patch."""
     builder = newton.ModelBuilder(gravity=wp.vec3())
     rigid_triangles = [
@@ -60,13 +60,15 @@ def make_cross_target_case(device, *, shared_body=False, precision="float64", mi
         soft_contact_max=1024,
     )
     solver = SolverVBD(
-        model, collision_pipeline=pipeline, rigid_soft_contact_use_esp=True, rigid_soft_contact_esp_precision=precision
+        model,
+        collision_pipeline=pipeline,
+        rigid_soft_contact_use_esp=True,
     )
     state = model.state()
     pipeline.collide(state, solver.contacts)
     solver._refresh_body_particle_contact_state(solver.contacts, True)
     wp.launch(
-        solver._esp_kernels.update_rigid_positions,
+        esp_contact.update_rigid_positions,
         dim=solver._esp_rigid_positions.shape[0],
         inputs=[
             solver._esp_data.rigid_local_positions,
@@ -200,7 +202,11 @@ class TestEspCrossTarget(unittest.TestCase):
                 np.testing.assert_allclose(body_force[1, 0], -np.sqrt(0.5) * normal_load, rtol=2e-5, atol=1e-7)
                 np.testing.assert_allclose(body_force[0], 0, atol=1e-10)
                 np.testing.assert_allclose(particle_force[3:], 0, atol=1e-10)
-                np.testing.assert_allclose(particle_force.sum(axis=0) + body_force[1, :3], 0, atol=1e-8)
+                np.testing.assert_allclose(
+                    particle_force.sum(axis=0) + body_force[1, :3],
+                    0,
+                    atol=8 * np.finfo(np.float32).eps * np.max(np.abs(body_force)),
+                )
                 np.testing.assert_allclose(particle_force[0], particle_force[1], rtol=2e-6, atol=1e-8)
 
     def test_target_support_and_materials(self):

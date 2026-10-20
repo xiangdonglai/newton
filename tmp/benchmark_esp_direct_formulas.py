@@ -27,7 +27,7 @@ def run(device, count, samples, repeats, *, direct_first=False):
     methods = (True, False) if direct_first else (False, True)
     with wp.ScopedDevice(device):
         positions = wp.array(base[None] + rng.normal(size=(count, 4, 3)) * 0.001, dtype=wp.vec3d)
-        for scalar in (wp.float32, wp.float64):
+        for scalar in (wp.float32,):
             for size in (3, 6):
                 for kind in (0, 1):
                     # VT differentiates the point; TV differentiates vertex a.

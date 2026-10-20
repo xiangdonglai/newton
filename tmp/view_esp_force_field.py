@@ -54,7 +54,7 @@ arrows still include all weight derivatives. Friction arrows do not represent
 the gradient of that displayed conservative energy.
 
 Target triangles are visible in both modes. EE mode always uses the current
-integrated FP64 derivatives, even if --esp-formulas=chain selects historical
+integrated FP32 derivatives, even if --esp-formulas=chain selects historical
 point-mode formulas. Collision positions are float32. No simulation is advanced
 and there is no collision prevention: dragging into intersecting/singular configurations
 is outside this ESP evaluation's domain. Reported errors hide the arrows,
@@ -160,7 +160,7 @@ def evaluate_contacts(
     edge_vertex_indices: wp.array[wp.vec2i],
     tri_edge_indices: wp.array2d[int],
     edge_tri_indices: wp.array2d[int],
-    vertex_term_coefficient: wp.array[wp.float64],
+    vertex_term_coefficient: wp.array[float],
     target_positions: wp.array[wp.vec3d],
     support: float,
     stiffness: float,
@@ -206,7 +206,7 @@ def evaluate_contacts(
                     energy, mode, particle, newton_contact_energy(distance, support, stiffness, use_log_barrier)
                 )
                 wp.atomic_add(forces, mode, particle, wp.vec3d(force))
-    # Reject singular samples explicitly instead of displaying a clamped barrier.
+    # The distance gradient is undefined at coincidence, even with finite energy continuation.
     if wp.abs(distance) <= 1.0e-9:
         wp.atomic_add(energy, 0, particle, wp.float64(wp.inf))
         wp.atomic_add(energy, 1, particle, wp.float64(wp.inf))
@@ -219,18 +219,19 @@ def evaluate_contacts(
         tri_indices, tri_edge_indices, edge_tri_indices, vertex_term_coefficient, face
     )
     if use_direct_formulas:
-        value, gradient, hessian = particle_triangle(
-            particle_q64[particle],
-            target_positions[triangle_vertex_indices[0]],
-            target_positions[triangle_vertex_indices[1]],
-            target_positions[triangle_vertex_indices[2]],
+        value32, gradient32, hessian32 = particle_triangle(
+            wp.vec3(particle_q64[particle]),
+            wp.vec3(target_positions[triangle_vertex_indices[0]]),
+            wp.vec3(target_positions[triangle_vertex_indices[1]]),
+            wp.vec3(target_positions[triangle_vertex_indices[2]]),
             0,
             edge_coefficients,
             vertex_coefficients,
-            r,
-            r,
+            support,
+            support,
             False,
         )
+        value, gradient, hessian = wp.float64(value32), wp.vec3d(gradient32), wp.mat33d(hessian32)
     else:
         # Explicitly selected historical reference; the default above calls
         # exactly the direct mathematical function used by SolverVBD.
@@ -243,27 +244,27 @@ def evaluate_contacts(
         c = particle_point(target_positions[triangle_vertex_indices[2]], False)
         p = particle_point(particle_q64[particle], True)
         value, gradient, hessian = particle_triangle_potential(
-            p, a, b, c, edge_coefficients, vertex_coefficients, r, r, False, reversed_edges
+            p, a, b, c, wp.vec3d(edge_coefficients), wp.vec3d(vertex_coefficients), r, r, False, reversed_edges
         )
     esp_force = -coefficient * gradient
     hessian *= coefficient
     wp.atomic_add(energy, 0, particle, coefficient * value)
     if soft_contact_force_mask[row]:
         # Zero feature weights leave only the existing triangle barrier law.
-        value, gradient, _h = particle_triangle(
-            particle_q64[particle],
-            target_positions[triangle_vertex_indices[0]],
-            target_positions[triangle_vertex_indices[1]],
-            target_positions[triangle_vertex_indices[2]],
+        value32, gradient32, _h = particle_triangle(
+            wp.vec3(particle_q64[particle]),
+            wp.vec3(target_positions[triangle_vertex_indices[0]]),
+            wp.vec3(target_positions[triangle_vertex_indices[1]]),
+            wp.vec3(target_positions[triangle_vertex_indices[2]]),
             0,
-            wp.vec3d(),
-            wp.vec3d(),
-            r,
-            r,
+            wp.vec3(),
+            wp.vec3(),
+            support,
+            support,
             False,
         )
-        ogc_force = -coefficient * gradient
-        wp.atomic_add(energy, 1, particle, coefficient * value)
+        ogc_force = -coefficient * wp.vec3d(gradient32)
+        wp.atomic_add(energy, 1, particle, coefficient * wp.float64(value32))
     wp.atomic_add(forces, 0, particle, esp_force)
     wp.atomic_add(forces, 1, particle, ogc_force)
     if compute_hessian:
@@ -379,6 +380,55 @@ def select_edge_rows(
     selected_rigid_indices[row] = rigid
 
 
+@wp.kernel
+def evaluate_ee_markers(
+    soft_contact_count: wp.array[int],
+    soft_contact_primitive_index: wp.array[int],
+    soft_contact_rigid_primitive_index: wp.array[int],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    soft_contact_shape: wp.array[int],
+    data: esp_contact.EspData,
+    particle_q: wp.array[wp.vec3],
+    rigid_positions: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    shape_margin: wp.array[float],
+    shape_material_ke: wp.array[float],
+    soft_contact_ke: float,
+    ee_samples: wp.array2d[wp.vec4],
+):
+    """Evaluate marker positions/weights for selected EE rows, not a solver cache."""
+    row = wp.tid()
+    if row >= soft_contact_count[0]:
+        return
+    ee_samples[row, 0] = wp.vec4()
+    ee_samples[row, 1] = wp.vec4()
+    if soft_contact_rigid_indices[row][0] < 0:
+        return
+    soft_edge = soft_contact_primitive_index[row]
+    rigid_edge = soft_contact_rigid_primitive_index[row]
+    _support, near, _stiffness = esp_contact.contact_support_and_stiffness(
+        2,
+        soft_edge,
+        soft_contact_shape[row],
+        data,
+        particle_radius,
+        shape_margin,
+        shape_material_ke,
+        soft_contact_ke,
+    )
+    soft_vertices = data.soft_edge_vertex_indices[soft_edge]
+    rigid_vertices = data.rigid_edge_vertex_indices[rigid_edge]
+    q, q_bar, weight = esp_contact.ee_quadrature_sample(
+        particle_q[soft_vertices[0]],
+        particle_q[soft_vertices[1]],
+        rigid_positions[rigid_vertices[0]],
+        rigid_positions[rigid_vertices[1]],
+        near,
+    )
+    ee_samples[row, 0] = wp.vec4(q[0], q[1], q[2], weight)
+    ee_samples[row, 1] = wp.vec4(q_bar[0], q_bar[1], q_bar[2], 0.0)
+
+
 class EdgeForceProbe:
     """EE terms involving edge A--B, evaluated by the actual VBD launch path.
 
@@ -432,6 +482,7 @@ class EdgeForceProbe:
                 iterations=1,
             )
             self.contacts = self.solver.contacts
+            self.ee_samples = wp.empty((self.contacts.soft_contact_max, 2), dtype=wp.vec4)
             self.selected_contacts = copy.copy(self.contacts)
             self.selected_contacts.soft_contact_rigid_indices = wp.empty_like(self.contacts.soft_contact_rigid_indices)
             edge_vertex_indices_np = self.solver._esp_data.soft_edge_vertex_indices.numpy()
@@ -466,7 +517,7 @@ class EdgeForceProbe:
             # initial material allocation, even with only three particles.
             solver._refresh_body_particle_contact_state(self.contacts, refresh=True)
             wp.launch(
-                solver._esp_kernels.update_rigid_positions,
+                esp_contact.update_rigid_positions,
                 dim=solver._esp_rigid_positions.shape[0],
                 inputs=[
                     solver._esp_data.rigid_local_positions,
@@ -490,17 +541,13 @@ class EdgeForceProbe:
                 outputs=[self.selected_contacts.soft_contact_rigid_indices],
             )
             solver._esp_error.zero_()
-            # The normal single-worker solve no longer stores EE sample values.
-            # Populate them explicitly here for the viewer's sample markers and
-            # active-row count, using the same production preparation kernel.
-            worker_count = esp_contact._contact_worker_count(self.contacts.soft_contact_max, self.device)
+            # Marker positions reuse the production sample formula. The solver
+            # computes these values directly and has no sample-storage buffer.
             wp.launch(
-                esp_contact.prepare_contact_evaluation,
-                dim=worker_count,
+                evaluate_ee_markers,
+                dim=self.contacts.soft_contact_max,
                 inputs=[
-                    worker_count,
                     self.selected_contacts.soft_contact_count,
-                    self.selected_contacts.soft_contact_indices,
                     self.selected_contacts.soft_contact_primitive_index,
                     self.selected_contacts.soft_contact_rigid_primitive_index,
                     self.selected_contacts.soft_contact_rigid_indices,
@@ -513,7 +560,7 @@ class EdgeForceProbe:
                     self.model.shape_material_ke,
                     self.model.soft_contact_ke,
                 ],
-                outputs=[solver._esp_ee_samples],
+                outputs=[self.ee_samples],
             )
             for kind in (esp_contact._PARTICLE_BLOCKS, esp_contact._ENERGY_ONLY):
                 esp_contact.launch_contact_blocks(
@@ -528,7 +575,7 @@ class EdgeForceProbe:
                     solver._esp_particle_hessians,
                     solver._esp_energy,
                     solver._esp_error,
-                    ee_samples=solver._esp_ee_samples,
+                    partitions=8 if kind == esp_contact._PARTICLE_BLOCKS and self.device.is_cuda else 1,
                 )
             error = int(solver._esp_error.numpy()[0])
             if error:
@@ -548,13 +595,18 @@ class EdgeForceProbe:
                 saved_contacts = solver.contacts
                 solver.contacts = self.selected_contacts
                 try:
-                    solver._accumulate_esp_contacts(self.state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
+                    solver._accumulate_esp_contacts(
+                        self.state,
+                        esp_contact._PARTICLE_BLOCKS,
+                        partitions=8 if self.device.is_cuda else 1,
+                        dt=0.01,
+                    )
                     solver.check_esp_contacts()
                     friction_force = solver._esp_particle_forces.numpy().copy() - force
                 finally:
                     solver.contacts = saved_contacts
             primitive_indices_np = contact_primitive_indices_np(self.selected_contacts, solver._esp_data)
-            ee_samples_np = solver._esp_ee_samples.numpy()[:soft_contact_count]
+            ee_samples_np = self.ee_samples.numpy()[:soft_contact_count]
             ee_rows = (primitive_indices_np[:, 0] >= 0) & ((primitive_indices_np[:, 0] & 7) == 2)
             active = ee_rows & (ee_samples_np[:, 0, 3] > 0)
             return (
@@ -645,11 +697,19 @@ def test_probes(device, *, esp_formulas="direct"):
     assert center[5, 1, 1] > center[5, 0, 1], "The log-barrier option must change the near-contact force"
     for scene in range(2):
         probe = ForceProbe(scene, 1, device, esp_formulas=esp_formulas)
+        # These point fixtures are above the Taylor-continuation threshold,
+        # where the saved FP64 chain implements the same energy. Use it for
+        # differences, rather than subtracting nearly equal FP32 values.
+        reference_probe = ForceProbe(scene, 1, device, esp_formulas="chain")
         radius = 0.03 if scene == 0 else 0.06
         for name, position in PRESETS[scene].items():
             x = np.asarray(position).reshape(1, 3)
             energy, force, counts, _distance = probe.evaluate(x, radius)
             assert np.all(np.isfinite(energy)) and np.all(np.isfinite(force))
+            reference_energy, reference_force, _, _ = reference_probe.evaluate(x, radius)
+            np.testing.assert_allclose(energy[0], reference_energy[0], rtol=2e-5, atol=1e-8)
+            force_scale = max(float(np.max(np.abs(reference_force[0]))), 1.0)
+            np.testing.assert_allclose(force[0] / force_scale, reference_force[0] / force_scale, rtol=0, atol=2e-5)
             if scene == 1:
                 profile = probe.vertices_np[::2].astype(np.float64)
                 profile[:, 1] = 0
@@ -661,11 +721,11 @@ def test_probes(device, *, esp_formulas="direct"):
                 p, m = x.astype(np.float32), x.astype(np.float32)
                 p[0, axis] += 2e-6
                 m[0, axis] -= 2e-6
-                ep = probe.evaluate(p, radius)[0]
-                em = probe.evaluate(m, radius)[0]
+                ep = reference_probe.evaluate(p, radius)[0]
+                em = reference_probe.evaluate(m, radius)[0]
                 fd = -(ep - em)[:, 0] / float(p[0, axis] - m[0, axis])
                 # No finite-difference assertion for OGC: its mask can switch.
-                np.testing.assert_allclose(fd[0], force[0, 0, axis], rtol=5e-4, atol=1e-4)
+                np.testing.assert_allclose(fd[0] / force_scale, force[0, 0, axis] / force_scale, rtol=5e-4, atol=2e-5)
             print(f"{SCENES[scene]} / {name}: E={energy[:, 0]}, F={force[:, 0]}, rows={counts[:, 0]}")
         if scene == 0:
             x = np.array([[0.0, 0.0, 0.008]])
@@ -681,7 +741,7 @@ def test_probes(device, *, esp_formulas="direct"):
             assert counts[1, 0] >= 2
             assert energy[1, 0] > energy[0, 0], "ESP subtracts the maximum missed by minimum-only OGC"
             assert np.linalg.norm(force[0, 0] - force[1, 0]) > 0.1
-        # Differentiate the actual displayed ESP force, away from feature ties.
+        # Compare the displayed Hessian against FP64 force differences, away from feature ties.
         # Keep PSD off: a projected matrix is not the derivative of that force.
         point = np.array([[0.039, 0.004, 0.008] if scene == 0 else [0.012, 0.007, 0.04]], dtype=np.float32)
         probe.evaluate(point, radius, compute_hessian=True)
@@ -691,9 +751,12 @@ def test_probes(device, *, esp_formulas="direct"):
             plus, minus = point.copy(), point.copy()
             plus[0, axis] += 2e-6
             minus[0, axis] -= 2e-6
-            fp, fm = probe.evaluate(plus, radius)[1][0, 0], probe.evaluate(minus, radius)[1][0, 0]
+            fp, fm = reference_probe.evaluate(plus, radius)[1][0, 0], reference_probe.evaluate(minus, radius)[1][0, 0]
             finite_hessian[:, axis] = -(fp - fm) / float(plus[0, axis] - minus[0, axis])
-        np.testing.assert_allclose(hessian, finite_hessian, rtol=5e-4, atol=1e-3)
+        # Feature cancellation leaves near-zero entries with FP32 noise.
+        # Compare the whole block at its scale, as in the solver checks.
+        scale = max(float(np.max(np.abs(hessian))), 1.0)
+        np.testing.assert_allclose(hessian / scale, finite_hessian / scale, rtol=5e-4, atol=2e-5)
         print(
             f"{SCENES[scene]}: displayed ESP force / raw Hessian finite differences PASS; max error={np.max(abs(hessian - finite_hessian)):.3g}"
         )
@@ -702,6 +765,10 @@ def test_probes(device, *, esp_formulas="direct"):
 
 def test_edge_probes(device):
     """Check both endpoint gradients after fresh collision detection each time."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from esp_derivatives import EspDerivativeEvaluator  # noqa: PLC0415
+
     for scene in range(2):
         probe = EdgeForceProbe(scene, device)
         support = 0.03 if scene == 0 else 0.06
@@ -728,18 +795,37 @@ def test_edge_probes(device):
             energy, force, info = probe.evaluate(endpoints, support, 1.0)
             assert energy > 0 and info["active"] > 0
             assert np.all(np.linalg.norm(force[:2], axis=1) > 0)
+            # Differentiate independent FP64 energies: subtracting production
+            # FP32 totals at nanometre steps cannot resolve these transitions.
+            # Compare their center values/gradients against production too.
+            reference = EspDerivativeEvaluator(
+                SimpleNamespace(
+                    contacts=probe.selected_contacts,
+                    data=probe.solver._esp_data,
+                    lists=probe.solver._esp_lists,
+                    model=probe.model,
+                    state=probe.state,
+                    solver=probe.solver,
+                    support=float(np.float32(support)),
+                    near_cutoff=float(np.float32(0.05) * np.float32(support)),
+                )
+            )
+            reference_energy, reference_force, _ = reference.evaluate(compute_hessian=False)
+            np.testing.assert_allclose(energy, reference_energy[1], rtol=2e-3, atol=1e-9)
+            force_scale = max(float(np.max(np.abs(reference_force[1, :3]))), 1e-8)
+            np.testing.assert_allclose(force / force_scale, reference_force[1, :3] / force_scale, rtol=0, atol=2e-3)
             finite_force = np.zeros((2, 3))
             for endpoint in range(2):
                 for axis in range(3):
-                    plus, minus = endpoints.copy(), endpoints.copy()
+                    plus, minus = reference.soft_positions_np.copy(), reference.soft_positions_np.copy()
                     delta = 2e-8 if name == "endpoint mollifier transition" else 1e-7
                     plus[endpoint, axis] += delta
                     minus[endpoint, axis] -= delta
-                    ep = probe.evaluate(plus, support, 1.0)[0]
-                    em = probe.evaluate(minus, support, 1.0)[0]
+                    ep = reference.evaluate(plus, compute_hessian=False)[0][1]
+                    em = reference.evaluate(minus, compute_hessian=False)[0][1]
                     step = float(plus[endpoint, axis] - minus[endpoint, axis])
                     finite_force[endpoint, axis] = -(ep - em) / step
-            np.testing.assert_allclose(force[:2], finite_force, rtol=3e-4, atol=2e-5)
+            np.testing.assert_allclose(reference_force[1, :2], finite_force, rtol=3e-4, atol=2e-5)
 
             # Check the production per-color entry point, not another force law.
             probe.evaluate(endpoints, support, 1.0)
@@ -750,9 +836,15 @@ def test_edge_probes(device):
                 assembled = np.zeros_like(force)
                 colors = probe.model.particle_colors.numpy()
                 for color in np.unique(colors):
-                    solver._accumulate_esp_contacts(probe.state, esp_contact._PARTICLE_BLOCKS, color=int(color))
+                    solver._accumulate_esp_contacts(
+                        probe.state,
+                        esp_contact._PARTICLE_BLOCKS,
+                        color=int(color),
+                        partitions=8 if probe.device.is_cuda else 1,
+                    )
                     assembled[colors == color] = solver._esp_particle_forces.numpy()[colors == color]
-                np.testing.assert_allclose(force, assembled, rtol=1e-12, atol=1e-12)
+                scale = max(float(np.max(np.abs(force))), 1.0)
+                np.testing.assert_allclose(force / scale, assembled / scale, rtol=0, atol=2e-5)
             finally:
                 solver.contacts = original_contacts
             print(
@@ -1030,7 +1122,7 @@ class Viewer:
             return
         _, self.mode = ui.Combo("Method", self.mode, MODES)
         ui.TextUnformatted("Drag the particle's arrows / plane handles.")
-        formula_label = "integrated direct" if self.args.esp_formulas == "direct" else "saved chain reference"
+        formula_label = "integrated FP32" if self.args.esp_formulas == "direct" else "saved FP64 chain"
         ui.TextUnformatted(f"ESP derivatives: {formula_label}")
         changed, self.preset = ui.Combo("Position preset", self.preset, list(PRESETS[self.scene]))
         if changed:
@@ -1057,7 +1149,7 @@ class Viewer:
             ui.TextUnformatted(f"  F=({force[i, 0, 0]:.5g}, {force[i, 0, 1]:.5g}, {force[i, 0, 2]:.5g}) N")
         if distance[0] <= 1e-9:
             ui.TextColored((0.85, 0.08, 0.05, 1), "On surface: ESP-barrier arrows are hidden.")
-        ui.TextUnformatted("ESP barrier: singular; Newton log: continued at zero.")
+        ui.TextUnformatted("Near-zero ESP samples are hidden; Newton log uses continuation.")
         ui.TextUnformatted("Magenta: selected force. Teal: field directions.")
         ui.TextUnformatted("Arrows capped at 35 / 4.5 mm; values are not capped.")
         if self.scene == 1:
@@ -1093,7 +1185,7 @@ class Viewer:
         self.refresh_edge()
         energy, force, info = self.edge_result
         ui.Separator()
-        ui.TextUnformatted("Integrated ESP kernels (FP64); EE terms only.")
+        ui.TextUnformatted("Integrated ESP kernels (FP32); EE terms only.")
         ui.TextUnformatted("A--B versus all queried rigid edges, both directions.")
         ui.TextWrapped("Fixed rest areas; sample and weight derivatives included.")
         ui.TextUnformatted(f"EE support = 0.05 x support = {50 * self.radius:.3g} mm")

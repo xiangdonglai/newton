@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare ESP geometry with Newton's shared closest-point algorithm.
+"""Compare historical FP64 ESP geometry with Newton's shared closest-point algorithm.
 
 Run from the worktree root:
     PYTHONPATH=tmp uv run --no-sync --with torch python tmp/test_esp_triangle_reuse.py -v
 
+Production ESP is now FP32; this preserves the original FP64 diagnosis.
 The test-only copy below changes ONLY the
 shared routine's name and float types, verified against its live source.
 Distances are checked against an 80-digit Decimal oracle. The skinny-triangle
@@ -29,6 +30,7 @@ from decimal import Decimal, localcontext
 
 import numpy as np
 import warp as wp
+from esp_chain_solver_reference import barrier_energy, triangle_distance_squared_value
 from esp_derivatives import Point, vertex
 from esp_entry_reference import (
     barrier_derivatives_from_squared_distance,
@@ -50,7 +52,6 @@ from newton._src.geometry.kernels import (
     TRI_CONTACT_FEATURE_VERTEX_C,
     triangle_closest_point,
 )
-from newton._src.solvers.vbd.esp_contact import barrier_energy, triangle_distance_squared_value
 
 wp.set_module_options({"enable_backward": False})
 

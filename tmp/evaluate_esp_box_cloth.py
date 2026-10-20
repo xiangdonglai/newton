@@ -30,7 +30,7 @@ import argparse
 import numpy as np
 import warp as wp
 from esp_common import box_mesh, patch
-from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks, use_contact_formulas
+from esp_vbd_blocks import EspVbdBlockEvaluator, run_checks
 
 import newton
 
@@ -85,12 +85,6 @@ def run_example(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="cpu", help="cpu, cuda:0, or all")
-    parser.add_argument(
-        "--esp-formulas",
-        choices=("direct", "chain", "direct-per-triangle"),
-        default="direct",
-        help="Integrated shared direct formulas (default), or saved chain/per-triangle references",
-    )
     parser.add_argument("--gap", type=float, default=0.0003, help="Positive cloth height above the box [m]")
     parser.add_argument(
         "--cloth-tilt", type=float, default=0.0, help="Cloth z slope; use 0.003 for smooth Hessian validation"
@@ -110,13 +104,12 @@ if __name__ == "__main__":
     if args.gap <= 0:
         parser.error("--gap must be positive; this script does not evaluate penetration recovery")
     devices = wp.get_devices() if args.device == "all" else [wp.get_device(args.device)]
-    with use_contact_formulas(args.esp_formulas):
-        for device in devices:
-            run_example(
-                device,
-                args.gap,
-                check_derivatives=args.check_derivatives,
-                check_autodiff=args.check_autodiff,
-                check_torch_energy=args.check_torch_energy,
-                cloth_tilt=args.cloth_tilt,
-            )
+    for device in devices:
+        run_example(
+            device,
+            args.gap,
+            check_derivatives=args.check_derivatives,
+            check_autodiff=args.check_autodiff,
+            check_torch_energy=args.check_torch_energy,
+            cloth_tilt=args.cloth_tilt,
+        )

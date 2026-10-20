@@ -5,6 +5,7 @@
 
 import copy
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import numpy as np
@@ -19,6 +20,20 @@ from newton._src.solvers.vbd.esp_contact import (
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
 from newton._src.utils.mesh import MeshAdjacency
+
+
+@contextmanager
+def particle_ee_partitions(partitions):
+    """Override only the diagnostic launch argument, not solver configuration."""
+    launch = esp_contact.launch_contact_blocks
+
+    def with_partitions(*args, **kwargs):
+        if args[6] == esp_contact._PARTICLE_BLOCKS:
+            kwargs["partitions"] = partitions
+        return launch(*args, **kwargs)
+
+    with patch.object(esp_contact, "launch_contact_blocks", side_effect=with_partitions):
+        yield
 
 
 def contact_primitive_indices_np(contacts, data):
@@ -72,15 +87,15 @@ def _primitive_supports(
     h, near, ke = esp_contact.contact_support_and_stiffness(
         rows[i][0] & 7, rows[i][1], 0, data, radii, margins, stiffness, 0.0
     )
-    output[i] = wp.vec3d(h, near, ke)
+    output[i] = wp.vec3d(wp.vec3(h, near, ke))
 
 
 @wp.kernel
 def _copy_raw_blocks(
-    source_force: wp.array2d[wp.float64],
-    source_hessian: wp.array3d[wp.float64],
-    destination_force: wp.array2d[wp.float64],
-    destination_hessian: wp.array3d[wp.float64],
+    source_force: wp.array2d[wp.float32],
+    source_hessian: wp.array3d[wp.float32],
+    destination_force: wp.array2d[wp.float32],
+    destination_hessian: wp.array3d[wp.float32],
     count: int,
     source_start: int,
     destination_start: int,
@@ -101,10 +116,10 @@ class _EspReference:
         self.solver, self.model = solver, solver.model
         self.lists, self.contacts = solver._esp_lists, solver.contacts
         self.data = solver._esp_data
-        self.energy = wp.zeros(2, dtype=wp.float64, device=solver.device)
+        self.energy = wp.zeros(2, dtype=wp.float32, device=solver.device)
         count = self.model.particle_count + self.model.body_count
-        self.raw_force = wp.zeros((count, 6), dtype=wp.float64, device=solver.device)
-        self.raw_hessian = wp.zeros((count, 6, 6), dtype=wp.float64, device=solver.device)
+        self.raw_force = wp.zeros((count, 6), dtype=wp.float32, device=solver.device)
+        self.raw_hessian = wp.zeros((count, 6, 6), dtype=wp.float32, device=solver.device)
         self.force = self.raw_force.reshape((1, count, 6))
         self.hessian = self.raw_hessian.reshape((1, count, 6, 6))
         self.reference_model = self.model
@@ -115,7 +130,7 @@ class _EspReference:
 
     def assemble(self, state):
         wp.launch(
-            self.solver._esp_kernels.update_rigid_positions,
+            esp_contact.update_rigid_positions,
             dim=self.solver._esp_rigid_positions.shape[0],
             inputs=[
                 self.data.rigid_local_positions,
@@ -220,7 +235,6 @@ def make_case(
     grid=False,
     grid_extent=0.04,
     isolated_particle=False,
-    precision="float64",
 ):
     """Place a tilted triangle over a closed box, with optional analytic ground."""
     with wp.ScopedDevice(device):
@@ -308,14 +322,13 @@ def make_case(
             collision_pipeline=pipeline,
             iterations=iterations,
             rigid_soft_contact_use_esp=enabled,
-            rigid_soft_contact_esp_precision=precision,
             rigid_soft_enable_dat=dat,
             rigid_soft_dat_use_interval_arithmetic=dat,
         )
         return model, pipeline, solver
 
 
-def make_point_contact_case(device, kind, *, precision="float64", floor=False):
+def make_point_contact_case(device, kind, *, floor=False):
     """Put point samples or a tetrahedral interior vertex above a dynamic mesh box."""
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(gravity=wp.vec3())
@@ -378,7 +391,6 @@ def make_point_contact_case(device, kind, *, precision="float64", floor=False):
             collision_pipeline=pipeline,
             iterations=1,
             rigid_soft_contact_use_esp=True,
-            rigid_soft_contact_esp_precision=precision,
         )
         return model, pipeline, solver
 
@@ -429,113 +441,131 @@ class TestVbdEsp(unittest.TestCase):
                         evaluate()
                     else:
                         wp.capture_launch(graph)
-                    expected = np.r_[values, values.max(), values[edges].max(axis=1)].astype(float)
-                    expected += float(model.shape_margin.numpy()[0])
-                    np.testing.assert_allclose(output.numpy()[:, 0], expected, rtol=0, atol=1e-15)
-                    np.testing.assert_allclose(output.numpy()[:, 1], 0.05 * expected, rtol=0, atol=1e-15)
+                    expected = np.r_[values, values.max(), values[edges].max(axis=1)]
+                    expected += model.shape_margin.numpy()[0]
+                    np.testing.assert_array_equal(output.numpy()[:, 0], expected)
+                    np.testing.assert_array_equal(output.numpy()[:, 1], np.float32(0.05) * expected)
 
-    def test_ee_preparation_only_for_shared_rows(self):
-        """Match cached and on-demand blocks after geometry/count changes and graph replay.
+    def test_ee_partition_launches_and_graph(self):
+        """Match one/eight partitions after geometry/count changes and graph replay.
 
-        One particle worker per row evaluates its sample directly; three workers
-        share a freshly prepared sample. Body and energy rows have one consumer.
-        Dirty outputs and sample storage must not survive an empty contact set.
+        Eight particle workers split the EE lists within a fixed total grid.
+        Body/energy stay unpartitioned, and every worker computes sample values
+        directly. Dirty outputs must not survive an empty contact set.
         """
         for device in wp.get_devices():
-            for precision in ("float64", "float32"):
-                with self.subTest(device=str(device), precision=precision), wp.ScopedDevice(device):
-                    model, pipeline, solver = make_case(
-                        device, dynamic=True, grid=True, gap=0.00012, precision=precision
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device, dynamic=True, grid=True, gap=0.00012)
+                state = model.state()
+                pipeline.collide(state, solver.contacts)
+                kernels, contacts = esp_contact, solver.contacts
+                self.assertFalse(hasattr(solver, "_esp_particle_ee_partitions"))
+                with patch.object(kernels, "launch_contact_blocks") as launches, patch.object(wp, "launch"):
+                    solver._add_esp_particle_contacts(state, model.particle_color_groups[0])
+                    solver._add_esp_body_contacts(state, model.body_color_groups[0])
+                    solver._accumulate_esp_contacts(state, kernels._ENERGY_ONLY, partitions=1)
+                self.assertEqual(
+                    [call.kwargs["partitions"] for call in launches.call_args_list],
+                    [8 if device.is_cuda else 1, 1, 1],
+                )
+                # Forward an explicit diagnostic choice without overriding it.
+                with patch.object(kernels, "launch_contact_blocks") as launches:
+                    solver._accumulate_esp_contacts(state, kernels._PARTICLE_BLOCKS, partitions=4)
+                self.assertEqual(launches.call_args.kwargs["partitions"], 4)
+                self.assertFalse(hasattr(solver, "_esp_ee_samples"))
+                self.assertFalse(hasattr(kernels, "read_ee_quadrature_sample"))
+                arrays = [
+                    getattr(solver, "_esp_" + name)
+                    for name in ("energy", "particle_forces", "particle_hessians", "body_forces", "body_hessians")
+                ]
+
+                def evaluate(solver=solver, kernels=kernels, state=state):
+                    kernels.rebuild_edge_triangle_lists(
+                        solver.contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
                     )
-                    state = model.state()
-                    pipeline.collide(state, solver.contacts)
-                    kernels, contacts = solver._esp_kernels, solver.contacts
-                    arrays = [
-                        getattr(solver, "_esp_" + name)
-                        for name in ("energy", "particle_forces", "particle_hessians", "body_forces", "body_hessians")
-                    ]
+                    for kind in (kernels._PARTICLE_BLOCKS, kernels._BODY_BLOCKS, kernels._ENERGY_ONLY):
+                        solver._accumulate_esp_contacts(state, kind)
 
-                    def evaluate(solver=solver, kernels=kernels, state=state):
-                        kernels.rebuild_edge_triangle_lists(
-                            solver.contacts, solver._esp_data, solver._esp_lists, solver._esp_list_sort_values
-                        )
-                        for kind in (kernels._PARTICLE_BLOCKS, kernels._BODY_BLOCKS, kernels._ENERGY_ONLY):
-                            solver._accumulate_esp_contacts(state, kind)
-
-                    # Check actual launches, separately from numerical equivalence.
-                    for partitions in (1, 3):
-                        solver._esp_ee_partitions = partitions
-                        with (
-                            patch.object(wp, "launch", wraps=wp.launch) as launch,
-                            patch.object(wp.array, "zero_", autospec=True, side_effect=wp.array.zero_) as clear,
+                # Check actual launches, separately from numerical equivalence.
+                for partitions in (1, 8):
+                    with (
+                        particle_ee_partitions(partitions),
+                        patch.object(wp, "launch", wraps=wp.launch) as launch,
+                        patch.object(wp.array, "zero_", autospec=True, side_effect=wp.array.zero_) as clear,
+                    ):
+                        evaluate()
+                    # Clearing has one owner, independent of partition count.
+                    for output in arrays:
+                        self.assertEqual(sum(call.args[0] is output for call in clear.call_args_list), 1)
+                    for call in launch.call_args_list:
+                        if call.args and call.args[0] is kernels.accumulate_particle_contact_derivatives:
+                            self.assertEqual(
+                                call.kwargs["dim"],
+                                (
+                                    esp_contact._contact_worker_count(contacts.soft_contact_max, device, partitions),
+                                    partitions,
+                                ),
+                            )
+                        elif call.args and call.args[0] in (
+                            kernels.accumulate_body_contact_derivatives,
+                            kernels.evaluate_contact_energy,
                         ):
-                            evaluate()
-                        # Clearing has one owner even when EE preparation runs.
-                        for output in arrays:
-                            self.assertEqual(sum(call.args[0] is output for call in clear.call_args_list), 1)
-                        preparation_calls = sum(
-                            bool(call.args) and call.args[0] is kernels.prepare_contact_evaluation
-                            for call in launch.call_args_list
-                        )
-                        self.assertEqual(preparation_calls, int(partitions > 1))
-                        for call in launch.call_args_list:
-                            if call.args and call.args[0] is kernels.prepare_contact_evaluation:
-                                self.assertEqual(len(call.kwargs["outputs"]), 1)
-                                self.assertIs(call.kwargs["outputs"][0], solver._esp_ee_samples)
-                    solver._esp_ee_partitions = 1
+                            # Particle partitions must not multiply body/energy workers.
+                            self.assertEqual(
+                                call.kwargs["dim"],
+                                esp_contact._contact_worker_count(contacts.soft_contact_max, device),
+                            )
+                with particle_ee_partitions(1):
                     evaluate()
-                    self.assertGreater(solver._esp_energy.numpy()[1], 0, "Exercise active EE quadrature")
-                    initial_force = solver._esp_particle_forces.numpy().copy()
-                    graphs = {}
-                    if device.is_cuda:
-                        for partitions in (1, 3):
-                            solver._esp_ee_partitions = partitions
-                            with wp.ScopedCapture(device=device) as capture:
-                                evaluate()
-                            graphs[partitions] = capture.graph
+                self.assertGreater(solver._esp_energy.numpy()[1], 0, "Exercise active EE quadrature")
+                initial_force = solver._esp_particle_forces.numpy().copy()
+                graphs = {}
+                if device.is_cuda:
+                    for partitions in (1, 8):
+                        with particle_ee_partitions(partitions), wp.ScopedCapture(device=device) as capture:
+                            evaluate()
+                        graphs[partitions] = capture.graph
 
-                    for moved in (False, True):
-                        if moved:
-                            positions = state.particle_q.numpy().copy()
-                            positions[:, 2] += 2.5e-5
-                            state.particle_q.assign(positions)
-                            poses = state.body_q.numpy().copy()
-                            poses[0, 2] += 5e-6
-                            state.body_q.assign(poses)
-                        pipeline.collide(state, contacts)
-                        count = int(contacts.soft_contact_count.numpy()[0])
-                        for active in (count, 0, count):
-                            contacts.soft_contact_count.fill_(active)
-                            for a in arrays:
-                                a.fill_(123.0)
-                            solver._esp_ee_samples.fill_(kernels.Vec4(123.0))
-                            solver._esp_ee_partitions = 3
-                            if device.is_cuda:
-                                wp.capture_launch(graphs[3])
-                            else:
+                for moved in (False, True):
+                    if moved:
+                        positions = state.particle_q.numpy().copy()
+                        positions[:, 2] += 2.5e-5
+                        state.particle_q.assign(positions)
+                        poses = state.body_q.numpy().copy()
+                        poses[0, 2] += 5e-6
+                        state.body_q.assign(poses)
+                    pipeline.collide(state, contacts)
+                    count = int(contacts.soft_contact_count.numpy()[0])
+                    for active in (count, 0, count):
+                        contacts.soft_contact_count.fill_(active)
+                        for a in arrays:
+                            a.fill_(123.0)
+                        if device.is_cuda:
+                            wp.capture_launch(graphs[8])
+                        else:
+                            with particle_ee_partitions(8):
                                 evaluate()
-                            expected = [a.numpy().copy() for a in arrays]
-                            for a in arrays:
-                                a.fill_(123.0)
-                            solver._esp_ee_samples.fill_(kernels.Vec4(123.0))
-                            solver._esp_ee_partitions = 1
-                            if device.is_cuda:
-                                wp.capture_launch(graphs[1])
-                            else:
+                        expected = [a.numpy().copy() for a in arrays]
+                        for a in arrays:
+                            a.fill_(123.0)
+                        if device.is_cuda:
+                            wp.capture_launch(graphs[1])
+                        else:
+                            with particle_ee_partitions(1):
                                 evaluate()
-                            solver.check_esp_contacts()
-                            for a, want in zip(arrays, expected, strict=True):
-                                got = a.numpy()
-                                scale = max(float(np.max(np.abs(want), initial=0)), 1.0)
-                                np.testing.assert_allclose(
-                                    got / scale,
-                                    want / scale,
-                                    rtol=0,
-                                    atol=2e-5 if precision == "float32" else 2e-10,
-                                )
-                                if active == 0:
-                                    self.assertFalse(got.any())
-                    self.assertGreater(np.linalg.norm(solver._esp_particle_forces.numpy() - initial_force), 0)
+                        solver.check_esp_contacts()
+                        for a, want in zip(arrays, expected, strict=True):
+                            got = a.numpy()
+                            scale = max(float(np.max(np.abs(want), initial=0)), 1.0)
+                            np.testing.assert_allclose(
+                                got / scale,
+                                want / scale,
+                                rtol=0,
+                                atol=2e-5,
+                            )
+                            if active == 0:
+                                self.assertFalse(got.any())
+                self.assertGreater(np.linalg.norm(solver._esp_particle_forces.numpy() - initial_force), 0)
 
     def test_rigid_positions_refresh_during_particle_colors(self):
         """Refresh once per particle iteration, except DAT must refresh every color.
@@ -569,7 +599,7 @@ class TestVbdEsp(unittest.TestCase):
                                 original(*args)
                             refresh_count = sum(
                                 (call.args[0] if call.args else call.kwargs.get("kernel"))
-                                is solver._esp_kernels.update_rigid_positions
+                                is esp_contact.update_rigid_positions
                                 for call in launches.call_args_list
                             )
                             self.assertEqual(refresh_count, expected)
@@ -613,9 +643,9 @@ class TestVbdEsp(unittest.TestCase):
                 self.assertGreater(int(lengths.max()), 1)
                 for kind in (esp_contact._PARTICLE_BLOCKS, esp_contact._BODY_BLOCKS):
                     reference = None
-                    for partitions in (1, 3, int(lengths.max()) + 1):
-                        solver._esp_ee_partitions = partitions
-                        solver._accumulate_esp_contacts(state, kind)
+                    for partitions in (1, 3, 8, int(lengths.max()) + 1):
+                        with particle_ee_partitions(partitions):
+                            solver._accumulate_esp_contacts(state, kind)
                         solver.check_esp_contacts()
                         arrays = (
                             (solver._esp_particle_forces, solver._esp_particle_hessians)
@@ -630,30 +660,27 @@ class TestVbdEsp(unittest.TestCase):
                             for value, expected in zip(actual, reference, strict=True):
                                 scale = max(float(np.max(np.abs(expected))), 1.0)
                                 with self.subTest(device=str(device), kind=kind, partitions=partitions):
-                                    np.testing.assert_allclose(value / scale, expected / scale, atol=2e-10, rtol=0)
+                                    np.testing.assert_allclose(value / scale, expected / scale, atol=2e-5, rtol=0)
 
     def test_point_without_surface_uses_esp(self):
         """Give an isolated particle unit ESP weight, not native mesh forces."""
         for device in wp.get_devices():
-            for precision in ("float32", "float64"):
-                with self.subTest(device=str(device), precision=precision), wp.ScopedDevice(device):
-                    model, pipeline, solver = make_case(
-                        device, dynamic=True, isolated_particle=True, precision=precision
-                    )
-                    state = model.state()
-                    pipeline.collide(state, solver.contacts)
-                    solver._refresh_body_particle_contact_state(solver.contacts, True)
-                    solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
-                    self.assertGreater(float(solver._esp_energy.numpy().sum()), 0.0)
-                    self.assertEqual(float(solver._esp_data.soft_vertex_quadrature_weight.numpy()[-1]), 1.0)
-                    solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
-                    particle_force = solver._esp_particle_forces.numpy().copy()
-                    solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS)
-                    solver.check_esp_contacts()
-                    self.assertGreater(particle_force[-1, 2], 0.0)
-                    np.testing.assert_allclose(
-                        solver._esp_body_forces.numpy()[0, :3], -particle_force.sum(axis=0), rtol=2e-5, atol=1e-5
-                    )
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device, dynamic=True, isolated_particle=True)
+                state = model.state()
+                pipeline.collide(state, solver.contacts)
+                solver._refresh_body_particle_contact_state(solver.contacts, True)
+                solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+                self.assertGreater(float(solver._esp_energy.numpy().sum()), 0.0)
+                self.assertEqual(float(solver._esp_data.soft_vertex_quadrature_weight.numpy()[-1]), 1.0)
+                solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
+                particle_force = solver._esp_particle_forces.numpy().copy()
+                solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS)
+                solver.check_esp_contacts()
+                self.assertGreater(particle_force[-1, 2], 0.0)
+                np.testing.assert_allclose(
+                    solver._esp_body_forces.numpy()[0, :3], -particle_force.sum(axis=0), rtol=2e-5, atol=1e-5
+                )
 
     def test_point_weights_and_interior_exclusion(self):
         """Use unit point weights and exclude solid interiors, including friction/damping.
@@ -663,101 +690,96 @@ class TestVbdEsp(unittest.TestCase):
         its row: zero force must follow from the policy, not from a missing row.
         """
         for device in wp.get_devices():
-            for precision in ("float32", "float64"):
-                for kind in ("particle", "spring", "edge", "interior"):
-                    with self.subTest(device=str(device), precision=precision, kind=kind), wp.ScopedDevice(device):
-                        model, pipeline, solver = make_point_contact_case(device, kind, precision=precision)
-                        state = model.state()
-                        pipeline.collide(state, solver.contacts)
-                        solver._refresh_body_particle_contact_state(solver.contacts, True)
-                        count = int(solver.contacts.soft_contact_count.numpy()[0])
-                        self.assertGreater(count, 0)
-                        self.assertLessEqual(count, solver.contacts.soft_contact_max)
-                        indices_np = solver.contacts.soft_contact_rigid_indices.numpy().copy()
-                        soft_indices_np = solver.contacts.soft_contact_indices.numpy()
-                        point_rows = (indices_np[:count, 2] >= 0) & (soft_indices_np[:count, 0] == 0)
-                        self.assertTrue(point_rows.any())
-                        weights = solver._esp_data.soft_vertex_quadrature_weight.numpy()
+            for kind in ("particle", "spring", "edge", "interior"):
+                with self.subTest(device=str(device), kind=kind), wp.ScopedDevice(device):
+                    model, pipeline, solver = make_point_contact_case(device, kind)
+                    state = model.state()
+                    pipeline.collide(state, solver.contacts)
+                    solver._refresh_body_particle_contact_state(solver.contacts, True)
+                    count = int(solver.contacts.soft_contact_count.numpy()[0])
+                    self.assertGreater(count, 0)
+                    self.assertLessEqual(count, solver.contacts.soft_contact_max)
+                    indices_np = solver.contacts.soft_contact_rigid_indices.numpy().copy()
+                    soft_indices_np = solver.contacts.soft_contact_indices.numpy()
+                    point_rows = (indices_np[:count, 2] >= 0) & (soft_indices_np[:count, 0] == 0)
+                    self.assertTrue(point_rows.any())
+                    weights = solver._esp_data.soft_vertex_quadrature_weight.numpy()
+                    if kind == "interior":
+                        self.assertEqual(weights[0], 0.0)
+                        self.assertTrue(np.all(weights[1:] > 0.0))
+                        self.assertNotIn(0, model.tri_indices.numpy())
+                        # Isolate vertex 0's raw rows, including its native
+                        # damping rows, and check its rigid reaction too.
+                        indices_np[:count][~point_rows] = -1
+                        solver.contacts.soft_contact_rigid_indices.assign(indices_np)
+                        mask = solver.contacts.soft_contact_force_mask.numpy().copy()
+                        mask[:count] &= point_rows
+                        solver.contacts.soft_contact_force_mask.assign(mask)
+                    else:
+                        self.assertEqual(model.tri_count, 0)
+                        np.testing.assert_array_equal(weights, 1.0)
+                    solver.particle_q_prev.assign(state.particle_q.numpy() - np.array([0.001, 0, -0.001], np.float32))
+                    solver.body_q_prev.assign(state.body_q)
+
+                    def evaluate(solver=solver, state=state):
+                        solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+                        solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
+                        solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS, dt=0.01)
+
+                    evaluate()
+                    solver.check_esp_contacts()
+                    arrays = [
+                        solver._esp_energy,
+                        solver._esp_particle_forces,
+                        solver._esp_particle_hessians,
+                        solver._esp_body_forces,
+                        solver._esp_body_hessians,
+                    ]
+                    expected = [array.numpy().copy() for array in arrays]
+                    for value in expected:
+                        self.assertTrue(np.isfinite(value).all())
                         if kind == "interior":
-                            self.assertEqual(weights[0], 0.0)
-                            self.assertTrue(np.all(weights[1:] > 0.0))
-                            self.assertNotIn(0, model.tri_indices.numpy())
-                            # Isolate vertex 0's raw rows, including its native
-                            # damping rows, and check its rigid reaction too.
-                            indices_np[:count][~point_rows] = -1
-                            solver.contacts.soft_contact_rigid_indices.assign(indices_np)
-                            mask = solver.contacts.soft_contact_force_mask.numpy().copy()
-                            mask[:count] &= point_rows
-                            solver.contacts.soft_contact_force_mask.assign(mask)
-                        else:
-                            self.assertEqual(model.tri_count, 0)
-                            np.testing.assert_array_equal(weights, 1.0)
-                        solver.particle_q_prev.assign(
-                            state.particle_q.numpy() - np.array([0.001, 0, -0.001], np.float32)
+                            np.testing.assert_array_equal(value, 0.0)
+                    if kind != "interior":
+                        self.assertGreater(expected[0].sum(), 0.0)
+                        self.assertTrue(np.all(expected[1][:, 2] > 0))
+                        self.assertTrue(np.all(expected[1][:, 0] < 0), "Point samples receive ESP friction")
+                        np.testing.assert_allclose(expected[3][0, :3], -expected[1].sum(axis=0), rtol=3e-5, atol=1e-4)
+                        # Inside one top face and outside every edge's support,
+                        # the unit-weight energy is exactly k*b(z/support).
+                        ratio = float(state.particle_q.numpy()[0, 2]) / float(model.particle_radius.numpy()[0])
+                        energy = model.particle_count * 1000.0 * -((1.0 - ratio) ** 2) * np.log(ratio)
+                        np.testing.assert_allclose(expected[0].sum(), energy, rtol=2e-5)
+                        support = float(model.particle_radius.numpy()[0])
+                        gap = 1.0 - ratio
+                        first = (2.0 * gap * np.log(ratio) - gap * gap / ratio) / support
+                        second = (-2.0 * np.log(ratio) + 4.0 * gap / ratio + gap * gap / ratio**2) / support**2
+                        solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
+                        normal_force = np.zeros((model.particle_count, 3))
+                        normal_force[:, 2] = -1000.0 * first
+                        normal_hessian = np.zeros((model.particle_count, 3, 3))
+                        normal_hessian[:, 2, 2] = 1000.0 * second
+                        np.testing.assert_allclose(
+                            solver._esp_particle_forces.numpy(), normal_force, rtol=2e-5, atol=1e-5
                         )
-                        solver.body_q_prev.assign(state.body_q)
-
-                        def evaluate(solver=solver, state=state):
-                            solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
-                            solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
-                            solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS, dt=0.01)
-
-                        evaluate()
+                        np.testing.assert_allclose(
+                            solver._esp_particle_hessians.numpy(), normal_hessian, rtol=2e-5, atol=1e-5
+                        )
+                    if device.is_cuda:
+                        with wp.ScopedCapture(device=device) as capture:
+                            evaluate()
+                        wp.capture_launch(capture.graph)
                         solver.check_esp_contacts()
-                        arrays = [
-                            solver._esp_energy,
-                            solver._esp_particle_forces,
-                            solver._esp_particle_hessians,
-                            solver._esp_body_forces,
-                            solver._esp_body_hessians,
-                        ]
-                        expected = [array.numpy().copy() for array in arrays]
-                        for value in expected:
-                            self.assertTrue(np.isfinite(value).all())
-                            if kind == "interior":
-                                np.testing.assert_array_equal(value, 0.0)
-                        if kind != "interior":
-                            self.assertGreater(expected[0].sum(), 0.0)
-                            self.assertTrue(np.all(expected[1][:, 2] > 0))
-                            self.assertTrue(np.all(expected[1][:, 0] < 0), "Point samples receive ESP friction")
-                            np.testing.assert_allclose(
-                                expected[3][0, :3], -expected[1].sum(axis=0), rtol=3e-5, atol=1e-4
-                            )
-                            # Inside one top face and outside every edge's support,
-                            # the unit-weight energy is exactly k*b(z/support).
-                            ratio = float(state.particle_q.numpy()[0, 2]) / float(model.particle_radius.numpy()[0])
-                            energy = model.particle_count * 1000.0 * -((1.0 - ratio) ** 2) * np.log(ratio)
-                            np.testing.assert_allclose(expected[0].sum(), energy, rtol=2e-5)
-                            support = float(model.particle_radius.numpy()[0])
-                            gap = 1.0 - ratio
-                            first = (2.0 * gap * np.log(ratio) - gap * gap / ratio) / support
-                            second = (-2.0 * np.log(ratio) + 4.0 * gap / ratio + gap * gap / ratio**2) / support**2
-                            solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
-                            normal_force = np.zeros((model.particle_count, 3))
-                            normal_force[:, 2] = -1000.0 * first
-                            normal_hessian = np.zeros((model.particle_count, 3, 3))
-                            normal_hessian[:, 2, 2] = 1000.0 * second
-                            np.testing.assert_allclose(
-                                solver._esp_particle_forces.numpy(), normal_force, rtol=2e-5, atol=1e-5
-                            )
-                            np.testing.assert_allclose(
-                                solver._esp_particle_hessians.numpy(), normal_hessian, rtol=2e-5, atol=1e-5
-                            )
-                        if device.is_cuda:
-                            with wp.ScopedCapture(device=device) as capture:
-                                evaluate()
-                            wp.capture_launch(capture.graph)
-                            solver.check_esp_contacts()
-                            for array, reference in zip(arrays, expected, strict=True):
-                                np.testing.assert_allclose(array.numpy(), reference, rtol=3e-5, atol=1e-4)
-                        if kind != "interior":
-                            initial_z = state.particle_q.numpy()[0, 2].copy()
-                            out = model.state()
-                            solver.step(state, out, None, None, 1e-4)
-                            solver.check_esp_contacts()
-                            self.assertTrue(np.isfinite(out.particle_q.numpy()).all())
-                            self.assertTrue(np.isfinite(out.body_q.numpy()).all())
-                            self.assertGreater(out.particle_q.numpy()[0, 2], initial_z)
+                        for array, reference in zip(arrays, expected, strict=True):
+                            np.testing.assert_allclose(array.numpy(), reference, rtol=3e-5, atol=1e-4)
+                    if kind != "interior":
+                        initial_z = state.particle_q.numpy()[0, 2].copy()
+                        out = model.state()
+                        solver.step(state, out, None, None, 1e-4)
+                        solver.check_esp_contacts()
+                        self.assertTrue(np.isfinite(out.particle_q.numpy()).all())
+                        self.assertTrue(np.isfinite(out.body_q.numpy()).all())
+                        self.assertGreater(out.particle_q.numpy()[0, 2], initial_z)
 
     def test_interior_vertex_keeps_analytical_contact(self):
         """Exclude interior vertices from mesh forces without changing ground contact."""
@@ -879,7 +901,7 @@ class TestVbdEsp(unittest.TestCase):
     def test_rigid_adjacency_matches_standard_builder(self):
         """Match the standard adjacency tables and keep them on the requested device.
 
-        Include a closed box and an open two-triangle patch, on both devices/precisions.
+        Include a closed box and an open two-triangle patch, on both devices.
         The soft topology-sharing test separately checks model-owned aliases.
         """
         box = newton.Mesh.create_box(0.05, duplicate_vertices=False)
@@ -891,53 +913,167 @@ class TestVbdEsp(unittest.TestCase):
             ),
         )
         for device in wp.get_devices():
-            for scalar in (wp.float32, wp.float64):
-                for vertices_np, tri_indices_np in meshes:
-                    with (
-                        self.subTest(device=str(device), scalar=scalar, triangles=len(tri_indices_np)),
-                        wp.ScopedDevice(device),
+            scalar = wp.float32
+            for vertices_np, tri_indices_np in meshes:
+                with (
+                    self.subTest(device=str(device), scalar=scalar, triangles=len(tri_indices_np)),
+                    wp.ScopedDevice(device),
+                ):
+                    builder = newton.ModelBuilder()
+                    builder.add_shape_mesh(
+                        -1,
+                        mesh=newton.Mesh(vertices_np, tri_indices_np.ravel(), compute_inertia=False),
+                    )
+                    builder.add_particle(pos=wp.vec3(0, 0, 0.06), vel=wp.vec3(), mass=1.0, radius=0.005)
+                    model = builder.finalize()
+                    pipeline = newton.CollisionPipeline(
+                        model,
+                        enable_rigid_soft_full_surface_contact=True,
+                        full_surface_contact_return_unfiltered=True,
+                    )
+                    kernels = esp_contact
+                    data = kernels.create_esp_data(model, pipeline)
+                    rigid_tri_indices_np = data.rigid_tri_indices.numpy()
+                    rigid_local_positions_np = data.rigid_local_positions.numpy()
+                    # Compact vertex numbering may differ; triangle corner positions must not.
+                    np.testing.assert_array_equal(
+                        rigid_local_positions_np[rigid_tri_indices_np], vertices_np[tri_indices_np]
+                    )
+                    reference = MeshAdjacency(rigid_tri_indices_np)
+                    reference.init_vertex_adjacency(len(rigid_local_positions_np))
+                    np.testing.assert_array_equal(
+                        data.rigid_edge_vertex_indices.numpy(), reference.edge_indices[:, 2:4]
+                    )
+                    for name in (
+                        "tri_edge_indices",
+                        "edge_tri_indices",
+                        "v_adj_edges",
+                        "v_adj_edges_offsets",
+                        "v_adj_tris",
+                        "v_adj_tris_offsets",
+                        "v_adj_springs",
+                        "v_adj_springs_offsets",
+                        "v_adj_tets",
+                        "v_adj_tets_offsets",
                     ):
-                        builder = newton.ModelBuilder()
-                        builder.add_shape_mesh(
-                            -1,
-                            mesh=newton.Mesh(vertices_np, tri_indices_np.ravel(), compute_inertia=False),
-                        )
-                        builder.add_particle(pos=wp.vec3(0, 0, 0.06), vel=wp.vec3(), mass=1.0, radius=0.005)
-                        model = builder.finalize()
-                        pipeline = newton.CollisionPipeline(
-                            model,
-                            enable_rigid_soft_full_surface_contact=True,
-                            full_surface_contact_return_unfiltered=True,
-                        )
-                        kernels = esp_contact.get_esp_kernels(scalar)
-                        data = kernels.create_esp_data(model, pipeline)
-                        rigid_tri_indices_np = data.rigid_tri_indices.numpy()
-                        rigid_local_positions_np = data.rigid_local_positions.numpy()
-                        # Compact vertex numbering may differ; triangle corner positions must not.
-                        np.testing.assert_array_equal(
-                            rigid_local_positions_np[rigid_tri_indices_np], vertices_np[tri_indices_np]
-                        )
-                        reference = MeshAdjacency(rigid_tri_indices_np)
-                        reference.init_vertex_adjacency(len(rigid_local_positions_np))
-                        np.testing.assert_array_equal(
-                            data.rigid_edge_vertex_indices.numpy(), reference.edge_indices[:, 2:4]
-                        )
-                        for name in (
-                            "tri_edge_indices",
-                            "edge_tri_indices",
-                            "v_adj_edges",
-                            "v_adj_edges_offsets",
-                            "v_adj_tris",
-                            "v_adj_tris_offsets",
-                            "v_adj_springs",
-                            "v_adj_springs_offsets",
-                            "v_adj_tets",
-                            "v_adj_tets_offsets",
-                        ):
-                            actual = getattr(data.rigid_adjacency, name)
-                            self.assertIsNotNone(actual, name)
-                            self.assertEqual(actual.device, device)
-                            np.testing.assert_array_equal(actual.numpy(), getattr(reference, name))
+                        actual = getattr(data.rigid_adjacency, name)
+                        self.assertIsNotNone(actual, name)
+                        self.assertEqual(actual.device, device)
+                        np.testing.assert_array_equal(actual.numpy(), getattr(reference, name))
+
+    def test_row_selection_and_zero_weights(self):
+        """Preserve skipped rows, zero weights/materials and damping order."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device, dynamic=True, grid=True, grid_extent=0.06, gap=0.00012)
+                model.soft_contact_ke = 0.0
+                state = model.state()
+                pipeline.collide(state, solver.contacts)
+                solver._refresh_body_particle_contact_state(solver.contacts, True)
+                solver.particle_q_prev.assign(state.particle_q.numpy() + np.array([0, 0, 0.001], np.float32))
+                solver.body_q_prev.assign(state.body_q)
+                solver.body_particle_contact_material_kd.fill_(5.0)
+                contacts, data = solver.contacts, solver._esp_data
+                fields = (
+                    "soft_contact_indices",
+                    "soft_contact_rigid_indices",
+                    "soft_contact_primitive_index",
+                    "soft_contact_rigid_primitive_index",
+                )
+                original = {name: getattr(contacts, name).numpy().copy() for name in fields}
+                rows_np = contact_primitive_indices_np(contacts, data)
+                vertex_weight_np = data.soft_vertex_quadrature_weight.numpy().copy()
+                edge_area_np = data.soft_edge_area.numpy().copy()
+                radii_np = model.particle_radius.numpy().copy()
+                cases = (
+                    "active",
+                    "skipped",
+                    "missing_soft_id",
+                    "missing_rigid_id",
+                    "malformed_layout",
+                    "zero_stiffness",
+                    "zero_support",
+                    "zero_weight",
+                )
+                for family in (0, 1, 2):
+                    selected_np = np.zeros(contacts.soft_contact_max, dtype=bool)
+                    selected_np[: len(rows_np)] = rows_np[:, 0] == family
+                    self.assertTrue(selected_np.any())
+                    for case in cases:
+                        # TV has a rigid source weight, not the soft-vertex/edge exclusions under test.
+                        if case == "zero_weight" and family == 1:
+                            continue
+                        for name, values_np in original.items():
+                            getattr(contacts, name).assign(values_np)
+                        rigid_indices_np = original["soft_contact_rigid_indices"].copy()
+                        rigid_indices_np[~selected_np] = -1
+                        if case == "skipped":
+                            rigid_indices_np[selected_np] = -1  # Analytical/SDF or EE_DEPTH metadata.
+                        elif case == "malformed_layout":
+                            rigid_indices_np[selected_np] = (0, -1, -1) if family == 0 else (0, 1, 2)
+                        contacts.soft_contact_rigid_indices.assign(rigid_indices_np)
+                        contacts.soft_contact_force_mask.assign(selected_np)
+                        if case in ("missing_soft_id", "missing_rigid_id"):
+                            name = (
+                                "soft_contact_primitive_index"
+                                if case == "missing_soft_id"
+                                else "soft_contact_rigid_primitive_index"
+                            )
+                            ids_np = original[name].copy()
+                            ids_np[selected_np] = -1
+                            getattr(contacts, name).assign(ids_np)
+                        data.soft_vertex_quadrature_weight.assign(vertex_weight_np)
+                        data.soft_edge_area.assign(edge_area_np)
+                        model.particle_radius.assign(radii_np)
+                        model.shape_margin.zero_()
+                        model.shape_material_ke.fill_(1000.0)
+                        if case == "zero_weight":
+                            if family == 0:
+                                data.soft_vertex_quadrature_weight.zero_()
+                            else:
+                                self.assertGreater(float(data.rigid_edge_area.numpy().max()), 0.0)
+                                data.soft_edge_area.zero_()
+                        if case == "zero_support":
+                            model.particle_radius.zero_()
+                        if case == "zero_stiffness":
+                            model.shape_material_ke.zero_()
+                        expected_error = 0
+                        if case in ("missing_soft_id", "missing_rigid_id", "malformed_layout"):
+                            expected_error = 8
+                        for dt in (0.0, 0.01):
+                            for kind in (
+                                esp_contact._ENERGY_ONLY,
+                                esp_contact._PARTICLE_BLOCKS,
+                                esp_contact._BODY_BLOCKS,
+                            ):
+                                with self.subTest(device=str(device), family=family, case=case, dt=dt, kind=kind):
+                                    solver._esp_error.zero_()
+                                    solver._accumulate_esp_contacts(
+                                        state,
+                                        kind,
+                                        partitions=8 if device.is_cuda and kind == esp_contact._PARTICLE_BLOCKS else 1,
+                                        dt=dt,
+                                    )
+                                    self.assertEqual(int(solver._esp_error.numpy()[0]), expected_error)
+                                    if kind == esp_contact._ENERGY_ONLY:
+                                        outputs = (solver._esp_energy,)
+                                    elif kind == esp_contact._PARTICLE_BLOCKS:
+                                        outputs = (solver._esp_particle_forces, solver._esp_particle_hessians)
+                                    else:
+                                        outputs = (solver._esp_body_forces, solver._esp_body_hessians)
+                                    expect_nonzero = case == "active"
+                                    if dt > 0 and kind != esp_contact._ENERGY_ONLY:
+                                        # Damping precedes row exclusion, but excludes interior vertices itself.
+                                        expect_nonzero |= case != "zero_support" and not (
+                                            family == 0 and case == "zero_weight"
+                                        )
+                                    for output in outputs:
+                                        values_np = output.numpy()
+                                        self.assertTrue(np.isfinite(values_np).all())
+                                        if expect_nonzero:
+                                            self.assertGreater(float(np.linalg.norm(values_np)), 0.0)
+                                        else:
+                                            np.testing.assert_array_equal(values_np, 0.0)
 
     def test_material_support_and_stiffness(self):
         """Use local primitive radii and each rigid shape's margin and material.
@@ -1022,7 +1158,7 @@ class TestVbdEsp(unittest.TestCase):
                 solver.contacts.soft_contact_rigid_indices.assign(rigid_indices_np)
                 for got, want in zip(actual, expected, strict=True):
                     scale = max(np.abs(want).max(), 1e-12)
-                    np.testing.assert_allclose(got / scale, want / scale, rtol=0, atol=2e-10)
+                    np.testing.assert_allclose(got / scale, want / scale, rtol=0, atol=2e-5)
 
                 graph = None
                 if device.is_cuda:
@@ -1039,7 +1175,7 @@ class TestVbdEsp(unittest.TestCase):
                 esp.check()
                 for output, before in zip((esp.energy, esp.force, esp.hessian), actual, strict=True):
                     scale = max(np.abs(before).max(), 1e-12)
-                    np.testing.assert_allclose(output.numpy() / scale, 2 * before / scale, rtol=0, atol=2e-10)
+                    np.testing.assert_allclose(output.numpy() / scale, 2 * before / scale, rtol=0, atol=2e-5)
 
                 # At 7 mm, the first pair's maximum support is 5 mm; the second
                 # pair has contributing rows with supports up to 10 mm.
@@ -1194,8 +1330,8 @@ class TestVbdEsp(unittest.TestCase):
             with self.subTest(device=str(device)), wp.ScopedDevice(device):
                 selected = np.arange(0, len(raw), 2, dtype=np.int32)
                 ids = wp.array(selected, dtype=int)
-                source_hessian = wp.array(raw, dtype=wp.float64)
-                source_force = wp.zeros((len(raw), 6), dtype=wp.float64)
+                source_hessian = wp.array(raw, dtype=wp.float32)
+                source_force = wp.zeros((len(raw), 6), dtype=wp.float32)
                 error = wp.zeros(1, dtype=int)
                 for size in (3, 6):
                     forces = [wp.zeros(len(raw), dtype=wp.vec3) for _ in range(size // 3)]
@@ -1474,6 +1610,7 @@ class TestVbdEsp(unittest.TestCase):
                             block_kind,
                             color=-1,
                             *,
+                            partitions=1,
                             refresh_rigid_positions=True,
                             dt=0.0,
                             solver=solver,

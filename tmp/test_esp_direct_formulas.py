@@ -15,13 +15,17 @@ import numpy as np
 import warp as wp
 from esp_chain_solver_reference import make_esp_derivative_functions
 
-from newton._src.solvers.vbd.esp_contact import make_direct_contact_formulas
+from newton._src.solvers.vbd.esp_contact import body_triangle, particle_triangle
 
 
-def make_comparison_kernel(size, kind, direct, scalar=wp.float64):
-    """Select production direct formulas or saved chain math, with the same inputs."""
+def make_comparison_kernel(size, kind, direct, scalar=wp.float32):
+    """Compare production FP32 with chain math; FP64 direct is an archived reference."""
     vec3 = wp.types.vector(length=3, dtype=scalar)
-    direct_particle, direct_body = make_direct_contact_formulas(scalar)
+    direct_particle, direct_body = particle_triangle, body_triangle
+    if direct and scalar == wp.float64:
+        from esp_direct_formulas import make_direct_contact_formulas  # noqa: PLC0415
+
+        direct_particle, direct_body = make_direct_contact_formulas(scalar)
     create_point, current_triangle, *_ = make_esp_derivative_functions(size, scalar)
 
     @wp.kernel(module="unique", enable_backward=False)
@@ -163,9 +167,13 @@ class TestEspDirectFormulas(unittest.TestCase):
                     rows = [
                         (name, points, moving)
                         for name, points in cases()
+                        # This saved chain reference predates the Taylor
+                        # continuation. The sub-threshold permutation fixtures
+                        # are checked against the current Torch energy below.
+                        if not name.startswith("permuted")
                         for moving in (range(4) if size == 3 else (0,))
                     ]
-                    for scalar in (wp.float64, wp.float32):
+                    for scalar in (wp.float32,):
                         # FP32 chain-rule arithmetic loses accuracy on the thin
                         # fixtures. Compare to FP64, not to that known loss of
                         # accuracy. The independent Torch check below includes
@@ -202,7 +210,11 @@ class TestEspDirectFormulas(unittest.TestCase):
 
         with wp.ScopedDevice("cpu"):
             kernel = make_comparison_kernel(3, 0, True)
-            for name, positions in cases()[:8] + [case for case in cases() if case[0].startswith(("permuted", "thin"))]:
+            reference_kernel = make_comparison_kernel(3, 0, False, wp.float64)
+            for name, positions_np in cases()[:8] + [
+                case for case in cases() if case[0].startswith(("permuted", "thin"))
+            ]:
+                positions = positions_np.astype(np.float32).astype(np.float64)
                 for moving in range(4):
 
                     def energy(displacement, positions=positions, moving=moving):
@@ -213,25 +225,30 @@ class TestEspDirectFormulas(unittest.TestCase):
                     expected = energy_derivatives(energy, np.zeros(3))
                     e, g, h = evaluate(kernel, [positions], [moving], 3)
                     with self.subTest(case=name, moving=moving):
-                        np.testing.assert_allclose(e[0], expected[0], rtol=1e-10, atol=1e-12)
+                        np.testing.assert_allclose(e[0], expected[0], rtol=3e-5, atol=1e-7)
                         for actual, reference in ((g[0], -expected[1]), (h[0], expected[2])):
                             scale = max(np.max(np.abs(reference)), 1.0)
-                            np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-8)
-                        # Fixed micrometre FD steps cross branches of the thin
-                        # faces and near-edge permutations. Those fixtures use
-                        # the independent Torch derivatives above instead.
-                        for step in () if name.startswith(("thin", "permuted")) else (1e-6, 3e-7):
+                            np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=3e-5)
+                        # Differentiate FP64 reference values to avoid FP32
+                        # subtraction noise. Production is independently checked
+                        # against Torch above. Thin/near-edge fixtures can cross
+                        # branches at these steps and use selected-branch AD only.
+                        for step in () if name.startswith(("thin", "permuted")) else (3e-7, 1e-7):
                             for axis in range(3):
                                 plus, minus = positions.copy(), positions.copy()
                                 plus[moving, axis] += step
                                 minus[moving, axis] -= step
-                                ep, gp, _ = evaluate(kernel, [plus], [moving], 3)
-                                em, gm, _ = evaluate(kernel, [minus], [moving], 3)
+                                ep, gp, _ = evaluate(reference_kernel, [plus], [moving], 3)
+                                em, gm, _ = evaluate(reference_kernel, [minus], [moving], 3)
                                 np.testing.assert_allclose(
-                                    (ep[0] - em[0]) / (2 * step), g[0, axis], rtol=2e-6, atol=2e-7
+                                    (ep[0] - em[0]) / (2 * step), g[0, axis], rtol=3e-5, atol=3e-5
                                 )
+                                scale = max(float(np.max(np.abs(h[0]))), 1.0)
                                 np.testing.assert_allclose(
-                                    (gp[0] - gm[0]) / (2 * step), h[0, :, axis], rtol=2e-6, atol=2e-6
+                                    (gp[0] - gm[0]) / (2 * step) / scale,
+                                    h[0, :, axis] / scale,
+                                    rtol=0,
+                                    atol=3e-5,
                                 )
 
     def test_independent_body_derivatives(self):
@@ -266,7 +283,7 @@ class TestEspDirectFormulas(unittest.TestCase):
                             (e[0], g[0], h[0]), (expected[0], -expected[1], expected[2]), strict=True
                         ):
                             scale = max(np.max(np.abs(reference)), 1.0)
-                            np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-8)
+                            np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=3e-5)
 
 
 if __name__ == "__main__":
