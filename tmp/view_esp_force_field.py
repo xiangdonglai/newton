@@ -166,6 +166,9 @@ def evaluate_contacts(
     stiffness: float,
     compute_hessian: bool,
     use_direct_formulas: bool,
+    esp_row_forces: wp.array2d[float],
+    esp_row_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
     energy: wp.array2d[wp.float64],
     forces: wp.array2d[wp.vec3d],
     row_counts: wp.array2d[int],
@@ -219,7 +222,7 @@ def evaluate_contacts(
         tri_indices, tri_edge_indices, edge_tri_indices, vertex_term_coefficient, face
     )
     if use_direct_formulas:
-        value32, gradient32, hessian32 = particle_triangle(
+        value32 = particle_triangle(
             wp.vec3(particle_q64[particle]),
             wp.vec3(target_positions[triangle_vertex_indices[0]]),
             wp.vec3(target_positions[triangle_vertex_indices[1]]),
@@ -230,7 +233,19 @@ def evaluate_contacts(
             support,
             support,
             False,
+            row,
+            1.0,
+            esp_row_forces,
+            esp_row_hessians,
+            esp_error,
         )
+        # Each thread owns its row: read the production evaluator's output
+        # before summing in float64, as in the original comparison viewer.
+        gradient32, hessian32 = wp.vec3(), wp.mat33()
+        for i in range(3):
+            gradient32[i] = -esp_row_forces[row, i]
+            for j in range(3):
+                hessian32[i, j] = esp_row_hessians[row, i, j]
         value, gradient, hessian = wp.float64(value32), wp.vec3d(gradient32), wp.mat33d(hessian32)
     else:
         # Explicitly selected historical reference; the default above calls
@@ -251,7 +266,9 @@ def evaluate_contacts(
     wp.atomic_add(energy, 0, particle, coefficient * value)
     if soft_contact_force_mask[row]:
         # Zero feature weights leave only the existing triangle barrier law.
-        value32, gradient32, _h = particle_triangle(
+        # The second half of the row buffers holds the face-only OGC result.
+        ogc_row = row + soft_contact_indices.shape[0]
+        value32 = particle_triangle(
             wp.vec3(particle_q64[particle]),
             wp.vec3(target_positions[triangle_vertex_indices[0]]),
             wp.vec3(target_positions[triangle_vertex_indices[1]]),
@@ -262,8 +279,14 @@ def evaluate_contacts(
             support,
             support,
             False,
+            ogc_row,
+            1.0,
+            esp_row_forces,
+            esp_row_hessians,
+            esp_error,
         )
-        ogc_force = -coefficient * wp.vec3d(gradient32)
+        for i in range(3):
+            ogc_force[i] = coefficient * wp.float64(esp_row_forces[ogc_row, i])
         wp.atomic_add(energy, 1, particle, coefficient * wp.float64(value32))
     wp.atomic_add(forces, 0, particle, esp_force)
     wp.atomic_add(forces, 1, particle, ogc_force)
@@ -307,6 +330,11 @@ class ForceProbe:
             self.row_counts = wp.zeros((2, particle_count), dtype=int)
             self.distances = wp.empty(particle_count, dtype=float)
             self.hessians = wp.zeros(particle_count, dtype=wp.mat33d)
+            # Production evaluators accumulate FP32 force/Hessian. Keep each
+            # row separate here to preserve the viewer's float64 summation.
+            self.esp_row_forces = wp.zeros((2 * self.contacts.soft_contact_max, 3), dtype=float)
+            self.esp_row_hessians = wp.zeros((2 * self.contacts.soft_contact_max, 3, 3), dtype=float)
+            self.esp_error = wp.zeros(1, dtype=int)
 
     def evaluate(self, particle_q_np, support, stiffness=100.0, *, compute_hessian=False):
         particle_q_np = np.asarray(particle_q_np, dtype=np.float32).reshape(-1, 3)
@@ -325,6 +353,9 @@ class ForceProbe:
             self.forces.zero_()
             self.row_counts.zero_()
             self.distances.fill_(np.inf)
+            self.esp_row_forces.zero_()
+            self.esp_row_hessians.zero_()
+            self.esp_error.zero_()
             if compute_hessian:
                 self.hessians.zero_()
             wp.launch(
@@ -349,11 +380,22 @@ class ForceProbe:
                     compute_hessian,
                     self.use_direct_formulas,
                 ],
-                outputs=[self.energy, self.forces, self.row_counts, self.distances, self.hessians],
+                outputs=[
+                    self.esp_row_forces,
+                    self.esp_row_hessians,
+                    self.esp_error,
+                    self.energy,
+                    self.forces,
+                    self.row_counts,
+                    self.distances,
+                    self.hessians,
+                ],
             )
         # CPU .numpy() can alias the reusable buffers. Keep each probe result
         # unchanged when the next frame (or finite-difference test) evaluates.
         energy, forces = self.energy.numpy().copy(), self.forces.numpy().copy()
+        if self.esp_error.numpy()[0] != 0:
+            energy[:2] = np.nan  # A failed derivative must not look like zero force.
         forces[~np.isfinite(energy)] = np.nan
         return energy, forces, self.row_counts.numpy().copy(), self.distances.numpy().copy()
 

@@ -14,7 +14,7 @@ There are no derivative-point objects in these kernels or their math calls.
 from copy import copy
 
 import warp as wp
-from esp_chain_solver_reference import EspContactData
+from esp_chain_solver_reference import EspContactData, accumulate_body_block, accumulate_particle_block
 from esp_direct_ee_per_triangle_reference import make_direct_ee_formulas
 from esp_direct_formulas import make_direct_contact_formulas
 
@@ -169,7 +169,7 @@ def accumulate_particle_contact_derivatives(
             near,
             False,
         )
-        shared.accumulate_particle_block(
+        accumulate_particle_block(
             force, hessian, particle, stiffness * data.soft_vertex_weight[particle], e, g, h, error
         )
     elif family == 1:
@@ -192,7 +192,7 @@ def accumulate_particle_contact_derivatives(
                 near,
                 False,
             )
-            shared.accumulate_particle_block(
+            accumulate_particle_block(
                 force, hessian, particle, stiffness * data.rigid_vertex_area[row[2]], e, g, h, error
             )
     else:
@@ -209,7 +209,7 @@ def accumulate_particle_contact_derivatives(
             e, g, h = ee_particle_source(
                 row, particle, data, particle_q, rigid_positions, lists, support, near, partition, partitions
             )
-            shared.accumulate_particle_block(force, hessian, particle, stiffness, e, g, h, error)
+            accumulate_particle_block(force, hessian, particle, stiffness, e, g, h, error)
         # Target-only particles cannot move q_bar or w. Use the simpler direct
         # triangle block and do not count source endpoints for a second time.
         soft_mesh = data.soft.vertex_mesh[soft_edge[0]]
@@ -238,7 +238,7 @@ def accumulate_particle_contact_derivatives(
                     near,
                     True,
                 )
-                shared.accumulate_particle_block(
+                accumulate_particle_block(
                     force, hessian, particle, stiffness * weight * data.rigid_edge_area[row[2]], e, g, h, error
                 )
 
@@ -377,7 +377,7 @@ def accumulate_body_contact_derivatives(
             return
         e, g, h = ee_body(row, com, data, particle_q, rigid_positions, lists, support, near)
         scale = wp.float64(1.0)
-    shared.accumulate_body_block(force, hessian, body, stiffness * scale, e, g, h, error)
+    accumulate_body_block(force, hessian, body, stiffness * scale, e, g, h, error)
 
 
 def launch_contact_blocks(

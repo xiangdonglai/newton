@@ -18,9 +18,11 @@ from esp_chain_solver_reference import make_esp_derivative_functions
 from newton._src.solvers.vbd.esp_contact import body_triangle, particle_triangle
 
 
-def make_comparison_kernel(size, kind, direct, scalar=wp.float32):
+def make_comparison_kernel(size, kind, direct, scalar=wp.float32, scale=1.0):
     """Compare production FP32 with chain math; FP64 direct is an archived reference."""
     vec3 = wp.types.vector(length=3, dtype=scalar)
+    vector = wp.types.vector(length=size, dtype=scalar)
+    matrix = wp.types.matrix(shape=(size, size), dtype=scalar)
     direct_particle, direct_body = particle_triangle, body_triangle
     if direct and scalar == wp.float64:
         from esp_direct_formulas import make_direct_contact_formulas  # noqa: PLC0415
@@ -36,6 +38,9 @@ def make_comparison_kernel(size, kind, direct, scalar=wp.float32):
         energy: wp.array[wp.float64],
         gradient: wp.array2d[wp.float64],
         hessian: wp.array3d[wp.float64],
+        production_forces: wp.array2d[float],
+        production_hessians: wp.array3d[float],
+        error: wp.array[int],
     ):
         row = wp.tid()
         point, a, b, c = (
@@ -48,7 +53,50 @@ def make_comparison_kernel(size, kind, direct, scalar=wp.float32):
         vertex_weights = vec3(scalar(0.2), scalar(0.25), scalar(0.2))
         com = vec3(scalar(0.01), scalar(-0.02), scalar(-0.03))
         moving = moving_vertices[row]
-        if wp.static(direct):
+        if wp.static(direct and scalar == wp.float32):
+            if wp.static(size == 3):
+                e = direct_particle(
+                    point,
+                    a,
+                    b,
+                    c,
+                    moving,
+                    edge_weights,
+                    vertex_weights,
+                    1.0,
+                    0.15,
+                    near_only,
+                    row,
+                    scale,
+                    production_forces,
+                    production_hessians,
+                    error,
+                )
+            else:
+                e = direct_body(
+                    point,
+                    a,
+                    b,
+                    c,
+                    com,
+                    wp.static(kind == 0),
+                    edge_weights,
+                    vertex_weights,
+                    1.0,
+                    0.15,
+                    near_only,
+                    row,
+                    scale,
+                    production_forces,
+                    production_hessians,
+                    error,
+                )
+            g, h = vector(), matrix()
+            for i in range(size):
+                g[i] = -production_forces[row, i]
+                for j in range(size):
+                    h[i, j] = production_hessians[row, i, j]
+        elif wp.static(direct):
             if wp.static(size == 3):
                 e, g, h = direct_particle(
                     point, a, b, c, moving, edge_weights, vertex_weights, scalar(1.0), scalar(0.15), near_only
@@ -85,6 +133,10 @@ def make_comparison_kernel(size, kind, direct, scalar=wp.float32):
             e, g, h = current_triangle(
                 p0, p1, p2, p3, edge_weights, vertex_weights, scalar(1.0), scalar(0.15), near_only, wp.vec3i(0)
             )
+        if wp.static(not (direct and scalar == wp.float32)):
+            e *= scalar(scale)
+            g *= scalar(scale)
+            h *= scalar(scale)
         energy[row] = wp.float64(e)
         for i in range(size):
             gradient[row, i] = wp.float64(g[i])
@@ -129,12 +181,15 @@ def cases():
     return result
 
 
-def evaluate(kernel, positions, moving, size, near_only=False):
+def evaluate(kernel, positions, moving, size, near_only=False, initial=0.0):
     """Evaluate a batch without building or stepping a simulation."""
     outputs = [
         wp.empty(len(positions), dtype=wp.float64),
         wp.empty((len(positions), size), dtype=wp.float64),
         wp.empty((len(positions), size, size), dtype=wp.float64),
+        wp.full((len(positions), size), initial, dtype=float),
+        wp.full((len(positions), size, size), initial, dtype=float),
+        wp.zeros(1, dtype=int),
     ]
     wp.launch(
         kernel,
@@ -142,7 +197,9 @@ def evaluate(kernel, positions, moving, size, near_only=False):
         inputs=[wp.array(positions, dtype=wp.vec3d), wp.array(moving, dtype=int), near_only],
         outputs=outputs,
     )
-    return [array.numpy() for array in outputs]
+    if outputs[-1].numpy()[0] != 0:
+        raise AssertionError("Production ESP derivatives reported nonfinite values")
+    return [array.numpy() for array in outputs[:3]]
 
 
 def torch_energy(positions):
@@ -159,6 +216,30 @@ def torch_energy(positions):
 
 
 class TestEspDirectFormulas(unittest.TestCase):
+    def test_weighted_accumulation(self):
+        """Scale energy/force/Hessian once and add to existing particle/body outputs."""
+        positions = np.array([[[0.2, 0.3, 0.04], [0, 0, 0], [1, 0, 0], [0, 1, 0]]], dtype=np.float64)
+        for device in wp.get_devices():
+            with wp.ScopedDevice(device):
+                for size, kind in ((3, 0), (6, 0), (6, 1)):
+                    for selected_vertex in range(4) if size == 3 else (0,):
+                        moving = [selected_vertex]
+                        reference = evaluate(make_comparison_kernel(size, kind, True), positions, moving, size)
+                        for scale in (0.0, 0.25, -2.0):
+                            with self.subTest(
+                                device=str(device), size=size, kind=kind, vertex=selected_vertex, scale=scale
+                            ):
+                                actual = evaluate(
+                                    make_comparison_kernel(size, kind, True, scale=scale),
+                                    positions,
+                                    moving,
+                                    size,
+                                    initial=7.0,
+                                )
+                                np.testing.assert_allclose(actual[0], scale * reference[0], rtol=2e-6)
+                                np.testing.assert_allclose(actual[1], -7.0 + scale * reference[1], rtol=2e-6, atol=1e-6)
+                                np.testing.assert_allclose(actual[2], 7.0 + scale * reference[2], rtol=2e-6, atol=1e-6)
+
     def test_against_geometric_chain_rule(self):
         """Compare every selected particle and both body roles on CPU/CUDA."""
         for device in wp.get_devices():

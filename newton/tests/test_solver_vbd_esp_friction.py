@@ -426,8 +426,18 @@ class TestVbdEspFriction(unittest.TestCase):
         kernels = esp_contact
         self.assertFalse(hasattr(kernels, "accumulate_sample_friction"))
         self.assertFalse(hasattr(kernels, "map_friction_samples"))
-        for name in ("accumulate_contact_friction", "accumulate_triangle_friction", "accumulate_contact_damping"):
+        for name in (
+            "accumulate_contact_friction",
+            "accumulate_triangle_friction",
+            "accumulate_contact_damping",
+            "accumulate_particle_block",
+            "accumulate_body_block",
+        ):
             self.assertFalse(hasattr(kernels, name), name)
+        for function in (kernels.particle_triangle, kernels.body_triangle, kernels.ee_particle_source, kernels.ee_body):
+            source = inspect.getsource(function.func)
+            self.assertIn("wp.atomic_add(esp_forces,", source)
+            self.assertIn("wp.atomic_add(esp_hessians,", source)
         for function in (
             kernels.particle_triangle,
             kernels.body_triangle,

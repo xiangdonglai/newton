@@ -1003,6 +1003,11 @@ def particle_triangle(
     support: float,
     near: float,
     near_only: bool,
+    particle_index: int,
+    scale: float,
+    esp_forces: wp.array2d[float],
+    esp_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
     stiffness: float = 1.0,
     sample_displacement: wp.vec3 = wp.vec3(),  # noqa: B008  # Warp bakes @wp.func defaults at compile time.
     triangle_displacements: wp.mat33 = wp.mat33(),  # noqa: B008
@@ -1011,7 +1016,7 @@ def particle_triangle(
     dt: float = 0.0,
     smoothing: float = 0.0,
 ):
-    """Evaluate one triangle's ESP potential and derivatives for one vertex position.
+    """Accumulate one triangle's weighted force/Hessian for a particle; return its energy.
 
     With d_feature the distance from ``point`` to that triangle feature:
         E(point, a, b, c) = stiffness * [B(d_face)
@@ -1021,8 +1026,8 @@ def particle_triangle(
     window when ``near_only`` is true.
 
     ``derivative_vertex_slot`` selects the three Cartesian coordinates x:
-    0 = point, 1 = a, 2 = b, 3 = c. With friction/damping disabled, return
-    E, gradient dE/dx (vec3), and Hessian d2E/dx2 (mat33). The other three
+    0 = point, 1 = a, 2 = b, 3 = c. With friction/damping disabled, compute
+    gradient dE/dx (vec3) and Hessian d2E/dx2 (mat33). The other three
     positions, material parameters and feature coefficients stay fixed.
     This selects a differentiation variable; only its Hessian block is computed,
     not cross-vertex blocks.
@@ -1030,14 +1035,16 @@ def particle_triangle(
     With friction/damping enabled, gradient also includes minus their force on
     the selected vertex, and hessian includes their frozen-geometry local blocks.
     Energy remains conservative-only, so those extra terms are not derivatives
-    of the returned energy. Source area (and fixed EE weight for a target-only
-    particle) multiplies all outputs afterwards.
+    of the returned energy. ``scale`` is the fixed source area (times the fixed
+    EE weight for a target-only particle). Add -scale*gradient and scale*hessian
+    to the output row ``particle_index`` and return scale*E. Nonfinite values
+    set ``esp_error`` without writing the force/Hessian. Buffers are not cleared.
     """
     cutoff = near if near_only else support
     box_delta = wp.max(wp.max(wp.min(wp.min(a, b), c) - point, point - wp.max(wp.max(a, b), c)), wp.vec3())
     energy, gradient, hessian = float(0.0), wp.vec3(), wp.mat33()
     if wp.dot(box_delta, box_delta) > cutoff * cutoff:
-        return energy, gradient, hessian
+        return 0.0
     for feature_index in range(7):
         coefficient = float(1.0)
         if feature_index > 0:
@@ -1064,7 +1071,14 @@ def particle_triangle(
             motion_coefficient = -barycentric[derivative_vertex_slot - 1]
         gradient += coefficient * motion_coefficient * friction_damping_gradient
         hessian += coefficient * motion_coefficient * motion_coefficient * friction_damping_hessian
-    return energy, gradient, hessian
+    if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
+        wp.atomic_or(esp_error, 0, 4)
+        return scale * energy
+    for i in range(3):
+        wp.atomic_add(esp_forces, particle_index, i, -scale * gradient[i])
+        for j in range(3):
+            wp.atomic_add(esp_hessians, particle_index, i, j, scale * hessian[i, j])
+    return scale * energy
 
 
 @wp.func
@@ -1080,6 +1094,11 @@ def body_triangle(
     support: float,
     near: float,
     near_only: bool,
+    body_index: int,
+    scale: float,
+    esp_forces: wp.array2d[float],
+    esp_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
     stiffness: float = 1.0,
     sample_displacement: wp.vec3 = wp.vec3(),  # noqa: B008  # Warp bakes @wp.func defaults at compile time.
     triangle_displacements: wp.mat33 = wp.mat33(),  # noqa: B008
@@ -1088,19 +1107,23 @@ def body_triangle(
     dt: float = 0.0,
     smoothing: float = 0.0,
 ):
-    """Exact conservative pose block plus frozen-geometry dissipative blocks.
+    """Accumulate one triangle's weighted force/Hessian for a body; return its energy.
 
     Conservative rigid-motion invariance maps the point gradient/Hessian by
     J=[-I,skew(point-com)] when the triangle moves, or [I,-skew] otherwise.
     Dissipative terms instead use each feature's actual rigid material point
     and J^T H J, without the conservative rotation-curvature correction.
+    Add -scale*gradient and scale*hessian to output row ``body_index`` and
+    return scale*E. Coordinates are COM translation then world rotation.
+    Nonfinite values set ``esp_error`` without writing the force/Hessian;
+    buffers are not cleared. ``scale`` is fixed during differentiation.
     """
     cutoff = near if near_only else support
     box_delta = wp.max(wp.max(wp.min(wp.min(a, b), c) - point, point - wp.max(wp.max(a, b), c)), wp.vec3())
     energy, conservative_gradient, conservative_hessian = float(0.0), wp.vec3(), wp.mat33()
     gradient, hessian = wp.spatial_vector(), wp.spatial_matrix()
     if wp.dot(box_delta, box_delta) > cutoff * cutoff:
-        return energy, gradient, hessian
+        return 0.0
     for feature_index in range(7):
         coefficient = float(1.0)
         if feature_index > 0:
@@ -1159,7 +1182,14 @@ def body_triangle(
             if i == j:
                 curvature -= wp.dot(offset, conservative_gradient)
             hessian[i + 3, j + 3] += wp.dot(rotation_i, conservative_hessian * rotation_j) + curvature
-    return energy, gradient, hessian
+    if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
+        wp.atomic_or(esp_error, 0, 4)
+        return scale * energy
+    for i in range(6):
+        wp.atomic_add(esp_forces, body_index, i, -scale * gradient[i])
+        for j in range(6):
+            wp.atomic_add(esp_hessians, body_index, i, j, scale * hessian[i, j])
+    return scale * energy
 
 
 def _make_ee_block_functions(size: int):
@@ -1990,48 +2020,6 @@ def contact_support_and_stiffness(
 
 
 @wp.func
-def accumulate_particle_block(
-    esp_forces: wp.array2d[float],
-    esp_hessians: wp.array3d[float],
-    particle_index: int,
-    scale: float,
-    energy: float,
-    gradient: wp.vec3,
-    block: wp.mat33,
-    esp_error: wp.array[int],
-) -> None:
-    """Add the complete 3x3 energy block and negative gradient to one particle."""
-    if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(block):
-        wp.atomic_or(esp_error, 0, 4)
-        return
-    for i in range(3):
-        wp.atomic_add(esp_forces, particle_index, i, -scale * gradient[i])
-        for j in range(3):
-            wp.atomic_add(esp_hessians, particle_index, i, j, scale * block[i, j])
-
-
-@wp.func
-def accumulate_body_block(
-    esp_forces: wp.array2d[float],
-    esp_hessians: wp.array3d[float],
-    body_index: int,
-    scale: float,
-    energy: float,
-    gradient: wp.spatial_vector,
-    block: wp.spatial_matrix,
-    esp_error: wp.array[int],
-) -> None:
-    """Add the complete 6x6 energy block and negative gradient to one body."""
-    if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(block):
-        wp.atomic_or(esp_error, 0, 4)
-        return
-    for i in range(6):
-        wp.atomic_add(esp_forces, body_index, i, -scale * gradient[i])
-        for j in range(6):
-            wp.atomic_add(esp_hessians, body_index, i, j, scale * block[i, j])
-
-
-@wp.func
 def rigid_vertex_displacement(
     vertex_index: int,
     data: EspData,
@@ -2354,8 +2342,15 @@ def ee_particle_source(
     soft_contact_mu: float,
     shape_material_kd: wp.array[float],
     soft_contact_kd: float,
+    esp_forces: wp.array2d[float],
+    esp_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
 ):
-    """Differentiate both EE sample directions with respect to a source particle."""
+    """Differentiate both EE sample directions and accumulate the source particle's force/Hessian.
+
+    Area factors and position-dependent EE weights are included before writing
+    to ``particle_index``. Return the conservative energy; no extra scale is applied.
+    """
     soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
     rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
     a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
@@ -2366,7 +2361,7 @@ def ee_particle_source(
     # The generating pair determines q, q_bar, w and their derivatives.
     pair = prepare_particle_ee_pair(a, b, c, d, source_mask, wp.vec3(), near)
     if pair.weight <= 0.0:
-        return 0.0, wp.vec3(), wp.mat33()
+        return 0.0
     potential, gradient, parameter_gradient_sum, hessian = float(0.0), wp.vec3(), wp.vec2(), wp.mat33()
     dissipative_gradient = wp.vec3()
     dissipative_hessian = wp.mat33()
@@ -2487,7 +2482,16 @@ def ee_particle_source(
             dissipative_hessian += scale * dh
     energy, gradient, hessian = finish_particle_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
     # Only the conservative block differentiates q and w. Dissipation freezes both.
-    return energy, gradient + pair.weight * dissipative_gradient, hessian + pair.weight * dissipative_hessian
+    gradient += pair.weight * dissipative_gradient
+    hessian += pair.weight * dissipative_hessian
+    if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
+        wp.atomic_or(esp_error, 0, 4)
+        return energy
+    for i in range(3):
+        wp.atomic_add(esp_forces, particle_index, i, -gradient[i])
+        for j in range(3):
+            wp.atomic_add(esp_hessians, particle_index, i, j, hessian[i, j])
+    return energy
 
 
 @wp.kernel(module="unique", enable_backward=False)
@@ -2582,7 +2586,7 @@ def accumulate_particle_contact_derivatives(
         if use_friction:
             mu = wp.sqrt(soft_contact_mu * shape_material_mu[shape_index])
         kd = 0.5 * (soft_contact_kd + shape_material_kd[shape_index])
-        if family == 0:
+        if family == 0:  # VT
             particle_index = soft_primitive_index
             if color >= 0 and particle_colors[particle_index] != color:
                 continue
@@ -2612,7 +2616,7 @@ def accumulate_particle_contact_derivatives(
                 body_q_prev,
                 dt,
             )
-            e, g, h = particle_triangle(
+            particle_triangle(
                 particle_q[particle_index],
                 rigid_positions[triangle_vertex_indices[0]],
                 rigid_positions[triangle_vertex_indices[1]],
@@ -2623,6 +2627,11 @@ def accumulate_particle_contact_derivatives(
                 support,
                 near,
                 False,
+                particle_index,
+                data.soft_vertex_quadrature_weight[particle_index],
+                esp_forces,
+                esp_hessians,
+                esp_error,
                 stiffness,
                 sample_displacement,
                 triangle_displacements,
@@ -2631,17 +2640,7 @@ def accumulate_particle_contact_derivatives(
                 dt,
                 friction_epsilon * dt,
             )
-            accumulate_particle_block(
-                esp_forces,
-                esp_hessians,
-                particle_index,
-                data.soft_vertex_quadrature_weight[particle_index],
-                e,
-                g,
-                h,
-                esp_error,
-            )
-        elif family == 1:
+        elif family == 1:  # TV
             triangle_index = soft_primitive_index
             triangle_vertex_indices = data.soft_tri_indices[triangle_index]
             edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
@@ -2672,7 +2671,7 @@ def accumulate_particle_contact_derivatives(
                 particle_index = triangle_vertex_indices[corner]
                 if color >= 0 and particle_colors[particle_index] != color:
                     continue
-                e, g, h = particle_triangle(
+                particle_triangle(
                     rigid_positions[rigid_primitive_index],
                     particle_q[triangle_vertex_indices[0]],
                     particle_q[triangle_vertex_indices[1]],
@@ -2683,6 +2682,11 @@ def accumulate_particle_contact_derivatives(
                     support,
                     near,
                     False,
+                    particle_index,
+                    data.rigid_vertex_quadrature_weight[rigid_primitive_index],
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
                     stiffness,
                     sample_displacement,
                     triangle_displacements,
@@ -2691,17 +2695,7 @@ def accumulate_particle_contact_derivatives(
                     dt,
                     friction_epsilon * dt,
                 )
-                accumulate_particle_block(
-                    esp_forces,
-                    esp_hessians,
-                    particle_index,
-                    data.rigid_vertex_quadrature_weight[rigid_primitive_index],
-                    e,
-                    g,
-                    h,
-                    esp_error,
-                )
-        else:
+        else:  # EE
             soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
             rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
             _q, q_bar, weight = ee_quadrature_sample(
@@ -2717,7 +2711,7 @@ def accumulate_particle_contact_derivatives(
                 particle_index = soft_edge_vertex_indices[endpoint]
                 if color >= 0 and particle_colors[particle_index] != color:
                     continue
-                e, g, h = ee_particle_source(
+                ee_particle_source(
                     soft_primitive_index,
                     rigid_primitive_index,
                     shape_index,
@@ -2747,8 +2741,10 @@ def accumulate_particle_contact_derivatives(
                     soft_contact_mu,
                     shape_material_kd,
                     soft_contact_kd,
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
                 )
-                accumulate_particle_block(esp_forces, esp_hessians, particle_index, 1.0, e, g, h, esp_error)
             rigid_parameter = segment_parameter(
                 q_bar, rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
             )
@@ -2801,7 +2797,7 @@ def accumulate_particle_contact_derivatives(
                         continue
                     if color >= 0 and particle_colors[particle_index] != color:
                         continue
-                    e, g, h = particle_triangle(
+                    particle_triangle(
                         q_bar,
                         particle_q[triangle_vertex_indices[0]],
                         particle_q[triangle_vertex_indices[1]],
@@ -2812,6 +2808,11 @@ def accumulate_particle_contact_derivatives(
                         target_support,
                         target_near,
                         True,
+                        particle_index,
+                        weight * data.rigid_edge_area[rigid_primitive_index],
+                        esp_forces,
+                        esp_hessians,
+                        esp_error,
                         target_ke,
                         sample_displacement,
                         triangle_displacements,
@@ -2819,16 +2820,6 @@ def accumulate_particle_contact_derivatives(
                         kd,
                         dt,
                         friction_epsilon * dt,
-                    )
-                    accumulate_particle_block(
-                        esp_forces,
-                        esp_hessians,
-                        particle_index,
-                        weight * data.rigid_edge_area[rigid_primitive_index],
-                        e,
-                        g,
-                        h,
-                        esp_error,
                     )
 
 
@@ -2862,15 +2853,22 @@ def ee_body(
     soft_contact_mu: float,
     shape_material_kd: wp.array[float],
     soft_contact_kd: float,
+    esp_forces: wp.array2d[float],
+    esp_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
 ):
-    """Differentiate q, q_bar, w and all targets moved by the generating body."""
+    """Differentiate q, q_bar, w and its targets; accumulate the generating body's force/Hessian.
+
+    Area factors and position-dependent EE weights are included before writing
+    to ``body_index``. Return the conservative energy; no extra scale is applied.
+    """
     soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
     rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
     a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
     c, d = rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
     pair = prepare_body_ee_pair(a, b, c, d, 0, com, near)
     if pair.weight <= 0.0:
-        return 0.0, wp.spatial_vector(), wp.spatial_matrix()
+        return 0.0
     potential, gradient, parameter_gradient_sum, hessian = (
         float(0.0),
         wp.spatial_vector(),
@@ -2993,7 +2991,16 @@ def ee_body(
             dissipative_hessian += scale * dh
     energy, gradient, hessian = finish_body_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
     # Only the conservative block differentiates q and w. Dissipation freezes both.
-    return energy, gradient + pair.weight * dissipative_gradient, hessian + pair.weight * dissipative_hessian
+    gradient += pair.weight * dissipative_gradient
+    hessian += pair.weight * dissipative_hessian
+    if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
+        wp.atomic_or(esp_error, 0, 4)
+        return energy
+    for i in range(6):
+        wp.atomic_add(esp_forces, body_index, i, -gradient[i])
+        for j in range(6):
+            wp.atomic_add(esp_hessians, body_index, i, j, hessian[i, j])
+    return energy
 
 
 @wp.kernel(module="unique", enable_backward=False)
@@ -3152,7 +3159,7 @@ def accumulate_body_contact_derivatives(
                 if use_friction:
                     target_mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
                 target_kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
-                e, g, h = body_triangle(
+                body_triangle(
                     q,
                     rigid_positions[triangle_vertex_indices[0]],
                     rigid_positions[triangle_vertex_indices[1]],
@@ -3164,6 +3171,11 @@ def accumulate_body_contact_derivatives(
                     target_support,
                     target_near,
                     True,
+                    target_body_index,
+                    weight * data.soft_edge_area[soft_primitive_index],
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
                     target_ke,
                     sample_displacement,
                     triangle_displacements,
@@ -3172,19 +3184,9 @@ def accumulate_body_contact_derivatives(
                     dt,
                     friction_epsilon * dt,
                 )
-                accumulate_body_block(
-                    esp_forces,
-                    esp_hessians,
-                    target_body_index,
-                    weight * data.soft_edge_area[soft_primitive_index],
-                    e,
-                    g,
-                    h,
-                    esp_error,
-                )
             if body_index >= 0 and (color < 0 or body_colors[body_index] == color):
                 com = wp.transform_point(body_q[body_index], body_com[body_index])
-                e, g, h = ee_body(
+                ee_body(
                     soft_primitive_index,
                     rigid_primitive_index,
                     shape_index,
@@ -3213,8 +3215,10 @@ def accumulate_body_contact_derivatives(
                     soft_contact_mu,
                     shape_material_kd,
                     soft_contact_kd,
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
                 )
-                accumulate_body_block(esp_forces, esp_hessians, body_index, 1.0, e, g, h, esp_error)
             continue
         if body_index < 0 or (color >= 0 and body_colors[body_index] != color):
             continue
@@ -3246,7 +3250,7 @@ def accumulate_body_contact_derivatives(
                 body_q_prev,
                 dt,
             )
-            e, g, h = body_triangle(
+            body_triangle(
                 particle_q[soft_primitive_index],
                 rigid_positions[triangle_vertex_indices[0]],
                 rigid_positions[triangle_vertex_indices[1]],
@@ -3258,6 +3262,11 @@ def accumulate_body_contact_derivatives(
                 support,
                 near,
                 False,
+                body_index,
+                data.soft_vertex_quadrature_weight[soft_primitive_index],
+                esp_forces,
+                esp_hessians,
+                esp_error,
                 stiffness,
                 sample_displacement,
                 triangle_displacements,
@@ -3266,7 +3275,6 @@ def accumulate_body_contact_derivatives(
                 dt,
                 friction_epsilon * dt,
             )
-            scale = data.soft_vertex_quadrature_weight[soft_primitive_index]
         elif family == 1:
             triangle_index = soft_primitive_index
             triangle_vertex_indices = data.soft_tri_indices[triangle_index]
@@ -3294,7 +3302,7 @@ def accumulate_body_contact_derivatives(
                 body_q_prev,
                 dt,
             )
-            e, g, h = body_triangle(
+            body_triangle(
                 rigid_positions[rigid_primitive_index],
                 particle_q[triangle_vertex_indices[0]],
                 particle_q[triangle_vertex_indices[1]],
@@ -3306,6 +3314,11 @@ def accumulate_body_contact_derivatives(
                 support,
                 near,
                 False,
+                body_index,
+                data.rigid_vertex_quadrature_weight[rigid_primitive_index],
+                esp_forces,
+                esp_hessians,
+                esp_error,
                 stiffness,
                 sample_displacement,
                 triangle_displacements,
@@ -3314,8 +3327,6 @@ def accumulate_body_contact_derivatives(
                 dt,
                 friction_epsilon * dt,
             )
-            scale = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
-        accumulate_body_block(esp_forces, esp_hessians, body_index, scale, e, g, h, esp_error)
 
 
 def create_esp_data(

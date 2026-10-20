@@ -39,7 +39,13 @@ def make_probe(scalar):
     vec3 = wp.types.vector(length=3, dtype=scalar)
 
     @wp.kernel
-    def probe(points: wp.array[vec3], output: wp.array2d[scalar]):
+    def probe(
+        points: wp.array[vec3],
+        output: wp.array2d[scalar],
+        forces: wp.array2d[float],
+        hessians: wp.array3d[float],
+        error: wp.array[int],
+    ):
         i = wp.tid()
         distance = points[i][2]
         energy, first, second = barrier(distance, scalar(0.005), scalar(0.00025), False)
@@ -47,7 +53,7 @@ def make_probe(scalar):
         output[i, 1] = first
         output[i, 2] = second
         output[i, 3] = kernels.barrier_energy(distance * distance, scalar(0.005), scalar(0.00025), False)
-        value, gradient, hessian = triangle(
+        value = triangle(
             points[i],
             vec3(),
             vec3(0.01, 0.0, 0.0),
@@ -58,12 +64,17 @@ def make_probe(scalar):
             scalar(0.005),
             scalar(0.00025),
             False,
+            i,
+            1.0,
+            forces,
+            hessians,
+            error,
         )
         output[i, 4] = value
         for j in range(3):
-            output[i, 5 + j] = gradient[j]
+            output[i, 5 + j] = -forces[i, j]
             for k in range(3):
-                output[i, 8 + 3 * j + k] = hessian[j, k]
+                output[i, 8 + 3 * j + k] = hessians[i, j, k]
 
     return probe, vec3
 
@@ -92,14 +103,20 @@ class TestEspSmallDistance(unittest.TestCase):
         for device in wp.get_devices():
             with self.subTest(precision=scalar.__name__, device=str(device)):
                 out = wp.empty((1, 17), dtype=scalar, device=device)
+                forces = wp.zeros((1, 3), dtype=float, device=device)
+                hessians = wp.zeros((1, 3, 3), dtype=float, device=device)
+                error = wp.zeros(1, dtype=int, device=device)
                 wp.launch(
                     probe,
                     1,
                     inputs=[wp.array([[0.002, 0.002, np.nan]], dtype=vec3, device=device)],
-                    outputs=[out],
+                    outputs=[out, forces, hessians, error],
                     device=device,
                 )
                 self.assertTrue(np.isnan(out.numpy()[0, :4]).all())
+                self.assertEqual(error.numpy()[0], 4)
+                np.testing.assert_array_equal(forces.numpy(), 0)
+                np.testing.assert_array_equal(hessians.numpy(), 0)
 
     def test_continued_derivatives_by_finite_difference(self):
         """Differentiate the actual energy below and across the continuation join."""
@@ -112,9 +129,17 @@ class TestEspSmallDistance(unittest.TestCase):
                 with self.subTest(device=str(device), distance=center):
                     points = [[0.002, 0.002, center + offset] for offset in (-h, 0, h)]
                     out = wp.empty((3, 17), dtype=wp.float32, device=device)
+                    forces = wp.zeros((3, 3), dtype=float, device=device)
+                    hessians = wp.zeros((3, 3, 3), dtype=float, device=device)
+                    error = wp.zeros(1, dtype=int, device=device)
                     wp.launch(
-                        probe, 3, inputs=[wp.array(points, dtype=vec3, device=device)], outputs=[out], device=device
+                        probe,
+                        3,
+                        inputs=[wp.array(points, dtype=vec3, device=device)],
+                        outputs=[out, forces, hessians, error],
+                        device=device,
                     )
+                    self.assertEqual(error.numpy()[0], 0)
                     values = out.numpy().astype(np.float64)
                     numeric_gradient = (values[2, 4] - values[0, 4]) / (2 * h)
                     numeric_hessian = (values[2, 7] - values[0, 7]) / (2 * h)
@@ -169,14 +194,18 @@ class TestEspSmallDistance(unittest.TestCase):
         for device in wp.get_devices():
             with self.subTest(precision=scalar.__name__, device=str(device)):
                 out = wp.empty((len(points), 17), dtype=scalar, device=device)
+                forces = wp.zeros((len(points), 3), dtype=float, device=device)
+                hessians = wp.zeros((len(points), 3, 3), dtype=float, device=device)
+                error = wp.zeros(1, dtype=int, device=device)
                 wp.launch(
                     probe,
                     len(points),
                     inputs=[wp.array(points, dtype=vec3, device=device)],
-                    outputs=[out],
+                    outputs=[out, forces, hessians, error],
                     device=device,
                 )
                 values = out.numpy()
+                self.assertEqual(error.numpy()[0], 0)
                 self.assertTrue(np.isfinite(values).all())
                 expected = np.array([reference_barrier(p[2]) for p in points])
                 np.testing.assert_allclose(values[:, :3], expected, rtol=2e-6)
