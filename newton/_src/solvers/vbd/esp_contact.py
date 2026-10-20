@@ -17,8 +17,6 @@ import warp as wp
 from numpy.typing import NDArray
 from warp.fem.linalg import symmetric_eigenvalues_qr
 
-from ...geometry import GeoType, ShapeFlags
-from ...sim.builder import _deduplicate_convex_collision_mesh
 from ...utils.mesh import MeshAdjacency, MeshAdjacencyData
 from .rigid_vbd_kernels import (
     _eval_soft_ef_contact,
@@ -43,6 +41,31 @@ def _contact_worker_count(contact_capacity: int, device: wp.Device) -> int:
     return max(1, min(contact_capacity, 2 * 256 * sm_count))
 
 
+@wp.func
+def _mesh_contact_family(
+    soft_indices: wp.vec3i,
+    rigid_indices: wp.vec3i,
+    soft_primitive_index: int,
+    rigid_primitive_index: int,
+) -> int:
+    """Classify public contact metadata: VT=0, TV=1, EE=2, skip=-1, malformed=4.
+
+    This only validates the layout; primitive IDs already address shared geometry.
+    Analytical/SDF, edge-depth recovery and disabled diagnostic rows have no rigid primitive.
+    """
+    if soft_indices[0] < 0 or rigid_indices[0] < 0:
+        return -1
+    if soft_primitive_index < 0 or rigid_primitive_index < 0:
+        return 4
+    if soft_indices[1] < 0 and rigid_indices[2] >= 0:
+        return 0
+    if soft_indices[2] >= 0 and rigid_indices[1] < 0:
+        return 1
+    if soft_indices[1] >= 0 and soft_indices[2] < 0 and rigid_indices[1] >= 0 and rigid_indices[2] < 0:
+        return 2
+    return 4
+
+
 @cache
 def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
     """Build ESP kernels and matching data types once per arithmetic precision.
@@ -59,30 +82,36 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
 
     @wp.struct
     class EspData:
-        """Fixed ESP-only geometry and weights; no state or material-array copies.
+        """Shared geometry references and ESP-only weights; no state/material-array copies.
 
-        Soft topology references the model's shared arrays. Rigid topology uses
-        mesh-derived vertex and edge numbering. Current state and materials are explicit
-        kernel arguments; SolverVBD owns the world-position cache separately.
+        Soft topology references model arrays; rigid topology references the
+        CollisionPipeline's shared arrays and primitive numbering. Current state
+        and materials are explicit kernel arguments; SolverVBD owns the world-position cache.
         """
 
-        rigid_local_positions: wp.array[wp.vec3]  # Scaled shape-local positions in ESP vertex order.
-        rigid_vertex_shapes: wp.array[int]  # Owning shape for each ESP vertex.
+        rigid_local_positions: wp.array[wp.vec3]  # Scaled shape-local positions in shared vertex order.
+        rigid_vertex_shapes: wp.array[int]  # Owning shape for each shared rigid vertex.
         rigid_vertex_corners: wp.array[int]  # Representative collision-mesh corner for surface velocity.
         # Per-shape start in rigid_tri_indices, measured in triangles, not corners.
         rigid_triangle_offsets: wp.array[int]
         soft_tri_indices: wp.array[wp.vec3i]
         soft_edge_vertex_indices: wp.array[wp.vec2i]
         soft_adjacency: MeshAdjacencyData
-        soft_vertex_term_weight: wp.array[scalar]
+        soft_vertex_term_coefficient: wp.array[scalar]
+        """Target vertex correction: 1 / incident triangle count, zero at boundaries; see triangle_energy."""
         rigid_tri_indices: wp.array[wp.vec3i]
         rigid_edge_vertex_indices: wp.array[wp.vec2i]
         rigid_adjacency: MeshAdjacencyData
-        rigid_vertex_term_weight: wp.array[scalar]
-        soft_vertex_weight: wp.array[wp.float64]  # Rest area / 3; unit for point-only particles; zero inside solids.
-        rigid_vertex_area: wp.array[scalar]
+        rigid_vertex_term_coefficient: wp.array[scalar]
+        """Same target correction on the rigid surface; not a source quadrature weight."""
+        soft_vertex_quadrature_weight: wp.array[wp.float64]
+        """Source weight multiplying the complete triangle_energy result: area / 3, unit for points, zero inside solids."""
+        rigid_vertex_quadrature_weight: wp.array[scalar]
+        """Source quadrature weight: sum of incident scaled rigid triangle areas / 3."""
         soft_edge_area: wp.array[scalar]
         rigid_edge_area: wp.array[scalar]
+        total_edge_count: int
+        """All soft edges plus participating rigid mesh edges, independent of detected contacts."""
 
     @wp.struct
     class EdgeTriangleListData:
@@ -91,12 +120,12 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         Source edge IDs are soft edges first, then rigid edges. A soft edge keeps
         its native ID; a rigid edge uses soft_edge_count + its native ID. Target
         face IDs index the opposite combined EspData.*_tri_indices array. Rigid
-        shape-local triangle IDs acquire a per-shape offset during collection.
+        triangle IDs are already shared global IDs in contact rows.
         keys[i] is just a face ID, not a packed (edge, face) integer.
         starts/ends identify the source edge. Each active range is sorted and
         duplicate-free, so separate threads may evaluate disjoint parts of it.
-        An empty edge has start == end, which need not be zero. count and
-        edge_counts retain raw allocation counts, including duplicates.
+        An empty edge has start == end, which need not be zero. raw_entry_count
+        and edge_triangle_counts retain allocation counts, including duplicates.
 
         Build: count entries per edge, scan those counts into starts, compute
         ends, then repeat the contact expansion to fill each edge's slice.
@@ -124,89 +153,27 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         keys: wp.array[int]
         starts: wp.array[int]
         ends: wp.array[int]
-        count: wp.array[int]
+        raw_entry_count: wp.array[int]
+        """Total contributed edge-triangle entries before deduplication, shape [1]."""
         error: wp.array[int]
         capacity: int
         soft_edge_count: int
-        edge_counts: wp.array[int]
+        edge_triangle_counts: wp.array[int]
+        """Contributed triangle entries per source edge, including duplicates; unique count is ends - starts."""
         write_offsets: wp.array[int]
 
     @wp.func
-    def find_edge(
-        a: int,
-        b: int,
-        edge_vertex_indices: wp.array[wp.vec2i],
-        v_adj_edges_offsets: wp.array[int],
-        v_adj_edges: wp.array[int],
-    ) -> int:
-        """Find the mesh edge joining two vertices, checking only edges incident to a."""
-        for j in range(v_adj_edges_offsets[a], v_adj_edges_offsets[a + 1], 2):
-            if v_adj_edges[j + 1] >= 2:
-                edge = v_adj_edges[j]
-                endpoints = edge_vertex_indices[edge]
-                if (endpoints[0] == a and endpoints[1] == b) or (endpoints[0] == b and endpoints[1] == a):
-                    return edge
-        return -1
-
-    @wp.func
-    def contact_primitive_indices(
-        soft_indices: wp.vec3i,
-        rigid_indices: wp.vec3i,
-        rigid_triangle_offset: int,
-        soft_tri_indices: wp.array[wp.vec3i],
-        soft_edge_vertex_indices: wp.array[wp.vec2i],
-        soft_v_adj_tris_offsets: wp.array[int],
-        soft_v_adj_tris: wp.array[int],
-        soft_v_adj_edges_offsets: wp.array[int],
-        soft_v_adj_edges: wp.array[int],
-        rigid_tri_indices: wp.array[wp.vec3i],
-        rigid_edge_vertex_indices: wp.array[wp.vec2i],
-        rigid_v_adj_edges_offsets: wp.array[int],
-        rigid_v_adj_edges: wp.array[int],
-    ) -> wp.vec3i:
-        """Identify ESP primitives from public particle and mesh-corner indices.
-
-        Return (family, soft primitive, rigid primitive): VT=0, TV=1, EE=2.
-        Rigid vertices/edges use ESP geometry numbering; VT faces remain mesh-local.
-        All-negative rigid indices mean no complete primitive (SDF/recovery): skip.
-        Family 4 reports a malformed pair through the existing ESP error check.
-        """
-        if rigid_triangle_offset < 0 or rigid_indices[0] < 0 or soft_indices[0] < 0:
-            return wp.vec3i(-1)
-        if soft_indices[1] < 0 and rigid_indices[2] >= 0:
-            return wp.vec3i(0, soft_indices[0], rigid_indices[0] // 3)
-        corner = rigid_indices[0]
-        rigid_vertex = rigid_tri_indices[rigid_triangle_offset + corner // 3][corner % 3]
-        if soft_indices[2] >= 0 and rigid_indices[1] < 0:
-            for j in range(soft_v_adj_tris_offsets[soft_indices[0]], soft_v_adj_tris_offsets[soft_indices[0] + 1], 2):
-                triangle = soft_v_adj_tris[j]
-                if soft_tri_indices[triangle] == soft_indices:
-                    return wp.vec3i(1, triangle, rigid_vertex)
-        elif soft_indices[1] >= 0 and soft_indices[2] < 0 and rigid_indices[1] >= 0 and rigid_indices[2] < 0:
-            corner = rigid_indices[1]
-            other_vertex = rigid_tri_indices[rigid_triangle_offset + corner // 3][corner % 3]
-            soft_edge = find_edge(
-                soft_indices[0], soft_indices[1], soft_edge_vertex_indices, soft_v_adj_edges_offsets, soft_v_adj_edges
-            )
-            rigid_edge = find_edge(
-                rigid_vertex, other_vertex, rigid_edge_vertex_indices, rigid_v_adj_edges_offsets, rigid_v_adj_edges
-            )
-            if soft_edge >= 0 and rigid_edge >= 0:
-                return wp.vec3i(2, soft_edge, rigid_edge)
-        return wp.vec3i(4, -1, -1)
-
-    @wp.func
-    def add_edge_triangle(
+    def add_edge_triangle_pair(
         edge: int,
         face: int,
         count_only: bool,
         error: wp.array[int],
-        edge_counts: wp.array[int],
+        edge_triangle_counts: wp.array[int],
         write_offsets: wp.array[int],
         keys: wp.array[int],
     ) -> None:
         if count_only:
-            wp.atomic_add(edge_counts, edge, 1)
+            wp.atomic_add(edge_triangle_counts, edge, 1)
         elif error[0] == 0:
             slot = wp.atomic_add(write_offsets, edge, 1)
             keys[slot] = face
@@ -216,15 +183,9 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         worker_count: int,
         soft_contact_count: wp.array[int],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_primitive_index: wp.array[int],
+        soft_contact_rigid_primitive_index: wp.array[int],
         soft_contact_rigid_indices: wp.array[wp.vec3i],
-        soft_contact_shape: wp.array[int],
-        rigid_triangle_offsets: wp.array[int],
-        soft_tri_indices: wp.array[wp.vec3i],
-        soft_edge_vertex_indices: wp.array[wp.vec2i],
-        soft_v_adj_tris_offsets: wp.array[int],
-        soft_v_adj_tris: wp.array[int],
-        rigid_tri_indices: wp.array[wp.vec3i],
-        rigid_edge_vertex_indices: wp.array[wp.vec2i],
         soft_v_adj_edges_offsets: wp.array[int],
         soft_v_adj_edges: wp.array[int],
         soft_edge_tri_indices: wp.array2d[int],
@@ -233,14 +194,14 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         rigid_edge_tri_indices: wp.array2d[int],
         soft_edge_count: int,
         count_only: bool,
-        edge_counts: wp.array[int],
+        edge_triangle_counts: wp.array[int],
         write_offsets: wp.array[int],
         keys: wp.array[int],
         error: wp.array[int],
     ) -> None:
         """Count or fill each contact's incident edge/triangle entries.
 
-        The count pass increments edge_counts; the fill pass advances
+        The count pass increments edge_triangle_counts; the fill pass advances
         write_offsets and writes face IDs to keys. Both passes may set error.
         All four mutable arrays are passed as launch outputs; the other
         arguments are read-only contact data, connectivity, and controls.
@@ -249,72 +210,70 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             wp.atomic_or(error, 0, 1)
             return
         for i in range(wp.tid(), soft_contact_count[0], worker_count):
-            if rigid_triangle_offsets[soft_contact_shape[i]] < 0:
-                continue
-            row = contact_primitive_indices(
+            soft_primitive_index = soft_contact_primitive_index[i]
+            rigid_primitive_index = soft_contact_rigid_primitive_index[i]
+            family = _mesh_contact_family(
                 soft_contact_indices[i],
                 soft_contact_rigid_indices[i],
-                rigid_triangle_offsets[soft_contact_shape[i]],
-                soft_tri_indices,
-                soft_edge_vertex_indices,
-                soft_v_adj_tris_offsets,
-                soft_v_adj_tris,
-                soft_v_adj_edges_offsets,
-                soft_v_adj_edges,
-                rigid_tri_indices,
-                rigid_edge_vertex_indices,
-                rigid_v_adj_edges_offsets,
-                rigid_v_adj_edges,
+                soft_primitive_index,
+                rigid_primitive_index,
             )
-            if row[0] < 0:
+            if family < 0:
                 continue
-            family = row[0] & 7
             if family == 0:
                 if soft_edge_count == 0:
                     continue  # Point-only scenes have no soft edge adjacency.
-                vertex = row[1]
-                face = rigid_triangle_offsets[soft_contact_shape[i]] + row[2]
+                vertex = soft_primitive_index
+                face = rigid_primitive_index
                 for j in range(soft_v_adj_edges_offsets[vertex], soft_v_adj_edges_offsets[vertex + 1], 2):
                     # VBD's shared bending adjacency includes opposite vertices (slots 0/1).
                     # ESP needs only edges ending at this vertex (slots 2/3).
                     if soft_v_adj_edges[j + 1] >= 2:
-                        add_edge_triangle(
-                            soft_v_adj_edges[j], face, count_only, error, edge_counts, write_offsets, keys
+                        add_edge_triangle_pair(
+                            soft_v_adj_edges[j], face, count_only, error, edge_triangle_counts, write_offsets, keys
                         )
             elif family == 1:
-                vertex = row[2]
+                vertex = rigid_primitive_index
                 for j in range(rigid_v_adj_edges_offsets[vertex], rigid_v_adj_edges_offsets[vertex + 1], 2):
                     if rigid_v_adj_edges[j + 1] >= 2:
-                        add_edge_triangle(
+                        add_edge_triangle_pair(
                             soft_edge_count + rigid_v_adj_edges[j],
-                            row[1],
+                            soft_primitive_index,
                             count_only,
                             error,
-                            edge_counts,
+                            edge_triangle_counts,
                             write_offsets,
                             keys,
                         )
             elif family == 2:
                 for side in range(2):
-                    face = rigid_edge_tri_indices[row[2], side]
+                    face = rigid_edge_tri_indices[rigid_primitive_index, side]
                     if face >= 0:
-                        add_edge_triangle(row[1], face, count_only, error, edge_counts, write_offsets, keys)
-                    face = soft_edge_tri_indices[row[1], side]
+                        add_edge_triangle_pair(
+                            soft_primitive_index, face, count_only, error, edge_triangle_counts, write_offsets, keys
+                        )
+                    face = soft_edge_tri_indices[soft_primitive_index, side]
                     if face >= 0:
-                        add_edge_triangle(
-                            soft_edge_count + row[2], face, count_only, error, edge_counts, write_offsets, keys
+                        add_edge_triangle_pair(
+                            soft_edge_count + rigid_primitive_index,
+                            face,
+                            count_only,
+                            error,
+                            edge_triangle_counts,
+                            write_offsets,
+                            keys,
                         )
             elif family > 3:
                 wp.atomic_or(error, 0, 4)
 
     @wp.kernel
     def finish_edge_triangle_offsets(
-        edge_counts: wp.array[int],
+        edge_triangle_counts: wp.array[int],
         capacity: int,
         starts: wp.array[int],
         ends: wp.array[int],
         write_offsets: wp.array[int],
-        count: wp.array[int],
+        raw_entry_count: wp.array[int],
         error: wp.array[int],
     ) -> None:
         """Set each edge's write range and detect insufficient storage.
@@ -324,9 +283,9 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         """
         edge = wp.tid()
         start = starts[edge]
-        end = start + edge_counts[edge]
+        end = start + edge_triangle_counts[edge]
         if edge == starts.shape[0] - 1:
-            count[0] = end
+            raw_entry_count[0] = end
             if end > capacity:
                 wp.atomic_or(error, 0, 2)
         # Keep every sort range in bounds even when the whole result is invalid.
@@ -382,22 +341,22 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         data = EdgeTriangleListData()
         data.capacity = capacity
         data.soft_edge_count = soft_edge_vertex_indices.shape[0]
-        edge_count = soft_edge_vertex_indices.shape[0] + rigid_edge_vertex_indices.shape[0]
+        total_edge_count = soft_edge_vertex_indices.shape[0] + rigid_edge_vertex_indices.shape[0]
         # Unused capacity is neither cleared nor sorted on rebuild. Warp may
         # still copy capacity-sized buffers as part of the segmented sort.
         data.keys = wp.zeros(2 * capacity, dtype=int)
         sort_values = wp.zeros(2 * capacity, dtype=int)
-        data.starts = wp.zeros(edge_count, dtype=int)
-        data.ends = wp.zeros(edge_count, dtype=int)
-        data.edge_counts = wp.zeros(edge_count, dtype=int)
-        data.write_offsets = wp.zeros(edge_count, dtype=int)
-        data.count = wp.zeros(1, dtype=int)
+        data.starts = wp.zeros(total_edge_count, dtype=int)
+        data.ends = wp.zeros(total_edge_count, dtype=int)
+        data.edge_triangle_counts = wp.zeros(total_edge_count, dtype=int)
+        data.write_offsets = wp.zeros(total_edge_count, dtype=int)
+        data.raw_entry_count = wp.zeros(1, dtype=int)
         data.error = wp.zeros(1, dtype=int)
         return data, sort_values
 
     def rebuild_edge_triangle_lists(
         contacts: "Contacts",
-        contact_data: "EspData",
+        esp_data: "EspData",
         lists: EdgeTriangleListData,
         sort_values: wp.array[int],
     ) -> None:
@@ -416,41 +375,35 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 EE: soft e0 / rigid e2 -> (0,0), (0,1), (7,0)
             These are seven (source_edge, target_face) entries, including the
             repeated (0,0). The per-edge counts and their exclusive scan are:
-                edge_counts = [3,1,0,0,0,1,1,1,0,0]
-                starts      = [0,3,4,4,4,4,5,6,7,7]
-                ends        = [3,4,4,4,4,5,6,7,7,7]
+                edge_triangle_counts = [3,1,0,0,0,1,1,1,0,0]
+                starts               = [0,3,4,4,4,4,5,6,7,7]
+                ends                 = [3,4,4,4,4,5,6,7,7,7]
             With capacity=8, after filling and sorting each edge's range:
                 keys[:7] = [0,0,1,0,1,1,0]
-                count[0] = 7
+                raw_entry_count[0] = 7
             Slot 7 is unused and not sorted; no MAX_INT64 sentinel is needed.
             Compaction changes keys[0:2] to [0,1] and ends[0] to 2. Thus soft
-            e0 visits f0/f1 once each; slot 2 is ignored. count[0] stays 7 (raw
+            e0 visits f0/f1 once each; slot 2 is ignored. raw_entry_count[0] stays 7 (raw
             allocation), but only six unique entries remain. For rigid e2 (global
             source 7), keys[6:7]=[0] directly identifies soft face f0.
         """
-        lists.count.zero_()
+        lists.raw_entry_count.zero_()
         lists.error.zero_()
-        lists.edge_counts.zero_()
+        lists.edge_triangle_counts.zero_()
         worker_count = _contact_worker_count(contacts.soft_contact_max, lists.keys.device)
         collection_inputs = [
             worker_count,
             contacts.soft_contact_count,
             contacts.soft_contact_indices,
+            contacts.soft_contact_primitive_index,
+            contacts.soft_contact_rigid_primitive_index,
             contacts.soft_contact_rigid_indices,
-            contacts.soft_contact_shape,
-            contact_data.rigid_triangle_offsets,
-            contact_data.soft_tri_indices,
-            contact_data.soft_edge_vertex_indices,
-            contact_data.soft_adjacency.v_adj_tris_offsets,
-            contact_data.soft_adjacency.v_adj_tris,
-            contact_data.rigid_tri_indices,
-            contact_data.rigid_edge_vertex_indices,
-            contact_data.soft_adjacency.v_adj_edges_offsets,
-            contact_data.soft_adjacency.v_adj_edges,
-            contact_data.soft_adjacency.edge_tri_indices,
-            contact_data.rigid_adjacency.v_adj_edges_offsets,
-            contact_data.rigid_adjacency.v_adj_edges,
-            contact_data.rigid_adjacency.edge_tri_indices,
+            esp_data.soft_adjacency.v_adj_edges_offsets,
+            esp_data.soft_adjacency.v_adj_edges,
+            esp_data.soft_adjacency.edge_tri_indices,
+            esp_data.rigid_adjacency.v_adj_edges_offsets,
+            esp_data.rigid_adjacency.v_adj_edges,
+            esp_data.rigid_adjacency.edge_tri_indices,
             lists.soft_edge_count,
         ]
         # Run all list-building operations on the device holding the list buffers.
@@ -460,31 +413,31 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 collect_edge_triangles,
                 dim=worker_count,
                 inputs=[*collection_inputs, True],
-                outputs=[lists.edge_counts, lists.write_offsets, lists.keys, lists.error],
+                outputs=[lists.edge_triangle_counts, lists.write_offsets, lists.keys, lists.error],
             )
             # Compute each edge's starting offset from the counts of preceding edges.
-            wp.utils.array_scan(lists.edge_counts, lists.starts, inclusive=False)
+            wp.utils.array_scan(lists.edge_triangle_counts, lists.starts, inclusive=False)
             # Set end offsets and write positions, and flag insufficient capacity.
             wp.launch(
                 finish_edge_triangle_offsets,
-                dim=lists.starts.shape[0],
-                inputs=[lists.edge_counts, lists.capacity],
-                outputs=[lists.starts, lists.ends, lists.write_offsets, lists.count, lists.error],
+                dim=esp_data.total_edge_count,
+                inputs=[lists.edge_triangle_counts, lists.capacity],
+                outputs=[lists.starts, lists.ends, lists.write_offsets, lists.raw_entry_count, lists.error],
             )
             # Fill each edge's reserved range with target triangle IDs from the contact rows.
             wp.launch(
                 collect_edge_triangles,
                 dim=worker_count,
                 inputs=[*collection_inputs, False],
-                outputs=[lists.edge_counts, lists.write_offsets, lists.keys, lists.error],
+                outputs=[lists.edge_triangle_counts, lists.write_offsets, lists.keys, lists.error],
             )
-            if lists.starts.shape[0]:
+            if esp_data.total_edge_count:
                 # Sort each edge's triangle IDs so duplicates are adjacent.
                 wp.utils.segmented_sort_pairs(lists.keys, sort_values, lists.capacity, lists.starts, lists.ends)
                 # Keep one copy of each triangle ID and shorten that edge's active range.
                 wp.launch(
                     compact_sorted_edge_triangles,
-                    dim=lists.starts.shape[0],
+                    dim=esp_data.total_edge_count,
                     inputs=[lists.starts, lists.error],
                     outputs=[lists.keys, lists.ends],
                 )
@@ -494,7 +447,11 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         tri_areas_np: NDArray[np.float32],
         vertex_count: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float32], NDArray[np.float32]]:
-        """Return target vertex coefficients, source vertex areas, and source edge areas."""
+        """Return target vertex-term coefficients, source vertex quadrature weights, and source edge areas.
+
+        See triangle_energy for the target coefficients inside E_v and the
+        source quadrature weight multiplying the complete E_v.
+        """
         triangle_indices_np = mesh_adjacency.indices.reshape(-1, 3)
         edge_vertex_indices_np = mesh_adjacency.edge_indices[:, 2:4]
         if np.any(mesh_adjacency.tri_edge_indices < 0):
@@ -507,24 +464,26 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         if np.any(edge_incident_triangle_count_np > 2):
             raise ValueError("ESP requires manifold triangles")
         vertex_incident_triangle_count_np = np.bincount(triangle_indices_np.ravel(), minlength=vertex_count)
-        vertex_term_weight_np = np.zeros(vertex_count, dtype=np.float64)
-        # Share each target vertex term among its n incident triangles, with weight 1/n.
-        # Vertices with no incident triangles keep their initialized zero weight.
+        vertex_term_coefficient_np = np.zeros(vertex_count, dtype=np.float64)
+        # Share each target vertex term among its N_v incident triangles, with coefficient 1/N_v.
+        # This is vertex_term_coefficient in triangle_energy, not the source quadrature weight.
+        # Vertices with no incident triangles keep their initialized zero coefficient.
         np.divide(
             1.0,
             vertex_incident_triangle_count_np,
-            out=vertex_term_weight_np,
+            out=vertex_term_coefficient_np,
             where=vertex_incident_triangle_count_np > 0,
         )
         # Boundary edges have one incident triangle; their endpoints are boundary vertices.
         # ESP supplement S4, Eq. (S3), sums vertex-distance terms over interior vertices only.
         # Boundary vertices remain part of the triangle-distance terms and can be source samples.
-        vertex_term_weight_np[np.unique(edge_vertex_indices_np[edge_incident_triangle_count_np == 1])] = 0.0
-        vertex_area_np = np.zeros(vertex_count, dtype=np.float32)
+        vertex_term_coefficient_np[np.unique(edge_vertex_indices_np[edge_incident_triangle_count_np == 1])] = 0.0
+        # Source area weights multiply the whole potential; see triangle_energy's final atomic_add.
+        vertex_quadrature_weight_np = np.zeros(vertex_count, dtype=np.float32)
         edge_area_np = np.zeros(len(edge_vertex_indices_np), dtype=np.float32)
-        np.add.at(vertex_area_np, triangle_indices_np.ravel(), np.repeat(tri_areas_np / 3, 3))
+        np.add.at(vertex_quadrature_weight_np, triangle_indices_np.ravel(), np.repeat(tri_areas_np / 3, 3))
         np.add.at(edge_area_np, mesh_adjacency.tri_edge_indices.ravel(), np.repeat(2 * tri_areas_np, 3))
-        return vertex_term_weight_np, vertex_area_np, edge_area_np
+        return vertex_term_coefficient_np, vertex_quadrature_weight_np, edge_area_np
 
     @wp.kernel
     def update_rigid_positions(
@@ -637,7 +596,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         edge_vertex_indices: wp.array[wp.vec2i],
         tri_edge_indices: wp.array2d[int],
         edge_tri_indices: wp.array2d[int],
-        vertex_term_weight: wp.array[scalar],
+        vertex_term_coefficient: wp.array[scalar],
         face: int,
         support: scalar,
         near_cutoff: scalar,
@@ -655,16 +614,18 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         E_v -= edge_coefficient[e'] * b(distance(v, e'))
 
                     for each vertex v' of f':
-                        E_v += vertex_coefficient[v'] * b(distance(v, v'))
+                        E_v += vertex_term_coefficient[v'] * b(distance(v, v'))
 
-                    atomic_add(P_v, stiffness * (A_v / 3) * E_v)
+                    atomic_add(P_v, stiffness * vertex_quadrature_weight[v] * E_v)
 
         This function computes and returns only E_v, with p=v and f'=(a,b,c).
         The caller handles the contact rows, stiffness, source rest-area weight
-        A_v/3, and accumulation. A_v is the sum of rest areas incident to v.
+        vertex_quadrature_weight[v] = A_v/3, and accumulation. A_v is the sum
+        of rest areas incident to source v. Point-only soft particles instead
+        use weight 1; volume-interior particles with no surface triangles use 0.
 
         edge_coefficient[e'] = 1/2 for an interior edge, 0 at a boundary.
-        vertex_coefficient[v'] = 1/N_v' for an interior vertex, 0 at a boundary;
+        vertex_term_coefficient[v'] = 1/N_v' for an interior vertex, 0 at a boundary;
         N_v' is the number of target triangles incident to v'. These coefficients
         count each correction once when summed over its incident triangles.
 
@@ -698,9 +659,9 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 result -= scalar(0.5) * barrier_energy(
                     segment_distance_squared_value(p, edge_start, edge_end), support, near_cutoff, near_only
                 )
-            if vertex_term_weight[triangle_vertex_indices[corner]] != scalar(0.0):
+            if vertex_term_coefficient[triangle_vertex_indices[corner]] != scalar(0.0):
                 delta = p - start
-                result += vertex_term_weight[triangle_vertex_indices[corner]] * barrier_energy(
+                result += vertex_term_coefficient[triangle_vertex_indices[corner]] * barrier_energy(
                     wp.dot(delta, delta), support, near_cutoff, near_only
                 )
         return result
@@ -910,8 +871,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             b: vec3,
             c: vec3,
             moving: int,
-            edge_weights: vec3,
-            vertex_weights: vec3,
+            edge_coefficients: vec3,
+            vertex_coefficients: vec3,
             support: scalar,
             near: scalar,
             near_only: bool,
@@ -1000,7 +961,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     start, end, start_id, end_id = b, c, 2, 3
                 elif corner == 2:
                     start, end, start_id, end_id = c, a, 3, 1
-                if edge_weights[corner] != scalar(0.0):
+                if edge_coefficients[corner] != scalar(0.0):
                     value, grad, hess = segment_potential(
                         point,
                         start,
@@ -1013,17 +974,17 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         near_only,
                         plane_normal,
                     )
-                    energy -= edge_weights[corner] * value
-                    gradient -= edge_weights[corner] * grad
-                    hessian -= edge_weights[corner] * hess
-                if vertex_weights[corner] != scalar(0.0):
+                    energy -= edge_coefficients[corner] * value
+                    gradient -= edge_coefficients[corner] * grad
+                    hessian -= edge_coefficients[corner] * hess
+                if vertex_coefficients[corner] != scalar(0.0):
                     coefficient = scalar(int(moving == 0) - int(moving == start_id))
                     value, grad, hess = point_potential(
                         point, start, coefficient, support, near, near_only, plane_normal
                     )
-                    energy += vertex_weights[corner] * value
-                    gradient += vertex_weights[corner] * grad
-                    hessian += vertex_weights[corner] * hess
+                    energy += vertex_coefficients[corner] * value
+                    gradient += vertex_coefficients[corner] * grad
+                    hessian += vertex_coefficients[corner] * hess
             return energy, gradient, hessian
 
         @wp.func
@@ -1034,8 +995,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             c: vec3,
             com: vec3,
             triangle_moves: bool,
-            edge_weights: vec3,
-            vertex_weights: vec3,
+            edge_coefficients: vec3,
+            vertex_coefficients: vec3,
             support: scalar,
             near: scalar,
             near_only: bool,
@@ -1049,7 +1010,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             This maps the FINAL energy block, not a chain of point derivatives.
             """
             energy, grad, hess = triangle_potential(
-                point, a, b, c, 0, edge_weights, vertex_weights, support, near, near_only
+                point, a, b, c, 0, edge_coefficients, vertex_coefficients, support, near, near_only
             )
             offset = point - com
             sign = scalar(-1.0) if triangle_moves else scalar(1.0)
@@ -1586,8 +1547,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             target_is_rigid: bool,
             target_moves_with_body: bool,
             particle_mask: int,
-            edge_weights: vec3,
-            vertex_weights: vec3,
+            edge_coefficients: vec3,
+            vertex_coefficients: vec3,
             support: scalar,
             near: scalar,
         ):
@@ -1626,9 +1587,9 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 if feature > 0:
                     corner = (feature - 1) // 2
                     target = wp.vec3i(4 + corner, 4 + (corner + 1) % 3, -1)
-                    dim, coefficient = 1, -edge_weights[corner]
+                    dim, coefficient = 1, -edge_coefficients[corner]
                     if feature % 2 == 0:
-                        dim, coefficient = 0, vertex_weights[corner]
+                        dim, coefficient = 0, vertex_coefficients[corner]
                 if coefficient != scalar(0.0):
                     value, gradient, parameters, hessian = feature_distance(
                         positions,
@@ -1737,22 +1698,22 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
     Matrix6 = wp.types.matrix(shape=(6, 6), dtype=scalar)
 
     @wp.func
-    def triangle_feature_weights(
+    def triangle_feature_coefficients(
         tri_indices: wp.array[wp.vec3i],
         tri_edge_indices: wp.array2d[int],
         edge_tri_indices: wp.array2d[int],
-        vertex_term_weight: wp.array[scalar],
+        vertex_term_coefficient: wp.array[scalar],
         face: int,
     ) -> tuple[Vec3, Vec3]:
-        """Read shared-edge and vertex weights for one face."""
+        """Read target edge/vertex correction coefficients for one face; see triangle_energy."""
         triangle_vertex_indices = tri_indices[face]
-        edge_weights, vertex_weights = Vec3(), Vec3()
+        edge_coefficients, vertex_coefficients = Vec3(), Vec3()
         for corner in range(3):
             edge = tri_edge_indices[face, corner]
             if edge_tri_indices[edge, 0] >= 0 and edge_tri_indices[edge, 1] >= 0:
-                edge_weights[corner] = scalar(0.5)
-            vertex_weights[corner] = vertex_term_weight[triangle_vertex_indices[corner]]
-        return edge_weights, vertex_weights
+                edge_coefficients[corner] = scalar(0.5)
+            vertex_coefficients[corner] = vertex_term_coefficient[triangle_vertex_indices[corner]]
+        return edge_coefficients, vertex_coefficients
 
     _PARTICLE_BLOCKS = wp.constant(1)
     _BODY_BLOCKS = wp.constant(2)
@@ -1847,7 +1808,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
 
     @wp.func
     def contact_support_and_stiffness(
-        row: wp.vec3i,
+        family: int,
+        soft_primitive_index: int,
         shape: int,
         data: EspData,
         particle_radius: wp.array[float],
@@ -1860,17 +1822,16 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         VT uses its vertex radius, TV the maximum of its three vertex radii,
         and EE the maximum of its two endpoint radii. None depends on positions.
         """
-        family = row[0] & 7
         radius = float(0.0)
         if family == 0:
-            radius = particle_radius[row[1]]
+            radius = particle_radius[soft_primitive_index]
         elif family == 1:
-            triangle = data.soft_tri_indices[row[1]]
+            triangle = data.soft_tri_indices[soft_primitive_index]
             radius = wp.max(
                 wp.max(particle_radius[triangle[0]], particle_radius[triangle[1]]), particle_radius[triangle[2]]
             )
         elif family == 2:
-            edge = data.soft_edge_vertex_indices[row[1]]
+            edge = data.soft_edge_vertex_indices[soft_primitive_index]
             radius = wp.max(particle_radius[edge[0]], particle_radius[edge[1]])
         support = scalar(radius) + scalar(shape_margin[shape])
         stiffness = scalar(0.5) * (scalar(soft_contact_ke) + scalar(shape_material_ke[shape]))
@@ -1878,7 +1839,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
 
     @wp.func
     def checked_contact_parameters(
-        row: wp.vec3i,
+        family: int,
+        soft_primitive_index: int,
         shape: int,
         data: EspData,
         particle_radius: wp.array[float],
@@ -1893,20 +1855,19 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         are not quadrature samples. Unknown families or invalid materials set
         the persistent error flag before being skipped.
         """
-        if row[0] < 0 or data.rigid_triangle_offsets[shape] < 0:
+        if family < 0 or data.rigid_triangle_offsets[shape] < 0:
             return scalar(0.0), scalar(0.0), scalar(0.0)
-        family = row[0] & 7
         if family == 3:
             return scalar(0.0), scalar(0.0), scalar(0.0)
         if family > 3:
             wp.atomic_or(esp_error, 0, 8)
             return scalar(0.0), scalar(0.0), scalar(0.0)
-        if family == 0 and scalar(data.soft_vertex_weight[row[1]]) == scalar(0.0):
+        if family == 0 and scalar(data.soft_vertex_quadrature_weight[soft_primitive_index]) == scalar(0.0):
             return scalar(0.0), scalar(0.0), scalar(0.0)
-        if family == 2 and data.soft_edge_area[row[1]] == scalar(0.0):
+        if family == 2 and data.soft_edge_area[soft_primitive_index] == scalar(0.0):
             return scalar(0.0), scalar(0.0), scalar(0.0)
         support, near_cutoff, stiffness = contact_support_and_stiffness(
-            row, shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
+            family, soft_primitive_index, shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
         )
         if not wp.isfinite(support) or not wp.isfinite(stiffness) or support < 0 or stiffness < 0:
             wp.atomic_or(esp_error, 0, 16)
@@ -1916,7 +1877,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
     @wp.func
     def read_ee_quadrature_sample(
         row_id: int,
-        row: wp.vec3i,
+        soft_primitive_index: int,
+        rigid_primitive_index: int,
         data: EspData,
         particle_q: wp.array[wp.vec3],
         rigid_positions: wp.array[Vec3],
@@ -1931,7 +1893,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 Vec3(rigid_sample[0], rigid_sample[1], rigid_sample[2]),
                 soft_sample[3],
             )
-        soft_edge, rigid_edge = data.soft_edge_vertex_indices[row[1]], data.rigid_edge_vertex_indices[row[2]]
+        soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
+        rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
         return ee_quadrature_sample(
             Vec3(particle_q[soft_edge[0]]),
             Vec3(particle_q[soft_edge[1]]),
@@ -1945,6 +1908,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         worker_count: int,
         soft_contact_count: wp.array[int],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_primitive_index: wp.array[int],
+        soft_contact_rigid_primitive_index: wp.array[int],
         soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_shape: wp.array[int],
         data: EspData,
@@ -1954,62 +1919,49 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         shape_margin: wp.array[float],
         shape_material_ke: wp.array[float],
         soft_contact_ke: float,
-        energy_only: bool,
-        # Outputs: refreshed sample values and cleared output buffers.
+        # Output: EE sample values at the current positions.
         ee_samples: wp.array2d[Vec4],
-        esp_forces: wp.array2d[scalar],
-        esp_hessians: wp.array3d[scalar],
-        esp_energy: wp.array[scalar],
     ) -> None:
-        """Clear outputs and cache EE sample values at the current positions.
+        """Cache EE sample values at the current positions.
 
         This bookkeeping kernel does not differentiate anything. ee_samples[:,0]
         holds (soft sample xyz, weight); ee_samples[:,1] holds (rigid sample xyz, 0).
         Refresh after every position update. Derivative kernels still differentiate
         the sample and weight when a source endpoint or rigid body moves.
         """
-        worker = wp.tid()
-        # Clearing follows the output size, not the contact count.
-        if energy_only:
-            for i in range(worker, esp_energy.shape[0], worker_count):
-                esp_energy[i] = scalar(0.0)
-        else:
-            for row_id in range(worker, esp_forces.shape[0], worker_count):
-                for i in range(esp_forces.shape[1]):
-                    esp_forces[row_id, i] = scalar(0.0)
-                    for j in range(esp_forces.shape[1]):
-                        esp_hessians[row_id, i, j] = scalar(0.0)
         if soft_contact_count[0] > soft_contact_indices.shape[0]:
             return
-        for row_id in range(worker, soft_contact_count[0], worker_count):
+        for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
             ee_samples[row_id, 0] = Vec4()
             ee_samples[row_id, 1] = Vec4()
-            shape = soft_contact_shape[row_id]
-            row = contact_primitive_indices(
-                soft_contact_indices[row_id],
-                soft_contact_rigid_indices[row_id],
-                data.rigid_triangle_offsets[shape],
-                data.soft_tri_indices,
-                data.soft_edge_vertex_indices,
-                data.soft_adjacency.v_adj_tris_offsets,
-                data.soft_adjacency.v_adj_tris,
-                data.soft_adjacency.v_adj_edges_offsets,
-                data.soft_adjacency.v_adj_edges,
-                data.rigid_tri_indices,
-                data.rigid_edge_vertex_indices,
-                data.rigid_adjacency.v_adj_edges_offsets,
-                data.rigid_adjacency.v_adj_edges,
-            )
-            if row[0] < 0 or (row[0] & 7) != 2 or data.rigid_triangle_offsets[shape] < 0:
+            soft_indices = soft_contact_indices[row_id]
+            rigid_indices = soft_contact_rigid_indices[row_id]
+            if not (soft_indices[1] >= 0 and soft_indices[2] < 0 and rigid_indices[1] >= 0 and rigid_indices[2] < 0):
                 continue
-            if data.soft_edge_area[row[1]] == scalar(0.0):
+            soft_primitive_index = soft_contact_primitive_index[row_id]
+            rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
+            # Invalid IDs are reported by the evaluation kernels; do not index them here.
+            if soft_primitive_index < 0 or rigid_primitive_index < 0:
+                continue
+            shape = soft_contact_shape[row_id]
+            if data.rigid_triangle_offsets[shape] < 0:
+                continue
+            if data.soft_edge_area[soft_primitive_index] == scalar(0.0):
                 continue
             support, near_cutoff, _stiffness = contact_support_and_stiffness(
-                row, shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
+                2,
+                soft_primitive_index,
+                shape,
+                data,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
             )
             if support <= 0:
                 continue
-            soft_edge, rigid_edge = data.soft_edge_vertex_indices[row[1]], data.rigid_edge_vertex_indices[row[2]]
+            soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
+            rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
             q, q_bar, weight = ee_quadrature_sample(
                 Vec3(particle_q[soft_edge[0]]),
                 Vec3(particle_q[soft_edge[1]]),
@@ -2108,7 +2060,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         for i in range(3):
             particle = soft_particle_indices[i]
             if particle >= 0:
-                if data.soft_vertex_weight[particle] == wp.float64(0.0):
+                if data.soft_vertex_quadrature_weight[particle] == wp.float64(0.0):
                     return  # Interior solid vertices have no mesh-contact damping either.
                 if color < 0 or particle_colors[particle] == color:
                     active = True
@@ -2321,20 +2273,20 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             return
         if source_is_rigid:
             target_triangle_vertex_indices = wp.vec3i(data.soft_tri_indices[target_face])
-            edge_weights, vertex_weights = triangle_feature_weights(
+            edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                 data.soft_tri_indices,
                 data.soft_adjacency.tri_edge_indices,
                 data.soft_adjacency.edge_tri_indices,
-                data.soft_vertex_term_weight,
+                data.soft_vertex_term_coefficient,
                 target_face,
             )
         else:
             target_triangle_vertex_indices = wp.vec3i(data.rigid_tri_indices[target_face])
-            edge_weights, vertex_weights = triangle_feature_weights(
+            edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                 data.rigid_tri_indices,
                 data.rigid_adjacency.tri_edge_indices,
                 data.rigid_adjacency.edge_tri_indices,
-                data.rigid_vertex_term_weight,
+                data.rigid_vertex_term_coefficient,
                 target_face,
             )
         q, displacement = Vec3(), Vec3()
@@ -2398,9 +2350,9 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         for feature in range(7):
             coefficient = scalar(1.0)
             if feature >= 4:
-                coefficient = vertex_weights[feature - 4]
+                coefficient = vertex_coefficients[feature - 4]
             elif feature >= 1:
-                coefficient = -edge_weights[feature - 1]
+                coefficient = -edge_coefficients[feature - 1]
             if coefficient == scalar(0.0):
                 continue
             target_barycentric = friction_closest_barycentric(q, a, b, c, feature)
@@ -2467,7 +2419,9 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
     @wp.func
     def accumulate_contact_friction(
         row_id: int,
-        row: wp.vec3i,
+        family: int,
+        soft_primitive_index: int,
+        rigid_primitive_index: int,
         shape: int,
         data: EspData,
         particle_q: wp.array[wp.vec3],
@@ -2502,17 +2456,18 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         esp_error: wp.array[int],
     ) -> None:
         """Evaluate this row's primitive friction inside its conservative kernel."""
-        family = row[0] & 7
         soft_edge, rigid_edge = wp.vec2i(-1), wp.vec2i(-1)
         soft_barycentric, rigid_barycentric = Vec3(), Vec3()
         weight = scalar(1.0)
         if family == 2:
-            q, qb, weight = read_ee_quadrature_sample(row_id, row, data, particle_q, rigid_positions, near, ee_samples)
+            q, qb, weight = read_ee_quadrature_sample(
+                row_id, soft_primitive_index, rigid_primitive_index, data, particle_q, rigid_positions, near, ee_samples
+            )
             if weight <= scalar(0.0):
                 return
             soft_edge, rigid_edge = (
-                wp.vec2i(data.soft_edge_vertex_indices[row[1]]),
-                wp.vec2i(data.rigid_edge_vertex_indices[row[2]]),
+                wp.vec2i(data.soft_edge_vertex_indices[soft_primitive_index]),
+                wp.vec2i(data.rigid_edge_vertex_indices[rigid_primitive_index]),
             )
             a, b = Vec3(particle_q[soft_edge[0]]), Vec3(particle_q[soft_edge[1]])
             c, d = rigid_positions[rigid_edge[0]], rigid_positions[rigid_edge[1]]
@@ -2524,24 +2479,25 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             if family != 2 and direction == 1:
                 continue
             source_is_rigid = family == 1 or (family == 2 and direction == 1)
-            source_indices, source_barycentric = wp.vec3i(row[1], -1, -1), Vec3(scalar(1.0), scalar(0.0), scalar(0.0))
+            source_indices = wp.vec3i(soft_primitive_index, -1, -1)
+            source_barycentric = Vec3(scalar(1.0), scalar(0.0), scalar(0.0))
             source_quadrature_weight = scalar(0.0)
             if family == 0:
-                source_quadrature_weight = scalar(data.soft_vertex_weight[row[1]])
-            start = data.rigid_triangle_offsets[shape] + row[2]
+                source_quadrature_weight = scalar(data.soft_vertex_quadrature_weight[soft_primitive_index])
+            start = rigid_primitive_index
             end = start + 1
             if family == 1:
-                source_indices = wp.vec3i(row[2], -1, -1)
-                source_quadrature_weight = scalar(data.rigid_vertex_area[row[2]])
-                start, end = int(row[1]), row[1] + 1
+                source_indices = wp.vec3i(rigid_primitive_index, -1, -1)
+                source_quadrature_weight = scalar(data.rigid_vertex_quadrature_weight[rigid_primitive_index])
+                start, end = soft_primitive_index, soft_primitive_index + 1
             elif family == 2:
-                edge_list = int(row[1])
+                edge_list = soft_primitive_index
                 source_indices, source_barycentric = wp.vec3i(soft_edge[0], soft_edge[1], -1), soft_barycentric
-                source_quadrature_weight = data.soft_edge_area[row[1]] * weight
+                source_quadrature_weight = data.soft_edge_area[soft_primitive_index] * weight
                 if direction == 1:
-                    edge_list = lists.soft_edge_count + row[2]
+                    edge_list = lists.soft_edge_count + rigid_primitive_index
                     source_indices, source_barycentric = wp.vec3i(rigid_edge[0], rigid_edge[1], -1), rigid_barycentric
-                    source_quadrature_weight = data.rigid_edge_area[row[2]] * weight
+                    source_quadrature_weight = data.rigid_edge_area[rigid_primitive_index] * weight
                 start, end = int(lists.starts[edge_list]), int(lists.ends[edge_list])
             for k in range(start, end):
                 face = k
@@ -2549,14 +2505,15 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 target_support, target_near, target_ke = support, near, stiffness
                 if family == 2:
                     face = int(lists.keys[k])
-                    target_row = row
+                    target_family, target_soft_primitive_index = 2, soft_primitive_index
                     if direction == 0:
                         target_vertex = data.rigid_tri_indices[face][0]
                         target_shape = int(data.rigid_vertex_shapes[target_vertex])
                     else:
-                        target_row = wp.vec3i(1, face, -1)
+                        target_family, target_soft_primitive_index = 1, face
                     target_support, target_near, target_ke = contact_support_and_stiffness(
-                        target_row,
+                        target_family,
+                        target_soft_primitive_index,
                         target_shape,
                         data,
                         particle_radius,
@@ -2604,6 +2561,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         worker_count: int,
         soft_contact_count: wp.array[int],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_primitive_index: wp.array[int],
+        soft_contact_rigid_primitive_index: wp.array[int],
         soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_shape: wp.array[int],
         data: EspData,
@@ -2628,34 +2587,34 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             return
         for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
             shape = soft_contact_shape[row_id]
-            row = contact_primitive_indices(
+            soft_primitive_index = soft_contact_primitive_index[row_id]
+            rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
+            family = _mesh_contact_family(
                 soft_contact_indices[row_id],
                 soft_contact_rigid_indices[row_id],
-                data.rigid_triangle_offsets[shape],
-                data.soft_tri_indices,
-                data.soft_edge_vertex_indices,
-                data.soft_adjacency.v_adj_tris_offsets,
-                data.soft_adjacency.v_adj_tris,
-                data.soft_adjacency.v_adj_edges_offsets,
-                data.soft_adjacency.v_adj_edges,
-                data.rigid_tri_indices,
-                data.rigid_edge_vertex_indices,
-                data.rigid_adjacency.v_adj_edges_offsets,
-                data.rigid_adjacency.v_adj_edges,
+                soft_primitive_index,
+                rigid_primitive_index,
             )
             support, near_cutoff, stiffness = checked_contact_parameters(
-                row, shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke, esp_error
+                family,
+                soft_primitive_index,
+                shape,
+                data,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
+                esp_error,
             )
-            if support == 0 or (stiffness == 0 and (row[0] & 7) != 2):
+            if support == 0 or (stiffness == 0 and family != 2):
                 continue
-            family = row[0] & 7
             value = scalar(0.0)
             if family == 0:
                 # VT: soft vertex against a rigid triangle.
-                face = data.rigid_triangle_offsets[shape] + row[2]
+                face = rigid_primitive_index
                 triangle_vertex_indices = data.rigid_tri_indices[face]
-                value = scalar(data.soft_vertex_weight[row[1]]) * triangle_energy(
-                    Vec3(particle_q[row[1]]),
+                value = scalar(data.soft_vertex_quadrature_weight[soft_primitive_index]) * triangle_energy(
+                    Vec3(particle_q[soft_primitive_index]),
                     rigid_positions[triangle_vertex_indices[0]],
                     rigid_positions[triangle_vertex_indices[1]],
                     rigid_positions[triangle_vertex_indices[2]],
@@ -2663,7 +2622,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     data.rigid_edge_vertex_indices,
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
-                    data.rigid_vertex_term_weight,
+                    data.rigid_vertex_term_coefficient,
                     face,
                     support,
                     near_cutoff,
@@ -2671,10 +2630,10 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 )
             elif family == 1:
                 # TV: rigid vertex against a soft triangle.
-                face = row[1]
+                face = soft_primitive_index
                 triangle_vertex_indices = data.soft_tri_indices[face]
-                value = data.rigid_vertex_area[row[2]] * triangle_energy(
-                    rigid_positions[row[2]],
+                value = data.rigid_vertex_quadrature_weight[rigid_primitive_index] * triangle_energy(
+                    rigid_positions[rigid_primitive_index],
                     Vec3(particle_q[triangle_vertex_indices[0]]),
                     Vec3(particle_q[triangle_vertex_indices[1]]),
                     Vec3(particle_q[triangle_vertex_indices[2]]),
@@ -2682,7 +2641,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     data.soft_edge_vertex_indices,
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
-                    data.soft_vertex_term_weight,
+                    data.soft_vertex_term_coefficient,
                     face,
                     support,
                     near_cutoff,
@@ -2691,18 +2650,32 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             else:
                 # EE: weight * (W_soft P_near(q, rigid) + W_rigid P_near(q_bar, soft)).
                 q, q_bar, weight = read_ee_quadrature_sample(
-                    row_id, row, data, particle_q, rigid_positions, near_cutoff, ee_samples
+                    row_id,
+                    soft_primitive_index,
+                    rigid_primitive_index,
+                    data,
+                    particle_q,
+                    rigid_positions,
+                    near_cutoff,
+                    ee_samples,
                 )
                 if weight <= scalar(0.0):
                     continue
-                soft_edge, rigid_edge = row[1], row[2]
+                soft_edge, rigid_edge = soft_primitive_index, rigid_primitive_index
                 near_rigid, near_soft = scalar(0.0), scalar(0.0)
                 for k in range(lists.starts[soft_edge], lists.ends[soft_edge]):
                     face = lists.keys[k]
                     triangle_vertex_indices = data.rigid_tri_indices[face]
                     target_shape = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
                     target_support, target_near, target_ke = contact_support_and_stiffness(
-                        row, target_shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
+                        family,
+                        soft_primitive_index,
+                        target_shape,
+                        data,
+                        particle_radius,
+                        shape_margin,
+                        shape_material_ke,
+                        soft_contact_ke,
                     )
                     near_rigid += target_ke * triangle_energy(
                         q,
@@ -2713,7 +2686,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         data.rigid_edge_vertex_indices,
                         data.rigid_adjacency.tri_edge_indices,
                         data.rigid_adjacency.edge_tri_indices,
-                        data.rigid_vertex_term_weight,
+                        data.rigid_vertex_term_coefficient,
                         face,
                         target_support,
                         target_near,
@@ -2724,7 +2697,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     face = lists.keys[k]
                     triangle_vertex_indices = data.soft_tri_indices[face]
                     target_support, target_near, target_ke = contact_support_and_stiffness(
-                        wp.vec3i(1, face, -1),
+                        1,
+                        face,
                         shape,
                         data,
                         particle_radius,
@@ -2741,7 +2715,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         data.soft_edge_vertex_indices,
                         data.soft_adjacency.tri_edge_indices,
                         data.soft_adjacency.edge_tri_indices,
-                        data.soft_vertex_term_weight,
+                        data.soft_vertex_term_coefficient,
                         face,
                         target_support,
                         target_near,
@@ -2759,7 +2733,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
 
     @wp.func
     def ee_particle_source(
-        row: wp.vec3i,
+        soft_primitive_index: int,
+        rigid_primitive_index: int,
         shape: int,
         particle: int,
         data: EspData,
@@ -2775,7 +2750,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         partitions: int,
     ):
         """Differentiate both EE sample directions with respect to a source particle."""
-        soft_edge, rigid_edge = data.soft_edge_vertex_indices[row[1]], data.rigid_edge_vertex_indices[row[2]]
+        soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
+        rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
         a, b = Vec3(particle_q[soft_edge[0]]), Vec3(particle_q[soft_edge[1]])
         c, d = rigid_positions[rigid_edge[0]], rigid_positions[rigid_edge[1]]
         source_mask = int(soft_edge[0] == particle) | (int(soft_edge[1] == particle) << 1)
@@ -2785,13 +2761,14 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             return scalar(0.0), Vec3(), Mat33()
         potential, gradient, parameter_gradient_sum, hessian = scalar(0.0), Vec3(), Vec2(), Mat33()
         for direction in range(2):
-            edge_list = int(row[1])
+            edge_list = soft_primitive_index
             if direction == 1:
-                edge_list = lists.soft_edge_count + row[2]
+                edge_list = lists.soft_edge_count + rigid_primitive_index
             for k in range(lists.starts[edge_list] + partition, lists.ends[edge_list], partitions):
                 face = lists.keys[k]
                 particle_mask = source_mask
-                target_shape, target_row = shape, row
+                target_shape = shape
+                target_family, target_soft_primitive_index = 2, soft_primitive_index
                 sample = Vec3(pair.soft_sample)
                 if direction == 0:
                     triangle_vertex_indices = wp.vec3i(data.rigid_tri_indices[face])
@@ -2801,37 +2778,44 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         Vec3(rigid_positions[triangle_vertex_indices[1]]),
                         Vec3(rigid_positions[triangle_vertex_indices[2]]),
                     )
-                    edge_weights, vertex_weights = triangle_feature_weights(
+                    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                         data.rigid_tri_indices,
                         data.rigid_adjacency.tri_edge_indices,
                         data.rigid_adjacency.edge_tri_indices,
-                        data.rigid_vertex_term_weight,
+                        data.rigid_vertex_term_coefficient,
                         face,
                     )
-                    source_area_factor = scalar(data.soft_edge_area[row[1]])
+                    source_area_factor = scalar(data.soft_edge_area[soft_primitive_index])
                 else:
                     triangle_vertex_indices = wp.vec3i(data.soft_tri_indices[face])
-                    target_row = wp.vec3i(1, face, -1)
+                    target_family, target_soft_primitive_index = 1, face
                     ta, tb, tc = (
                         Vec3(particle_q[triangle_vertex_indices[0]]),
                         Vec3(particle_q[triangle_vertex_indices[1]]),
                         Vec3(particle_q[triangle_vertex_indices[2]]),
                     )
                     sample = Vec3(pair.rigid_sample)
-                    edge_weights, vertex_weights = triangle_feature_weights(
+                    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                         data.soft_tri_indices,
                         data.soft_adjacency.tri_edge_indices,
                         data.soft_adjacency.edge_tri_indices,
-                        data.soft_vertex_term_weight,
+                        data.soft_vertex_term_coefficient,
                         face,
                     )
-                    source_area_factor = scalar(data.rigid_edge_area[row[2]])
+                    source_area_factor = scalar(data.rigid_edge_area[rigid_primitive_index])
                     # One particle may be both source endpoint and target corner.
                     for corner in range(3):
                         if triangle_vertex_indices[corner] == particle:
                             particle_mask |= 1 << (4 + corner)
                 support, target_near, stiffness = contact_support_and_stiffness(
-                    target_row, target_shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
+                    target_family,
+                    target_soft_primitive_index,
+                    target_shape,
+                    data,
+                    particle_radius,
+                    shape_margin,
+                    shape_material_ke,
+                    soft_contact_ke,
                 )
                 lower = wp.min(wp.min(ta - pair.origin, tb - pair.origin), tc - pair.origin)
                 upper = wp.max(wp.max(ta - pair.origin, tb - pair.origin), tc - pair.origin)
@@ -2846,8 +2830,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     direction == 0,
                     False,
                     particle_mask,
-                    edge_weights,
-                    vertex_weights,
+                    edge_coefficients,
+                    vertex_coefficients,
                     support,
                     target_near,
                 )
@@ -2864,6 +2848,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         worker_count: int,
         soft_contact_count: wp.array[int],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_primitive_index: wp.array[int],
+        soft_contact_rigid_primitive_index: wp.array[int],
         soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_shape: wp.array[int],
         data: EspData,
@@ -2913,20 +2899,13 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             return
         for row_id in range(worker, soft_contact_count[0], worker_count):
             shape = soft_contact_shape[row_id]
-            row = contact_primitive_indices(
+            soft_primitive_index = soft_contact_primitive_index[row_id]
+            rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
+            family = _mesh_contact_family(
                 soft_contact_indices[row_id],
                 soft_contact_rigid_indices[row_id],
-                data.rigid_triangle_offsets[shape],
-                data.soft_tri_indices,
-                data.soft_edge_vertex_indices,
-                data.soft_adjacency.v_adj_tris_offsets,
-                data.soft_adjacency.v_adj_tris,
-                data.soft_adjacency.v_adj_edges_offsets,
-                data.soft_adjacency.v_adj_edges,
-                data.rigid_tri_indices,
-                data.rigid_edge_vertex_indices,
-                data.rigid_adjacency.v_adj_edges_offsets,
-                data.rigid_adjacency.v_adj_edges,
+                soft_primitive_index,
+                rigid_primitive_index,
             )
             if partition == 0:
                 accumulate_contact_damping(
@@ -2959,17 +2938,26 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     esp_error,
                 )
             support, near, stiffness = checked_contact_parameters(
-                row, shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke, esp_error
+                family,
+                soft_primitive_index,
+                shape,
+                data,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
+                esp_error,
             )
-            if support == 0 or (stiffness == 0 and (row[0] & 7) != 2):
+            if support == 0 or (stiffness == 0 and family != 2):
                 continue
-            family = row[0] & 7
             if family < 2 and partition != 0:
                 continue
             if use_friction and partition == 0:
                 accumulate_contact_friction(
                     row_id,
-                    row,
+                    family,
+                    soft_primitive_index,
+                    rigid_primitive_index,
                     shape,
                     data,
                     particle_q,
@@ -3004,16 +2992,16 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     esp_error,
                 )
             if family == 0:
-                particle = row[1]
+                particle = soft_primitive_index
                 if color >= 0 and particle_colors[particle] != color:
                     continue
-                face = data.rigid_triangle_offsets[shape] + row[2]
+                face = rigid_primitive_index
                 triangle_vertex_indices = data.rigid_tri_indices[face]
-                edge_weights, vertex_weights = triangle_feature_weights(
+                edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                     data.rigid_tri_indices,
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
-                    data.rigid_vertex_term_weight,
+                    data.rigid_vertex_term_coefficient,
                     face,
                 )
                 e, g, h = particle_triangle(
@@ -3022,8 +3010,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     rigid_positions[triangle_vertex_indices[1]],
                     rigid_positions[triangle_vertex_indices[2]],
                     0,
-                    edge_weights,
-                    vertex_weights,
+                    edge_coefficients,
+                    vertex_coefficients,
                     support,
                     near,
                     False,
@@ -3032,20 +3020,20 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     esp_forces,
                     esp_hessians,
                     particle,
-                    stiffness * scalar(data.soft_vertex_weight[particle]),
+                    stiffness * scalar(data.soft_vertex_quadrature_weight[particle]),
                     e,
                     g,
                     h,
                     esp_error,
                 )
             elif family == 1:
-                face = row[1]
+                face = soft_primitive_index
                 triangle_vertex_indices = data.soft_tri_indices[face]
-                edge_weights, vertex_weights = triangle_feature_weights(
+                edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                     data.soft_tri_indices,
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
-                    data.soft_vertex_term_weight,
+                    data.soft_vertex_term_coefficient,
                     face,
                 )
                 for corner in range(3):
@@ -3053,13 +3041,13 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     if color >= 0 and particle_colors[particle] != color:
                         continue
                     e, g, h = particle_triangle(
-                        rigid_positions[row[2]],
+                        rigid_positions[rigid_primitive_index],
                         Vec3(particle_q[triangle_vertex_indices[0]]),
                         Vec3(particle_q[triangle_vertex_indices[1]]),
                         Vec3(particle_q[triangle_vertex_indices[2]]),
                         corner + 1,
-                        edge_weights,
-                        vertex_weights,
+                        edge_coefficients,
+                        vertex_coefficients,
                         support,
                         near,
                         False,
@@ -3068,7 +3056,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         esp_forces,
                         esp_hessians,
                         particle,
-                        stiffness * data.rigid_vertex_area[row[2]],
+                        stiffness * data.rigid_vertex_quadrature_weight[rigid_primitive_index],
                         e,
                         g,
                         h,
@@ -3076,17 +3064,25 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     )
             else:
                 _q, q_bar, weight = read_ee_quadrature_sample(
-                    row_id, row, data, particle_q, rigid_positions, near, ee_samples
+                    row_id,
+                    soft_primitive_index,
+                    rigid_primitive_index,
+                    data,
+                    particle_q,
+                    rigid_positions,
+                    near,
+                    ee_samples,
                 )
                 if weight <= scalar(0.0):
                     continue
-                soft_edge = data.soft_edge_vertex_indices[row[1]]
+                soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
                 for endpoint in range(2):
                     particle = soft_edge[endpoint]
                     if color >= 0 and particle_colors[particle] != color:
                         continue
                     e, g, h = ee_particle_source(
-                        row,
+                        soft_primitive_index,
+                        rigid_primitive_index,
                         shape,
                         particle,
                         data,
@@ -3104,12 +3100,13 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     accumulate_particle_block(esp_forces, esp_hessians, particle, scalar(1.0), e, g, h, esp_error)
                 # Target-only particles cannot move q_bar or w. Use the simpler direct
                 # triangle block and do not count source endpoints for a second time.
-                edge_list = lists.soft_edge_count + row[2]
+                edge_list = lists.soft_edge_count + rigid_primitive_index
                 for k in range(lists.starts[edge_list] + partition, lists.ends[edge_list], partitions):
                     face = lists.keys[k]
                     triangle_vertex_indices = data.soft_tri_indices[face]
                     target_support, target_near, target_ke = contact_support_and_stiffness(
-                        wp.vec3i(1, face, -1),
+                        1,
+                        face,
                         shape,
                         data,
                         particle_radius,
@@ -3117,11 +3114,11 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         shape_material_ke,
                         soft_contact_ke,
                     )
-                    edge_weights, vertex_weights = triangle_feature_weights(
+                    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                         data.soft_tri_indices,
                         data.soft_adjacency.tri_edge_indices,
                         data.soft_adjacency.edge_tri_indices,
-                        data.soft_vertex_term_weight,
+                        data.soft_vertex_term_coefficient,
                         face,
                     )
                     for corner in range(3):
@@ -3136,8 +3133,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                             Vec3(particle_q[triangle_vertex_indices[1]]),
                             Vec3(particle_q[triangle_vertex_indices[2]]),
                             corner + 1,
-                            edge_weights,
-                            vertex_weights,
+                            edge_coefficients,
+                            vertex_coefficients,
                             target_support,
                             target_near,
                             True,
@@ -3146,7 +3143,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                             esp_forces,
                             esp_hessians,
                             particle,
-                            target_ke * weight * data.rigid_edge_area[row[2]],
+                            target_ke * weight * data.rigid_edge_area[rigid_primitive_index],
                             e,
                             g,
                             h,
@@ -3155,7 +3152,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
 
     @wp.func
     def ee_body(
-        row: wp.vec3i,
+        soft_primitive_index: int,
+        rigid_primitive_index: int,
         shape: int,
         body: int,
         com: Vec3,
@@ -3171,7 +3169,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         soft_contact_ke: float,
     ):
         """Differentiate q, q_bar, w and all targets moved by the generating body."""
-        soft_edge, rigid_edge = data.soft_edge_vertex_indices[row[1]], data.rigid_edge_vertex_indices[row[2]]
+        soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
+        rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
         a, b = Vec3(particle_q[soft_edge[0]]), Vec3(particle_q[soft_edge[1]])
         c, d = rigid_positions[rigid_edge[0]], rigid_positions[rigid_edge[1]]
         pair = prepare_body_ee_pair(a, b, c, d, 0, com, near)
@@ -3179,12 +3178,13 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             return scalar(0.0), Vector6(), Matrix6()
         potential, gradient, parameter_gradient_sum, hessian = scalar(0.0), Vector6(), Vec2(), Matrix6()
         for direction in range(2):
-            edge_list = int(row[1])
+            edge_list = soft_primitive_index
             if direction == 1:
-                edge_list = lists.soft_edge_count + row[2]
+                edge_list = lists.soft_edge_count + rigid_primitive_index
             for k in range(lists.starts[edge_list], lists.ends[edge_list]):
                 face = lists.keys[k]
-                target_shape, target_row = shape, row
+                target_shape = shape
+                target_family, target_soft_primitive_index = 2, soft_primitive_index
                 sample = Vec3(pair.soft_sample)
                 target_moves = bool(False)
                 if direction == 0:
@@ -3196,33 +3196,40 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         Vec3(rigid_positions[triangle_vertex_indices[1]]),
                         Vec3(rigid_positions[triangle_vertex_indices[2]]),
                     )
-                    edge_weights, vertex_weights = triangle_feature_weights(
+                    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                         data.rigid_tri_indices,
                         data.rigid_adjacency.tri_edge_indices,
                         data.rigid_adjacency.edge_tri_indices,
-                        data.rigid_vertex_term_weight,
+                        data.rigid_vertex_term_coefficient,
                         face,
                     )
-                    source_area_factor = scalar(data.soft_edge_area[row[1]])
+                    source_area_factor = scalar(data.soft_edge_area[soft_primitive_index])
                 else:
                     triangle_vertex_indices = data.soft_tri_indices[face]
-                    target_row = wp.vec3i(1, face, -1)
+                    target_family, target_soft_primitive_index = 1, face
                     ta, tb, tc = (
                         Vec3(particle_q[triangle_vertex_indices[0]]),
                         Vec3(particle_q[triangle_vertex_indices[1]]),
                         Vec3(particle_q[triangle_vertex_indices[2]]),
                     )
                     sample = Vec3(pair.rigid_sample)
-                    edge_weights, vertex_weights = triangle_feature_weights(
+                    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                         data.soft_tri_indices,
                         data.soft_adjacency.tri_edge_indices,
                         data.soft_adjacency.edge_tri_indices,
-                        data.soft_vertex_term_weight,
+                        data.soft_vertex_term_coefficient,
                         face,
                     )
-                    source_area_factor = scalar(data.rigid_edge_area[row[2]])
+                    source_area_factor = scalar(data.rigid_edge_area[rigid_primitive_index])
                 support, target_near, stiffness = contact_support_and_stiffness(
-                    target_row, target_shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
+                    target_family,
+                    target_soft_primitive_index,
+                    target_shape,
+                    data,
+                    particle_radius,
+                    shape_margin,
+                    shape_material_ke,
+                    soft_contact_ke,
                 )
                 lower = wp.min(wp.min(ta - pair.origin, tb - pair.origin), tc - pair.origin)
                 upper = wp.max(wp.max(ta - pair.origin, tb - pair.origin), tc - pair.origin)
@@ -3237,8 +3244,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     direction == 0,
                     target_moves,
                     0,
-                    edge_weights,
-                    vertex_weights,
+                    edge_coefficients,
+                    vertex_coefficients,
                     support,
                     target_near,
                 )
@@ -3254,6 +3261,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         worker_count: int,
         soft_contact_count: wp.array[int],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_primitive_index: wp.array[int],
+        soft_contact_rigid_primitive_index: wp.array[int],
         soft_contact_rigid_indices: wp.array[wp.vec3i],
         soft_contact_shape: wp.array[int],
         shape_body: wp.array[int],
@@ -3301,20 +3310,13 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             return
         for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
             shape = soft_contact_shape[row_id]
-            row = contact_primitive_indices(
+            soft_primitive_index = soft_contact_primitive_index[row_id]
+            rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
+            family = _mesh_contact_family(
                 soft_contact_indices[row_id],
                 soft_contact_rigid_indices[row_id],
-                data.rigid_triangle_offsets[shape],
-                data.soft_tri_indices,
-                data.soft_edge_vertex_indices,
-                data.soft_adjacency.v_adj_tris_offsets,
-                data.soft_adjacency.v_adj_tris,
-                data.soft_adjacency.v_adj_edges_offsets,
-                data.soft_adjacency.v_adj_edges,
-                data.rigid_tri_indices,
-                data.rigid_edge_vertex_indices,
-                data.rigid_adjacency.v_adj_edges_offsets,
-                data.rigid_adjacency.v_adj_edges,
+                soft_primitive_index,
+                rigid_primitive_index,
             )
             accumulate_contact_damping(
                 row_id,
@@ -3346,15 +3348,25 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 esp_error,
             )
             support, near, stiffness = checked_contact_parameters(
-                row, shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke, esp_error
+                family,
+                soft_primitive_index,
+                shape,
+                data,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
+                esp_error,
             )
-            if support == 0 or (stiffness == 0 and (row[0] & 7) != 2):
+            if support == 0 or (stiffness == 0 and family != 2):
                 continue
             body = shape_body[shape]
             if use_friction:
                 accumulate_contact_friction(
                     row_id,
-                    row,
+                    family,
+                    soft_primitive_index,
+                    rigid_primitive_index,
                     shape,
                     data,
                     particle_q,
@@ -3388,16 +3400,22 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     esp_hessians,
                     esp_error,
                 )
-            family = row[0] & 7
             if family == 2:
                 q, _qb, weight = read_ee_quadrature_sample(
-                    row_id, row, data, particle_q, rigid_positions, near, ee_samples
+                    row_id,
+                    soft_primitive_index,
+                    rigid_primitive_index,
+                    data,
+                    particle_q,
+                    rigid_positions,
+                    near,
+                    ee_samples,
                 )
                 if weight <= scalar(0.0):
                     continue
                 # A different target body moves only its target triangle: q and w
                 # do not depend on it. Evaluate its ordinary rigid triangle block.
-                edge_list = row[1]
+                edge_list = soft_primitive_index
                 for k in range(lists.starts[edge_list], lists.ends[edge_list]):
                     face = lists.keys[k]
                     triangle_vertex_indices = data.rigid_tri_indices[face]
@@ -3408,14 +3426,21 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                     if color >= 0 and body_colors[target_body] != color:
                         continue
                     target_support, target_near, target_ke = contact_support_and_stiffness(
-                        row, target_shape, data, particle_radius, shape_margin, shape_material_ke, soft_contact_ke
+                        2,
+                        soft_primitive_index,
+                        target_shape,
+                        data,
+                        particle_radius,
+                        shape_margin,
+                        shape_material_ke,
+                        soft_contact_ke,
                     )
                     target_com = Vec3(wp.transform_point(body_q[target_body], body_com[target_body]))
-                    edge_weights, vertex_weights = triangle_feature_weights(
+                    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                         data.rigid_tri_indices,
                         data.rigid_adjacency.tri_edge_indices,
                         data.rigid_adjacency.edge_tri_indices,
-                        data.rigid_vertex_term_weight,
+                        data.rigid_vertex_term_coefficient,
                         face,
                     )
                     e, g, h = body_triangle(
@@ -3425,8 +3450,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         rigid_positions[triangle_vertex_indices[2]],
                         target_com,
                         True,
-                        edge_weights,
-                        vertex_weights,
+                        edge_coefficients,
+                        vertex_coefficients,
                         target_support,
                         target_near,
                         True,
@@ -3435,7 +3460,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         esp_forces,
                         esp_hessians,
                         target_body,
-                        target_ke * weight * data.soft_edge_area[row[1]],
+                        target_ke * weight * data.soft_edge_area[soft_primitive_index],
                         e,
                         g,
                         h,
@@ -3444,7 +3469,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 if body >= 0 and (color < 0 or body_colors[body] == color):
                     com = Vec3(wp.transform_point(body_q[body], body_com[body]))
                     e, g, h = ee_body(
-                        row,
+                        soft_primitive_index,
+                        rigid_primitive_index,
                         shape,
                         body,
                         com,
@@ -3465,53 +3491,53 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 continue
             com = Vec3(wp.transform_point(body_q[body], body_com[body]))
             if family == 0:
-                face = data.rigid_triangle_offsets[shape] + row[2]
+                face = rigid_primitive_index
                 triangle_vertex_indices = data.rigid_tri_indices[face]
-                edge_weights, vertex_weights = triangle_feature_weights(
+                edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                     data.rigid_tri_indices,
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
-                    data.rigid_vertex_term_weight,
+                    data.rigid_vertex_term_coefficient,
                     face,
                 )
                 e, g, h = body_triangle(
-                    Vec3(particle_q[row[1]]),
+                    Vec3(particle_q[soft_primitive_index]),
                     rigid_positions[triangle_vertex_indices[0]],
                     rigid_positions[triangle_vertex_indices[1]],
                     rigid_positions[triangle_vertex_indices[2]],
                     com,
                     True,
-                    edge_weights,
-                    vertex_weights,
+                    edge_coefficients,
+                    vertex_coefficients,
                     support,
                     near,
                     False,
                 )
-                scale = scalar(data.soft_vertex_weight[row[1]])
+                scale = scalar(data.soft_vertex_quadrature_weight[soft_primitive_index])
             elif family == 1:
-                face = row[1]
+                face = soft_primitive_index
                 triangle_vertex_indices = data.soft_tri_indices[face]
-                edge_weights, vertex_weights = triangle_feature_weights(
+                edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                     data.soft_tri_indices,
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
-                    data.soft_vertex_term_weight,
+                    data.soft_vertex_term_coefficient,
                     face,
                 )
                 e, g, h = body_triangle(
-                    rigid_positions[row[2]],
+                    rigid_positions[rigid_primitive_index],
                     Vec3(particle_q[triangle_vertex_indices[0]]),
                     Vec3(particle_q[triangle_vertex_indices[1]]),
                     Vec3(particle_q[triangle_vertex_indices[2]]),
                     com,
                     False,
-                    edge_weights,
-                    vertex_weights,
+                    edge_coefficients,
+                    vertex_coefficients,
                     support,
                     near,
                     False,
                 )
-                scale = data.rigid_vertex_area[row[2]]
+                scale = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
             accumulate_body_block(esp_forces, esp_hessians, body, stiffness * scale, e, g, h, esp_error)
 
     def create_esp_data(
@@ -3520,26 +3546,21 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         *,
         query_gap: float | None = None,
     ) -> EspData:
-        """Reuse soft topology and build ESP weights and rigid mappings.
+        """Reuse model/pipeline topology and compute ESP quadrature weights.
 
-        Soft indices keep model numbering. Rigid topology comes directly from
-        collision meshes, independently of BVH query tables; shape-local faces
-        acquire an offset into the combined rigid face array. Only exact seam duplicates
-        may be welded. Shape scales and topology must remain fixed after setup.
+        Soft indices keep model numbering. Rigid indices address the pipeline's
+        shared complete geometry, not private BVH query tables. Only exact seam
+        duplicates are supported by ESP. Shape scales/topology stay fixed after setup.
         SolverVBD owns this fixed data and passes current state/materials separately.
         """
         data = EspData()
         if not pipeline.enable_rigid_soft_full_surface_contact or not pipeline.full_surface_contact_return_unfiltered:
             raise ValueError("ESP requires unfiltered full-surface mesh contacts")
-        # Use model geometry, not the detector's selected meshes or feature tables.
-        shape_type_np = model.shape_type.numpy()
-        shape_flags_np = model.shape_flags.numpy()
-        rigid_shape_indices_np = np.flatnonzero(
-            np.isin(shape_type_np, (int(GeoType.MESH), int(GeoType.CONVEX_MESH)))
-            & ((shape_flags_np & int(ShapeFlags.COLLIDE_PARTICLES)) != 0)
-        )
-        if len(rigid_shape_indices_np) == 0:
+        if len(pipeline.rigid_mesh_shape_indices_np) == 0:
             raise ValueError("ESP requires at least one particle-colliding mesh shape")
+        if not pipeline.rigid_mesh_exact_vertices:
+            raise ValueError("Near-coincident welded vertices differ: only exact seam duplicates are supported")
+        rigid_shape_indices_np = pipeline.rigid_mesh_shape_indices_np
         with wp.ScopedDevice(model.device):
             soft_mesh_adjacency = model.soft_mesh_adjacency
             soft_tri_indices_np = soft_mesh_adjacency.indices.reshape(-1, 3)
@@ -3551,12 +3572,14 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             )
             tri_areas_np = model.tri_areas.numpy() if model.tri_count else np.empty(0, dtype=np.float32)
             data.soft_adjacency = model.soft_mesh_adjacency_device
-            soft_vertex_term_weight_np, soft_vertex_weight_np, soft_edge_area_np = _compute_surface_weights(
-                soft_mesh_adjacency,
-                tri_areas_np,
-                model.particle_count,
+            soft_vertex_term_coefficient_np, soft_vertex_quadrature_weight_np, soft_edge_area_np = (
+                _compute_surface_weights(
+                    soft_mesh_adjacency,
+                    tri_areas_np,
+                    model.particle_count,
+                )
             )
-            data.soft_vertex_term_weight = wp.array(soft_vertex_term_weight_np, dtype=scalar)
+            data.soft_vertex_term_coefficient = wp.array(soft_vertex_term_coefficient_np, dtype=scalar)
             # Zero surface area does not imply a point sample: vertices inside
             # a tetrahedral solid must remain excluded. Supplied boundary faces
             # distinguish those vertices from its surface vertices.
@@ -3564,8 +3587,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
             point_only_mask_np[soft_tri_indices_np.ravel()] = False
             if soft_mesh_adjacency.tet_indices is not None:
                 point_only_mask_np[soft_mesh_adjacency.tet_indices.ravel()] = False
-            soft_vertex_weight_np[point_only_mask_np] = 1.0
-            # Final source quadrature weights (not the target vertex_term_weight):
+            soft_vertex_quadrature_weight_np[point_only_mask_np] = 1.0
+            # Final source quadrature weights (not the target vertex_term_coefficient):
             # - In surface triangles: sum of incident rest-triangle areas / 3.
             # - In tetrahedra but no supplied surface triangle: 0 (excluded from ESP mesh contact).
             # - In neither triangles nor tetrahedra: 1, including standalone and spring/edge-only particles.
@@ -3577,51 +3600,17 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 particle_world_np[soft_edge_vertex_indices_np] != particle_world_np[soft_edge_vertex_indices_np[:, :1]]
             ):
                 raise ValueError("A soft edge must belong to one world")
-            shape_scale_np = model.shape_scale.numpy()
-            rigid_triangle_offsets_np = np.full(model.shape_count, -1, dtype=np.int32)
-            rigid_triangle_parts = []
-            rigid_position_parts = []
-            rigid_vertex_shapes = []
-            rigid_vertex_corners = []
-            vertex_count = 0
-            triangle_count = 0
-            convex_meshes = {}
-            for shape in rigid_shape_indices_np:
-                mesh = model.shape_source[shape]
-                if shape_type_np[shape] == int(GeoType.CONVEX_MESH):
-                    # Match ModelBuilder.finalize()'s collision-mesh numbering.
-                    if id(mesh) not in convex_meshes:
-                        convex_meshes[id(mesh)] = _deduplicate_convex_collision_mesh(mesh)
-                    mesh = convex_meshes[id(mesh)]
-                # Compact only vertices used by triangles, welding exact seam
-                # duplicates independently of the detector's query tables.
-                canonical_vertex_ids_np = mesh._canonical_vertex_ids()
-                # first_corners_np (len = #used canonical vertices):
-                # First corner representing each used canonical vertex.
-                # corner_vertices_np (len = #corners):
-                # Maps each corner to its index in the compact vertex list.
-                _, first_corners_np, corner_vertices_np = np.unique(
-                    canonical_vertex_ids_np[mesh.indices], return_index=True, return_inverse=True
-                )
-                # to be used together with corner_vertices_np as (vertex, tri_indices) with compacted vertices list
-                vertices_np = mesh.vertices[mesh.indices[first_corners_np]]
-                if not np.array_equal(mesh.vertices[mesh.indices], vertices_np[corner_vertices_np]):
-                    raise ValueError("Near-coincident welded vertices differ: only exact seam duplicates are supported")
-                rigid_triangle_offsets_np[shape] = triangle_count
-                rigid_triangle_parts.append((corner_vertices_np + vertex_count).reshape(-1, 3))
-                rigid_position_parts.append(vertices_np * shape_scale_np[shape])
-                rigid_vertex_shapes.extend([shape] * len(vertices_np))
-                rigid_vertex_corners.extend(first_corners_np)
-                vertex_count += len(vertices_np)
-                triangle_count += len(mesh.indices) // 3
-
-            rigid_local_positions_np = np.concatenate(rigid_position_parts)
-            rigid_tri_indices_np = np.concatenate(rigid_triangle_parts)
-            # Build and upload adjacency just as ModelBuilder.finalize() does.
-            # Edge order comes from the mesh topology, not BVH query tables.
-            rigid_mesh_adjacency = MeshAdjacency(rigid_tri_indices_np)
-            rigid_mesh_adjacency.init_vertex_adjacency(len(rigid_local_positions_np))
-            data.rigid_adjacency = rigid_mesh_adjacency.to(model.device)
+            # Alias the pipeline-owned topology; do not reconstruct or upload it again.
+            data.rigid_tri_indices = pipeline.rigid_mesh_tri_indices
+            data.rigid_edge_vertex_indices = pipeline.rigid_mesh_edge_vertex_indices
+            data.total_edge_count = data.soft_edge_vertex_indices.shape[0] + data.rigid_edge_vertex_indices.shape[0]
+            data.rigid_adjacency = pipeline.rigid_mesh_adjacency_device
+            data.rigid_local_positions = pipeline.rigid_mesh_vertex_positions
+            data.rigid_vertex_shapes = pipeline.rigid_mesh_vertex_shapes
+            data.rigid_vertex_corners = pipeline.rigid_mesh_vertex_corners
+            data.rigid_triangle_offsets = pipeline.rigid_mesh_triangle_offsets
+            rigid_local_positions_np = pipeline.rigid_mesh_vertex_positions_np
+            rigid_tri_indices_np = pipeline.rigid_mesh_tri_indices_np
             rigid_triangle_positions_np = rigid_local_positions_np[rigid_tri_indices_np]
             rigid_tri_areas_np = 0.5 * np.linalg.norm(
                 np.cross(
@@ -3630,18 +3619,14 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 ),
                 axis=1,
             )
-            rigid_vertex_term_weight_np, rigid_vertex_area_np, rigid_edge_area_np = _compute_surface_weights(
-                rigid_mesh_adjacency, rigid_tri_areas_np, len(rigid_local_positions_np)
+            rigid_vertex_term_coefficient_np, rigid_vertex_quadrature_weight_np, rigid_edge_area_np = (
+                _compute_surface_weights(
+                    pipeline.rigid_mesh_adjacency, rigid_tri_areas_np, len(rigid_local_positions_np)
+                )
             )
-            data.rigid_tri_indices = wp.array(rigid_tri_indices_np, dtype=wp.vec3i)
-            data.rigid_edge_vertex_indices = wp.array(rigid_mesh_adjacency.edge_indices[:, 2:4], dtype=wp.vec2i)
-            data.rigid_vertex_term_weight = wp.array(rigid_vertex_term_weight_np, dtype=scalar)
-            data.rigid_vertex_area = wp.array(rigid_vertex_area_np, dtype=scalar)
+            data.rigid_vertex_term_coefficient = wp.array(rigid_vertex_term_coefficient_np, dtype=scalar)
+            data.rigid_vertex_quadrature_weight = wp.array(rigid_vertex_quadrature_weight_np, dtype=scalar)
             data.rigid_edge_area = wp.array(rigid_edge_area_np, dtype=scalar)
-            data.rigid_local_positions = wp.array(rigid_local_positions_np, dtype=wp.vec3)
-            data.rigid_vertex_shapes = wp.array(rigid_vertex_shapes, dtype=int)
-            data.rigid_vertex_corners = wp.array(rigid_vertex_corners, dtype=int)
-            data.rigid_triangle_offsets = wp.array(rigid_triangle_offsets_np, dtype=int)
 
         particle_radius_np = model.particle_radius.numpy()
         shape_margin_np = model.shape_margin.numpy()[rigid_shape_indices_np]
@@ -3680,7 +3665,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                 "ESP requires soft_contact_gap to cover the largest radius difference within a soft triangle"
             )
         with wp.ScopedDevice(model.device):
-            data.soft_vertex_weight = wp.array(soft_vertex_weight_np, dtype=wp.float64)
+            data.soft_vertex_quadrature_weight = wp.array(soft_vertex_quadrature_weight_np, dtype=wp.float64)
             data.soft_edge_area = wp.array(soft_edge_area_np, dtype=scalar)
         return data
 
@@ -3720,14 +3705,20 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         worker_count = _contact_worker_count(contacts.soft_contact_max, model.device)
         with wp.ScopedDevice(model.device):
             energy_only = block_kind == _ENERGY_ONLY
+            # Clear this evaluation's outputs once, independently of EE caching.
+            if energy_only:
+                esp_energy.zero_()
+            else:
+                esp_forces.zero_()
+                esp_hessians.zero_()
             if block_kind != _PARTICLE_BLOCKS:
                 # Only particle EE evaluation partitions a row's target list.
                 partitions = 1
             if partitions == 1:
                 ee_samples = None
             if ee_samples is not None:
-                # Clear outputs and cache EE positions/weights for the workers
-                # sharing each row. Refresh after every color's position update;
+                # Cache EE positions/weights for workers sharing each row.
+                # Refresh after every color's position update;
                 # the derivative kernels still differentiate the samples and
                 # weights. Cache layout is documented in prepare_contact_evaluation.
                 wp.launch(
@@ -3737,6 +3728,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         worker_count,
                         contacts.soft_contact_count,
                         contacts.soft_contact_indices,
+                        contacts.soft_contact_primitive_index,
+                        contacts.soft_contact_rigid_primitive_index,
                         contacts.soft_contact_rigid_indices,
                         contacts.soft_contact_shape,
                         data,
@@ -3746,16 +3739,10 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         model.shape_margin,
                         model.shape_material_ke,
                         model.soft_contact_ke,
-                        energy_only,
                     ],
-                    outputs=[ee_samples, esp_forces, esp_hessians, esp_energy],
+                    outputs=[ee_samples],
                     device=model.device,
                 )
-            elif energy_only:
-                esp_energy.zero_()
-            else:
-                esp_forces.zero_()
-                esp_hessians.zero_()
             # Workers stride over active rows; unused capacity is never visited.
             if energy_only:
                 wp.launch(
@@ -3766,6 +3753,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         worker_count,
                         contacts.soft_contact_count,
                         contacts.soft_contact_indices,
+                        contacts.soft_contact_primitive_index,
+                        contacts.soft_contact_rigid_primitive_index,
                         contacts.soft_contact_rigid_indices,
                         contacts.soft_contact_shape,
                         data,
@@ -3791,6 +3780,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         worker_count,
                         contacts.soft_contact_count,
                         contacts.soft_contact_indices,
+                        contacts.soft_contact_primitive_index,
+                        contacts.soft_contact_rigid_primitive_index,
                         contacts.soft_contact_rigid_indices,
                         contacts.soft_contact_shape,
                         data,
@@ -3839,6 +3830,8 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
                         worker_count,
                         contacts.soft_contact_count,
                         contacts.soft_contact_indices,
+                        contacts.soft_contact_primitive_index,
+                        contacts.soft_contact_rigid_primitive_index,
                         contacts.soft_contact_rigid_indices,
                         contacts.soft_contact_shape,
                         model.shape_body,
@@ -3885,8 +3878,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         Vec3=Vec3,
         Vec4=Vec4,
         EdgeTriangleListData=EdgeTriangleListData,
-        contact_primitive_indices=contact_primitive_indices,
-        add_edge_triangle=add_edge_triangle,
+        add_edge_triangle_pair=add_edge_triangle_pair,
         collect_edge_triangles=collect_edge_triangles,
         finish_edge_triangle_offsets=finish_edge_triangle_offsets,
         compact_sorted_edge_triangles=compact_sorted_edge_triangles,
@@ -3904,7 +3896,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
         make_direct_barrier_coefficients=make_direct_barrier_coefficients,
         make_direct_contact_formulas=make_direct_contact_formulas,
         make_shared_direct_ee_formulas=make_shared_direct_ee_formulas,
-        triangle_feature_weights=triangle_feature_weights,
+        triangle_feature_coefficients=triangle_feature_coefficients,
         add_particle_blocks=add_particle_blocks,
         add_body_blocks=add_body_blocks,
         EspData=EspData,
@@ -3947,7 +3939,7 @@ def get_esp_kernels(scalar: type = wp.float64) -> SimpleNamespace:
 # Retain the existing float64 entry points used by standalone diagnostics.
 _default_kernels = get_esp_kernels(wp.float64)
 EdgeTriangleListData = _default_kernels.EdgeTriangleListData
-add_edge_triangle = _default_kernels.add_edge_triangle
+add_edge_triangle_pair = _default_kernels.add_edge_triangle_pair
 collect_edge_triangles = _default_kernels.collect_edge_triangles
 finish_edge_triangle_offsets = _default_kernels.finish_edge_triangle_offsets
 compact_sorted_edge_triangles = _default_kernels.compact_sorted_edge_triangles
@@ -3965,7 +3957,7 @@ ee_quadrature_sample = _default_kernels.ee_quadrature_sample
 make_direct_barrier_coefficients = _default_kernels.make_direct_barrier_coefficients
 make_direct_contact_formulas = _default_kernels.make_direct_contact_formulas
 make_shared_direct_ee_formulas = _default_kernels.make_shared_direct_ee_formulas
-triangle_feature_weights = _default_kernels.triangle_feature_weights
+triangle_feature_coefficients = _default_kernels.triangle_feature_coefficients
 add_particle_blocks = _default_kernels.add_particle_blocks
 add_body_blocks = _default_kernels.add_body_blocks
 EspData = _default_kernels.EspData

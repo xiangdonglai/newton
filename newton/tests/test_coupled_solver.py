@@ -4100,6 +4100,8 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
     (E7)."""
     # One particle soft contact: particle 0 on shape 0, unified record (0, -1, -1) + (1, 0, 0).
     dst_indices = wp.full(1, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=device)
+    dst_primitive_index = wp.full(1, -1, dtype=wp.int32, device=device)
+    dst_rigid_primitive_index = wp.full(1, -1, dtype=wp.int32, device=device)
     dst_rigid_indices = wp.full(1, wp.vec3i(-1), dtype=wp.vec3i, device=device)
     dst_barycentric = wp.zeros(1, dtype=wp.vec3, device=device)
     wp.launch(
@@ -4116,6 +4118,8 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
             wp.array([wp.vec3(0.0, 0.0, 1.0)], dtype=wp.vec3, device=device),  # src_normal
             wp.array([7], dtype=wp.int32, device=device),  # src_tids
             wp.array([wp.vec3i(0, -1, -1)], dtype=wp.vec3i, device=device),  # src_indices
+            wp.array([0], dtype=wp.int32, device=device),  # src_primitive_index
+            wp.array([2], dtype=wp.int32, device=device),  # src_rigid_primitive_index
             wp.array([wp.vec3i(6, 7, 8)], dtype=wp.vec3i, device=device),  # rigid triangle corners
             wp.array([wp.vec3(1.0, 0.0, 0.0)], dtype=wp.vec3, device=device),  # src_barycentric
             wp.array([int(ShapeFlags.COLLIDE_PARTICLES)], dtype=wp.int32, device=device),  # shape_flags
@@ -4132,6 +4136,8 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
             wp.zeros(1, dtype=wp.vec3, device=device),  # dst_normal
             wp.full(1, -1, dtype=wp.int32, device=device),  # dst_tids
             dst_indices,
+            dst_primitive_index,
+            dst_rigid_primitive_index,
             dst_rigid_indices,
             dst_barycentric,
             wp.full(1, -1, dtype=wp.int32, device=device),  # src_to_dst
@@ -4146,6 +4152,8 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
     )
     np.testing.assert_allclose(dst_barycentric.numpy()[0], [1.0, 0.0, 0.0])
     np.testing.assert_array_equal(dst_rigid_indices.numpy()[0], [6, 7, 8])
+    np.testing.assert_array_equal(dst_primitive_index.numpy(), [0])
+    np.testing.assert_array_equal(dst_rigid_primitive_index.numpy(), [2])
 
 
 add_function_test(

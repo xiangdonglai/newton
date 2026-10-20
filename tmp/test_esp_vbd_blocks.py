@@ -73,6 +73,8 @@ class TestEspVbdBlocks(unittest.TestCase):
                 order = np.concatenate((retained, selected))
                 for field in (
                     blocks.contacts.soft_contact_indices,
+                    blocks.contacts.soft_contact_primitive_index,
+                    blocks.contacts.soft_contact_rigid_primitive_index,
                     blocks.contacts.soft_contact_rigid_indices,
                     blocks.contacts.soft_contact_shape,
                 ):

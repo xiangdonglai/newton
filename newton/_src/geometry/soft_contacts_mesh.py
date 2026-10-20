@@ -36,6 +36,7 @@ from .tri_mesh_collision import TriMeshCollisionDetector
 from .types import GeoType
 
 if TYPE_CHECKING:
+    from ..sim.collide import CollisionPipeline
     from ..sim.contacts import Contacts
     from ..sim.model import Model
     from ..sim.state import State
@@ -313,26 +314,19 @@ def _max_faces_near_point(lower: np.ndarray, upper: np.ndarray, band: float) -> 
     return int(counts.max())
 
 
-def _build_feature_adjacency(model: Model, meshes: dict[int, Mesh], edge_table: wp.array, contact_band: float):
-    """Build fixed incident-feature spans and ownership.
-
-    Also returns, per shape, how many faces one particle can lie within ``contact_band`` plus the
-    shape's margin of, which bounds the vertex contacts that detection reports for it.
-    """
-    rigid_edge_rows = edge_table.numpy()
+def _build_feature_adjacency(
+    model: Model, meshes: dict[int, Mesh], canonical_vertex_ids: dict[int, np.ndarray], rigid_edge_rows: np.ndarray
+):
+    """Build complete cone neighbors, including all incident faces on nonmanifold edges."""
     # Each shape starts at a mesh-corner slot in vertex_spans/edge_spans, not a triangle index.
     shape_corner_offsets = np.zeros(model.shape_count, dtype=np.int32)
-    near_faces = np.zeros(model.shape_count, dtype=np.int32)
-    shape_scale = model.shape_scale.numpy()
-    shape_margin = model.shape_margin.numpy() if model.shape_margin is not None else np.zeros(model.shape_count)
-    near_faces_cache = {}
     vertex_spans, edge_spans, neighbors = [], [], []
     ee = np.zeros(len(rigid_edge_rows), dtype=np.int32)
     cache = {}
 
-    def build(mesh):
+    def build(mesh, canonical_np):
         idx = np.asarray(mesh.indices).reshape(-1)
-        canon = mesh._canonical_vertex_ids()[idx]
+        canon = canonical_np[idx]
         representative = {}
         incident = {}
         opposite = {}
@@ -348,8 +342,6 @@ def _build_feature_adjacency(model: Model, meshes: dict[int, Mesh], edge_table: 
                 key = tuple(sorted((a, b)))
                 opposite.setdefault(key, set()).add(v)
                 edge_owner.setdefault(key, face)
-
-        triangles = np.asarray(mesh.vertices, dtype=np.float64)[idx].reshape(-1, 3, 3)
 
         def span(neighbor_vertex_ids, owner, representative_corner_slots=representative):
             start = len(neighbors)
@@ -369,23 +361,16 @@ def _build_feature_adjacency(model: Model, meshes: dict[int, Mesh], edge_table: 
         keys = sorted(es)
         edge_keys = np.asarray([(a << 32) | b for a, b in keys], dtype=np.int64)
         edge_data = np.asarray([edge_slots[key] for key in keys], dtype=np.int32)
-        return corner_offset, canon, edge_keys, edge_data, triangles
+        return corner_offset, canon, edge_keys, edge_data
 
     # Shape instances share immutable local topology. Only the feature rows
     # carry a shape id; constructing full adjacency per world is unnecessary.
     for shape, mesh in meshes.items():
         key = _geometry_key(mesh)
         if key not in cache:
-            cache[key] = build(mesh)
-        corner_offset, canon, edge_keys, edge_data, triangles = cache[key]
+            cache[key] = build(mesh, canonical_vertex_ids[shape])
+        corner_offset, canon, edge_keys, edge_data = cache[key]
         shape_corner_offsets[shape] = corner_offset
-        scale = shape_scale[shape].astype(np.float64)
-        band = contact_band + float(shape_margin[shape])
-        near_key = (key, tuple(scale), band)
-        if near_key not in near_faces_cache:
-            scaled = triangles * scale
-            near_faces_cache[near_key] = _max_faces_near_point(scaled.min(axis=1), scaled.max(axis=1), band)
-        near_faces[shape] = near_faces_cache[near_key]
         start, end = np.searchsorted(rigid_edge_rows[:, 0], (shape, shape + 1))
         edge_canon = np.sort(canon[rigid_edge_rows[start:end, 1:]].astype(np.int64), axis=1)
         keys = (edge_canon[:, 0] << 32) | edge_canon[:, 1]
@@ -399,15 +384,13 @@ def _build_feature_adjacency(model: Model, meshes: dict[int, Mesh], edge_table: 
     )
     arrays.append(wp.array(ee, dtype=int, device=model.device))
     arrays.append(wp.array(neighbors, dtype=int, device=model.device))
-    return arrays, near_faces
+    return arrays
 
 
 CONTACT_NORMAL_DEGENERATE_EPS = wp.constant(1.0e-6)
 
 
-def _mesh_feature_data(
-    mesh: Mesh, *, collision_edges: np.ndarray | None = None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _mesh_feature_data(mesh: Mesh, canonical: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return unique face-vertex slots, edges, and outward reference normals."""
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     idx = np.asarray(mesh.indices, dtype=np.int32).reshape(-1)
@@ -415,7 +398,6 @@ def _mesh_feature_data(
         empty_i = np.empty(0, dtype=np.int32)
         return empty_i, np.empty((0, 3), np.float32), np.empty((0, 2), np.int32), np.empty((0, 3), np.float32)
     tris = idx.reshape(-1, 3)
-    canonical = mesh._canonical_vertex_ids()
     n_canon = int(canonical.max()) + 1
 
     orig_edges, slot_keys, _sort_order, _keys_sorted, face_normals, face_norms = mesh._build_edge_slot_topology(
@@ -457,51 +439,32 @@ def _mesh_feature_data(
 
     index_of_canon = np.full(n_canon, -1, dtype=np.int32)
     index_of_canon[used_canon] = vertex_table
-    edge_keys, first_idx, inverse = np.unique(slot_keys, return_index=True, return_inverse=True)
+    _edge_keys, first_idx, inverse = np.unique(slot_keys, return_index=True, return_inverse=True)
     edge_normal_accumulation = np.zeros((len(first_idx), 3), dtype=np.float64)
     np.add.at(edge_normal_accumulation, inverse, np.repeat(fn_unit, 3, axis=0))
     edge_outward = _unit(edge_normal_accumulation).astype(np.float32)
-    if collision_edges is None:
-        edge_canon = canonical[orig_edges[first_idx]]
-    else:
-        # Keep exactly the SDF edge set, including an intentionally empty set.
-        # Full triangle adjacency still supplies the normals and validity cones.
-        edge_canon = canonical[collision_edges]
-        sorted_canon = np.sort(edge_canon.astype(np.int64), axis=1)
-        selected_keys = (sorted_canon[:, 0] << 32) | sorted_canon[:, 1]
-        edge_outward = edge_outward[_edge_rows(edge_keys, selected_keys, "Mesh collision edge set")]
+    edge_canon = canonical[orig_edges[first_idx]]
     edge_table = np.column_stack((index_of_canon[edge_canon[:, 0]], index_of_canon[edge_canon[:, 1]])).astype(np.int32)
 
     return vertex_table, vertex_normals, edge_table, edge_outward
 
 
 def _build_rigid_features(
-    model: Model, meshes: dict[int, Mesh], *, return_unfiltered: bool = False
-) -> tuple[wp.array[wp.vec2i], wp.array[wp.vec3], wp.array[wp.vec3i], wp.array[wp.vec3]]:
-
-    device = model.device
+    meshes: dict[int, Mesh], canonical_vertex_ids: dict[int, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute reference normals and original-corner query tables from shared canonical IDs."""
     rigid_vertex_rows: list[np.ndarray] = []
     vertex_normals: list[np.ndarray] = []
     rigid_edge_rows: list[np.ndarray] = []
     edge_outwards: list[np.ndarray] = []
     cache: dict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-    edge_ranges = model.shape_edge_range.numpy()
-    packed_edges = model.mesh_edge_indices.numpy()
-
     for shape, mesh in meshes.items():
-        start, count = (int(value) for value in edge_ranges[shape])
-        # Finalized tables include SDF edges cooked by the builder, which need
-        # not be attached to the source Mesh. Slices may differ for one source.
-        collision_edges = packed_edges[start : start + count] if start >= 0 else mesh._collision_edges
-        if return_unfiltered:
-            # DAT/ESP need the complete mesh topology, not SDF-selected edges.
-            collision_edges = None
-        key = (_geometry_key(mesh), None if collision_edges is None else np.asarray(collision_edges).tobytes())
-        data = cache.get(key)
-        if data is None:
-            data = _mesh_feature_data(mesh, collision_edges=collision_edges)
-            cache[key] = data
-        v_table, v_normals, e_table, e_outward = data
+        key = _geometry_key(mesh)
+        feature_data = cache.get(key)
+        if feature_data is None:
+            feature_data = _mesh_feature_data(mesh, canonical_vertex_ids[shape])
+            cache[key] = feature_data
+        v_table, v_normals, e_table, e_outward = feature_data
         if len(v_table):
             rigid_vertex_rows.append(np.column_stack((np.full(len(v_table), shape, np.int32), v_table)))
             vertex_normals.append(v_normals)
@@ -516,11 +479,43 @@ def _build_rigid_features(
         return np.concatenate(rows) if rows else np.empty((0, 3), np.float32)
 
     return (
-        wp.array(_stack(rigid_vertex_rows, 2), dtype=wp.vec2i, device=device),
-        wp.array(_stackf(vertex_normals), dtype=wp.vec3, device=device),
-        wp.array(_stack(rigid_edge_rows, 3), dtype=wp.vec3i, device=device),
-        wp.array(_stackf(edge_outwards), dtype=wp.vec3, device=device),
+        _stack(rigid_vertex_rows, 2),
+        _stackf(vertex_normals),
+        _stack(rigid_edge_rows, 3),
+        _stackf(edge_outwards),
     )
+
+
+def _selected_edge_rows(
+    model: Model, meshes: dict[int, Mesh], canonical_vertex_ids: dict[int, np.ndarray], edge_rows_np: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select SDF query edges without changing shared IDs or the previous endpoint order."""
+    edge_ranges_np = model.shape_edge_range.numpy()
+    packed_edges_np = model.mesh_edge_indices.numpy()
+    selected, query_rows = [], []
+    for shape, mesh in meshes.items():
+        start, count = edge_ranges_np[shape]
+        collision_edges_np = packed_edges_np[start : start + count] if start >= 0 else mesh._collision_edges
+        begin, end = np.searchsorted(edge_rows_np[:, 0], (shape, shape + 1))
+        if collision_edges_np is None:
+            selected.extend(range(begin, end))
+            query_rows.extend(edge_rows_np[begin:end])
+            continue
+        canonical_np = canonical_vertex_ids[shape]
+        corner_ids_np = canonical_np[mesh.indices]
+        full_edges_np = np.sort(corner_ids_np[edge_rows_np[begin:end, 1:]], axis=1).astype(np.int64)
+        keys_np = (full_edges_np[:, 0] << 32) | full_edges_np[:, 1]
+        selected_edges_np = np.sort(canonical_np[collision_edges_np], axis=1).astype(np.int64)
+        selected_keys_np = (selected_edges_np[:, 0] << 32) | selected_edges_np[:, 1]
+        selected_rows_np = begin + _edge_rows(keys_np, selected_keys_np, "Mesh collision edge set")
+        selected.extend(selected_rows_np)
+        selected_query_rows_np = edge_rows_np[selected_rows_np].copy()
+        # SDF edge preprocessing may retain the opposite endpoint order.
+        # Preserve it for closest-point parameters and contact metadata.
+        reverse_np = corner_ids_np[selected_query_rows_np[:, 1]] != canonical_np[collision_edges_np[:, 0]]
+        selected_query_rows_np[reverse_np, 1:] = selected_query_rows_np[reverse_np, 1:][:, ::-1]
+        query_rows.extend(selected_query_rows_np)
+    return np.asarray(selected, dtype=np.int32), np.asarray(query_rows, dtype=np.int32).reshape(-1, 3)
 
 
 _MESH_FEATURE_VT = wp.constant(0)
@@ -1130,9 +1125,14 @@ def _evaluate_mesh_contacts(
     rigid_vertex_normals: wp.array[wp.vec3],
     rigid_edge_table: wp.array[wp.vec3i],
     rigid_edge_outward_dirs: wp.array[wp.vec3],
+    rigid_triangle_offsets: wp.array[int],
+    rigid_vertex_primitive_indices: wp.array[int],
+    rigid_edge_primitive_indices: wp.array[int],
     edge_edge_parallel_epsilon: float,
     soft_contact_particle: wp.array[wp.int32],
     soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_primitive_index: wp.array[int],
+    soft_contact_rigid_primitive_index: wp.array[int],
     soft_contact_rigid_indices: wp.array[wp.vec3i],
     soft_contact_barycentric: wp.array[wp.vec3],
     soft_contact_body_pos: wp.array[wp.vec3],
@@ -1164,6 +1164,7 @@ def _evaluate_mesh_contacts(
     particle = wp.int32(-1)
     corners = wp.vec3i(-1, -1, -1)
     rigid_indices = wp.vec3i(-1)
+    rigid_primitive_index = int(-1)
     bary = wp.vec3(0.0)
     body_pos = wp.vec3(0.0)
     body_vel = wp.vec3(0.0)
@@ -1175,6 +1176,7 @@ def _evaluate_mesh_contacts(
         bary = wp.vec3(1.0, 0.0, 0.0)
         face = rigid_feature
         rigid_indices = wp.vec3i(3 * face, 3 * face + 1, 3 * face + 2)
+        rigid_primitive_index = rigid_triangle_offsets[shape_index] + face
         x_local = wp.transform_point(X_sw, particle_q[particle])
         a = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 0), scale)
         b = wp.cw_mul(wp.mesh_get_point(mesh, face * 3 + 1), scale)
@@ -1202,6 +1204,7 @@ def _evaluate_mesh_contacts(
         vertex_entry = rigid_vertex_table[rigid_feature]
         index = vertex_entry[1]
         rigid_indices = wp.vec3i(index, -1, -1)
+        rigid_primitive_index = rigid_vertex_primitive_indices[rigid_feature]
         t0 = tri_indices[soft_feature, 0]
         t1 = tri_indices[soft_feature, 1]
         t2 = tri_indices[soft_feature, 2]
@@ -1220,6 +1223,7 @@ def _evaluate_mesh_contacts(
         index0 = edge_entry[1]
         index1 = edge_entry[2]
         rigid_indices = wp.vec3i(index0, index1, -1)
+        rigid_primitive_index = rigid_edge_primitive_indices[rigid_feature]
         sv0 = edge_indices[soft_feature, 2]
         sv1 = edge_indices[soft_feature, 3]
         corners = wp.vec3i(sv0, sv1, -1)
@@ -1267,6 +1271,8 @@ def _evaluate_mesh_contacts(
 
     soft_contact_particle[tid] = particle
     soft_contact_indices[tid] = corners
+    soft_contact_primitive_index[tid] = soft_feature
+    soft_contact_rigid_primitive_index[tid] = rigid_primitive_index
     soft_contact_rigid_indices[tid] = rigid_indices
     soft_contact_barycentric[tid] = bary
     soft_contact_body_pos[tid] = body_pos
@@ -1474,11 +1480,16 @@ def _launch_evaluate_mesh_contacts(model: Model, state: State, contacts: Contact
             rigid_vertex_normals,
             rigid_edge_table,
             rigid_edge_outward_dirs,
+            data.rigid_triangle_offsets,
+            data.rigid_vertex_primitive_indices,
+            data.rigid_edge_primitive_indices,
             data.edge_edge_parallel_epsilon,
         ],
         outputs=[
             contacts.soft_contact_particle,
             contacts.soft_contact_indices,
+            contacts.soft_contact_primitive_index,
+            contacts.soft_contact_rigid_primitive_index,
             contacts.soft_contact_rigid_indices,
             contacts.soft_contact_barycentric,
             contacts.soft_contact_body_pos,
@@ -1744,29 +1755,67 @@ class MeshContactData:
         shape_mask: np.ndarray,
         vertex_pairs: wp.array[wp.vec2i],
         gap: float,
+        pipeline: CollisionPipeline,
         *,
+        meshes: dict[int, Mesh],
+        canonical_vertex_ids: dict[int, np.ndarray],
         return_unfiltered: bool = False,
     ):
         self.vertex_pairs = vertex_pairs
         self.return_unfiltered = return_unfiltered
-        meshes = _collision_meshes(model, shape_mask)
+        self.rigid_triangle_offsets = pipeline.rigid_mesh_triangle_offsets
+        # Query tables retain their existing ordering. Public primitive IDs
+        # instead index the shared complete topology on CollisionPipeline.
         if model.tri_count:
-            self.rigid_features = _build_rigid_features(model, meshes, return_unfiltered=return_unfiltered)
-            if model.edge_count == 0:
-                self.rigid_features = (
-                    *self.rigid_features[:2],
-                    wp.empty(0, dtype=wp.vec3i, device=model.device),
-                    wp.empty(0, dtype=wp.vec3, device=model.device),
-                )
-            self.detector = TriMeshCollisionDetector(model)
-        else:
-            self.rigid_features = (
-                wp.empty(0, dtype=wp.vec2i, device=model.device),
-                wp.empty(0, dtype=wp.vec3, device=model.device),
-                wp.empty(0, dtype=wp.vec3i, device=model.device),
-                wp.empty(0, dtype=wp.vec3, device=model.device),
+            vertex_rows_np, vertex_normals_np, edge_rows_np, edge_normals_np = _build_rigid_features(
+                meshes, canonical_vertex_ids
             )
-            self.detector = None
+        else:
+            # Point-only scenes query rigid faces, not rigid vertices or edges.
+            vertex_rows_np = np.empty((0, 2), dtype=np.int32)
+            vertex_normals_np = np.empty((0, 3), dtype=np.float32)
+        if not model.tri_count or not model.edge_count:
+            edge_rows_np = np.empty((0, 3), dtype=np.int32)
+            edge_normals_np = np.empty((0, 3), dtype=np.float32)
+        rigid_mesh_tri_indices_np = pipeline.rigid_mesh_tri_indices_np
+        rigid_mesh_triangle_offsets_np = pipeline.rigid_mesh_triangle_offsets_np
+        rigid_vertex_primitive_indices_np = rigid_mesh_tri_indices_np[
+            rigid_mesh_triangle_offsets_np[vertex_rows_np[:, 0]] + vertex_rows_np[:, 1] // 3,
+            vertex_rows_np[:, 1] % 3,
+        ]
+        rigid_edge_primitive_indices_np = np.empty(0, dtype=np.int32)
+        if len(edge_rows_np):
+            # Map all query edges at once; avoid a Python loop over every shape's edges.
+            shared_edges_np = np.sort(pipeline.rigid_mesh_edge_vertex_indices_np.astype(np.int64), axis=1)
+            shared_edge_keys_np = (shared_edges_np[:, 0] << 32) | shared_edges_np[:, 1]
+            shared_edge_order_np = np.argsort(shared_edge_keys_np)
+            edge_corners_np = edge_rows_np[:, 1:]
+            query_edge_vertices_np = rigid_mesh_tri_indices_np[
+                rigid_mesh_triangle_offsets_np[edge_rows_np[:, 0], None] + edge_corners_np // 3, edge_corners_np % 3
+            ]
+            query_edge_vertices_np = np.sort(query_edge_vertices_np.astype(np.int64), axis=1)
+            query_edge_keys_np = (query_edge_vertices_np[:, 0] << 32) | query_edge_vertices_np[:, 1]
+            rigid_edge_primitive_indices_np = shared_edge_order_np[
+                _edge_rows(shared_edge_keys_np[shared_edge_order_np], query_edge_keys_np, "Mesh query edges")
+            ].astype(np.int32)
+        if not return_unfiltered and model.tri_count and model.edge_count:
+            selected_np, edge_rows_np = _selected_edge_rows(model, meshes, canonical_vertex_ids, edge_rows_np)
+            edge_normals_np = edge_normals_np[selected_np]
+            rigid_edge_primitive_indices_np = rigid_edge_primitive_indices_np[selected_np]
+        adjacency = _build_feature_adjacency(model, meshes, canonical_vertex_ids, edge_rows_np)
+        self.rigid_features = tuple(
+            wp.array(values_np, dtype=dtype, device=model.device)
+            for values_np, dtype in zip(
+                (vertex_rows_np, vertex_normals_np, edge_rows_np, edge_normals_np),
+                (wp.vec2i, wp.vec3, wp.vec3i, wp.vec3),
+                strict=True,
+            )
+        )
+        self.rigid_vertex_primitive_indices = wp.array(
+            rigid_vertex_primitive_indices_np, dtype=int, device=model.device
+        )
+        self.rigid_edge_primitive_indices = wp.array(rigid_edge_primitive_indices_np, dtype=int, device=model.device)
+        self.detector = TriMeshCollisionDetector(model) if model.tri_count else None
         face_rows = [
             np.column_stack((np.full(len(mesh.indices) // 3, shape), np.arange(len(mesh.indices) // 3)))
             for shape, mesh in meshes.items()
@@ -1787,9 +1836,18 @@ class MeshContactData:
             > np.iinfo(np.int32).max
         ):
             raise ValueError("Mesh contact queries exceed 32-bit indexing capacity.")
-        adjacency, near_faces = _build_feature_adjacency(
-            model, meshes, rigid_edge_rows, gap + model.particle_max_radius
-        )
+        # Bounds depend on this query's radius and each shape's scale, unlike topology.
+        near_faces = np.zeros(model.shape_count, dtype=np.int32)
+        shape_scale_np, shape_margin_np = model.shape_scale.numpy(), model.shape_margin.numpy()
+        near_faces_cache = {}
+        for shape, mesh in meshes.items():
+            band = gap + model.particle_max_radius + float(shape_margin_np[shape])
+            key = (_geometry_key(mesh), tuple(shape_scale_np[shape]), band)
+            if key not in near_faces_cache:
+                triangle_positions_np = mesh.vertices.astype(np.float64)[mesh.indices].reshape(-1, 3, 3)
+                scaled_np = triangle_positions_np * shape_scale_np[shape].astype(np.float64)
+                near_faces_cache[key] = _max_faces_near_point(scaled_np.min(axis=1), scaled_np.max(axis=1), band)
+            near_faces[shape] = near_faces_cache[key]
         self.adjacency = [*adjacency, vertex_normals, edge_normals]
         # A query emits at most one contact per feature pair, or two depth probes per
         # face crossing. Bound the wide append counter before allocating; final writes

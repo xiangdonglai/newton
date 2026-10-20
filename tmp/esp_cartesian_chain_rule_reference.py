@@ -141,7 +141,7 @@ def triangle_potential(points, surface, face, support, near, near_only):
             value -= 0.5 * e
             gradient -= 0.5 * g
             hessian -= 0.5 * h
-        weight = surface["vertex_weight"][ids[k]]
+        weight = surface["vertex_term_coefficient"][ids[k]]
         if weight:
             delta = points[0] - points[k + 1]
             j = _IDENTITY[0] - _IDENTITY[k + 1]
@@ -255,16 +255,16 @@ class CartesianChainRuleEvaluator:
         self.area_weights = [a.numpy() for a in reference.weights]
         self.surfaces = []
         for start in (4, 9):
-            tri_indices, edge_vertex_indices, tri_edge_indices, edge_tri_indices, vertex_term_weight = reference.inputs[
-                start : start + 5
-            ]
+            tri_indices, edge_vertex_indices, tri_edge_indices, edge_tri_indices, vertex_term_coefficient = (
+                reference.inputs[start : start + 5]
+            )
             self.surfaces.append(
                 {
                     "faces": tri_indices.numpy(),
                     "edges": edge_vertex_indices.numpy(),
                     "face_edges": tri_edge_indices.numpy(),
                     "interior_edges": np.all(edge_tri_indices.numpy() >= 0, axis=1),
-                    "vertex_weight": vertex_term_weight.numpy(),
+                    "vertex_term_coefficient": vertex_term_coefficient.numpy(),
                 }
             )
         lists = reference.lists
@@ -292,7 +292,7 @@ class CartesianChainRuleEvaluator:
             if family < 2:
                 side = 1 if family == 0 else 0
                 offset = ns if side else 0
-                face = self.offsets[shape] + row[2] if family == 0 else row[1]
+                face = row[2] if family == 0 else row[1]
                 point = row[1] if family == 0 else ns + row[2]
                 weight = sv[row[1]] if family == 0 else rv[row[2]]
                 ids = np.r_[point, surfaces[side]["faces"][face] + offset]

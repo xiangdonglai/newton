@@ -237,7 +237,7 @@ def triangle_potential(
     edge_vertex_indices: wp.array[wp.vec2i],
     tri_edge_indices: wp.array2d[int],
     edge_tri_indices: wp.array2d[int],
-    vertex_term_weight: wp.array[wp.float64],
+    vertex_term_coefficient: wp.array[wp.float64],
     face: int,
     offset: int,
     i: int,
@@ -267,9 +267,9 @@ def triangle_potential(
             edge = edge_vertex_indices[edge_id]
             ea, eb = vertex(positions, edge[0], offset, i, j), vertex(positions, edge[1], offset, i, j)
             value -= wp.float64(0.5) * barrier(p - segment_closest(p, ea, eb), support, near_cutoff, near_only)
-        if vertex_term_weight[ids[k]] != wp.float64(0.0):
+        if vertex_term_coefficient[ids[k]] != wp.float64(0.0):
             v = vertex(positions, ids[k], offset, i, j)
-            value += barrier(p - v, support, near_cutoff, near_only) * vertex_term_weight[ids[k]]
+            value += barrier(p - v, support, near_cutoff, near_only) * vertex_term_coefficient[ids[k]]
     return value
 
 
@@ -282,7 +282,7 @@ def edge_potential(
     edge_vertex_indices: wp.array[wp.vec2i],
     tri_edge_indices: wp.array2d[int],
     edge_tri_indices: wp.array2d[int],
-    vertex_term_weight: wp.array[wp.float64],
+    vertex_term_coefficient: wp.array[wp.float64],
     offset: int,
     i: int,
     j: int,
@@ -300,7 +300,7 @@ def edge_potential(
             edge_vertex_indices,
             tri_edge_indices,
             edge_tri_indices,
-            vertex_term_weight,
+            vertex_term_coefficient,
             face,
             offset,
             i,
@@ -322,16 +322,16 @@ def evaluate_energy_derivatives(
     soft_edge_vertex_indices: wp.array[wp.vec2i],
     soft_tri_edge_indices: wp.array2d[int],
     soft_edge_tri_indices: wp.array2d[int],
-    soft_vertex_term_weight: wp.array[wp.float64],
+    soft_vertex_term_coefficient: wp.array[wp.float64],
     rigid_tri_indices: wp.array[wp.vec3i],
     rigid_edge_vertex_indices: wp.array[wp.vec2i],
     rigid_tri_edge_indices: wp.array2d[int],
     rigid_edge_tri_indices: wp.array2d[int],
-    rigid_vertex_term_weight: wp.array[wp.float64],
+    rigid_vertex_term_coefficient: wp.array[wp.float64],
     soft_positions: wp.array[wp.vec3d],
     rigid_positions: wp.array[wp.vec3d],
-    soft_vertex_weight: wp.array[wp.float64],
-    rigid_vertex_area: wp.array[wp.float64],
+    soft_vertex_quadrature_weight: wp.array[wp.float64],
+    rigid_vertex_quadrature_weight: wp.array[wp.float64],
     soft_edge_area: wp.array[wp.float64],
     rigid_edge_area: wp.array[wp.float64],
     support: wp.float64,
@@ -356,15 +356,15 @@ def evaluate_energy_derivatives(
         family = row[0] & 7
         if family == 0:
             p = vertex(soft_positions, row[1], 0, i, j)
-            fixed += soft_vertex_weight[row[1]] * triangle_potential(
+            fixed += soft_vertex_quadrature_weight[row[1]] * triangle_potential(
                 p,
                 rigid_positions,
                 rigid_tri_indices,
                 rigid_edge_vertex_indices,
                 rigid_tri_edge_indices,
                 rigid_edge_tri_indices,
-                rigid_vertex_term_weight,
-                rigid_triangle_offsets[shape] + row[2],
+                rigid_vertex_term_coefficient,
+                row[2],
                 offset,
                 i,
                 j,
@@ -375,14 +375,14 @@ def evaluate_energy_derivatives(
         elif family == 1:
             v_id = row[2]
             p = vertex(rigid_positions, v_id, offset, i, j)
-            fixed += rigid_vertex_area[v_id] * triangle_potential(
+            fixed += rigid_vertex_quadrature_weight[v_id] * triangle_potential(
                 p,
                 soft_positions,
                 soft_tri_indices,
                 soft_edge_vertex_indices,
                 soft_tri_edge_indices,
                 soft_edge_tri_indices,
-                soft_vertex_term_weight,
+                soft_vertex_term_coefficient,
                 row[1],
                 0,
                 i,
@@ -405,7 +405,7 @@ def evaluate_energy_derivatives(
                     rigid_edge_vertex_indices,
                     rigid_tri_edge_indices,
                     rigid_edge_tri_indices,
-                    rigid_vertex_term_weight,
+                    rigid_vertex_term_coefficient,
                     offset,
                     i,
                     j,
@@ -421,7 +421,7 @@ def evaluate_energy_derivatives(
                     soft_edge_vertex_indices,
                     soft_tri_edge_indices,
                     soft_edge_tri_indices,
-                    soft_vertex_term_weight,
+                    soft_vertex_term_coefficient,
                     0,
                     i,
                     j,
@@ -465,18 +465,23 @@ class EspDerivativeEvaluator:
             data.soft_edge_vertex_indices,
             data.soft_adjacency.tri_edge_indices,
             data.soft_adjacency.edge_tri_indices,
-            data.soft_vertex_term_weight,
+            data.soft_vertex_term_coefficient,
             data.rigid_tri_indices,
             data.rigid_edge_vertex_indices,
             data.rigid_adjacency.tri_edge_indices,
             data.rigid_adjacency.edge_tri_indices,
-            data.rigid_vertex_term_weight,
+            data.rigid_vertex_term_coefficient,
         )
         self.lists = blocks.lists
         self.device = blocks.model.device
         self.soft_positions_np = blocks.state.particle_q.numpy().astype(np.float64)
         self.rigid_positions_np = blocks.solver._esp_rigid_positions.numpy()
-        self.weights = [data.soft_vertex_weight, data.rigid_vertex_area, data.soft_edge_area, data.rigid_edge_area]
+        self.weights = [
+            data.soft_vertex_quadrature_weight,
+            data.rigid_vertex_quadrature_weight,
+            data.soft_edge_area,
+            data.rigid_edge_area,
+        ]
         self.support, self.near_cutoff = blocks.support, blocks.near_cutoff
 
     def evaluate(self, soft_positions=None, rigid_positions=None, *, compute_hessian=True):

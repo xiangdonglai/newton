@@ -75,7 +75,7 @@ from newton._src.geometry.soft_contacts_mesh import filter_soft_mesh_contacts
 from newton._src.solvers.vbd import esp_contact
 from newton._src.solvers.vbd.esp_contact import (
     particle_triangle,
-    triangle_feature_weights,
+    triangle_feature_coefficients,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
 from newton.solvers import SolverVBD
@@ -160,7 +160,7 @@ def evaluate_contacts(
     edge_vertex_indices: wp.array[wp.vec2i],
     tri_edge_indices: wp.array2d[int],
     edge_tri_indices: wp.array2d[int],
-    vertex_term_weight: wp.array[wp.float64],
+    vertex_term_coefficient: wp.array[wp.float64],
     target_positions: wp.array[wp.vec3d],
     support: float,
     stiffness: float,
@@ -215,8 +215,8 @@ def evaluate_contacts(
     r = wp.float64(support)
     coefficient = wp.float64(stiffness) * r * r
     triangle_vertex_indices = tri_indices[face]
-    edge_weights, vertex_weights = triangle_feature_weights(
-        tri_indices, tri_edge_indices, edge_tri_indices, vertex_term_weight, face
+    edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
+        tri_indices, tri_edge_indices, edge_tri_indices, vertex_term_coefficient, face
     )
     if use_direct_formulas:
         value, gradient, hessian = particle_triangle(
@@ -225,8 +225,8 @@ def evaluate_contacts(
             target_positions[triangle_vertex_indices[1]],
             target_positions[triangle_vertex_indices[2]],
             0,
-            edge_weights,
-            vertex_weights,
+            edge_coefficients,
+            vertex_coefficients,
             r,
             r,
             False,
@@ -243,7 +243,7 @@ def evaluate_contacts(
         c = particle_point(target_positions[triangle_vertex_indices[2]], False)
         p = particle_point(particle_q64[particle], True)
         value, gradient, hessian = particle_triangle_potential(
-            p, a, b, c, edge_weights, vertex_weights, r, r, False, reversed_edges
+            p, a, b, c, edge_coefficients, vertex_coefficients, r, r, False, reversed_edges
         )
     esp_force = -coefficient * gradient
     hessian *= coefficient
@@ -341,7 +341,7 @@ class ForceProbe:
                     self.data.rigid_edge_vertex_indices,
                     self.data.rigid_adjacency.tri_edge_indices,
                     self.data.rigid_adjacency.edge_tri_indices,
-                    self.data.rigid_vertex_term_weight,
+                    self.data.rigid_vertex_term_coefficient,
                     self.target_positions,
                     support,
                     stiffness,
@@ -465,7 +465,19 @@ class EdgeForceProbe:
             # materials. Detection can return more rows than the solver's
             # initial material allocation, even with only three particles.
             solver._refresh_body_particle_contact_state(self.contacts, refresh=True)
-            solver._prepare_esp_contact_inputs(self.state)
+            wp.launch(
+                solver._esp_kernels.update_rigid_positions,
+                dim=solver._esp_rigid_positions.shape[0],
+                inputs=[
+                    solver._esp_data.rigid_local_positions,
+                    solver._esp_data.rigid_vertex_shapes,
+                    self.model.shape_transform,
+                    self.model.shape_body,
+                    self.state.body_q,
+                ],
+                outputs=[solver._esp_rigid_positions],
+                device=self.device,
+            )
             wp.launch(
                 select_edge_rows,
                 dim=self.contacts.soft_contact_max,
@@ -489,6 +501,8 @@ class EdgeForceProbe:
                     worker_count,
                     self.selected_contacts.soft_contact_count,
                     self.selected_contacts.soft_contact_indices,
+                    self.selected_contacts.soft_contact_primitive_index,
+                    self.selected_contacts.soft_contact_rigid_primitive_index,
                     self.selected_contacts.soft_contact_rigid_indices,
                     self.selected_contacts.soft_contact_shape,
                     solver._esp_data,
@@ -498,14 +512,8 @@ class EdgeForceProbe:
                     self.model.shape_margin,
                     self.model.shape_material_ke,
                     self.model.soft_contact_ke,
-                    True,
                 ],
-                outputs=[
-                    solver._esp_ee_samples,
-                    solver._esp_particle_forces,
-                    solver._esp_particle_hessians,
-                    solver._esp_energy,
-                ],
+                outputs=[solver._esp_ee_samples],
             )
             for kind in (esp_contact._PARTICLE_BLOCKS, esp_contact._ENERGY_ONLY):
                 esp_contact.launch_contact_blocks(

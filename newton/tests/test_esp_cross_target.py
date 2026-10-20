@@ -65,7 +65,19 @@ def make_cross_target_case(device, *, shared_body=False, precision="float64", mi
     state = model.state()
     pipeline.collide(state, solver.contacts)
     solver._refresh_body_particle_contact_state(solver.contacts, True)
-    solver._prepare_esp_contact_inputs(state)
+    wp.launch(
+        solver._esp_kernels.update_rigid_positions,
+        dim=solver._esp_rigid_positions.shape[0],
+        inputs=[
+            solver._esp_data.rigid_local_positions,
+            solver._esp_data.rigid_vertex_shapes,
+            model.shape_transform,
+            model.shape_body,
+            state.body_q,
+        ],
+        outputs=[solver._esp_rigid_positions],
+        device=model.device,
+    )
     solver.particle_q_prev.assign(state.particle_q)
     solver.body_q_prev.assign(state.body_q)
     data = solver._esp_data
@@ -83,7 +95,12 @@ def make_cross_target_case(device, *, shared_body=False, precision="float64", mi
     if len(candidates) != 1:
         raise AssertionError(f"Expected the real collision query to return one generating EE pair; got {candidates}")
     rows[0], shapes[0] = rows[candidates[0]], shapes[candidates[0]]
-    for field in ("soft_contact_indices", "soft_contact_rigid_indices"):
+    for field in (
+        "soft_contact_indices",
+        "soft_contact_primitive_index",
+        "soft_contact_rigid_primitive_index",
+        "soft_contact_rigid_indices",
+    ):
         indices_np = getattr(solver.contacts, field).numpy().copy()
         indices_np[0] = indices_np[candidates[0]]
         getattr(solver.contacts, field).assign(indices_np)

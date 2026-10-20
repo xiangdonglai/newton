@@ -32,7 +32,7 @@ def contact_primitive_indices_np(contacts, data):
         if rigid[0] < 0 or offsets_np[shape] < 0:
             continue
         if rigid[2] >= 0:
-            result_np[i] = (0, soft[0], rigid[0] // 3)
+            result_np[i] = (0, soft[0], offsets_np[shape] + rigid[0] // 3)
         elif rigid[1] < 0:
             vertex = rigid_tri_indices_np[offsets_np[shape] + rigid[0] // 3, rigid[0] % 3]
             result_np[i] = (1, triangle_ids[tuple(soft)], vertex)

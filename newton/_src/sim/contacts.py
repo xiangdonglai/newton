@@ -406,6 +406,20 @@ class Contacts:
             Particle contact ``(p, -1, -1)``, edge contact ``(v0, v1, -1)``, face contact
             ``(v0, v1, v2)``. Pair with :attr:`soft_contact_barycentric` to recover the contact
             point over the non-negative slots."""
+            self.soft_contact_primitive_index = wp.full(soft_contact_max, -1, dtype=int)
+            """Soft primitive's model index per contact [dimensionless], shape (soft_contact_max,), dtype int.
+
+            The number of nonnegative entries in :attr:`soft_contact_indices` identifies its type:
+            one means a particle index, two an edge index into :attr:`Model.edge_indices`, and
+            three a triangle index into :attr:`Model.tri_indices`. Edge endpoints are columns 2:4
+            of ``Model.edge_indices``. These are model indices, not BVH query-table or thread IDs.
+            Applies to mesh, analytical/SDF, and recovery contacts. Initialized to -1 and reset
+            to -1 by full buffer clearing. Entries beyond :attr:`soft_contact_count` are not valid.
+
+            .. experimental::
+
+                Soft primitive metadata may change without prior notice.
+            """
             # Mesh feature selection is discrete and immutable through backward replay. Its
             # records use the final contact slots, never an intermediate candidate pool. The
             # parameter holds a detection-time soft-edge parameter for penetration recovery.
@@ -447,6 +461,21 @@ class Contacts:
             Mesh positions are unscaled shape-local coordinates; apply the shape's scale and transforms.
             Analytical/SDF contacts and edge-penetration recovery probes contain
             ``(-1, -1, -1)``: they do not identify a complete rigid mesh primitive.
+
+            .. experimental::
+
+                Rigid primitive metadata may change without prior notice.
+            """
+            self.soft_contact_rigid_primitive_index = wp.full(soft_contact_max, -1, dtype=int)
+            """Rigid primitive ID in the originating CollisionPipeline's shared rigid mesh.
+
+            Shape (soft_contact_max,), dtype int. The nonnegative entries in
+            :attr:`soft_contact_rigid_indices` identify the primitive type:
+            one indexes ``rigid_mesh_vertex_positions``, two ``rigid_mesh_edge_vertex_indices``,
+            and three ``rigid_mesh_tri_indices``. IDs are global across participating
+            shape instances, not private BVH query-table rows. Analytical/SDF
+            contacts and edge-depth recovery contain -1. Initialized to -1 and reset by full
+            buffer clearing; entries beyond :attr:`soft_contact_count` are not valid.
 
             .. experimental::
 
@@ -588,7 +617,9 @@ class Contacts:
                 self.rigid_contact_match_generation.fill_(GENERATION_SENTINEL)
 
             self.soft_contact_indices.fill_(wp.vec3i(-1, -1, -1))
+            self.soft_contact_primitive_index.fill_(-1)
             self.soft_contact_rigid_indices.fill_(wp.vec3i(-1, -1, -1))
+            self.soft_contact_rigid_primitive_index.fill_(-1)
             self.soft_contact_particle.fill_(-1)
             self.soft_contact_shape.fill_(-1)
             self.soft_contact_tids.fill_(-1)

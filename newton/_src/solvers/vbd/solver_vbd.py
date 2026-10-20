@@ -2485,38 +2485,49 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._esp_kernels = esp_contact.get_esp_kernels(scalar)
         with wp.ScopedDevice(self.device):
             self._esp_data = self._esp_kernels.create_esp_data(self.model, self.collision_pipeline)
+            # Current world positions in ESP's rigid vertex order; refreshed as bodies move.
             self._esp_rigid_positions = wp.empty(
                 self._esp_data.rigid_local_positions.shape[0], dtype=self._esp_kernels.Vec3
             )
+            # Nearby target triangles per source edge, plus scratch storage for sorting those lists.
             self._esp_lists, self._esp_list_sort_values = self._esp_kernels.create_edge_triangle_lists(
                 self._esp_data.soft_edge_vertex_indices,
                 self._esp_data.rigid_edge_vertex_indices,
                 self._pipeline_contacts.soft_contact_max,
             )
+            # Separate energy totals for diagnostics: [0] vertex samples (VT + TV), [1] adaptive EE samples.
+            # Their sum is the total conservative ESP energy, not separate soft/rigid energies.
             self._esp_energy = wp.zeros(2, dtype=scalar)
+            # Per contact row: [0] = (soft sample xyz, weight), [1] = (rigid sample xyz, unused).
+            # Used only when EE work is split across workers; otherwise each row's worker computes its samples.
             self._esp_ee_samples = wp.empty((self._pipeline_contacts.soft_contact_max, 2), dtype=self._esp_kernels.Vec4)
+            # Persistent error bitmask, read by check_esp_contacts() and cleared by reset().
             self._esp_error = wp.zeros(1, dtype=int)
+            # Summed world-space force and 3x3 Hessian contributions for each particle's local solve.
             self._esp_particle_forces = wp.zeros((self.model.particle_count, 3), dtype=scalar)
             self._esp_particle_hessians = wp.zeros((self.model.particle_count, 3, 3), dtype=scalar)
+            # Per body: [world force, world torque about COM]; Hessian coordinates are translation then rotation.
             self._esp_body_forces = wp.zeros((self.model.body_count, 6), dtype=scalar)
             self._esp_body_hessians = wp.zeros((self.model.body_count, 6, 6), dtype=scalar)
+            # Threads per CUDA block; workers stride over the live contact count.
             self._esp_block_dim = 32
-            # Whole-block derivatives share geometry across all Hessian entries.
-            # Each worker evaluates complete rows; no EE list subdivision by default.
+            # One worker evaluates each EE row's whole triangle list; >1 splits it and uses the sample cache.
             self._esp_ee_partitions = 1
+            # With no bodies, rigid world positions need to be computed only once.
             self._esp_static_positions_initialized = False
-            self._esp_shape_mask = wp.array(self._esp_data.rigid_triangle_offsets.numpy() >= 0, dtype=bool)
+            # Mesh shapes handled by ESP, excluded from the native rigid-soft force calculation.
+            self._esp_shape_mask = wp.array(self.collision_pipeline.rigid_mesh_triangle_offsets_np >= 0, dtype=bool)
 
-    def _prepare_esp_contact_inputs(self, state):
-        """Read the current iterate; DAT can move bodies during particle colors too."""
-        data = self._esp_data
-        if self.model.body_count or not self._esp_static_positions_initialized:
+    def _accumulate_esp_contacts(self, state, block_kind, color=-1, *, refresh_rigid_positions=True, dt=0.0):
+        """Accumulate one color's raw ESP blocks, or validate final-state energy."""
+        # Later particle colors may reuse positions only when DAT cannot move bodies between colors.
+        if refresh_rigid_positions and (self.model.body_count or not self._esp_static_positions_initialized):
             wp.launch(
                 self._esp_kernels.update_rigid_positions,
                 dim=self._esp_rigid_positions.shape[0],
                 inputs=[
-                    data.rigid_local_positions,
-                    data.rigid_vertex_shapes,
+                    self._esp_data.rigid_local_positions,
+                    self._esp_data.rigid_vertex_shapes,
                     self.model.shape_transform,
                     self.model.shape_body,
                     state.body_q,
@@ -2526,10 +2537,6 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
             self._esp_static_positions_initialized = True
 
-    def _accumulate_esp_contacts(self, state, block_kind, color=-1, *, refresh_rigid_positions=True, dt=0.0):
-        """Accumulate one color's raw ESP blocks, or validate final-state energy."""
-        if refresh_rigid_positions:
-            self._prepare_esp_contact_inputs(state)
         body_blocks = block_kind == esp_contact._BODY_BLOCKS
         self._esp_kernels.launch_contact_blocks(
             self.model,

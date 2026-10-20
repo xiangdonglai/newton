@@ -162,9 +162,9 @@ class TorchEspEnergy:
         self.surfaces = []
         # Each side supplies its five topology/weight arrays directly.
         for start in (4, 9):
-            tri_indices, edge_vertex_indices, tri_edge_indices, edge_tri_indices, vertex_term_weight = evaluator.inputs[
-                start : start + 5
-            ]
+            tri_indices, edge_vertex_indices, tri_edge_indices, edge_tri_indices, vertex_term_coefficient = (
+                evaluator.inputs[start : start + 5]
+            )
             triangle_indices_np, edge_vertex_indices_np = tri_indices.numpy(), edge_vertex_indices.numpy()
             self.surfaces.append(
                 {
@@ -172,9 +172,9 @@ class TorchEspEnergy:
                     "edges": edge_vertex_indices_np,
                     "face_edges": tri_edge_indices.numpy(),
                     "interior_edges": np.all(edge_tri_indices.numpy() >= 0, axis=1),
-                    "interior_vertices": vertex_term_weight.numpy() > 0,
+                    "interior_vertices": vertex_term_coefficient.numpy() > 0,
                     "vertex_face_count": np.bincount(
-                        triangle_indices_np.ravel(), minlength=vertex_term_weight.shape[0]
+                        triangle_indices_np.ravel(), minlength=vertex_term_coefficient.shape[0]
                     ),
                 }
             )
@@ -214,23 +214,23 @@ class TorchEspEnergy:
     def __call__(self, positions, term):
         soft_positions, rigid_positions = positions[: self.soft_count], positions[self.soft_count :]
         soft, rigid = self.surfaces
-        soft_vertex_weight, rigid_vertex_area, soft_edge_area, rigid_edge_area = self.weights
+        soft_vertex_quadrature_weight, rigid_vertex_quadrature_weight, soft_edge_area, rigid_edge_area = self.weights
         total = (positions * positions).sum() * 0
         for row, shape in zip(self.soft_contact_mesh_features_np, self.soft_contact_shape_np, strict=False):
             if row[0] < 0 or self.rigid_triangle_offsets_np[shape] < 0:
                 continue
             family = row[0] & 7
             if term == 0 and family == 0:
-                total = total + soft_vertex_weight[row[1]] * self.triangle_potential(
+                total = total + soft_vertex_quadrature_weight[row[1]] * self.triangle_potential(
                     soft_positions[row[1]],
                     rigid_positions,
                     rigid,
-                    self.rigid_triangle_offsets_np[shape] + row[2],
+                    row[2],
                     False,
                 )
             elif term == 0 and family == 1:
                 v = row[2]
-                total = total + rigid_vertex_area[v] * self.triangle_potential(
+                total = total + rigid_vertex_quadrature_weight[v] * self.triangle_potential(
                     rigid_positions[v], soft_positions, soft, row[1], False
                 )
             elif term == 1 and family == 2:

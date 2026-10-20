@@ -33,6 +33,8 @@ from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.soft_contacts_heightfield import _HEIGHTFIELD_CELLS_PER_TASK, launch_soft_heightfield_contacts
 from ..geometry.soft_contacts_mesh import (
     MeshContactData,
+    _collision_meshes,
+    _geometry_key,
     allocate_soft_mesh_contact_buffers,
     launch_soft_mesh_contacts,
 )
@@ -43,10 +45,11 @@ from ..geometry.support_function import (
     pack_mesh_ptr,
 )
 from ..geometry.tri_mesh_collision import TriMeshCollisionDetector
-from ..geometry.types import GeoType
+from ..geometry.types import GeoType, Mesh
 from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.model import Model
 from ..sim.state import State
+from ..utils.mesh import MeshAdjacency, MeshAdjacencyData
 
 
 def _shape_collide_mask(model: Model, shape_count: int | None = None) -> np.ndarray:
@@ -2163,6 +2166,38 @@ class CollisionPipeline:
         self.enable_rigid_soft_full_surface_contact = enable_rigid_soft_full_surface_contact
         self.full_surface_contact_return_unfiltered = full_surface_contact_return_unfiltered
         self._soft_mesh_contact_data = None
+        # Experimental shared topology for full-surface mesh contact. IDs are
+        # welded, compacted to vertices used by triangles, then packed across
+        # shape instances. They are not original mesh IDs or detector query rows.
+        # None without particles or particle-colliding meshes; visual-only meshes are not prepared.
+        self.rigid_mesh_vertex_positions: wp.array[wp.vec3] | None = None
+        """Canonical rigid vertices [m], scaled shape-local coordinates, shared with solvers.
+
+        .. experimental::
+
+            The shared ``rigid_mesh_*`` topology fields may change without prior notice.
+        """
+        self.rigid_mesh_tri_indices: wp.array[wp.vec3i] | None = None
+        """Complete triangles; entries index rigid_mesh_vertex_positions."""
+        self.rigid_mesh_edge_vertex_indices: wp.array[wp.vec2i] | None = None
+        """Complete edges; entries index rigid_mesh_vertex_positions."""
+        self.rigid_mesh_vertex_shapes: wp.array[int] | None = None
+        """Model shape index for each shared rigid vertex."""
+        self.rigid_mesh_vertex_corners: wp.array[int] | None = None
+        """Original mesh corner representing each shared rigid vertex."""
+        self.rigid_mesh_triangle_offsets: wp.array[int] | None = None
+        """Global triangle offset per model shape; -1 for shapes without shared topology."""
+        self.rigid_mesh_adjacency: MeshAdjacency | None = None
+        """Host connectivity for the complete shared topology."""
+        self.rigid_mesh_adjacency_device: MeshAdjacencyData | None = None
+        """Warp connectivity, uploaded once from rigid_mesh_adjacency."""
+        self.rigid_mesh_vertex_positions_np: np.ndarray | None = None
+        self.rigid_mesh_tri_indices_np: np.ndarray | None = None
+        self.rigid_mesh_edge_vertex_indices_np: np.ndarray | None = None
+        self.rigid_mesh_triangle_offsets_np: np.ndarray | None = None
+        self.rigid_mesh_shape_indices_np = np.empty(0, dtype=np.int32)
+        self.rigid_mesh_exact_vertices = True
+        """Whether canonicalization preserved all original corner positions exactly."""
         empty_pairs = wp.empty(0, dtype=wp.vec2i, device=model.device)
 
         if enable_rigid_soft_full_surface_contact and model.shape_count:
@@ -2178,14 +2213,21 @@ class CollisionPipeline:
             self.soft_face_rigid_pairs = _build_soft_face_rigid_contact_pairs(model, common_capable)
             self._soft_heightfield_face_pairs = _build_soft_face_rigid_contact_pairs(model, heightfield_capable)
             mesh_vertex_pairs = _build_soft_particle_rigid_contact_pairs(model, shape_ok=mesh_mask)
-            if len(mesh_vertex_pairs):
-                self._soft_mesh_contact_data = MeshContactData(
-                    model,
-                    mesh_mask,
-                    mesh_vertex_pairs,
-                    soft_contact_gap,
-                    return_unfiltered=full_surface_contact_return_unfiltered,
-                )
+            # Keep selected mesh topology available to solvers even when world
+            # filtering leaves no query pairs. Detection still has no work then.
+            if model.particle_count and np.any(mesh_mask):
+                meshes, canonical_vertex_ids = self._init_rigid_mesh_geometry(model, mesh_mask)
+                if len(mesh_vertex_pairs):
+                    self._soft_mesh_contact_data = MeshContactData(
+                        model,
+                        mesh_mask,
+                        mesh_vertex_pairs,
+                        soft_contact_gap,
+                        self,
+                        meshes=meshes,
+                        canonical_vertex_ids=canonical_vertex_ids,
+                        return_unfiltered=full_surface_contact_return_unfiltered,
+                    )
         else:
             self.soft_edge_rigid_pairs = empty_pairs
             self.soft_face_rigid_pairs = empty_pairs
@@ -2279,6 +2321,63 @@ class CollisionPipeline:
         model.rigid_contact_max = rigid_contact_max
         model.soft_contact_max = soft_contact_max
         model._contact_capacity_initialized = True
+
+    def _init_rigid_mesh_geometry(
+        self, model: Model, shape_mask: np.ndarray
+    ) -> tuple[dict[int, Mesh], dict[int, np.ndarray]]:
+        """Build shared topology and return mesh sources and canonical IDs for detector setup only."""
+        meshes = _collision_meshes(model, shape_mask)
+        self.rigid_mesh_shape_indices_np = np.flatnonzero(shape_mask)
+        shape_scale_np = model.shape_scale.numpy()
+        self.rigid_mesh_triangle_offsets_np = np.full(model.shape_count, -1, dtype=np.int32)
+        canonical_cache = {}
+        canonical_vertex_ids = {}
+        vertex_parts, triangle_parts, vertex_shapes, vertex_corners = [], [], [], []
+        vertex_count, triangle_count = 0, 0
+        self.rigid_mesh_exact_vertices = True
+        for shape, mesh in meshes.items():
+            key = _geometry_key(mesh)
+            if key not in canonical_cache:
+                canonical_np = mesh._canonical_vertex_ids()
+                # first_corners_np: one representative corner per used canonical vertex.
+                # corner_vertices_np: each corner's index in that compact vertex list.
+                _, first_corners_np, corner_vertices_np = np.unique(
+                    canonical_np[mesh.indices], return_index=True, return_inverse=True
+                )
+                vertices_np = mesh.vertices[mesh.indices[first_corners_np]]
+                exact = np.array_equal(mesh.vertices[mesh.indices], vertices_np[corner_vertices_np])
+                canonical_cache[key] = canonical_np, first_corners_np, corner_vertices_np, vertices_np, exact
+            canonical_np, first_corners_np, corner_vertices_np, vertices_np, exact = canonical_cache[key]
+            canonical_vertex_ids[shape] = canonical_np
+            self.rigid_mesh_exact_vertices = self.rigid_mesh_exact_vertices and exact
+            self.rigid_mesh_triangle_offsets_np[shape] = triangle_count
+            vertex_parts.append(vertices_np * shape_scale_np[shape])
+            triangle_parts.append((corner_vertices_np + vertex_count).reshape(-1, 3))
+            vertex_shapes.extend([shape] * len(vertices_np))
+            vertex_corners.extend(first_corners_np)
+            vertex_count += len(vertices_np)
+            triangle_count += len(mesh.indices) // 3
+
+        self.rigid_mesh_vertex_positions_np = (
+            np.concatenate(vertex_parts) if vertex_parts else np.empty((0, 3), np.float32)
+        )
+        self.rigid_mesh_tri_indices_np = (
+            np.concatenate(triangle_parts).astype(np.int32) if triangle_parts else np.empty((0, 3), np.int32)
+        )
+        self.rigid_mesh_adjacency = MeshAdjacency(self.rigid_mesh_tri_indices_np)
+        # Reuse MeshAdjacency's owned copy instead of retaining a second host triangle array.
+        self.rigid_mesh_tri_indices_np = self.rigid_mesh_adjacency.indices
+        self.rigid_mesh_adjacency.init_vertex_adjacency(vertex_count)
+        self.rigid_mesh_edge_vertex_indices_np = self.rigid_mesh_adjacency.edge_indices[:, 2:4]
+        with wp.ScopedDevice(model.device):
+            self.rigid_mesh_vertex_positions = wp.array(self.rigid_mesh_vertex_positions_np, dtype=wp.vec3)
+            self.rigid_mesh_tri_indices = wp.array(self.rigid_mesh_tri_indices_np, dtype=wp.vec3i)
+            self.rigid_mesh_edge_vertex_indices = wp.array(self.rigid_mesh_edge_vertex_indices_np, dtype=wp.vec2i)
+            self.rigid_mesh_vertex_shapes = wp.array(vertex_shapes, dtype=int)
+            self.rigid_mesh_vertex_corners = wp.array(vertex_corners, dtype=int)
+            self.rigid_mesh_triangle_offsets = wp.array(self.rigid_mesh_triangle_offsets_np, dtype=int)
+            self.rigid_mesh_adjacency_device = self.rigid_mesh_adjacency.to(model.device)
+        return meshes, canonical_vertex_ids
 
     @property
     def rigid_contact_max(self) -> int:
@@ -3109,6 +3208,8 @@ class CollisionPipeline:
                     contacts.soft_contact_count,
                     contacts.soft_contact_particle,
                     contacts.soft_contact_indices,
+                    contacts.soft_contact_primitive_index,
+                    contacts.soft_contact_rigid_primitive_index,
                     contacts.soft_contact_rigid_indices,
                     contacts.soft_contact_barycentric,
                     contacts.soft_contact_shape,

@@ -123,7 +123,6 @@ class EspVbdBlockEvaluator:
         self.data, self.lists = self.solver._esp_data, self.solver._esp_lists
         pipeline.collide(state, self.contacts)
         esp_contact.rebuild_edge_triangle_lists(self.contacts, self.data, self.lists, self.solver._esp_list_sort_values)
-        self.solver._prepare_esp_contact_inputs(state)
         self.soft_rest_vertices_np = model.particle_q.numpy().astype(np.float64)
         self.rigid_rest_vertices_np = self.data.rigid_local_positions.numpy().astype(np.float64)
         # The independent dense/Torch references below use one coefficient and
@@ -162,7 +161,19 @@ class EspVbdBlockEvaluator:
         """Evaluate split quadratures with the same launch function as SolverVBD."""
         self.state = state
         with wp.ScopedDevice(self.model.device):
-            self.solver._prepare_esp_contact_inputs(state)
+            wp.launch(
+                self.solver._esp_kernels.update_rigid_positions,
+                dim=self.solver._esp_rigid_positions.shape[0],
+                inputs=[
+                    self.data.rigid_local_positions,
+                    self.data.rigid_vertex_shapes,
+                    self.model.shape_transform,
+                    self.model.shape_body,
+                    state.body_q,
+                ],
+                outputs=[self.solver._esp_rigid_positions],
+                device=self.model.device,
+            )
             if self.model.body_count:
                 wp.launch(
                     _body_centers,
@@ -170,8 +181,6 @@ class EspVbdBlockEvaluator:
                     inputs=[state.body_q, self.model.body_com],
                     outputs=[self.body_com_world],
                 )
-            self.force.zero_()
-            self.hessian.zero_()
             if clear_error:
                 self.error.zero_()
             particle_count = self.model.particle_count

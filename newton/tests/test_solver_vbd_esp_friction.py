@@ -86,12 +86,13 @@ def make_row_friction_probe(kernels):
     Data, Lists = kernels.EspData, kernels.EdgeTriangleListData
     parameters = kernels.checked_contact_parameters
     friction = kernels.accumulate_contact_friction
-    primitive_indices = kernels.contact_primitive_indices
 
     @wp.kernel
     def probe(
         count: wp.array[int],
         soft_contact_indices: wp.array[wp.vec3i],
+        soft_contact_primitive_index: wp.array[int],
+        soft_contact_rigid_primitive_index: wp.array[int],
         soft_contact_rigid_indices: wp.array[wp.vec3i],
         shapes: wp.array[int],
         data: Data,
@@ -124,28 +125,24 @@ def make_row_friction_probe(kernels):
         row_id = wp.tid()
         if row_id < count[0]:
             shape = shapes[row_id]
-            row = primitive_indices(
-                soft_contact_indices[row_id],
-                soft_contact_rigid_indices[row_id],
-                data.rigid_triangle_offsets[shape],
-                data.soft_tri_indices,
-                data.soft_edge_vertex_indices,
-                data.soft_adjacency.v_adj_tris_offsets,
-                data.soft_adjacency.v_adj_tris,
-                data.soft_adjacency.v_adj_edges_offsets,
-                data.soft_adjacency.v_adj_edges,
-                data.rigid_tri_indices,
-                data.rigid_edge_vertex_indices,
-                data.rigid_adjacency.v_adj_edges_offsets,
-                data.rigid_adjacency.v_adj_edges,
-            )
+            family = int(0)
+            if soft_contact_indices[row_id][2] >= 0:
+                family = 1
+            elif soft_contact_indices[row_id][1] >= 0:
+                family = 2
+            soft_primitive_index = soft_contact_primitive_index[row_id]
+            rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
+            if soft_contact_rigid_indices[row_id][0] < 0:
+                family = -1
             support, near, stiffness = parameters(
-                row, shape, data, particle_radius, shape_margin, shape_ke, soft_ke, error
+                family, soft_primitive_index, shape, data, particle_radius, shape_margin, shape_ke, soft_ke, error
             )
             if support > scalar(0.0):
                 friction(
                     row_id,
-                    row,
+                    family,
+                    soft_primitive_index,
+                    rigid_primitive_index,
                     shape,
                     data,
                     particle_q,
@@ -601,7 +598,19 @@ class TestVbdEspFriction(unittest.TestCase):
                     pipeline.collide(state, solver.contacts)
                     solver._refresh_body_particle_contact_state(solver.contacts, True)
                     solver.particle_q_prev.assign(state.particle_q.numpy() - np.array([0.001, 0, 0], np.float32))
-                    solver._prepare_esp_contact_inputs(state)
+                    wp.launch(
+                        solver._esp_kernels.update_rigid_positions,
+                        dim=solver._esp_rigid_positions.shape[0],
+                        inputs=[
+                            solver._esp_data.rigid_local_positions,
+                            solver._esp_data.rigid_vertex_shapes,
+                            model.shape_transform,
+                            model.shape_body,
+                            state.body_q,
+                        ],
+                        outputs=[solver._esp_rigid_positions],
+                        device=model.device,
+                    )
                     kernels = esp_contact.get_esp_kernels(wp.float32 if precision == "float32" else wp.float64)
                     probe = make_row_friction_probe(kernels)
 
@@ -614,6 +623,8 @@ class TestVbdEspFriction(unittest.TestCase):
                             inputs=[
                                 solver.contacts.soft_contact_count,
                                 solver.contacts.soft_contact_indices,
+                                solver.contacts.soft_contact_primitive_index,
+                                solver.contacts.soft_contact_rigid_primitive_index,
                                 solver.contacts.soft_contact_rigid_indices,
                                 solver.contacts.soft_contact_shape,
                                 solver._esp_data,

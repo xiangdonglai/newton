@@ -3030,6 +3030,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     contacts.soft_contact_normal,
                     contacts.soft_contact_tids,
                     contacts.soft_contact_indices,
+                    contacts.soft_contact_primitive_index,
+                    contacts.soft_contact_rigid_primitive_index,
                     contacts.soft_contact_rigid_indices,
                     contacts.soft_contact_barycentric,
                     entry.view.shape_flags,
@@ -3046,6 +3048,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     filtered.soft_contact_normal,
                     filtered.soft_contact_tids,
                     filtered.soft_contact_indices,
+                    filtered.soft_contact_primitive_index,
+                    filtered.soft_contact_rigid_primitive_index,
                     filtered.soft_contact_rigid_indices,
                     filtered.soft_contact_barycentric,
                     soft_src_to_dst,
@@ -3929,6 +3933,8 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     src_normal: wp.array[wp.vec3],
     src_tids: wp.array[int],
     src_indices: wp.array[wp.vec3i],
+    src_primitive_index: wp.array[int],
+    src_rigid_primitive_index: wp.array[int],
     src_rigid_indices: wp.array[wp.vec3i],
     src_barycentric: wp.array[wp.vec3],
     shape_flags: wp.array[wp.int32],
@@ -3945,6 +3951,8 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     dst_normal: wp.array[wp.vec3],
     dst_tids: wp.array[int],
     dst_indices: wp.array[wp.vec3i],
+    dst_primitive_index: wp.array[int],
+    dst_rigid_primitive_index: wp.array[int],
     dst_rigid_indices: wp.array[wp.vec3i],
     dst_barycentric: wp.array[wp.vec3],
     src_to_dst: wp.array[wp.int32],
@@ -4002,5 +4010,7 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     # reads these fields, so dropping them delivers the contact as (-1, -1, -1) and regresses coupled
     # VBD even with full-surface contact off (E7).
     dst_indices[dst_id] = src_indices[contact_id]
+    dst_primitive_index[dst_id] = src_primitive_index[contact_id]
+    dst_rigid_primitive_index[dst_id] = src_rigid_primitive_index[contact_id]
     dst_rigid_indices[dst_id] = src_rigid_indices[contact_id]
     dst_barycentric[dst_id] = src_barycentric[contact_id]

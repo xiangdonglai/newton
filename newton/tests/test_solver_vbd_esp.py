@@ -42,7 +42,7 @@ def contact_primitive_indices_np(contacts, data):
         if rigid[0] < 0 or offsets_np[shape] < 0:
             continue
         if rigid[2] >= 0:
-            result_np[i] = (0, soft[0], rigid[0] // 3)
+            result_np[i] = (0, soft[0], offsets_np[shape] + rigid[0] // 3)
         elif rigid[1] < 0:
             vertex = rigid_tri_indices_np[offsets_np[shape] + rigid[0] // 3, rigid[0] % 3]
             result_np[i] = (1, triangle_ids[tuple(soft)], vertex)
@@ -69,7 +69,9 @@ def _primitive_supports(
     output: wp.array[wp.vec3d],
 ):
     i = wp.tid()
-    h, near, ke = esp_contact.contact_support_and_stiffness(rows[i], 0, data, radii, margins, stiffness, 0.0)
+    h, near, ke = esp_contact.contact_support_and_stiffness(
+        rows[i][0] & 7, rows[i][1], 0, data, radii, margins, stiffness, 0.0
+    )
     output[i] = wp.vec3d(h, near, ke)
 
 
@@ -112,9 +114,19 @@ class _EspReference:
             self.reference_model.soft_contact_ke = 1.0
 
     def assemble(self, state):
-        self.solver._prepare_esp_contact_inputs(state)
-        self.force.zero_()
-        self.hessian.zero_()
+        wp.launch(
+            self.solver._esp_kernels.update_rigid_positions,
+            dim=self.solver._esp_rigid_positions.shape[0],
+            inputs=[
+                self.data.rigid_local_positions,
+                self.data.rigid_vertex_shapes,
+                self.model.shape_transform,
+                self.model.shape_body,
+                state.body_q,
+            ],
+            outputs=[self.solver._esp_rigid_positions],
+            device=self.model.device,
+        )
         count = self.model.particle_count
         for kind, start, end in (
             (esp_contact._PARTICLE_BLOCKS, 0, count),
@@ -453,22 +465,34 @@ class TestVbdEsp(unittest.TestCase):
                     # Check actual launches, separately from numerical equivalence.
                     for partitions in (1, 3):
                         solver._esp_ee_partitions = partitions
-                        with patch.object(wp, "launch", wraps=wp.launch) as launch:
+                        with (
+                            patch.object(wp, "launch", wraps=wp.launch) as launch,
+                            patch.object(wp.array, "zero_", autospec=True, side_effect=wp.array.zero_) as clear,
+                        ):
                             evaluate()
+                        # Clearing has one owner even when EE preparation runs.
+                        for output in arrays:
+                            self.assertEqual(sum(call.args[0] is output for call in clear.call_args_list), 1)
                         preparation_calls = sum(
                             bool(call.args) and call.args[0] is kernels.prepare_contact_evaluation
                             for call in launch.call_args_list
                         )
                         self.assertEqual(preparation_calls, int(partitions > 1))
+                        for call in launch.call_args_list:
+                            if call.args and call.args[0] is kernels.prepare_contact_evaluation:
+                                self.assertEqual(len(call.kwargs["outputs"]), 1)
+                                self.assertIs(call.kwargs["outputs"][0], solver._esp_ee_samples)
                     solver._esp_ee_partitions = 1
                     evaluate()
                     self.assertGreater(solver._esp_energy.numpy()[1], 0, "Exercise active EE quadrature")
                     initial_force = solver._esp_particle_forces.numpy().copy()
-                    graph = None
+                    graphs = {}
                     if device.is_cuda:
-                        with wp.ScopedCapture(device=device) as capture:
-                            evaluate()
-                        graph = capture.graph
+                        for partitions in (1, 3):
+                            solver._esp_ee_partitions = partitions
+                            with wp.ScopedCapture(device=device) as capture:
+                                evaluate()
+                            graphs[partitions] = capture.graph
 
                     for moved in (False, True):
                         if moved:
@@ -482,17 +506,23 @@ class TestVbdEsp(unittest.TestCase):
                         count = int(contacts.soft_contact_count.numpy()[0])
                         for active in (count, 0, count):
                             contacts.soft_contact_count.fill_(active)
+                            for a in arrays:
+                                a.fill_(123.0)
+                            solver._esp_ee_samples.fill_(kernels.Vec4(123.0))
                             solver._esp_ee_partitions = 3
-                            evaluate()
+                            if device.is_cuda:
+                                wp.capture_launch(graphs[3])
+                            else:
+                                evaluate()
                             expected = [a.numpy().copy() for a in arrays]
                             for a in arrays:
                                 a.fill_(123.0)
                             solver._esp_ee_samples.fill_(kernels.Vec4(123.0))
                             solver._esp_ee_partitions = 1
-                            if graph is None:
-                                evaluate()
+                            if device.is_cuda:
+                                wp.capture_launch(graphs[1])
                             else:
-                                wp.capture_launch(graph)
+                                evaluate()
                             solver.check_esp_contacts()
                             for a, want in zip(arrays, expected, strict=True):
                                 got = a.numpy()
@@ -535,11 +565,14 @@ class TestVbdEsp(unittest.TestCase):
                         def check_iteration(
                             *args, solver=solver, original=original_iteration, expected=expected_refreshes
                         ):
-                            with patch.object(
-                                solver, "_prepare_esp_contact_inputs", wraps=solver._prepare_esp_contact_inputs
-                            ) as refresh:
+                            with patch.object(wp, "launch", wraps=wp.launch) as launches:
                                 original(*args)
-                            self.assertEqual(refresh.call_count, expected)
+                            refresh_count = sum(
+                                (call.args[0] if call.args else call.kwargs.get("kernel"))
+                                is solver._esp_kernels.update_rigid_positions
+                                for call in launches.call_args_list
+                            )
+                            self.assertEqual(refresh_count, expected)
 
                         solver._solve_particle_iteration = check_iteration
                         state, out = model.state(), model.state()
@@ -612,7 +645,7 @@ class TestVbdEsp(unittest.TestCase):
                     solver._refresh_body_particle_contact_state(solver.contacts, True)
                     solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
                     self.assertGreater(float(solver._esp_energy.numpy().sum()), 0.0)
-                    self.assertEqual(float(solver._esp_data.soft_vertex_weight.numpy()[-1]), 1.0)
+                    self.assertEqual(float(solver._esp_data.soft_vertex_quadrature_weight.numpy()[-1]), 1.0)
                     solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
                     particle_force = solver._esp_particle_forces.numpy().copy()
                     solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS)
@@ -644,7 +677,7 @@ class TestVbdEsp(unittest.TestCase):
                         soft_indices_np = solver.contacts.soft_contact_indices.numpy()
                         point_rows = (indices_np[:count, 2] >= 0) & (soft_indices_np[:count, 0] == 0)
                         self.assertTrue(point_rows.any())
-                        weights = solver._esp_data.soft_vertex_weight.numpy()
+                        weights = solver._esp_data.soft_vertex_quadrature_weight.numpy()
                         if kind == "interior":
                             self.assertEqual(weights[0], 0.0)
                             self.assertTrue(np.all(weights[1:] > 0.0))
@@ -789,12 +822,12 @@ class TestVbdEsp(unittest.TestCase):
                 expected_e = np.zeros(model.edge_count, dtype=np.float32)
                 np.add.at(expected_v, model.tri_indices.numpy().ravel(), np.repeat(areas / 3, 3))
                 np.add.at(expected_e, adjacency.tri_edge_indices.numpy().ravel(), np.repeat(2 * areas, 3))
-                np.testing.assert_array_equal(data.soft_vertex_weight.numpy(), expected_v)
+                np.testing.assert_array_equal(data.soft_vertex_quadrature_weight.numpy(), expected_v)
                 np.testing.assert_array_equal(data.soft_edge_area.numpy(), expected_e)
                 np.testing.assert_array_equal(model.tri_areas.numpy(), areas)
 
     def test_geometry_without_private_pipeline_data(self):
-        """Build mesh/convex ESP geometry from the model, with private pipeline data inaccessible."""
+        """Reuse mesh/convex geometry with private detector data inaccessible."""
         for device in wp.get_devices():
             for with_triangles in (False, True):
                 with self.subTest(device=str(device), with_triangles=with_triangles), wp.ScopedDevice(device):
@@ -1040,8 +1073,9 @@ class TestVbdEsp(unittest.TestCase):
     def test_edge_triangle_lists_from_contacts(self):
         """Check list construction against a host oracle and changing device counts.
 
-        Expand actual VT/TV/EE rows into per-edge sets independently of the
-        GPU count/scan/fill/sort implementation. Replay the same captured
+        Expand actual VT/TV/EE rows into per-edge lists independently of the
+        GPU count/scan/fill/sort implementation. Check raw counts separately
+        from the deduplicated triangle IDs. Replay the same captured
         rebuild with fewer rows, no rows, and all rows again, so stale list
         entries or counters cannot pass unnoticed.
         """
@@ -1053,11 +1087,12 @@ class TestVbdEsp(unittest.TestCase):
                 contacts, data, lists = solver.contacts, solver._esp_data, solver._esp_lists
                 count = int(contacts.soft_contact_count.numpy()[0])
                 rows = contact_primitive_indices_np(contacts, data)
-                shapes = contacts.soft_contact_shape.numpy()[:count]
-                offsets = data.rigid_triangle_offsets.numpy()
                 soft_edges, rigid_edges = data.soft_edge_vertex_indices.numpy(), data.rigid_edge_vertex_indices.numpy()
                 soft_faces, rigid_faces = data.soft_tri_indices.numpy(), data.rigid_tri_indices.numpy()
                 self.assertEqual(set(rows[:, 0] & 7), {0, 1, 2})
+                self.assertEqual(data.total_edge_count, len(soft_edges) + len(rigid_edges))
+                self.assertEqual(lists.edge_triangle_counts.shape[0], data.total_edge_count)
+                self.assertEqual(lists.starts.shape[0], data.total_edge_count)
 
                 def rebuild(contacts=contacts, data=data, lists=lists, sort_values=solver._esp_list_sort_values):
                     esp_contact.rebuild_edge_triangle_lists(contacts, data, lists, sort_values)
@@ -1069,35 +1104,37 @@ class TestVbdEsp(unittest.TestCase):
                         rebuild()
                     graph = capture.graph
                 for active in (count, count // 2, 0, count):
-                    expected = [set() for _ in range(len(soft_edges) + len(rigid_edges))]
-                    for row, shape in zip(rows[:active], shapes[:active], strict=True):
+                    expected = [[] for _ in range(data.total_edge_count)]
+                    for row in rows[:active]:
                         family, source, target = int(row[0]) & 7, int(row[1]), int(row[2])
                         if family == 0:
                             for edge, endpoints in enumerate(soft_edges):
                                 if source in endpoints:
-                                    expected[edge].add(int(offsets[shape]) + target)
+                                    expected[edge].append(target)
                         elif family == 1:
                             for edge, endpoints in enumerate(rigid_edges):
                                 if target in endpoints:
-                                    expected[len(soft_edges) + edge].add(source)
+                                    expected[len(soft_edges) + edge].append(source)
                         else:
                             for face, vertices in enumerate(rigid_faces):
                                 if set(rigid_edges[target]).issubset(vertices):
-                                    expected[source].add(face)
+                                    expected[source].append(face)
                             for face, vertices in enumerate(soft_faces):
                                 if set(soft_edges[source]).issubset(vertices):
-                                    expected[len(soft_edges) + target].add(face)
+                                    expected[len(soft_edges) + target].append(face)
                     contacts.soft_contact_count.fill_(active)
                     if graph is None:
                         rebuild()
                     else:
                         wp.capture_launch(graph)
                     self.assertEqual(int(lists.error.numpy()[0]), 0)
+                    np.testing.assert_array_equal(
+                        lists.edge_triangle_counts.numpy(), [len(faces) for faces in expected]
+                    )
+                    self.assertEqual(int(lists.raw_entry_count.numpy()[0]), sum(len(faces) for faces in expected))
                     starts, ends, keys = lists.starts.numpy(), lists.ends.numpy(), lists.keys.numpy()
                     for edge, faces in enumerate(expected):
-                        np.testing.assert_array_equal(keys[starts[edge] : ends[edge]], sorted(faces))
-                    if active == 0:
-                        self.assertEqual(int(lists.count.numpy()[0]), 0)
+                        np.testing.assert_array_equal(keys[starts[edge] : ends[edge]], sorted(set(faces)))
 
     def test_edge_triangle_list_compaction(self):
         """Keep exactly one copy per edge, including empty slices and graph replay."""
