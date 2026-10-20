@@ -87,7 +87,7 @@ def make_target_probe(size, scalar, baseline):
                 scalar(0.15),
             )
         else:
-            e, g, z, h = triangle(
+            e, g, z, h, _dissipative_gradient, _dissipative_hessian = triangle(
                 pair,
                 vec3(points[row, 4]),
                 vec3(points[row, 5]),

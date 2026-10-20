@@ -76,7 +76,7 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
                     for corner in range(3):
                         if ids[corner] == selected_vertex:
                             particle_mask |= 1 << (corner + 4)
-                    e, g, parameter_gradient, h = triangle_contribution(
+                    e, g, parameter_gradient, h, _dissipative_gradient, _dissipative_hessian = triangle_contribution(
                         pair,
                         ta,
                         tb,

@@ -43,148 +43,47 @@ def friction_blocks(solver, state, kind=esp_contact._PARTICLE_BLOCKS, color=-1):
     return force.numpy() - normal_force, hessian.numpy() - normal_hessian
 
 
-def make_primitive_friction_probe(kernels):
+def make_feature_friction_damping_probe(kernels):
     """Evaluate all seven unsigned terms; tests apply their signed coefficients."""
     scalar, Vec3 = wp.float32, wp.vec3
     Mat33 = wp.types.matrix(shape=(3, 3), dtype=scalar)
-    closest_weights = kernels.friction_closest_barycentric
-    friction = kernels.primitive_friction
 
     @wp.kernel
     def probe(
         points: wp.array[Vec3],
         motion: Vec3,
         near_only: bool,
+        damping_only: bool,
         force: wp.array[Vec3],
         hessian: wp.array[Mat33],
     ):
         feature = wp.tid()
         q, a, b, c = points[0], points[1], points[2], points[3]
-        weights = closest_weights(q, a, b, c, feature)
-        closest = weights[0] * a + weights[1] * b + weights[2] * c
-        f, h = friction(
-            q,
-            closest,
+        # The oracle below lists face, three edges, then three vertices.
+        production_feature = int(0)
+        if feature > 0:
+            production_feature = 2 * feature - 1 if feature < 4 else 2 * (feature - 3)
+        _weights, normal, distance, _dimension, _edge = kernels.triangle_feature_geometry(
+            q, a, b, c, production_feature
+        )
+        _energy, first, _second = kernels.barrier_coefficients(distance, 0.2, 0.05, near_only)
+        mu, kd = float(0.5), float(0.0)
+        if damping_only:
+            mu, kd = 0.0, 5.0
+        gradient, feature_hessian = kernels.feature_friction_and_damping(
+            normal,
+            distance,
+            first,
             motion,
-            wp.normalize(wp.cross(b - a, c - a)),
-            scalar(0.5),
+            scalar(0.05 if near_only else 0.2),
             scalar(2.0),
-            scalar(0.2),
-            scalar(0.05),
-            near_only,
+            mu,
+            kd,
+            scalar(0.01),
             scalar(0.01),
         )
-        force[feature] = f
-        hessian[feature] = h
-
-    return probe
-
-
-def make_row_friction_probe(kernels):
-    """Call production friction directly, avoiding subtraction of large normal blocks."""
-    scalar, Vec3 = wp.float32, wp.vec3
-    Data, Lists = kernels.EspData, kernels.EdgeTriangleListData
-    parameters = kernels.contact_support_and_stiffness
-    contact_family = kernels._mesh_contact_family
-    friction = kernels.accumulate_contact_friction
-
-    @wp.kernel
-    def probe(
-        count: wp.array[int],
-        soft_contact_indices: wp.array[wp.vec3i],
-        soft_contact_primitive_index: wp.array[int],
-        soft_contact_rigid_primitive_index: wp.array[int],
-        soft_contact_rigid_indices: wp.array[wp.vec3i],
-        shapes: wp.array[int],
-        data: Data,
-        lists: Lists,
-        particle_q: wp.array[wp.vec3],
-        particle_q_prev: wp.array[wp.vec3],
-        rigid_positions: wp.array[Vec3],
-        shape_transform: wp.array[wp.transform],
-        shape_body: wp.array[int],
-        shape_scale: wp.array[wp.vec3],
-        shape_source_ptr: wp.array[wp.uint64],
-        body_q: wp.array[wp.transform],
-        body_q_prev: wp.array[wp.transform],
-        body_com: wp.array[wp.vec3],
-        particle_colors: wp.array[int],
-        body_colors: wp.array[int],
-        shape_mu: wp.array[float],
-        soft_mu: float,
-        particle_radius: wp.array[float],
-        shape_margin: wp.array[float],
-        shape_ke: wp.array[float],
-        soft_ke: float,
-        color: int,
-        smoothing: float,
-        force: wp.array2d[scalar],
-        hessian: wp.array3d[scalar],
-        error: wp.array[int],
-    ):
-        row_id = wp.tid()
-        if row_id < count[0]:
-            shape = shapes[row_id]
-            soft_primitive_index = soft_contact_primitive_index[row_id]
-            rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
-            family = contact_family(
-                soft_contact_indices[row_id],
-                soft_contact_rigid_indices[row_id],
-                soft_primitive_index,
-                rigid_primitive_index,
-            )
-            if family < 0:
-                return
-            if family > 2:
-                wp.atomic_or(error, 0, 8)
-                return
-            if family == 0:
-                if data.soft_vertex_quadrature_weight[soft_primitive_index] == 0.0:
-                    return
-            elif family == 2:
-                if data.soft_edge_area[soft_primitive_index] == 0.0:
-                    return
-            support, near, stiffness = parameters(
-                family, soft_primitive_index, shape, data, particle_radius, shape_margin, shape_ke, soft_ke
-            )
-            if support > scalar(0.0):
-                friction(
-                    row_id,
-                    family,
-                    soft_primitive_index,
-                    rigid_primitive_index,
-                    shape,
-                    data,
-                    particle_q,
-                    particle_q_prev,
-                    rigid_positions,
-                    shape_transform,
-                    shape_body,
-                    shape_scale,
-                    shape_source_ptr,
-                    body_q,
-                    body_q_prev,
-                    body_com,
-                    particle_colors,
-                    body_colors,
-                    shape_mu,
-                    soft_mu,
-                    particle_radius,
-                    shape_margin,
-                    shape_ke,
-                    soft_ke,
-                    lists,
-                    support,
-                    near,
-                    stiffness,
-                    False,
-                    color,
-                    0.01,
-                    smoothing,
-                    force,
-                    hessian,
-                    error,
-                )
+        force[feature] = -gradient
+        hessian[feature] = feature_hessian
 
     return probe
 
@@ -218,33 +117,235 @@ def numpy_barrier(distance, near_only):
     return energy
 
 
+def numpy_damping_blocks(model, solver, state, dt, diagnostics=None):
+    """Independent feature-by-feature assembly; fixtures use translating bodies.
+
+    Visit every target triangle (not the production neighborhood lists), use
+    float64 closest points, and freeze all interpolation/EE weights. The
+    conservative stiffness and OGC row mask are intentionally never read.
+    """
+    data = solver._esp_data
+    particle_q_np = state.particle_q.numpy().astype(float)
+    rigid_positions_np = solver._esp_rigid_positions.numpy().astype(float)
+    particle_displacements_np = particle_q_np - solver.particle_q_prev.numpy()
+    body_q_np = state.body_q.numpy().astype(float)
+    body_q_prev_np = solver.body_q_prev.numpy().astype(float)
+    np.testing.assert_array_equal(body_q_np[:, 3:], body_q_prev_np[:, 3:])
+    np.testing.assert_array_equal(body_q_np[:, 3:], np.tile([0, 0, 0, 1], (model.body_count, 1)))
+    body_com_np = model.body_com.numpy()
+    shape_body_np = model.shape_body.numpy()
+    rigid_vertex_shapes_np = data.rigid_vertex_shapes.numpy()
+    rigid_displacements_np = np.zeros_like(rigid_positions_np)
+    for v, shape in enumerate(rigid_vertex_shapes_np):
+        body = shape_body_np[shape]
+        if body >= 0:
+            rigid_displacements_np[v] = body_q_np[body, :3] - body_q_prev_np[body, :3]
+    particle_radius_np, shape_margin_np, shape_material_kd_np = (
+        model.particle_radius.numpy(),
+        model.shape_margin.numpy(),
+        model.shape_material_kd.numpy(),
+    )
+    soft_tri_indices_np, rigid_tri_indices_np = data.soft_tri_indices.numpy(), data.rigid_tri_indices.numpy()
+    soft_edge_vertex_indices_np, rigid_edge_vertex_indices_np = (
+        data.soft_edge_vertex_indices.numpy(),
+        data.rigid_edge_vertex_indices.numpy(),
+    )
+    soft_vertex_quadrature_weight_np = data.soft_vertex_quadrature_weight.numpy()
+    rigid_vertex_quadrature_weight_np = data.rigid_vertex_quadrature_weight.numpy()
+    soft_edge_area_np, rigid_edge_area_np = data.soft_edge_area.numpy(), data.rigid_edge_area.numpy()
+    soft_contact_shape_np = solver.contacts.soft_contact_shape.numpy()
+    contact_primitives_np = contact_primitive_indices_np(solver.contacts, data)
+    vertex_term_coefficients_np = (
+        data.soft_vertex_term_coefficient.numpy(),
+        data.rigid_vertex_term_coefficient.numpy(),
+    )
+    edge_counts = []
+    for faces in (soft_tri_indices_np, rigid_tri_indices_np):
+        counts = {}
+        for face in faces:
+            for i in range(3):
+                key = tuple(sorted((face[i], face[(i + 1) % 3])))
+                counts[key] = counts.get(key, 0) + 1
+        edge_counts.append(counts)
+    particle_forces_np = np.zeros_like(particle_q_np)
+    particle_hessians_np = np.zeros((len(particle_q_np), 3, 3))
+    body_forces_np = np.zeros((model.body_count, 6))
+    body_hessians_np = np.zeros((model.body_count, 6, 6))
+
+    def accumulate(source_ids, source_weights, source_rigid, target_face, shape, area, near_only):
+        target_faces = soft_tri_indices_np if source_rigid else rigid_tri_indices_np
+        ids = target_faces[target_face]
+        source_positions_np, target_positions_np = (
+            (rigid_positions_np, particle_q_np) if source_rigid else (particle_q_np, rigid_positions_np)
+        )
+        source_displacements_np, target_displacements_np = (
+            (rigid_displacements_np, particle_displacements_np)
+            if source_rigid
+            else (particle_displacements_np, rigid_displacements_np)
+        )
+        q = source_weights @ source_positions_np[source_ids]
+        dq = source_weights @ source_displacements_np[source_ids]
+        triangle = target_positions_np[ids]
+        radius = particle_radius_np[ids].max() if source_rigid else particle_radius_np[source_ids].max()
+        support = float(radius + shape_margin_np[shape]) * (0.05 if near_only else 1)
+        side = 0 if source_rigid else 1
+        coefficients = [1.0]
+        for i in range(3):
+            count = edge_counts[side][tuple(sorted((ids[i], ids[(i + 1) % 3])))]
+            coefficients.append(-1.0 / count if count == 2 else 0.0)
+        coefficients.extend(vertex_term_coefficients_np[side][ids])
+        for closest, coefficient in zip(numpy_closest_points(q, triangle), coefficients, strict=True):
+            delta = q - closest
+            distance = np.linalg.norm(delta)
+            if coefficient == 0 or distance >= support or distance == 0:
+                continue
+            normal = delta / distance
+            # Closest-point barycentrics from an independent linear solve.
+            uv = np.linalg.lstsq(
+                np.column_stack((triangle[1] - triangle[0], triangle[2] - triangle[0])),
+                closest - triangle[0],
+                rcond=None,
+            )[0]
+            target_weights = np.array([1 - uv.sum(), *uv])
+            relative = dq - target_weights @ target_displacements_np[ids]
+            if normal @ relative >= 0:
+                continue
+            if diagnostics is not None:
+                diagnostics["minimum_distance"] = min(diagnostics.get("minimum_distance", np.inf), distance)
+            block = 0.5 * (model.soft_contact_kd + shape_material_kd_np[shape]) / dt * np.outer(normal, normal)
+            force = -block @ relative
+            scale = area * coefficient
+            soft_ids, weights, sign = (ids, target_weights, -1) if source_rigid else (source_ids, source_weights, 1)
+            for vertex, weight in zip(soft_ids, weights, strict=True):
+                particle_forces_np[vertex] += scale * weight * sign * force
+                particle_hessians_np[vertex] += scale * weight**2 * block
+            body = shape_body_np[shape]
+            if body >= 0:
+                point = q if source_rigid else closest
+                arm = point - (body_q_np[body, :3] + body_com_np[body])
+                x, y, z = arm
+                skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+                jacobian = np.column_stack((np.eye(3), -skew))
+                body_forces_np[body] -= scale * sign * jacobian.T @ force
+                body_hessians_np[body] += scale * jacobian.T @ block @ jacobian
+
+    for (family, soft_id, rigid_id), shape in zip(contact_primitives_np, soft_contact_shape_np, strict=False):
+        if family == 0:
+            accumulate([soft_id], np.ones(1), False, rigid_id, shape, soft_vertex_quadrature_weight_np[soft_id], False)
+        elif family == 1:
+            accumulate([rigid_id], np.ones(1), True, soft_id, shape, rigid_vertex_quadrature_weight_np[rigid_id], False)
+        elif family == 2:
+            se, re = soft_edge_vertex_indices_np[soft_id], rigid_edge_vertex_indices_np[rigid_id]
+            a, b = particle_q_np[se]
+            c, d = rigid_positions_np[re]
+            u, v = b - a, d - c
+            if np.dot(np.cross(u, v), np.cross(u, v)) == 0:
+                continue
+            s, t = np.linalg.lstsq(np.column_stack((u, -v)), c - a, rcond=None)[0]
+            if not (0 < s < 1 and 0 < t < 1):
+                continue
+            q, qb = a + s * u, c + t * v
+            distance_sq = np.dot(q - qb, q - qb)
+            near = 0.05 * (particle_radius_np[se].max() + shape_margin_np[shape])
+            if distance_sq <= 0 or distance_sq >= near**2:
+                continue
+            ratio = 2 * np.sqrt(distance_sq) / near
+            weight = 1 - 1.5 * ratio**2 + 0.75 * ratio**3 if ratio < 1 else 0.25 * (2 - ratio) ** 3
+            for p, start, end in ((a, c, d), (b, c, d), (c, a, b), (d, a, b)):
+                closest = start + np.clip(np.dot(p - start, end - start) / np.dot(end - start, end - start), 0, 1) * (
+                    end - start
+                )
+                excess = np.clip((np.dot(p - closest, p - closest) - distance_sq) / (0.01 * distance_sq), 0, 1)
+                weight *= excess * (2 - excess)
+            for face, ids in enumerate(rigid_tri_indices_np):
+                accumulate(
+                    se,
+                    np.array([1 - s, s]),
+                    False,
+                    face,
+                    rigid_vertex_shapes_np[ids[0]],
+                    weight * soft_edge_area_np[soft_id],
+                    True,
+                )
+            for face in range(len(soft_tri_indices_np)):
+                accumulate(re, np.array([1 - t, t]), True, face, shape, weight * rigid_edge_area_np[rigid_id], True)
+    return particle_forces_np, particle_hessians_np, body_forces_np, body_hessians_np
+
+
+@wp.kernel
+def _feature_damping_probe(motions: wp.array[wp.vec3], forces: wp.array[wp.vec3], hessians: wp.array[wp.mat33]):
+    i = wp.tid()
+    gradient, hessian = esp_contact.feature_friction_and_damping(
+        wp.vec3(0.0, 0.0, 1.0), 0.01, -1.0, motions[i], 0.1, 0.0, 0.0, 5.0, 0.01, 0.001
+    )
+    forces[i] = -gradient
+    hessians[i] = hessian
+
+
 class TestVbdEspFriction(unittest.TestCase):
-    def test_mesh_damping_owned_by_esp(self):
-        """Preserve row damping in ESP, including rigid reaction and graph replay."""
+    def test_signed_damping_cancellation(self):
+        """Opposite ESP feature coefficients cancel damping, without clamping."""
+        triangle_np = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        cases = (
+            ([0.5, -0.03, 0.02], [0, 0.002, -0.003], [1, -1, 0, 0, 0, 0, 0]),
+            ([-0.03, -0.02, 0.01], [0.003, 0.002, -0.001], [1, -1, 0, -1, 1, 0, 0]),
+        )
         for device in wp.get_devices():
             with self.subTest(device=str(device)), wp.ScopedDevice(device):
-                model, pipeline, solver = make_case(device, dynamic=True, grid=True, grid_extent=0.06, gap=0.001)
-                # Damping must work independently of conservative stiffness.
+                probe = make_feature_friction_damping_probe(esp_contact)
+                for point, motion, coefficients in cases:
+                    points_np = np.vstack((np.array(point, np.float32), triangle_np))
+                    closest_np = numpy_closest_points(points_np[0].astype(float), triangle_np.astype(float))
+                    delta_np = points_np[0] - closest_np
+                    normals_np = delta_np / np.linalg.norm(delta_np, axis=1)[:, None]
+                    hessian_np = 500.0 * normals_np[:, :, None] * normals_np[:, None, :]
+                    active_np = (normals_np @ motion < 0) & (np.linalg.norm(delta_np, axis=1) < 0.2)
+                    hessian_np[~active_np] = 0
+                    force_np = -(hessian_np @ motion)
+                    force, hessian = wp.empty(7, dtype=wp.vec3), wp.empty(7, dtype=wp.mat33)
+                    wp.launch(
+                        probe,
+                        dim=7,
+                        inputs=[wp.array(points_np, dtype=wp.vec3), wp.vec3(*motion), False, True],
+                        outputs=[force, hessian],
+                    )
+                    np.testing.assert_allclose(force.numpy(), force_np, rtol=3e-5, atol=2e-6)
+                    np.testing.assert_allclose(hessian.numpy(), hessian_np, rtol=3e-5, atol=2e-5)
+                    self.assertGreater(np.linalg.norm(force.numpy()[0]), 0)
+                    np.testing.assert_allclose(np.array(coefficients) @ force.numpy(), 0, atol=1e-10)
+                    np.testing.assert_allclose(np.einsum("i,ijk->jk", coefficients, hessian.numpy()), 0, atol=1e-10)
+
+    def test_feature_damping_approach_and_recovery(self):
+        """Keep the native approach-only rule, independently of ke and friction."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                motions = wp.array([[0, 0, -0.001], [0, 0, 0.001], [0.001, 0, 0]], dtype=wp.vec3)
+                forces, hessians = wp.empty(3, dtype=wp.vec3), wp.empty(3, dtype=wp.mat33)
+                wp.launch(_feature_damping_probe, dim=3, inputs=[motions], outputs=[forces, hessians])
+                np.testing.assert_allclose(forces.numpy(), [[0, 0, 0.5], [0, 0, 0], [0, 0, 0]], atol=1e-7)
+                expected = np.zeros((3, 3, 3))
+                expected[0, 2, 2] = 500
+                np.testing.assert_array_equal(hessians.numpy(), expected)
+
+    def test_mesh_damping_owned_by_esp(self):
+        """Compare VT/TV/EE damping against independent signed feature assembly."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, pipeline, solver = make_case(device, dynamic=True, grid=True, grid_extent=0.06, gap=0.00012)
                 model.soft_contact_ke = 0.0
                 model.shape_material_ke.zero_()
+                model.soft_contact_kd = 2.0
+                model.shape_material_kd.fill_(8.0)  # Arithmetic mean is 5.
                 state = model.state()
                 pipeline.collide(state, solver.contacts)
                 solver._refresh_body_particle_contact_state(solver.contacts, True)
-                solver.body_particle_contact_material_kd.fill_(5.0)
+                # ESP must not use cached row kd or the OGC force mask.
+                solver.body_particle_contact_material_kd.fill_(999.0)
+                solver.contacts.soft_contact_force_mask.zero_()
                 previous_body = state.body_q.numpy().copy()
                 previous_body[:, 0] -= 0.0003
                 solver.body_q_prev.assign(previous_body)
-                contacts = solver.contacts
-                count = int(contacts.soft_contact_count.numpy()[0])
-                indices = contacts.soft_contact_indices.numpy()[:count]
-                weights = contacts.soft_contact_barycentric.numpy()[:count]
-                normals = contacts.soft_contact_normal.numpy()[:count]
-                rigid_points = contacts.soft_contact_body_pos.numpy()[:count]
-                mask = contacts.soft_contact_force_mask.numpy()[:count]
-                points = state.particle_q.numpy()
-                radii = model.particle_radius.numpy()
-                com = model.body_com.numpy()[0].astype(float)
-                self.assertGreater(np.count_nonzero(mask), 0)
+                points = state.particle_q.numpy().copy()
 
                 def evaluate(solver=solver, state=state):
                     solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
@@ -257,68 +358,55 @@ class TestVbdEspFriction(unittest.TestCase):
                     with wp.ScopedCapture(device=device) as capture:
                         evaluate()
                     graph = capture.graph
-                for dz in (-0.001, 0.001):
-                    previous = (points - np.array([0.0002, 0, dz])).astype(np.float32)
-                    solver.particle_q_prev.assign(previous)
-                    expected_f = np.zeros((model.particle_count, 3))
-                    expected_h = np.zeros((model.particle_count, 3, 3))
-                    expected_bf = np.zeros((1, 6))
-                    expected_bh = np.zeros((1, 6, 6))
-                    # The current body transform is identity; use its actual COM.
-                    for row in range(count):
-                        if not mask[row]:
-                            continue
-                        valid = indices[row] >= 0
-                        ids, bary = indices[row, valid], weights[row, valid]
-                        x = bary @ points[ids]
-                        dx = bary @ (points[ids] - previous[ids]) - [0.0003, 0, 0]
-                        n, p = normals[row].astype(float), rigid_points[row].astype(float)
-                        if n @ (x - p) >= radii[ids].max() or n @ dx >= 0:
-                            continue
-                        h = 500.0 * np.outer(n, n)
-                        f = -h @ dx
-                        for vertex, w in zip(ids, bary, strict=True):
-                            expected_f[vertex] += w * f
-                            expected_h[vertex] += w * w * h
-                        r = p - com
-                        skew = np.array([[0, -r[2], r[1]], [r[2], 0, -r[0]], [-r[1], r[0], 0]])
-                        jacobian = np.column_stack((np.eye(3), -skew))
-                        expected_bf[0] -= jacobian.T @ f
-                        expected_bh[0] += jacobian.T @ h @ jacobian
-                    if dz < 0:
-                        self.assertGreater(np.linalg.norm(expected_f), 0.0)
+                for dz in (-0.001, 0.0, 0.001):
+                    solver.particle_q_prev.assign(points - np.array([0.0002, 0, dz], np.float32))
+                    diagnostics = {}
+                    expected = numpy_damping_blocks(model, solver, state, 0.01, diagnostics)
                     if graph is None:
                         evaluate()
                     else:
                         wp.capture_launch(graph)
                     solver.check_esp_contacts()
-                    for actual, expected in (
-                        (solver._esp_particle_forces.numpy(), expected_f),
-                        (solver._esp_particle_hessians.numpy(), expected_h),
-                        (solver._esp_body_forces.numpy(), expected_bf),
-                        (solver._esp_body_hessians.numpy(), expected_bh),
-                    ):
-                        np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=2e-5)
+                    actual = (
+                        solver._esp_particle_forces.numpy().copy(),
+                        solver._esp_particle_hessians.numpy().copy(),
+                        solver._esp_body_forces.numpy().copy(),
+                        solver._esp_body_hessians.numpy().copy(),
+                    )
+                    # In this captured EE fixture a 70 um normal gap coexists
+                    # with a 70 nm lateral offset. FP32 rounds the latter by
+                    # several nm: n_x/n_z=-0.000958 vs the FP64 -0.001.
+                    # Compare whole blocks at their coordinate-roundoff scale,
+                    # not relative to their small off-diagonal entries.
+                    normal_roundoff = (
+                        4 * np.finfo(np.float32).eps * np.max(np.abs(points)) / diagnostics.get("minimum_distance", 1.0)
+                    )
+                    for index, (result, reference) in enumerate(zip(actual, expected, strict=True)):
+                        if dz == 0 and index in (1, 3):
+                            # At zero normal velocity the approach-only damper's
+                            # Hessian switches between zero and kd/dt. Its force
+                            # is continuous; check that, not a unique Hessian.
+                            continue
+                        tolerance = max(2e-5, normal_roundoff * np.max(np.abs(reference)))
+                        np.testing.assert_allclose(result, reference, rtol=3e-5, atol=tolerance)
                     if dz < 0:
-                        # Splitting EE lists must not duplicate row damping;
-                        # summing separately evaluated colors must reproduce it.
-                        color_f = np.zeros_like(expected_f)
-                        color_h = np.zeros_like(expected_h)
+                        self.assertGreater(np.linalg.norm(expected[0]), 0)
+                        np.testing.assert_allclose(actual[0].sum(axis=0) + actual[2][0, :3], 0, atol=2e-6)
+                        motion = points - solver.particle_q_prev.numpy()
+                        work = np.sum(actual[0] * motion) + actual[2][0, :3] @ [0.0003, 0, 0]
+                        self.assertLess(work, 0)
+                        color_f, color_h = np.zeros_like(expected[0]), np.zeros_like(expected[1])
                         with particle_ee_partitions(2):
                             for color in range(len(model.particle_color_groups)):
                                 solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, color, dt=0.01)
                                 color_f += solver._esp_particle_forces.numpy()
                                 color_h += solver._esp_particle_hessians.numpy()
-                        np.testing.assert_allclose(color_f, expected_f, rtol=3e-5, atol=2e-5)
-                        np.testing.assert_allclose(color_h, expected_h, rtol=3e-5, atol=2e-5)
-                # Mask rejection and zero kd must remove damping on both solve sides.
-                solver.particle_q_prev.assign(points + np.array([0, 0, 0.001], np.float32))
-                contacts.soft_contact_force_mask.zero_()
-                evaluate()
-                np.testing.assert_array_equal(solver._esp_particle_forces.numpy(), 0)
-                np.testing.assert_array_equal(solver._esp_body_forces.numpy(), 0)
-                contacts.soft_contact_force_mask.fill_(True)
-                solver.body_particle_contact_material_kd.zero_()
+                        # Scheduling comparisons use the same FP32 geometry,
+                        # so no cross-precision normal allowance is necessary.
+                        np.testing.assert_allclose(color_f, actual[0], rtol=3e-5, atol=2e-5)
+                        np.testing.assert_allclose(color_h, actual[1], rtol=3e-5, atol=2e-5)
+                model.soft_contact_kd = 0
+                model.shape_material_kd.zero_()
                 evaluate()
                 np.testing.assert_array_equal(solver._esp_particle_forces.numpy(), 0)
                 np.testing.assert_array_equal(solver._esp_body_forces.numpy(), 0)
@@ -338,9 +426,21 @@ class TestVbdEspFriction(unittest.TestCase):
         kernels = esp_contact
         self.assertFalse(hasattr(kernels, "accumulate_sample_friction"))
         self.assertFalse(hasattr(kernels, "map_friction_samples"))
-        for kernel in (kernels.accumulate_particle_contact_derivatives, kernels.accumulate_body_contact_derivatives):
-            self.assertIn("accumulate_contact_friction(", inspect.getsource(kernel.func))
-            self.assertIn("accumulate_contact_damping(", inspect.getsource(kernel.func))
+        for name in ("accumulate_contact_friction", "accumulate_triangle_friction", "accumulate_contact_damping"):
+            self.assertFalse(hasattr(kernels, name), name)
+        for function in (
+            kernels.particle_triangle,
+            kernels.body_triangle,
+            kernels.particle_ee_triangle_contribution,
+            kernels.body_ee_triangle_contribution,
+        ):
+            source = inspect.getsource(function.func)
+            self.assertIn("barrier_coefficients(", source)
+            self.assertIn("feature_friction_and_damping(", source)
+            self.assertEqual(source.count("for feature_index in range(7)"), 1)
+        launch = inspect.getsource(kernels.launch_contact_blocks)
+        for field in ("soft_contact_force_mask", "soft_contact_normal", "body_particle_contact_material_kd"):
+            self.assertNotIn(field, launch)
 
     def test_native_kernels_skip_esp_rows(self):
         """Skip mesh damping and friction in both native particle paths and body assembly."""
@@ -537,7 +637,7 @@ class TestVbdEspFriction(unittest.TestCase):
             dtype = wp.float32
             with self.subTest(device=str(device), dtype=dtype), wp.ScopedDevice(device):
                 kernels = esp_contact
-                probe = make_primitive_friction_probe(kernels)
+                probe = make_feature_friction_damping_probe(kernels)
                 for point, coefficients, cancels in cases:
                     points = np.vstack((point, triangle)).astype(np.float32)
                     closest = numpy_closest_points(points[0].astype(float), points[1:].astype(float))
@@ -553,7 +653,7 @@ class TestVbdEspFriction(unittest.TestCase):
                             wp.launch(
                                 probe,
                                 dim=7,
-                                inputs=[wp.array(points, dtype=wp.vec3), wp.vec3(*motion), near_only],
+                                inputs=[wp.array(points, dtype=wp.vec3), wp.vec3(*motion), near_only, False],
                                 outputs=[force, hessian],
                             )
                             # Independent distance finite differences provide the loads.
@@ -597,7 +697,7 @@ class TestVbdEspFriction(unittest.TestCase):
                                 np.testing.assert_allclose(signed_force, numerical, rtol=3e-5, atol=2e-5)
 
     def test_ee_friction_color_assembly(self):
-        """Include both EE directions and preserve their signed friction across colors."""
+        """Both EE directions give the same result across colors and partitions."""
         for device in wp.get_devices():
             with self.subTest(device=str(device)), wp.ScopedDevice(device):
                 model, pipeline, solver = make_case(device, grid=True, grid_extent=0.06, gap=0.00012)
@@ -607,73 +707,21 @@ class TestVbdEspFriction(unittest.TestCase):
                 pipeline.collide(state, solver.contacts)
                 solver._refresh_body_particle_contact_state(solver.contacts, True)
                 solver.particle_q_prev.assign(state.particle_q.numpy() - np.array([0.001, 0, 0], np.float32))
-                wp.launch(
-                    esp_contact.update_rigid_positions,
-                    dim=solver._esp_rigid_positions.shape[0],
-                    inputs=[
-                        solver._esp_data.rigid_local_positions,
-                        solver._esp_data.rigid_vertex_shapes,
-                        model.shape_transform,
-                        model.shape_body,
-                        state.body_q,
-                    ],
-                    outputs=[solver._esp_rigid_positions],
-                    device=model.device,
-                )
-                kernels = esp_contact
-                probe = make_row_friction_probe(kernels)
-
-                def evaluate(color, solver=solver, model=model, state=state, probe=probe):
-                    solver._esp_particle_forces.zero_()
-                    solver._esp_particle_hessians.zero_()
-                    wp.launch(
-                        probe,
-                        dim=solver.contacts.soft_contact_max,
-                        inputs=[
-                            solver.contacts.soft_contact_count,
-                            solver.contacts.soft_contact_indices,
-                            solver.contacts.soft_contact_primitive_index,
-                            solver.contacts.soft_contact_rigid_primitive_index,
-                            solver.contacts.soft_contact_rigid_indices,
-                            solver.contacts.soft_contact_shape,
-                            solver._esp_data,
-                            solver._esp_lists,
-                            state.particle_q,
-                            solver.particle_q_prev,
-                            solver._esp_rigid_positions,
-                            model.shape_transform,
-                            model.shape_body,
-                            model.shape_scale,
-                            model.shape_source_ptr,
-                            state.body_q,
-                            solver.body_q_prev if model.body_count else None,
-                            model.body_com,
-                            model.particle_colors,
-                            model.body_colors,
-                            model.shape_material_mu,
-                            model.soft_contact_mu,
-                            model.particle_radius,
-                            model.shape_margin,
-                            model.shape_material_ke,
-                            model.soft_contact_ke,
-                            color,
-                            solver.friction_epsilon * 0.01,
-                        ],
-                        outputs=[solver._esp_particle_forces, solver._esp_particle_hessians, solver._esp_error],
-                    )
-                    solver.check_esp_contacts()
-                    return solver._esp_particle_forces.numpy().copy(), solver._esp_particle_hessians.numpy().copy()
-
-                force, hessian = evaluate(-1)
-                self.assertGreater(np.linalg.norm(force), 0)
-                color_force, color_hessian = np.zeros_like(force), np.zeros_like(hessian)
-                for color in range(len(model.particle_color_groups)):
-                    f, h = evaluate(color)
-                    color_force += f
-                    color_hessian += h
-                for actual, expected in ((color_force, force), (color_hessian, hessian)):
-                    scale = max(1, np.max(np.abs(expected)))
-                    np.testing.assert_allclose(actual / scale, expected / scale, rtol=0, atol=2e-5)
+                # Friction is now accumulated together with conservative blocks.
+                # Test complete outputs to avoid subtracting large FP32 totals.
+                solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, dt=0.01)
+                expected_f = solver._esp_particle_forces.numpy().copy()
+                expected_h = solver._esp_particle_hessians.numpy().copy()
+                for partitions in (1, 2, 8):
+                    color_f, color_h = np.zeros_like(expected_f), np.zeros_like(expected_h)
+                    with particle_ee_partitions(partitions):
+                        for color in range(len(model.particle_color_groups)):
+                            solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS, color, dt=0.01)
+                            color_f += solver._esp_particle_forces.numpy()
+                            color_h += solver._esp_particle_hessians.numpy()
+                    for actual, expected in ((color_f, expected_f), (color_h, expected_h)):
+                        scale = max(1, np.max(np.abs(expected)))
+                        np.testing.assert_allclose(actual / scale, expected / scale, rtol=0, atol=2e-5)
 
     def test_vertex_sample_load_and_friction(self):
         """Check the planar limit, opposite rigid reaction, torque, and zero coefficient."""

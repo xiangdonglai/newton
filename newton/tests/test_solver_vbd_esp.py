@@ -962,7 +962,7 @@ class TestVbdEsp(unittest.TestCase):
                         np.testing.assert_array_equal(actual.numpy(), getattr(reference, name))
 
     def test_row_selection_and_zero_weights(self):
-        """Preserve skipped rows, zero weights/materials and damping order."""
+        """All ESP terms follow the same row/weight policy; damping survives zero ke."""
         for device in wp.get_devices():
             with self.subTest(device=str(device)), wp.ScopedDevice(device):
                 model, pipeline, solver = make_case(device, dynamic=True, grid=True, grid_extent=0.06, gap=0.00012)
@@ -972,7 +972,8 @@ class TestVbdEsp(unittest.TestCase):
                 solver._refresh_body_particle_contact_state(solver.contacts, True)
                 solver.particle_q_prev.assign(state.particle_q.numpy() + np.array([0, 0, 0.001], np.float32))
                 solver.body_q_prev.assign(state.body_q)
-                solver.body_particle_contact_material_kd.fill_(5.0)
+                model.soft_contact_kd = 5.0
+                model.shape_material_kd.fill_(5.0)
                 contacts, data = solver.contacts, solver._esp_data
                 fields = (
                     "soft_contact_indices",
@@ -1063,10 +1064,7 @@ class TestVbdEsp(unittest.TestCase):
                                         outputs = (solver._esp_body_forces, solver._esp_body_hessians)
                                     expect_nonzero = case == "active"
                                     if dt > 0 and kind != esp_contact._ENERGY_ONLY:
-                                        # Damping precedes row exclusion, but excludes interior vertices itself.
-                                        expect_nonzero |= case != "zero_support" and not (
-                                            family == 0 and case == "zero_weight"
-                                        )
+                                        expect_nonzero |= case == "zero_stiffness"
                                     for output in outputs:
                                         values_np = output.numpy()
                                         self.assertTrue(np.isfinite(values_np).all())

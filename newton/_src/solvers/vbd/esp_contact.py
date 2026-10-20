@@ -16,11 +16,7 @@ from numpy.typing import NDArray
 from warp.fem.linalg import symmetric_eigenvalues_qr
 
 from ...utils.mesh import MeshAdjacency, MeshAdjacencyData
-from .rigid_vbd_kernels import (
-    _eval_soft_ef_contact,
-    _point_force_to_body_torque_and_hessian,
-    compute_projected_isotropic_friction,
-)
+from .rigid_vbd_kernels import compute_projected_isotropic_friction
 
 if TYPE_CHECKING:
     from ...sim import CollisionPipeline, Contacts, Model, State
@@ -153,8 +149,8 @@ class EdgeTriangleListData:
 
 @wp.func
 def add_edge_triangle_pair(
-    edge: int,
-    face: int,
+    edge_index: int,
+    triangle_index: int,
     count_only: bool,
     error: wp.array[int],
     edge_triangle_counts: wp.array[int],
@@ -162,10 +158,10 @@ def add_edge_triangle_pair(
     keys: wp.array[int],
 ) -> None:
     if count_only:
-        wp.atomic_add(edge_triangle_counts, edge, 1)
+        wp.atomic_add(edge_triangle_counts, edge_index, 1)
     elif error[0] == 0:
-        slot = wp.atomic_add(write_offsets, edge, 1)
-        keys[slot] = face
+        entry_index = wp.atomic_add(write_offsets, edge_index, 1)
+        keys[entry_index] = triangle_index
 
 
 @wp.kernel
@@ -199,12 +195,12 @@ def collect_edge_triangles(
     if soft_contact_count[0] > soft_contact_indices.shape[0]:
         wp.atomic_or(error, 0, 1)
         return
-    for i in range(wp.tid(), soft_contact_count[0], worker_count):
-        soft_primitive_index = soft_contact_primitive_index[i]
-        rigid_primitive_index = soft_contact_rigid_primitive_index[i]
+    for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
+        soft_primitive_index = soft_contact_primitive_index[row_id]
+        rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
         family = _mesh_contact_family(
-            soft_contact_indices[i],
-            soft_contact_rigid_indices[i],
+            soft_contact_indices[row_id],
+            soft_contact_rigid_indices[row_id],
             soft_primitive_index,
             rigid_primitive_index,
         )
@@ -213,21 +209,31 @@ def collect_edge_triangles(
         if family == 0:
             if soft_edge_count == 0:
                 continue  # Point-only scenes have no soft edge adjacency.
-            vertex = soft_primitive_index
-            face = rigid_primitive_index
-            for j in range(soft_v_adj_edges_offsets[vertex], soft_v_adj_edges_offsets[vertex + 1], 2):
+            vertex_index = soft_primitive_index
+            triangle_index = rigid_primitive_index
+            for adjacency_offset in range(
+                soft_v_adj_edges_offsets[vertex_index], soft_v_adj_edges_offsets[vertex_index + 1], 2
+            ):
                 # VBD's shared bending adjacency includes opposite vertices (slots 0/1).
                 # ESP needs only edges ending at this vertex (slots 2/3).
-                if soft_v_adj_edges[j + 1] >= 2:
+                if soft_v_adj_edges[adjacency_offset + 1] >= 2:
                     add_edge_triangle_pair(
-                        soft_v_adj_edges[j], face, count_only, error, edge_triangle_counts, write_offsets, keys
+                        soft_v_adj_edges[adjacency_offset],
+                        triangle_index,
+                        count_only,
+                        error,
+                        edge_triangle_counts,
+                        write_offsets,
+                        keys,
                     )
         elif family == 1:
-            vertex = rigid_primitive_index
-            for j in range(rigid_v_adj_edges_offsets[vertex], rigid_v_adj_edges_offsets[vertex + 1], 2):
-                if rigid_v_adj_edges[j + 1] >= 2:
+            vertex_index = rigid_primitive_index
+            for adjacency_offset in range(
+                rigid_v_adj_edges_offsets[vertex_index], rigid_v_adj_edges_offsets[vertex_index + 1], 2
+            ):
+                if rigid_v_adj_edges[adjacency_offset + 1] >= 2:
                     add_edge_triangle_pair(
-                        soft_edge_count + rigid_v_adj_edges[j],
+                        soft_edge_count + rigid_v_adj_edges[adjacency_offset],
                         soft_primitive_index,
                         count_only,
                         error,
@@ -237,16 +243,22 @@ def collect_edge_triangles(
                     )
         elif family == 2:
             for side in range(2):
-                face = rigid_edge_tri_indices[rigid_primitive_index, side]
-                if face >= 0:
+                triangle_index = rigid_edge_tri_indices[rigid_primitive_index, side]
+                if triangle_index >= 0:
                     add_edge_triangle_pair(
-                        soft_primitive_index, face, count_only, error, edge_triangle_counts, write_offsets, keys
+                        soft_primitive_index,
+                        triangle_index,
+                        count_only,
+                        error,
+                        edge_triangle_counts,
+                        write_offsets,
+                        keys,
                     )
-                face = soft_edge_tri_indices[soft_primitive_index, side]
-                if face >= 0:
+                triangle_index = soft_edge_tri_indices[soft_primitive_index, side]
+                if triangle_index >= 0:
                     add_edge_triangle_pair(
                         soft_edge_count + rigid_primitive_index,
-                        face,
+                        triangle_index,
                         count_only,
                         error,
                         edge_triangle_counts,
@@ -272,17 +284,17 @@ def finish_edge_triangle_offsets(
     starts contains the exclusive scan on entry and is clamped in place.
     error preserves earlier flags. The remaining outputs are overwritten.
     """
-    edge = wp.tid()
-    start = starts[edge]
-    end = start + edge_triangle_counts[edge]
-    if edge == starts.shape[0] - 1:
+    edge_index = wp.tid()
+    start = starts[edge_index]
+    end = start + edge_triangle_counts[edge_index]
+    if edge_index == starts.shape[0] - 1:
         raw_entry_count[0] = end
         if end > capacity:
             wp.atomic_or(error, 0, 2)
     # Keep every sort range in bounds even when the whole result is invalid.
-    starts[edge] = wp.min(start, capacity)
-    ends[edge] = wp.min(end, capacity)
-    write_offsets[edge] = start
+    starts[edge_index] = wp.min(start, capacity)
+    ends[edge_index] = wp.min(end, capacity)
+    write_offsets[edge_index] = start
 
 
 @wp.kernel
@@ -301,16 +313,16 @@ def compact_sorted_edge_triangles(
     """
     if error[0] != 0:
         return
-    edge = wp.tid()
-    write = starts[edge]
-    previous = int(-1)
-    for read in range(write, ends[edge]):
-        face = keys[read]
-        if face != previous:
-            keys[write] = face
-            write += 1
-        previous = face
-    ends[edge] = write
+    edge_index = wp.tid()
+    write_offset = starts[edge_index]
+    previous_triangle_index = int(-1)
+    for read_offset in range(write_offset, ends[edge_index]):
+        triangle_index = keys[read_offset]
+        if triangle_index != previous_triangle_index:
+            keys[write_offset] = triangle_index
+            write_offset += 1
+        previous_triangle_index = triangle_index
+    ends[edge_index] = write_offset
 
 
 def create_edge_triangle_lists(
@@ -491,13 +503,13 @@ def update_rigid_positions(
     rigid_positions: wp.array[wp.vec3],
 ) -> None:
     """Transform scaled shape-local positions to world space in ESP vertex order, using float32 arithmetic."""
-    i = wp.tid()
-    shape = rigid_vertex_shapes[i]
-    transform = shape_transform[shape]
-    body = shape_body[shape]
-    if body >= 0:
-        transform = body_q[body] * transform
-    rigid_positions[i] = wp.transform_point(transform, rigid_local_positions[i])
+    vertex_index = wp.tid()
+    shape_index = rigid_vertex_shapes[vertex_index]
+    transform = shape_transform[shape_index]
+    body_index = shape_body[shape_index]
+    if body_index >= 0:
+        transform = body_q[body_index] * transform
+    rigid_positions[vertex_index] = wp.transform_point(transform, rigid_local_positions[vertex_index])
 
 
 # Energy-only geometry uses ordinary positions and scalar values. It does not
@@ -505,15 +517,15 @@ def update_rigid_positions(
 @wp.func
 def segment_distance_squared_value(p: wp.vec3, a: wp.vec3, b: wp.vec3) -> float:
     """Match the analytical segment distance without evaluating derivatives."""
-    edge = b - a
-    length_sq = wp.dot(edge, edge)
-    t = wp.dot(p - a, edge) / length_sq
+    edge_vector = b - a
+    length_sq = wp.dot(edge_vector, edge_vector)
+    t = wp.dot(p - a, edge_vector) / length_sq
     delta = p - a
     if t >= 1.0:
         delta = p - b
     elif t > 0.0:
-        delta = p - (a + t * edge)
-        delta -= edge * (wp.dot(delta, edge) / length_sq)
+        delta = p - (a + t * edge_vector)
+        delta -= edge_vector * (wp.dot(delta, edge_vector) / length_sq)
     return wp.dot(delta, delta)
 
 
@@ -589,7 +601,7 @@ def triangle_energy(
     tri_edge_indices: wp.array2d[int],
     edge_tri_indices: wp.array2d[int],
     vertex_term_coefficient: wp.array[float],
-    face: int,
+    triangle_index: int,
     support: float,
     near_cutoff: float,
     near_only: bool,
@@ -636,21 +648,21 @@ def triangle_energy(
     if distance_sq >= cutoff * cutoff:
         return 0.0
     result = barrier_energy(distance_sq, support, near_cutoff, near_only)
-    triangle_vertex_indices = tri_indices[face]
+    triangle_vertex_indices = tri_indices[triangle_index]
     for corner in range(3):
         start, end = a, b
         if corner == 1:
             start, end = b, c
         elif corner == 2:
             start, end = c, a
-        edge = tri_edge_indices[face, corner]
+        edge_index = tri_edge_indices[triangle_index, corner]
         # Subtract the edge correction only for interior edges (two incident triangles).
         # Boundary edges have a missing triangle (-1) and no subtraction.
-        if edge_tri_indices[edge, 0] >= 0 and edge_tri_indices[edge, 1] >= 0:
+        if edge_tri_indices[edge_index, 0] >= 0 and edge_tri_indices[edge_index, 1] >= 0:
             edge_start, edge_end = start, end
             # Use the stored endpoint order for numerical consistency between incident triangles:
             # reversing the endpoints can change floating-point rounding in the distance calculation.
-            if edge_vertex_indices[edge][0] != triangle_vertex_indices[corner]:
+            if edge_vertex_indices[edge_index][0] != triangle_vertex_indices[corner]:
                 edge_start, edge_end = end, start
             result -= 0.5 * barrier_energy(
                 segment_distance_squared_value(p, edge_start, edge_end), support, near_cutoff, near_only
@@ -760,86 +772,223 @@ def ee_quadrature_sample(
 
 
 @wp.func
-def point_potential(
-    point: wp.vec3,
-    target: wp.vec3,
-    coefficient: float,
-    support: float,
-    near: float,
-    near_only: bool,
-    touching_normal: wp.vec3,
-):
-    # coefficient = +1 when point moves, -1 when target moves, else 0.
-    # grad(E)=c*b'(d)*n; H=c^2*[b'' nn^T + (b'/d)(I-nn^T)].
-    delta = point - target
-    distance = wp.length(delta)
-    energy, first, second = barrier_coefficients(distance, support, near, near_only)
-    normal = touching_normal
-    tangent_curvature = float(0.0)
-    if distance > 0.0:
-        normal = delta / distance
-        tangent_curvature = first / distance
-    # At coincidence, unsigned distance has no unique derivative. Use
-    # the incident face's outward normal and its finite normal curvature,
-    # not an undefined 0/0 direction or infinite tangential curvature.
-    nn = wp.outer(normal, normal)
-    identity = wp.identity(n=3, dtype=float)
-    hessian = coefficient * coefficient * (second * nn + tangent_curvature * (identity - nn))
-    return energy, coefficient * first * normal, hessian
-
-
-@wp.func
 def segment_parameter(point: wp.vec3, start: wp.vec3, end: wp.vec3):
-    edge = end - start
-    length_sq = wp.dot(edge, edge)
+    edge_vector = end - start
+    length_sq = wp.dot(edge_vector, edge_vector)
     if length_sq <= 0.0:
         return 0.0
-    return wp.clamp(wp.dot(point - start, edge) / length_sq, 0.0, 1.0)
+    return wp.clamp(wp.dot(point - start, edge_vector) / length_sq, 0.0, 1.0)
 
 
 @wp.func
-def segment_potential(
+def triangle_feature_geometry(
     point: wp.vec3,
-    start: wp.vec3,
-    end: wp.vec3,
-    point_moves: bool,
-    start_moves: bool,
-    end_moves: bool,
-    support: float,
-    near: float,
-    near_only: bool,
-    touching_normal: wp.vec3,
-):
-    t = segment_parameter(point, start, end)
-    if t <= 0.0:
-        return point_potential(
-            point, start, float(int(point_moves) - int(start_moves)), support, near, near_only, touching_normal
-        )
-    if t >= 1.0:
-        return point_potential(
-            point, end, float(int(point_moves) - int(end_moves)), support, near, near_only, touching_normal
-        )
-    edge = end - start
-    length_sq = wp.dot(edge, edge)
-    delta = point - start - t * edge
-    delta -= (wp.dot(delta, edge) / length_sq) * edge
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    feature_index: int,
+) -> tuple[wp.vec3, wp.vec3, float, int, int]:
+    """Closest geometry shared by all three contact laws.
+
+    Args:
+        point: Sample position, in the same coordinate frame as a, b, c.
+        a: Triangle corner 0 position. The triangle must be nondegenerate.
+        b: Triangle corner 1 position.
+        c: Triangle corner 2 position.
+        feature_index: Target feature whose distance is evaluated:
+            0 = complete triangle (a, b, c), including its boundary;
+            1 = segment (a, b); 2 = vertex a;
+            3 = segment (b, c); 4 = vertex b;
+            5 = segment (c, a); 6 = vertex c.
+            This selects one ESP term, not a global mesh feature index.
+
+    Returns:
+        Tuple (barycentric, normal, distance, dimension, corner):
+            barycentric: Weights of the closest point relative to (a, b, c).
+            normal: Unit direction from the closest point toward the sample.
+                At zero distance, use the triangle's oriented unit normal
+                normalize(cross(b - a, c - a)).
+            distance: Nonnegative distance to the selected finite feature.
+            dimension: Location of the closest point: 2 = face interior,
+                1 = edge interior, 0 = vertex. This can differ from the
+                requested feature: a triangle/segment can be closest at a vertex.
+            corner: Triangle-local corner number, not a global vertex/edge index.
+                For a face-interior result, -1 (unused).
+                For a vertex term (feature_index 2/4/6), 0/1/2 respectively.
+                For an edge term or a triangle's selected boundary edge,
+                the edge's START corner: 0 = (a,b), 1 = (b,c), 2 = (c,a).
+                This remains the start corner even if the closest point is
+                the other endpoint; use barycentric to identify that vertex.
+
+        Callers name the last result edge_corner because the derivative code
+        reads it only when dimension == 1, to select the edge direction.
+        For dimension == 0, vertex dependence comes from barycentric instead.
+    """
+    ab, ac = b - a, c - a
+    cross = wp.cross(ab, ac)
+    area_sq = wp.dot(cross, cross)
+    plane_normal = cross / wp.sqrt(area_sq)
+    if feature_index == 0:
+        signed_distance = wp.dot(point - a, plane_normal)
+        projected = point - signed_distance * plane_normal
+        u = wp.dot(wp.cross(projected - a, ac), cross) / area_sq
+        v = wp.dot(wp.cross(ab, projected - a), cross) / area_sq
+        if u > 0.0 and v > 0.0 and u + v < 1.0:
+            normal = plane_normal if signed_distance >= 0.0 else -plane_normal
+            return wp.vec3(1.0 - u - v, u, v), normal, wp.abs(signed_distance), 2, -1
+    corner = (feature_index - 1) // 2
+    if feature_index == 0:
+        corner = int(0)
+        closest_distance_sq = float(wp.inf)
+        # Preserve the strict closest-edge tie rule of the conservative path.
+        for candidate in range(3):
+            start, end = a, b
+            if candidate == 1:
+                start, end = b, c
+            elif candidate == 2:
+                start, end = c, a
+            t = segment_parameter(point, start, end)
+            delta = point - start - t * (end - start)
+            if wp.dot(delta, delta) < closest_distance_sq:
+                corner, closest_distance_sq = candidate, wp.dot(delta, delta)
+    start, end = a, b
+    if corner == 1:
+        start, end = b, c
+    elif corner == 2:
+        start, end = c, a
+    barycentric = wp.vec3()
+    dimension = int(0)
+    delta = point - start
+    if feature_index > 0 and feature_index % 2 == 0:
+        barycentric[corner] = 1.0
+    else:
+        t = segment_parameter(point, start, end)
+        barycentric[corner] = 1.0 - t
+        barycentric[(corner + 1) % 3] = t
+        if t >= 1.0:
+            delta = point - end
+        elif t > 0.0:
+            dimension = 1
+            edge_vector = end - start
+            delta -= t * edge_vector
+            delta -= (wp.dot(delta, edge_vector) / wp.dot(edge_vector, edge_vector)) * edge_vector
     distance = wp.length(delta)
-    energy, first, second = barrier_coefficients(distance, support, near, near_only)
-    normal = touching_normal
-    tangent_curvature = float(0.0)
+    normal = plane_normal
     if distance > 0.0:
         normal = delta / distance
-        tangent_curvature = first / distance
-    # c is the selected vertex's coefficient in point-(1-t)*start-t*end.
-    # k is its coefficient in end-start. No derivative arrays are seeded.
-    c = float(int(point_moves)) - (1.0 - t) * float(int(start_moves)) - t * float(int(end_moves))
-    k = float(int(end_moves) - int(start_moves))
+    return barycentric, normal, distance, dimension, corner
+
+
+@wp.func
+def feature_particle_derivatives(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    derivative_vertex_slot: int,
+    barycentric: wp.vec3,
+    normal: wp.vec3,
+    distance: float,
+    dimension: int,
+    edge_corner: int,
+    first: float,
+    second: float,
+):
+    """Differentiate one feature potential B(d) with respect to one vertex position.
+
+    d is the distance from the sample point to the selected triangle feature.
+    ``first`` and ``second`` are dB/dd and d2B/dd2, supplied by
+    ``barrier_coefficients``: derivatives with respect to distance, not position.
+
+    ``derivative_vertex_slot`` selects the three Cartesian coordinates x:
+    0 = sample point, 1 = a, 2 = b, 3 = c. Return gradient dB/dx (vec3) and
+    Hessian d2B/dx2 (mat33), holding the other three positions fixed.
+    This is one diagonal vertex block, not the full four-vertex Hessian.
+    Closest-point and normal changes are included on the selected smooth branch;
+    the supplied barycentric coordinates and normal describe its current geometry.
+
+    Stiffness, signed feature coefficients and quadrature weights are applied
+    by callers. ``edge_corner`` is used only when dimension == 1: the triangle-local
+    start corner (0/1/2), not a mesh edge index. See ``triangle_feature_geometry``.
+    """
+    coefficient = float(1.0)
+    if derivative_vertex_slot > 0:
+        coefficient = -barycentric[derivative_vertex_slot - 1]
     nn = wp.outer(normal, normal)
-    perpendicular = wp.identity(n=3, dtype=float) - wp.outer(edge, edge) / length_sq
-    hessian = c * c * (second * nn + tangent_curvature * (perpendicular - nn))
-    hessian -= (first * c * k / length_sq) * (wp.outer(edge, normal) + wp.outer(normal, edge))
-    hessian -= (first * distance * k * k / length_sq) * nn
-    return energy, c * first * normal, hessian
+    gradient = coefficient * first * normal
+    if dimension == 2:
+        ab, ac = b - a, c - a
+        cross = wp.cross(ab, ac)
+        area_sq = wp.dot(cross, cross)
+        reciprocal_ab = wp.cross(ac, cross) / area_sq
+        reciprocal_ac = wp.cross(cross, ab) / area_sq
+        reciprocal = wp.vec3()
+        if derivative_vertex_slot == 1:
+            reciprocal = -reciprocal_ab - reciprocal_ac
+        elif derivative_vertex_slot == 2:
+            reciprocal = reciprocal_ab
+        elif derivative_vertex_slot == 3:
+            reciprocal = reciprocal_ac
+        hessian = (coefficient * coefficient * second - distance * first * wp.dot(reciprocal, reciprocal)) * nn
+        hessian -= coefficient * first * (wp.outer(reciprocal, normal) + wp.outer(normal, reciprocal))
+        return gradient, hessian
+    tangent_curvature = float(0.0)
+    if distance > 0.0:
+        tangent_curvature = first / distance
+    perpendicular = wp.identity(n=3, dtype=float)
+    hessian = wp.mat33()
+    if dimension == 1:
+        edge_vector = b - a
+        if edge_corner == 1:
+            edge_vector = c - b
+        elif edge_corner == 2:
+            edge_vector = a - c
+        length_sq = wp.dot(edge_vector, edge_vector)
+        k = float(
+            int(derivative_vertex_slot == (edge_corner + 1) % 3 + 1) - int(derivative_vertex_slot == edge_corner + 1)
+        )
+        perpendicular -= wp.outer(edge_vector, edge_vector) / length_sq
+        hessian -= (first * coefficient * k / length_sq) * (
+            wp.outer(edge_vector, normal) + wp.outer(normal, edge_vector)
+        )
+        hessian -= (first * distance * k * k / length_sq) * nn
+    hessian += coefficient * coefficient * (second * nn + tangent_curvature * (perpendicular - nn))
+    return gradient, hessian
+
+
+@wp.func
+def feature_friction_and_damping(
+    normal: wp.vec3,
+    distance: float,
+    first: float,
+    relative_displacement: wp.vec3,
+    support: float,
+    stiffness: float,
+    mu: float,
+    kd: float,
+    dt: float,
+    smoothing: float,
+):
+    """Return friction/damping gradient and Hessian with respect to relative displacement.
+
+    The differentiation variable is the sample displacement minus the closest
+    target point's displacement. Gradient is minus the force on the sample;
+    Hessian is its derivative with geometry and normal load held fixed.
+    Callers map these derivatives to the selected vertex/body and apply the
+    signed feature coefficient and fixed quadrature weight.
+    """
+    gradient, hessian = wp.vec3(), wp.mat33()
+    if dt > 0.0:
+        if mu != 0.0 and stiffness != 0.0:
+            force, hessian = compute_projected_isotropic_friction(
+                mu, -stiffness * first, normal, relative_displacement, smoothing
+            )
+            gradient = -force
+        normal_displacement = wp.dot(normal, relative_displacement)
+        if kd != 0.0 and distance < support and normal_displacement < 0.0:
+            damping_hessian = (kd / dt) * wp.outer(normal, normal)
+            gradient += damping_hessian * relative_displacement
+            hessian += damping_hessian
+    return gradient, hessian
 
 
 @wp.func
@@ -848,119 +997,73 @@ def particle_triangle(
     a: wp.vec3,
     b: wp.vec3,
     c: wp.vec3,
-    moving: int,
+    derivative_vertex_slot: int,
     edge_coefficients: wp.vec3,
     vertex_coefficients: wp.vec3,
     support: float,
     near: float,
     near_only: bool,
+    stiffness: float = 1.0,
+    sample_displacement: wp.vec3 = wp.vec3(),  # noqa: B008  # Warp bakes @wp.func defaults at compile time.
+    triangle_displacements: wp.mat33 = wp.mat33(),  # noqa: B008
+    mu: float = 0.0,
+    kd: float = 0.0,
+    dt: float = 0.0,
+    smoothing: float = 0.0,
 ):
-    """Return the final xyz energy block; moving=0 is point, 1/2/3 is a/b/c.
+    """Evaluate one triangle's ESP potential and derivatives for one vertex position.
 
-    E = b(distance(point, triangle))
-        - sum_edges weight * b(distance(point, edge))
-        + sum_vertices weight * b(distance(point, vertex)).
+    With d_feature the distance from ``point`` to that triangle feature:
+        E(point, a, b, c) = stiffness * [B(d_face)
+            - sum(edge_coefficient * B(d_edge))
+            + sum(vertex_coefficient * B(d_vertex))].
+    B is the barrier from ``barrier_coefficients``, including the near-distance
+    window when ``near_only`` is true.
 
-    Source rest-area and stiffness multiply all three outputs afterwards.
-    Branch ties follow the existing strict face/interior comparisons.
+    ``derivative_vertex_slot`` selects the three Cartesian coordinates x:
+    0 = point, 1 = a, 2 = b, 3 = c. With friction/damping disabled, return
+    E, gradient dE/dx (vec3), and Hessian d2E/dx2 (mat33). The other three
+    positions, material parameters and feature coefficients stay fixed.
+    This selects a differentiation variable; only its Hessian block is computed,
+    not cross-vertex blocks.
+
+    With friction/damping enabled, gradient also includes minus their force on
+    the selected vertex, and hessian includes their frozen-geometry local blocks.
+    Energy remains conservative-only, so those extra terms are not derivatives
+    of the returned energy. Source area (and fixed EE weight for a target-only
+    particle) multiplies all outputs afterwards.
     """
     cutoff = near if near_only else support
-    lower, upper = wp.min(wp.min(a, b), c), wp.max(wp.max(a, b), c)
-    box_delta = wp.max(wp.max(lower - point, point - upper), wp.vec3())
-    if wp.dot(box_delta, box_delta) > cutoff * cutoff:
-        return 0.0, wp.vec3(), wp.mat33()
-    ab, ac = b - a, c - a
-    cross = wp.cross(ab, ac)
-    area_sq = wp.dot(cross, cross)
-    plane_normal = cross / wp.sqrt(area_sq)
-    signed_distance = wp.dot(point - a, plane_normal)
-    projected = point - signed_distance * plane_normal
-    u = wp.dot(wp.cross(projected - a, ac), cross) / area_sq
-    v = wp.dot(wp.cross(ab, projected - a), cross) / area_sq
+    box_delta = wp.max(wp.max(wp.min(wp.min(a, b), c) - point, point - wp.max(wp.max(a, b), c)), wp.vec3())
     energy, gradient, hessian = float(0.0), wp.vec3(), wp.mat33()
-    if u > 0.0 and v > 0.0 and u + v < 1.0:
-        distance = wp.abs(signed_distance)
-        normal = plane_normal if signed_distance >= 0.0 else -plane_normal
-        energy, first, second = barrier_coefficients(distance, support, near, near_only)
+    if wp.dot(box_delta, box_delta) > cutoff * cutoff:
+        return energy, gradient, hessian
+    for feature_index in range(7):
         coefficient = float(1.0)
-        reciprocal = wp.vec3()
-        # These are ordinary reciprocal edge vectors. They express how
-        # the plane changes when a selected triangle vertex moves.
-        reciprocal_ab = wp.cross(ac, cross) / area_sq
-        reciprocal_ac = wp.cross(cross, ab) / area_sq
-        if moving == 1:
-            coefficient, reciprocal = -(1.0 - u - v), -reciprocal_ab - reciprocal_ac
-        elif moving == 2:
-            coefficient, reciprocal = -u, reciprocal_ab
-        elif moving == 3:
-            coefficient, reciprocal = -v, reciprocal_ac
-        # Direct final face Hessian, after eliminating closest parameters:
-        # H = [c^2 b'' - d b' |l|^2] nn^T - c b' (l n^T + n l^T).
-        gradient = coefficient * first * normal
-        hessian = (coefficient * coefficient * second - distance * first * wp.dot(reciprocal, reciprocal)) * wp.outer(
-            normal, normal
+        if feature_index > 0:
+            corner = (feature_index - 1) // 2
+            coefficient = -edge_coefficients[corner]
+            if feature_index % 2 == 0:
+                coefficient = vertex_coefficients[corner]
+        if coefficient == 0.0:
+            continue
+        barycentric, normal, distance, dimension, edge_corner = triangle_feature_geometry(point, a, b, c, feature_index)
+        value, first, second = barrier_coefficients(distance, support, near, near_only)
+        conservative_gradient, conservative_hessian = feature_particle_derivatives(
+            a, b, c, derivative_vertex_slot, barycentric, normal, distance, dimension, edge_corner, first, second
         )
-        hessian -= coefficient * first * (wp.outer(reciprocal, normal) + wp.outer(normal, reciprocal))
-    else:
-        # Choose a finite edge (including its endpoints), using values only.
-        closest_edge = int(0)
-        closest_distance_sq = float(wp.inf)
-        for corner in range(3):
-            start, end = a, b
-            if corner == 1:
-                start, end = b, c
-            elif corner == 2:
-                start, end = c, a
-            t = segment_parameter(point, start, end)
-            delta = point - start - t * (end - start)
-            candidate = wp.dot(delta, delta)
-            if candidate < closest_distance_sq:
-                closest_edge, closest_distance_sq = corner, candidate
-        start, end, start_id, end_id = a, b, int(1), int(2)
-        if closest_edge == 1:
-            start, end, start_id, end_id = b, c, 2, 3
-        elif closest_edge == 2:
-            start, end, start_id, end_id = c, a, 3, 1
-        energy, gradient, hessian = segment_potential(
-            point,
-            start,
-            end,
-            moving == 0,
-            moving == start_id,
-            moving == end_id,
-            support,
-            near,
-            near_only,
-            plane_normal,
+        energy += coefficient * stiffness * value
+        gradient += coefficient * stiffness * conservative_gradient
+        hessian += coefficient * stiffness * conservative_hessian
+        relative_displacement = sample_displacement - wp.transpose(triangle_displacements) * barycentric
+        friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
+            normal, distance, first, relative_displacement, cutoff, stiffness, mu, kd, dt, smoothing
         )
-    for corner in range(3):
-        start, end, start_id, end_id = a, b, int(1), int(2)
-        if corner == 1:
-            start, end, start_id, end_id = b, c, 2, 3
-        elif corner == 2:
-            start, end, start_id, end_id = c, a, 3, 1
-        if edge_coefficients[corner] != 0.0:
-            value, grad, hess = segment_potential(
-                point,
-                start,
-                end,
-                moving == 0,
-                moving == start_id,
-                moving == end_id,
-                support,
-                near,
-                near_only,
-                plane_normal,
-            )
-            energy -= edge_coefficients[corner] * value
-            gradient -= edge_coefficients[corner] * grad
-            hessian -= edge_coefficients[corner] * hess
-        if vertex_coefficients[corner] != 0.0:
-            coefficient = float(int(moving == 0) - int(moving == start_id))
-            value, grad, hess = point_potential(point, start, coefficient, support, near, near_only, plane_normal)
-            energy += vertex_coefficients[corner] * value
-            gradient += vertex_coefficients[corner] * grad
-            hessian += vertex_coefficients[corner] * hess
+        motion_coefficient = float(1.0)
+        if derivative_vertex_slot > 0:
+            motion_coefficient = -barycentric[derivative_vertex_slot - 1]
+        gradient += coefficient * motion_coefficient * friction_damping_gradient
+        hessian += coefficient * motion_coefficient * motion_coefficient * friction_damping_hessian
     return energy, gradient, hessian
 
 
@@ -977,41 +1080,85 @@ def body_triangle(
     support: float,
     near: float,
     near_only: bool,
+    stiffness: float = 1.0,
+    sample_displacement: wp.vec3 = wp.vec3(),  # noqa: B008  # Warp bakes @wp.func defaults at compile time.
+    triangle_displacements: wp.mat33 = wp.mat33(),  # noqa: B008
+    mu: float = 0.0,
+    kd: float = 0.0,
+    dt: float = 0.0,
+    smoothing: float = 0.0,
 ):
-    """Form the exact 6x6 energy block for a rigid point OR rigid triangle.
+    """Exact conservative pose block plus frozen-geometry dissipative blocks.
 
-    If the triangle moves, rigid-motion invariance lets us instead move
-    the query point by the inverse transform against the fixed triangle.
-    J = [-I, skew(point-com)] for that case; otherwise J=[I,-skew(point-com)].
-    H_pose=J^T H_xyz J plus the explicit rotation/mixed-motion terms below.
-    This maps the FINAL energy block, not a chain of point derivatives.
+    Conservative rigid-motion invariance maps the point gradient/Hessian by
+    J=[-I,skew(point-com)] when the triangle moves, or [I,-skew] otherwise.
+    Dissipative terms instead use each feature's actual rigid material point
+    and J^T H J, without the conservative rotation-curvature correction.
     """
-    energy, grad, hess = particle_triangle(
-        point, a, b, c, 0, edge_coefficients, vertex_coefficients, support, near, near_only
-    )
+    cutoff = near if near_only else support
+    box_delta = wp.max(wp.max(wp.min(wp.min(a, b), c) - point, point - wp.max(wp.max(a, b), c)), wp.vec3())
+    energy, conservative_gradient, conservative_hessian = float(0.0), wp.vec3(), wp.mat33()
+    gradient, hessian = wp.spatial_vector(), wp.spatial_matrix()
+    if wp.dot(box_delta, box_delta) > cutoff * cutoff:
+        return energy, gradient, hessian
+    for feature_index in range(7):
+        coefficient = float(1.0)
+        if feature_index > 0:
+            corner = (feature_index - 1) // 2
+            coefficient = -edge_coefficients[corner]
+            if feature_index % 2 == 0:
+                coefficient = vertex_coefficients[corner]
+        if coefficient == 0.0:
+            continue
+        barycentric, normal, distance, dimension, edge_corner = triangle_feature_geometry(point, a, b, c, feature_index)
+        value, first, second = barrier_coefficients(distance, support, near, near_only)
+        feature_gradient, feature_hessian = feature_particle_derivatives(
+            a, b, c, 0, barycentric, normal, distance, dimension, edge_corner, first, second
+        )
+        energy += coefficient * stiffness * value
+        conservative_gradient += coefficient * stiffness * feature_gradient
+        conservative_hessian += coefficient * stiffness * feature_hessian
+        relative_displacement = sample_displacement - wp.transpose(triangle_displacements) * barycentric
+        friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
+            normal, distance, first, relative_displacement, cutoff, stiffness, mu, kd, dt, smoothing
+        )
+        rigid_point, body_gradient = point, friction_damping_gradient
+        if triangle_moves:
+            rigid_point = barycentric[0] * a + barycentric[1] * b + barycentric[2] * c
+            body_gradient = -friction_damping_gradient
+        arm = rigid_point - com
+        for i in range(6):
+            axis_i = wp.vec3()
+            axis_i[i % 3] = 1.0
+            ji = axis_i if i < 3 else wp.cross(axis_i, arm)
+            gradient[i] += coefficient * wp.dot(ji, body_gradient)
+            for j in range(6):
+                axis_j = wp.vec3()
+                axis_j[j % 3] = 1.0
+                jj = axis_j if j < 3 else wp.cross(axis_j, arm)
+                hessian[i, j] += coefficient * wp.dot(ji, friction_damping_hessian * jj)
     offset = point - com
     sign = -1.0 if triangle_moves else 1.0
-    gradient, hessian = wp.spatial_vector(), wp.spatial_matrix()
     for i in range(3):
         ei = wp.vec3()
         ei[i] = float(1.0)
         rotation_i = sign * wp.cross(ei, offset)
-        gradient[i] = sign * grad[i]
-        gradient[i + 3] = wp.dot(rotation_i, grad)
+        gradient[i] += sign * conservative_gradient[i]
+        gradient[i + 3] += wp.dot(rotation_i, conservative_gradient)
         for j in range(3):
             ej = wp.vec3()
             ej[j] = float(1.0)
             rotation_j = sign * wp.cross(ej, offset)
-            hessian[i, j] = hess[i, j]
-            mixed = sign * wp.dot(ei, hess * rotation_j)
+            hessian[i, j] += conservative_hessian[i, j]
+            mixed = sign * wp.dot(ei, conservative_hessian * rotation_j)
             if triangle_moves:
-                mixed += wp.dot(grad, wp.cross(ej, ei))
-            hessian[i, j + 3] = mixed
-            hessian[j + 3, i] = mixed
-            curvature = 0.5 * (offset[i] * grad[j] + grad[i] * offset[j])
+                mixed += wp.dot(conservative_gradient, wp.cross(ej, ei))
+            hessian[i, j + 3] += mixed
+            hessian[j + 3, i] += mixed
+            curvature = 0.5 * (offset[i] * conservative_gradient[j] + conservative_gradient[i] * offset[j])
             if i == j:
-                curvature -= wp.dot(offset, grad)
-            hessian[i + 3, j + 3] = wp.dot(rotation_i, hess * rotation_j) + curvature
+                curvature -= wp.dot(offset, conservative_gradient)
+            hessian[i + 3, j + 3] += wp.dot(rotation_i, conservative_hessian * rotation_j) + curvature
     return energy, gradient, hessian
 
 
@@ -1159,10 +1306,10 @@ def _make_ee_block_functions(size: int):
     @wp.func
     def feature_distance(
         positions: positions_type,
-        source: vec7,
+        source_coefficients: vec7,
         coefficient_s: vec7,
         coefficient_t: vec7,
-        target: wp.vec3i,
+        target_vertex_slots: wp.vec3i,
         dimension: int,
         ds: vector,
         dt: vector,
@@ -1175,46 +1322,57 @@ def _make_ee_block_functions(size: int):
         D is the minimized squared distance to a point/edge/triangle.
         Eliminate its closest parameters with the Schur complement, projecting
         before squaring to avoid cancellation of large tangential derivatives.
-        dimension=-1 evaluates |source·positions|² with no target subtraction.
+        target_vertex_slots index the local positions matrix, not model vertices.
+        dimension=-1 evaluates |source_coefficients·positions|² with no target subtraction.
         """
-        p = position_sum(positions, source)
-        coefficients = source
-        ids, dim = target, dimension
-        bary = wp.vec3(1.0, 0.0, 0.0)
+        p = position_sum(positions, source_coefficients)
+        coefficients = source_coefficients
+        closest_vertex_slots, dim = target_vertex_slots, dimension
+        barycentric = wp.vec3(1.0, 0.0, 0.0)
         if dim == 2:
-            a, b, c = positions[ids[0]], positions[ids[1]], positions[ids[2]]
+            a, b, c = (
+                positions[closest_vertex_slots[0]],
+                positions[closest_vertex_slots[1]],
+                positions[closest_vertex_slots[2]],
+            )
             cross = wp.cross(b - a, c - a)
             area_sq = wp.dot(cross, cross)
             u = wp.dot(wp.cross(p - a, c - a), cross) / area_sq
             v = wp.dot(wp.cross(b - a, p - a), cross) / area_sq
             if u > 0.0 and v > 0.0 and u + v < 1.0:
-                bary = wp.vec3(1.0 - u - v, u, v)
+                barycentric = wp.vec3(1.0 - u - v, u, v)
             else:
-                best, start_id, end_id = float(wp.inf), int(0), int(0)
+                closest_distance_sq, closest_start_slot, closest_end_slot = float(wp.inf), int(0), int(0)
                 for corner in range(3):
-                    i0, i1 = ids[corner], ids[(corner + 1) % 3]
-                    edge = positions[i1] - positions[i0]
-                    t = wp.clamp(wp.dot(p - positions[i0], edge) / wp.dot(edge, edge), 0.0, 1.0)
-                    delta = p - positions[i0] - t * edge
-                    if wp.dot(delta, delta) < best:
-                        best, start_id, end_id = wp.dot(delta, delta), i0, i1
-                ids, dim = wp.vec3i(start_id, end_id, -1), 1
+                    start_slot, end_slot = closest_vertex_slots[corner], closest_vertex_slots[(corner + 1) % 3]
+                    edge_vector = positions[end_slot] - positions[start_slot]
+                    t = wp.clamp(
+                        wp.dot(p - positions[start_slot], edge_vector) / wp.dot(edge_vector, edge_vector), 0.0, 1.0
+                    )
+                    delta = p - positions[start_slot] - t * edge_vector
+                    if wp.dot(delta, delta) < closest_distance_sq:
+                        closest_distance_sq, closest_start_slot, closest_end_slot = (
+                            wp.dot(delta, delta),
+                            start_slot,
+                            end_slot,
+                        )
+                closest_vertex_slots, dim = wp.vec3i(closest_start_slot, closest_end_slot, -1), 1
         if dim == 1:
-            edge = positions[ids[1]] - positions[ids[0]]
-            t = wp.dot(p - positions[ids[0]], edge) / wp.dot(edge, edge)
+            edge_vector = positions[closest_vertex_slots[1]] - positions[closest_vertex_slots[0]]
+            t = wp.dot(p - positions[closest_vertex_slots[0]], edge_vector) / wp.dot(edge_vector, edge_vector)
             if t <= 0.0:
                 dim = 0
             elif t >= 1.0:
-                ids, dim = wp.vec3i(ids[1], -1, -1), 0
+                closest_vertex_slots, dim = wp.vec3i(closest_vertex_slots[1], -1, -1), 0
             else:
-                bary = wp.vec3(1.0 - t, t, 0.0)
+                barycentric = wp.vec3(1.0 - t, t, 0.0)
         for i in range(dim + 1):
-            coefficients[ids[i]] -= bary[i]
+            coefficients[closest_vertex_slots[i]] -= barycentric[i]
         residual = position_sum(positions, coefficients)
         axis_s, axis_t = position_sum(positions, coefficient_s), position_sum(positions, coefficient_t)
         partial_parameters = 2.0 * wp.vec2(wp.dot(axis_s, residual), wp.dot(axis_t, residual))
-        j = motion_jacobian(positions, coefficients, particle_mask, target_moves_with_body, com)
-        j += wp.outer(axis_s, ds) + wp.outer(axis_t, dt)
+        fixed_jacobian = motion_jacobian(positions, coefficients, particle_mask, target_moves_with_body, com)
+        j = fixed_jacobian + wp.outer(axis_s, ds) + wp.outer(axis_t, dt)
         second = residual_second(
             positions,
             coefficients,
@@ -1230,8 +1388,8 @@ def _make_ee_block_functions(size: int):
         squared = wp.transpose(j) * j
         if dim > 0:
             edge0 = vec7()
-            edge0[ids[0]] = float(1.0)
-            edge0[ids[1]] = -1.0
+            edge0[closest_vertex_slots[0]] = float(1.0)
+            edge0[closest_vertex_slots[1]] = -1.0
             axis0 = position_sum(positions, edge0)
             length0 = wp.length(axis0)
             basis0 = axis0 / length0
@@ -1245,8 +1403,8 @@ def _make_ee_block_functions(size: int):
             correction = wp.outer(along0, change0) + wp.outer(change0, along0) + wp.outer(change0, change0)
             if dim == 2:
                 edge1 = vec7()
-                edge1[ids[0]] = float(1.0)
-                edge1[ids[2]] = -1.0
+                edge1[closest_vertex_slots[0]] = float(1.0)
+                edge1[closest_vertex_slots[2]] = -1.0
                 axis1 = position_sum(positions, edge1)
                 normal = wp.normalize(wp.cross(axis0, axis1))
                 basis1 = wp.cross(normal, basis0)
@@ -1265,6 +1423,9 @@ def _make_ee_block_functions(size: int):
             2.0 * wp.transpose(j) * residual,
             partial_parameters,
             2.0 * (squared + second),
+            coefficients,
+            residual,
+            fixed_jacobian,
         )
 
     @wp.func
@@ -1419,7 +1580,7 @@ def _make_ee_block_functions(size: int):
         change1 = (wp.transpose(jt) * residual - r01 * change0) / r11
         dt = -(wp.transpose(j_fixed) * basis1 + change1) / r11
         ds = -(wp.transpose(j_fixed) * basis0 + change0 + r01 * dt) / r00
-        distance_sq, gd, zd, hd = feature_distance(
+        distance_sq, gd, zd, hd, _coefficients, _residual, _fixed_jacobian = feature_distance(
             positions,
             coefficients,
             coefficient_s,
@@ -1521,12 +1682,21 @@ def _make_ee_block_functions(size: int):
         vertex_coefficients: wp.vec3,
         support: float,
         near: float,
+        stiffness: float = 1.0,
+        sample_displacement: wp.vec3 = wp.vec3(),  # noqa: B008  # Warp bakes @wp.func defaults at compile time.
+        triangle_displacements: wp.mat33 = wp.mat33(),  # noqa: B008
+        mu: float = 0.0,
+        kd: float = 0.0,
+        dt: float = 0.0,
+        smoothing: float = 0.0,
     ):
         """Return P_f, its total first derivative, (s,t) partial, and reduced H.
 
         This does NOT multiply by the EE weight or finish the implicit Hessian.
         Sum these four outputs with their source-area factors over triangles
-        and both sample directions, then call finish_ee_pair once.
+        and both sample directions, then call finish_ee_pair once. The last
+        two outputs are dissipative blocks with fixed sample/weight; add them
+        AFTER finishing the conservative derivatives, multiplied by pair.weight.
         Particle mask bits 4..6 include repeated identities in the triangle.
         For a body block, the generating rigid edge moves with that body;
         target_moves_with_body says whether this target triangle does too.
@@ -1545,28 +1715,29 @@ def _make_ee_block_functions(size: int):
         upper = wp.max(wp.max(positions[4], positions[5]), positions[6])
         box_delta = wp.max(wp.max(lower - sample, sample - upper), wp.vec3())
         if pair.weight <= 0.0 or wp.dot(box_delta, box_delta) > near * near:
-            return 0.0, vector(), wp.vec2(), matrix()
+            return 0.0, vector(), wp.vec2(), matrix(), vector(), matrix()
 
         # P_near = +face -sum(weight_edge*edge) +sum(weight_vertex*vertex).
-        source, param_s, param_t = rigid, vec7(), rigid_t
+        source_coefficients, param_s, param_t = rigid, vec7(), rigid_t
         if target_is_rigid:
-            source, param_s, param_t = soft, soft_s, vec7()
+            source_coefficients, param_s, param_t = soft, soft_s, vec7()
         potential, gp, zp, hp = float(0.0), vector(), wp.vec2(), matrix()
-        for feature in range(7):
-            target, dim, coefficient = wp.vec3i(4, 5, 6), int(2), float(1.0)
-            if feature > 0:
-                corner = (feature - 1) // 2
-                target = wp.vec3i(4 + corner, 4 + (corner + 1) % 3, -1)
+        dissipative_gradient, dissipative_hessian = vector(), matrix()
+        for feature_index in range(7):
+            target_vertex_slots, dim, coefficient = wp.vec3i(4, 5, 6), int(2), float(1.0)
+            if feature_index > 0:
+                corner = (feature_index - 1) // 2
+                target_vertex_slots = wp.vec3i(4 + corner, 4 + (corner + 1) % 3, -1)
                 dim, coefficient = 1, -edge_coefficients[corner]
-                if feature % 2 == 0:
+                if feature_index % 2 == 0:
                     dim, coefficient = 0, vertex_coefficients[corner]
             if coefficient != 0.0:
-                value, gradient, parameters, hessian = feature_distance(
+                value, gradient, parameters, hessian, coefficients, residual, fixed_jacobian = feature_distance(
                     positions,
-                    source,
+                    source_coefficients,
                     param_s,
                     param_t,
-                    target,
+                    target_vertex_slots,
                     dim,
                     pair.ds,
                     pair.dt,
@@ -1576,23 +1747,41 @@ def _make_ee_block_functions(size: int):
                 )
                 # Every edge/vertex lies in its triangle. If the face term is
                 # outside near support, all six remaining terms contribute zero.
-                if feature == 0 and value >= near * near:
-                    return 0.0, vector(), wp.vec2(), matrix()
+                if feature_index == 0 and value >= near * near:
+                    return 0.0, vector(), wp.vec2(), matrix(), vector(), matrix()
                 distance = wp.sqrt(value)
                 energy, first, second = barrier_coefficients(distance, support, near, True)
+                # Reuse the closest feature's material weights and normal.
+                # fixed_jacobian excludes sample/closest-parameter derivatives,
+                # exactly as the native friction/damping local approximation.
+                relative_displacement = sample_displacement
+                for corner in range(3):
+                    relative_displacement += coefficients[4 + corner] * triangle_displacements[corner]
+                normal = wp.normalize(wp.cross(target_b - target_a, target_c - target_a))
+                if distance > 0.0:
+                    normal = residual / distance
+                friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
+                    normal, distance, first, relative_displacement, near, stiffness, mu, kd, dt, smoothing
+                )
+                dissipative_gradient += coefficient * wp.transpose(fixed_jacobian) * friction_damping_gradient
+                dissipative_hessian += (
+                    coefficient * wp.transpose(fixed_jacobian) * friction_damping_hessian * fixed_jacobian
+                )
                 # Do not materialize b_DD ~ 1/d^4: it overflows FP32 well
                 # before the final energy Hessian ~ 1/d^2 does. Form the
                 # distance gradient first, then multiply bounded quantities.
                 distance_gradient = gradient / (2.0 * distance)
                 radial_curvature = second - first / distance
                 first /= 2.0 * distance
-                potential += coefficient * energy
-                gp += coefficient * first * gradient
-                zp += coefficient * first * parameters
-                hp += coefficient * (
-                    first * hessian + radial_curvature * wp.outer(distance_gradient, distance_gradient)
+                potential += coefficient * stiffness * energy
+                gp += coefficient * stiffness * first * gradient
+                zp += coefficient * stiffness * first * parameters
+                hp += (
+                    coefficient
+                    * stiffness
+                    * (first * hessian + radial_curvature * wp.outer(distance_gradient, distance_gradient))
                 )
-        return potential, gp, zp, hp
+        return potential, gp, zp, hp, dissipative_gradient, dissipative_hessian
 
     @wp.func
     def finish_ee_pair(
@@ -1664,14 +1853,14 @@ def triangle_feature_coefficients(
     tri_edge_indices: wp.array2d[int],
     edge_tri_indices: wp.array2d[int],
     vertex_term_coefficient: wp.array[float],
-    face: int,
+    triangle_index: int,
 ) -> tuple[wp.vec3, wp.vec3]:
     """Read target edge/vertex correction coefficients for one face; see triangle_energy."""
-    triangle_vertex_indices = tri_indices[face]
+    triangle_vertex_indices = tri_indices[triangle_index]
     edge_coefficients, vertex_coefficients = wp.vec3(), wp.vec3()
     for corner in range(3):
-        edge = tri_edge_indices[face, corner]
-        if edge_tri_indices[edge, 0] >= 0 and edge_tri_indices[edge, 1] >= 0:
+        edge_index = tri_edge_indices[triangle_index, corner]
+        if edge_tri_indices[edge_index, 0] >= 0 and edge_tri_indices[edge_index, 1] >= 0:
             edge_coefficients[corner] = float(0.5)
         vertex_coefficients[corner] = vertex_term_coefficient[triangle_vertex_indices[corner]]
     return edge_coefficients, vertex_coefficients
@@ -1771,7 +1960,7 @@ def add_body_blocks(
 def contact_support_and_stiffness(
     family: int,
     soft_primitive_index: int,
-    shape: int,
+    shape_index: int,
     data: EspData,
     particle_radius: wp.array[float],
     shape_margin: wp.array[float],
@@ -1787,15 +1976,16 @@ def contact_support_and_stiffness(
     if family == 0:
         radius = particle_radius[soft_primitive_index]
     elif family == 1:
-        triangle = data.soft_tri_indices[soft_primitive_index]
+        triangle_vertex_indices = data.soft_tri_indices[soft_primitive_index]
         radius = wp.max(
-            wp.max(particle_radius[triangle[0]], particle_radius[triangle[1]]), particle_radius[triangle[2]]
+            wp.max(particle_radius[triangle_vertex_indices[0]], particle_radius[triangle_vertex_indices[1]]),
+            particle_radius[triangle_vertex_indices[2]],
         )
     elif family == 2:
-        edge = data.soft_edge_vertex_indices[soft_primitive_index]
-        radius = wp.max(particle_radius[edge[0]], particle_radius[edge[1]])
-    support = radius + shape_margin[shape]
-    stiffness = 0.5 * (soft_contact_ke + shape_material_ke[shape])
+        edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+        radius = wp.max(particle_radius[edge_vertex_indices[0]], particle_radius[edge_vertex_indices[1]])
+    support = radius + shape_margin[shape_index]
+    stiffness = 0.5 * (soft_contact_ke + shape_material_ke[shape_index])
     return support, 0.05 * support, stiffness
 
 
@@ -1842,196 +2032,8 @@ def accumulate_body_block(
 
 
 @wp.func
-def accumulate_contact_damping(
-    row_id: int,
-    data: EspData,
-    soft_contact_indices: wp.array[wp.vec3i],
-    soft_contact_barycentric: wp.array[wp.vec3],
-    soft_contact_shape: wp.array[int],
-    soft_contact_body_pos: wp.array[wp.vec3],
-    soft_contact_body_vel: wp.array[wp.vec3],
-    soft_contact_normal: wp.array[wp.vec3],
-    soft_contact_force_mask: wp.array[bool],
-    body_particle_contact_material_kd: wp.array[float],
-    particle_q: wp.array[wp.vec3],
-    particle_q_prev: wp.array[wp.vec3],
-    particle_radius: wp.array[float],
-    particle_colors: wp.array[int],
-    shape_body: wp.array[int],
-    shape_margin: wp.array[float],
-    body_q: wp.array[wp.transform],
-    body_q_prev: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    body_com: wp.array[wp.vec3],
-    body_colors: wp.array[int],
-    body_blocks: bool,
-    color: int,
-    dt: float,
-    esp_forces: wp.array2d[float],
-    esp_hessians: wp.array3d[float],
-    esp_error: wp.array[int],
-) -> None:
-    """Retain native row damping once, without ESP area or signed feature weights.
-
-    Use the original row's mask, barycentric contact point, normal and cached
-    kd. This is a relocation of contact damping, not a new ESP damping law.
-    It is independent of conservative stiffness and EE quadrature activity.
-    """
-    if dt <= 0.0 or not body_particle_contact_material_kd or body_particle_contact_material_kd[row_id] == 0.0:
-        return
-    if soft_contact_force_mask and not soft_contact_force_mask[row_id]:
-        return
-    shape = soft_contact_shape[row_id]
-    if shape < 0 or data.rigid_triangle_offsets[shape] < 0:
-        return
-    soft_particle_indices, soft_barycentric = soft_contact_indices[row_id], soft_contact_barycentric[row_id]
-    active = False
-    for i in range(3):
-        particle = soft_particle_indices[i]
-        if particle >= 0:
-            if data.soft_vertex_quadrature_weight[particle] == 0.0:
-                return  # Interior solid vertices have no mesh-contact damping either.
-            if color < 0 or particle_colors[particle] == color:
-                active = True
-    body = shape_body[shape]
-    if body_blocks:
-        if body < 0 or (color >= 0 and body_colors[body] != color):
-            return
-    elif not active:
-        return
-    # Zero ke and mu leave only damping in the shared native contact law.
-    f, h, point = _eval_soft_ef_contact(
-        row_id,
-        soft_particle_indices,
-        soft_barycentric,
-        particle_q,
-        particle_q_prev,
-        particle_radius,
-        0.0,
-        body_particle_contact_material_kd[row_id],
-        0.0,
-        0.0,
-        shape_body,
-        body_q,
-        body_q_prev,
-        body_qd,
-        body_com,
-        soft_contact_shape,
-        soft_contact_body_pos,
-        soft_contact_body_vel,
-        soft_contact_normal,
-        shape_margin,
-        dt,
-        False,
-    )
-    if body_blocks:
-        arm = point - wp.transform_point(body_q[body], body_com[body])
-        reaction = -f
-        torque, h_al, h_aa = _point_force_to_body_torque_and_hessian(arm, reaction, h)
-        gradient = -wp.spatial_vector(
-            reaction[0],
-            reaction[1],
-            reaction[2],
-            torque[0],
-            torque[1],
-            torque[2],
-        )
-        block = wp.spatial_matrix()
-        for i in range(3):
-            for j in range(3):
-                block[i, j] = h[i, j]
-                block[i + 3, j] = h_al[i, j]
-                block[i, j + 3] = h_al[j, i]
-                block[i + 3, j + 3] = h_aa[i, j]
-        accumulate_body_block(esp_forces, esp_hessians, body, 1.0, 0.0, gradient, block, esp_error)
-    else:
-        for i in range(3):
-            particle = soft_particle_indices[i]
-            if particle >= 0 and (color < 0 or particle_colors[particle] == color):
-                w = soft_barycentric[i]
-                accumulate_particle_block(
-                    esp_forces,
-                    esp_hessians,
-                    particle,
-                    1.0,
-                    0.0,
-                    (-w * f),
-                    wp.mat33((w * w) * h),
-                    esp_error,
-                )
-
-
-@wp.func
-def friction_closest_barycentric(point: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3, feature: int) -> wp.vec3:
-    """Return the closest material weights: 0=face, 1..3=edges, 4..6=vertices."""
-    if feature >= 4:
-        weights = wp.vec3()
-        weights[feature - 4] = float(1.0)
-        return weights
-    if feature == 0:
-        cross = wp.cross(b - a, c - a)
-        area_sq = wp.dot(cross, cross)
-        if area_sq > 0.0:
-            u = wp.dot(wp.cross(point - a, c - a), cross) / area_sq
-            v = wp.dot(wp.cross(b - a, point - a), cross) / area_sq
-            if u > 0.0 and v > 0.0 and u + v < 1.0:
-                return wp.vec3(1.0 - u - v, u, v)
-    closest_weights = wp.vec3()
-    best_distance_sq = float(wp.inf)
-    for corner in range(3):
-        if feature != 0 and feature != corner + 1:
-            continue
-        start, end = a, b
-        if corner == 1:
-            start, end = b, c
-        elif corner == 2:
-            start, end = c, a
-        edge = end - start
-        length_sq = wp.dot(edge, edge)
-        t = float(0.0)
-        if length_sq > 0.0:
-            t = wp.clamp(wp.dot(point - start, edge) / length_sq, 0.0, 1.0)
-        delta = point - start - t * edge
-        if wp.dot(delta, delta) < best_distance_sq:
-            best_distance_sq = wp.dot(delta, delta)
-            closest_weights = wp.vec3()
-            closest_weights[corner] = 1.0 - t
-            closest_weights[(corner + 1) % 3] = t
-    return closest_weights
-
-
-@wp.func
-def primitive_friction(
-    point: wp.vec3,
-    closest: wp.vec3,
-    relative_displacement: wp.vec3,
-    touching_normal: wp.vec3,
-    mu: float,
-    stiffness: float,
-    support: float,
-    near: float,
-    near_only: bool,
-    smoothing: float,
-) -> tuple[wp.vec3, wp.mat33]:
-    """Evaluate one unsigned distance term; its ESP coefficient is applied outside.
-
-    Geometry, load and quadrature weight are held fixed for friction.
-    The returned Hessian is the native VBD approximation, not the exact
-    Hessian of the smoothed potential. No signed ESP term is clamped away.
-    """
-    delta = point - closest
-    distance = wp.length(delta)
-    _energy, first, _second = barrier_coefficients(distance, support, near, near_only)
-    normal = touching_normal
-    if distance > 0.0:
-        normal = delta / distance
-    f, h = compute_projected_isotropic_friction(mu, (-stiffness * first), normal, relative_displacement, smoothing)
-    return f, wp.mat33(h)
-
-
-@wp.func
 def rigid_vertex_displacement(
-    vertex: int,
+    vertex_index: int,
     data: EspData,
     rigid_positions: wp.array[wp.vec3],
     shape_transform: wp.array[wp.transform],
@@ -2043,35 +2045,31 @@ def rigid_vertex_displacement(
     dt: float,
 ) -> wp.vec3:
     """Read this vertex's material displacement, including mesh surface velocity."""
-    shape = data.rigid_vertex_shapes[vertex]
-    mesh_corner_index = data.rigid_vertex_corners[vertex]
-    body = shape_body[shape]
-    # For a world shape (body < 0), shape_transform already maps to world.
-    body_local_position = wp.transform_point(shape_transform[shape], data.rigid_local_positions[vertex])
+    shape_index = data.rigid_vertex_shapes[vertex_index]
+    mesh_corner_index = data.rigid_vertex_corners[vertex_index]
+    body_index = shape_body[shape_index]
+    # For a world shape (body_index < 0), shape_transform already maps to world.
+    body_local_position = wp.transform_point(shape_transform[shape_index], data.rigid_local_positions[vertex_index])
     previous_world_position = body_local_position
-    if body >= 0:
-        previous_world_position = wp.transform_point(body_q_prev[body], body_local_position)
-    face = mesh_corner_index // 3
-    corner = mesh_corner_index - face * 3
-    velocity = wp.mesh_eval_velocity(shape_source_ptr[shape], face, float(corner == 0), float(corner == 1))
-    velocity = wp.transform_vector(shape_transform[shape], wp.cw_mul(velocity, shape_scale[shape]))
-    if body >= 0:
-        velocity = wp.transform_vector(body_q[body], velocity)
-    return rigid_positions[vertex] - previous_world_position + dt * velocity
+    if body_index >= 0:
+        previous_world_position = wp.transform_point(body_q_prev[body_index], body_local_position)
+    mesh_triangle_index = mesh_corner_index // 3
+    corner = mesh_corner_index - mesh_triangle_index * 3
+    velocity = wp.mesh_eval_velocity(
+        shape_source_ptr[shape_index], mesh_triangle_index, float(corner == 0), float(corner == 1)
+    )
+    velocity = wp.transform_vector(shape_transform[shape_index], wp.cw_mul(velocity, shape_scale[shape_index]))
+    if body_index >= 0:
+        velocity = wp.transform_vector(body_q[body_index], velocity)
+    return rigid_positions[vertex_index] - previous_world_position + dt * velocity
 
 
 @wp.func
-def accumulate_triangle_friction(
-    source_indices: wp.vec3i,
-    source_barycentric: wp.vec3,
+def contact_displacements(
+    source_vertex_indices: wp.vec3i,
+    source_weights: wp.vec3,
     source_is_rigid: bool,
-    target_face: int,
-    shape: int,
-    area_weight: float,
-    near_only: bool,
-    support: float,
-    near: float,
-    stiffness: float,
+    target_vertex_indices: wp.vec3i,
     data: EspData,
     particle_q: wp.array[wp.vec3],
     particle_q_prev: wp.array[wp.vec3],
@@ -2082,308 +2080,54 @@ def accumulate_triangle_friction(
     shape_source_ptr: wp.array[wp.uint64],
     body_q: wp.array[wp.transform],
     body_q_prev: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    particle_colors: wp.array[int],
-    body_colors: wp.array[int],
-    shape_material_mu: wp.array[float],
-    soft_contact_mu: float,
-    body_blocks: bool,
-    color: int,
     dt: float,
-    smoothing: float,
-    esp_forces: wp.array2d[float],
-    esp_hessians: wp.array3d[float],
-    esp_error: wp.array[int],
-) -> None:
-    """Sum signed face/edge/vertex friction into the affected particle/body blocks."""
-    mu = float(wp.sqrt(soft_contact_mu * shape_material_mu[shape]))
-    if mu == 0.0 or area_weight == 0.0 or stiffness == 0.0:
-        return
-    body = shape_body[shape]
-    if body_blocks and (body < 0 or (color >= 0 and body_colors[body] != color)):
-        return
-    if source_is_rigid:
-        target_triangle_vertex_indices = wp.vec3i(data.soft_tri_indices[target_face])
-        edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
-            data.soft_tri_indices,
-            data.soft_adjacency.tri_edge_indices,
-            data.soft_adjacency.edge_tri_indices,
-            data.soft_vertex_term_coefficient,
-            target_face,
-        )
-    else:
-        target_triangle_vertex_indices = wp.vec3i(data.rigid_tri_indices[target_face])
-        edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
-            data.rigid_tri_indices,
-            data.rigid_adjacency.tri_edge_indices,
-            data.rigid_adjacency.edge_tri_indices,
-            data.rigid_vertex_term_coefficient,
-            target_face,
-        )
-    q, displacement = wp.vec3(), wp.vec3()
-    for i in range(3):
-        vertex = source_indices[i]
-        if vertex < 0:
-            continue
-        if source_is_rigid:
-            q += source_barycentric[i] * rigid_positions[vertex]
-            displacement += source_barycentric[i] * rigid_vertex_displacement(
-                vertex,
-                data,
-                rigid_positions,
-                shape_transform,
-                shape_body,
-                shape_scale,
-                shape_source_ptr,
-                body_q,
-                body_q_prev,
-                dt,
-            )
-        else:
-            q += source_barycentric[i] * particle_q[vertex]
-            displacement += source_barycentric[i] * (particle_q[vertex] - particle_q_prev[vertex])
-    a, b, c = wp.vec3(), wp.vec3(), wp.vec3()
-    da, db, dc = wp.vec3(), wp.vec3(), wp.vec3()
-    for corner in range(3):
-        vertex = target_triangle_vertex_indices[corner]
-        position, motion = wp.vec3(), wp.vec3()
-        if source_is_rigid:
-            position = particle_q[vertex]
-            motion = particle_q[vertex] - particle_q_prev[vertex]
-        else:
-            position = rigid_positions[vertex]
-            motion = rigid_vertex_displacement(
-                vertex,
-                data,
-                rigid_positions,
-                shape_transform,
-                shape_body,
-                shape_scale,
-                shape_source_ptr,
-                body_q,
-                body_q_prev,
-                dt,
-            )
-        if corner == 0:
-            a, da = position, motion
-        elif corner == 1:
-            b, db = position, motion
-        else:
-            c, dc = position, motion
-    # Every feature lies inside its triangle's box. Outside this support
-    # all seven loads are zero, so no friction or output atomics are needed.
-    cutoff = near if near_only else support
-    lower, upper = wp.min(wp.min(a, b), c), wp.max(wp.max(a, b), c)
-    box_delta = wp.max(wp.max(lower - q, q - upper), wp.vec3())
-    if wp.dot(box_delta, box_delta) >= cutoff * cutoff:
-        return
-    touching_normal = wp.normalize(wp.cross(b - a, c - a))
-    for feature in range(7):
-        coefficient = float(1.0)
-        if feature >= 4:
-            coefficient = vertex_coefficients[feature - 4]
-        elif feature >= 1:
-            coefficient = -edge_coefficients[feature - 1]
-        if coefficient == 0.0:
-            continue
-        target_barycentric = friction_closest_barycentric(q, a, b, c, feature)
-        closest = target_barycentric[0] * a + target_barycentric[1] * b + target_barycentric[2] * c
-        delta = q - closest
-        if wp.dot(delta, delta) >= cutoff * cutoff:
-            continue
-        target_motion = target_barycentric[0] * da + target_barycentric[1] * db + target_barycentric[2] * dc
-        f, h = primitive_friction(
-            q,
-            closest,
-            displacement - target_motion,
-            touching_normal,
-            mu,
-            stiffness,
-            support,
-            near,
-            near_only,
-            smoothing,
-        )
-        scale = coefficient * area_weight
-        if body_blocks:
-            rigid_point = closest
-            body_force = -f
+) -> tuple[wp.vec3, wp.mat33]:
+    """Material motion at the sample and three target vertices, frozen for dissipation.
+
+    The source contains the quadrature sample; the target is the opposite triangle.
+    For VT, source_is_rigid=False: soft vertex against rigid triangle.
+    For TV, source_is_rigid=True: rigid vertex against soft triangle.
+    EE uses both directions: False for the soft-edge sample against rigid triangles,
+    True for the rigid-edge sample against soft triangles.
+    """
+    sample_displacement, triangle_displacements = wp.vec3(), wp.mat33()
+    if dt > 0.0:
+        for corner in range(3):
+            source_vertex_index = source_vertex_indices[corner]
+            target_vertex_index = target_vertex_indices[corner]
             if source_is_rigid:
-                rigid_point, body_force = q, f
-            arm = rigid_point - wp.transform_point(body_q[body], body_com[body])
-            torque = wp.cross(arm, body_force)
-            gradient = -wp.spatial_vector(body_force[0], body_force[1], body_force[2], torque[0], torque[1], torque[2])
-            block = wp.spatial_matrix()
-            for i in range(6):
-                axis_i = wp.vec3()
-                axis_i[i % 3] = float(1.0)
-                ji = axis_i if i < 3 else wp.cross(axis_i, arm)
-                for j in range(6):
-                    axis_j = wp.vec3()
-                    axis_j[j % 3] = float(1.0)
-                    jj = axis_j if j < 3 else wp.cross(axis_j, arm)
-                    block[i, j] = wp.dot(ji, h * jj)
-            accumulate_body_block(esp_forces, esp_hessians, body, scale, 0.0, gradient, block, esp_error)
-        else:
-            soft_particle_indices, soft_barycentric, soft_force = source_indices, source_barycentric, f
-            if source_is_rigid:
-                soft_particle_indices, soft_barycentric, soft_force = (
-                    target_triangle_vertex_indices,
-                    target_barycentric,
-                    -f,
-                )
-            for corner in range(3):
-                particle = soft_particle_indices[corner]
-                if particle >= 0 and (color < 0 or particle_colors[particle] == color):
-                    w = soft_barycentric[corner]
-                    accumulate_particle_block(
-                        esp_forces,
-                        esp_hessians,
-                        particle,
-                        scale,
-                        0.0,
-                        -w * soft_force,
-                        w * w * h,
-                        esp_error,
+                if source_vertex_index >= 0:
+                    sample_displacement += source_weights[corner] * rigid_vertex_displacement(
+                        source_vertex_index,
+                        data,
+                        rigid_positions,
+                        shape_transform,
+                        shape_body,
+                        shape_scale,
+                        shape_source_ptr,
+                        body_q,
+                        body_q_prev,
+                        dt,
                     )
-
-
-@wp.func
-def accumulate_contact_friction(
-    row_id: int,
-    family: int,
-    soft_primitive_index: int,
-    rigid_primitive_index: int,
-    shape: int,
-    data: EspData,
-    particle_q: wp.array[wp.vec3],
-    particle_q_prev: wp.array[wp.vec3],
-    rigid_positions: wp.array[wp.vec3],
-    shape_transform: wp.array[wp.transform],
-    shape_body: wp.array[int],
-    shape_scale: wp.array[wp.vec3],
-    shape_source_ptr: wp.array[wp.uint64],
-    body_q: wp.array[wp.transform],
-    body_q_prev: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    particle_colors: wp.array[int],
-    body_colors: wp.array[int],
-    shape_material_mu: wp.array[float],
-    soft_contact_mu: float,
-    particle_radius: wp.array[float],
-    shape_margin: wp.array[float],
-    shape_material_ke: wp.array[float],
-    soft_contact_ke: float,
-    lists: EdgeTriangleListData,
-    support: float,
-    near: float,
-    stiffness: float,
-    body_blocks: bool,
-    color: int,
-    dt: float,
-    smoothing: float,
-    esp_forces: wp.array2d[float],
-    esp_hessians: wp.array3d[float],
-    esp_error: wp.array[int],
-) -> None:
-    """Evaluate this row's primitive friction inside its conservative kernel."""
-    soft_edge, rigid_edge = wp.vec2i(-1), wp.vec2i(-1)
-    soft_barycentric, rigid_barycentric = wp.vec3(), wp.vec3()
-    weight = float(1.0)
-    if family == 2:
-        soft_edge, rigid_edge = (
-            wp.vec2i(data.soft_edge_vertex_indices[soft_primitive_index]),
-            wp.vec2i(data.rigid_edge_vertex_indices[rigid_primitive_index]),
-        )
-        a, b = particle_q[soft_edge[0]], particle_q[soft_edge[1]]
-        c, d = rigid_positions[rigid_edge[0]], rigid_positions[rigid_edge[1]]
-        q, qb, weight = ee_quadrature_sample(a, b, c, d, near)
-        if weight <= 0.0:
-            return
-        s = wp.dot(q - a, b - a) / wp.length_sq(b - a)
-        t = wp.dot(qb - c, d - c) / wp.length_sq(d - c)
-        soft_barycentric = wp.vec3(1.0 - s, s, 0.0)
-        rigid_barycentric = wp.vec3(1.0 - t, t, 0.0)
-    for direction in range(2):
-        if family != 2 and direction == 1:
-            continue
-        source_is_rigid = family == 1 or (family == 2 and direction == 1)
-        source_indices = wp.vec3i(soft_primitive_index, -1, -1)
-        source_barycentric = wp.vec3(1.0, 0.0, 0.0)
-        source_quadrature_weight = float(0.0)
-        if family == 0:
-            source_quadrature_weight = data.soft_vertex_quadrature_weight[soft_primitive_index]
-        start = rigid_primitive_index
-        end = start + 1
-        if family == 1:
-            source_indices = wp.vec3i(rigid_primitive_index, -1, -1)
-            source_quadrature_weight = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
-            start, end = soft_primitive_index, soft_primitive_index + 1
-        elif family == 2:
-            edge_list = soft_primitive_index
-            source_indices, source_barycentric = wp.vec3i(soft_edge[0], soft_edge[1], -1), soft_barycentric
-            source_quadrature_weight = data.soft_edge_area[soft_primitive_index] * weight
-            if direction == 1:
-                edge_list = lists.soft_edge_count + rigid_primitive_index
-                source_indices, source_barycentric = wp.vec3i(rigid_edge[0], rigid_edge[1], -1), rigid_barycentric
-                source_quadrature_weight = data.rigid_edge_area[rigid_primitive_index] * weight
-            start, end = int(lists.starts[edge_list]), int(lists.ends[edge_list])
-        for k in range(start, end):
-            face = k
-            target_shape = shape
-            target_support, target_near, target_ke = support, near, stiffness
-            if family == 2:
-                face = int(lists.keys[k])
-                target_family, target_soft_primitive_index = 2, soft_primitive_index
-                if direction == 0:
-                    target_vertex = data.rigid_tri_indices[face][0]
-                    target_shape = int(data.rigid_vertex_shapes[target_vertex])
-                else:
-                    target_family, target_soft_primitive_index = 1, face
-                target_support, target_near, target_ke = contact_support_and_stiffness(
-                    target_family,
-                    target_soft_primitive_index,
-                    target_shape,
+                triangle_displacements[corner] = particle_q[target_vertex_index] - particle_q_prev[target_vertex_index]
+            else:
+                if source_vertex_index >= 0:
+                    sample_displacement += source_weights[corner] * (
+                        particle_q[source_vertex_index] - particle_q_prev[source_vertex_index]
+                    )
+                triangle_displacements[corner] = rigid_vertex_displacement(
+                    target_vertex_index,
                     data,
-                    particle_radius,
-                    shape_margin,
-                    shape_material_ke,
-                    soft_contact_ke,
+                    rigid_positions,
+                    shape_transform,
+                    shape_body,
+                    shape_scale,
+                    shape_source_ptr,
+                    body_q,
+                    body_q_prev,
+                    dt,
                 )
-            accumulate_triangle_friction(
-                source_indices,
-                source_barycentric,
-                source_is_rigid,
-                face,
-                target_shape,
-                source_quadrature_weight,
-                family == 2,
-                target_support,
-                target_near,
-                target_ke,
-                data,
-                particle_q,
-                particle_q_prev,
-                rigid_positions,
-                shape_transform,
-                shape_body,
-                shape_scale,
-                shape_source_ptr,
-                body_q,
-                body_q_prev,
-                body_com,
-                particle_colors,
-                body_colors,
-                shape_material_mu,
-                soft_contact_mu,
-                body_blocks,
-                color,
-                dt,
-                smoothing,
-                esp_forces,
-                esp_hessians,
-                esp_error,
-            )
+    return sample_displacement, triangle_displacements
 
 
 @wp.kernel
@@ -2417,7 +2161,7 @@ def evaluate_contact_energy(
         wp.atomic_or(esp_error, 0, 2)
         return
     for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
-        shape = soft_contact_shape[row_id]
+        shape_index = soft_contact_shape[row_id]
         soft_primitive_index = soft_contact_primitive_index[row_id]
         rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
         family = _mesh_contact_family(
@@ -2444,7 +2188,7 @@ def evaluate_contact_energy(
         support, near_cutoff, stiffness = contact_support_and_stiffness(
             family,
             soft_primitive_index,
-            shape,
+            shape_index,
             data,
             particle_radius,
             shape_margin,
@@ -2459,8 +2203,8 @@ def evaluate_contact_energy(
         value = float(0.0)
         if family == 0:
             # VT: soft vertex against a rigid triangle.
-            face = rigid_primitive_index
-            triangle_vertex_indices = data.rigid_tri_indices[face]
+            triangle_index = rigid_primitive_index
+            triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
             value = data.soft_vertex_quadrature_weight[soft_primitive_index] * triangle_energy(
                 particle_q[soft_primitive_index],
                 rigid_positions[triangle_vertex_indices[0]],
@@ -2471,15 +2215,15 @@ def evaluate_contact_energy(
                 data.rigid_adjacency.tri_edge_indices,
                 data.rigid_adjacency.edge_tri_indices,
                 data.rigid_vertex_term_coefficient,
-                face,
+                triangle_index,
                 support,
                 near_cutoff,
                 False,
             )
         elif family == 1:
             # TV: rigid vertex against a soft triangle.
-            face = soft_primitive_index
-            triangle_vertex_indices = data.soft_tri_indices[face]
+            triangle_index = soft_primitive_index
+            triangle_vertex_indices = data.soft_tri_indices[triangle_index]
             value = data.rigid_vertex_quadrature_weight[rigid_primitive_index] * triangle_energy(
                 rigid_positions[rigid_primitive_index],
                 particle_q[triangle_vertex_indices[0]],
@@ -2490,34 +2234,34 @@ def evaluate_contact_energy(
                 data.soft_adjacency.tri_edge_indices,
                 data.soft_adjacency.edge_tri_indices,
                 data.soft_vertex_term_coefficient,
-                face,
+                triangle_index,
                 support,
                 near_cutoff,
                 False,
             )
         else:
             # EE: weight * (W_soft P_near(q, rigid) + W_rigid P_near(q_bar, soft)).
-            soft_edge_vertices = data.soft_edge_vertex_indices[soft_primitive_index]
-            rigid_edge_vertices = data.rigid_edge_vertex_indices[rigid_primitive_index]
+            soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+            rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
             q, q_bar, weight = ee_quadrature_sample(
-                particle_q[soft_edge_vertices[0]],
-                particle_q[soft_edge_vertices[1]],
-                rigid_positions[rigid_edge_vertices[0]],
-                rigid_positions[rigid_edge_vertices[1]],
+                particle_q[soft_edge_vertex_indices[0]],
+                particle_q[soft_edge_vertex_indices[1]],
+                rigid_positions[rigid_edge_vertex_indices[0]],
+                rigid_positions[rigid_edge_vertex_indices[1]],
                 near_cutoff,
             )
             if weight <= 0.0:
                 continue
-            soft_edge, rigid_edge = soft_primitive_index, rigid_primitive_index
+            soft_edge_index, rigid_edge_index = soft_primitive_index, rigid_primitive_index
             near_rigid, near_soft = float(0.0), float(0.0)
-            for k in range(lists.starts[soft_edge], lists.ends[soft_edge]):
-                face = lists.keys[k]
-                triangle_vertex_indices = data.rigid_tri_indices[face]
-                target_shape = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
+            for entry_index in range(lists.starts[soft_edge_index], lists.ends[soft_edge_index]):
+                triangle_index = lists.keys[entry_index]
+                triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
+                target_shape_index = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
                 target_support, target_near, target_ke = contact_support_and_stiffness(
                     family,
                     soft_primitive_index,
-                    target_shape,
+                    target_shape_index,
                     data,
                     particle_radius,
                     shape_margin,
@@ -2534,19 +2278,19 @@ def evaluate_contact_energy(
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
                     data.rigid_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                     target_support,
                     target_near,
                     True,
                 )
-            edge_list = lists.soft_edge_count + rigid_edge
-            for k in range(lists.starts[edge_list], lists.ends[edge_list]):
-                face = lists.keys[k]
-                triangle_vertex_indices = data.soft_tri_indices[face]
+            edge_list_index = lists.soft_edge_count + rigid_edge_index
+            for entry_index in range(lists.starts[edge_list_index], lists.ends[edge_list_index]):
+                triangle_index = lists.keys[entry_index]
+                triangle_vertex_indices = data.soft_tri_indices[triangle_index]
                 target_support, target_near, target_ke = contact_support_and_stiffness(
                     1,
-                    face,
-                    shape,
+                    triangle_index,
+                    shape_index,
                     data,
                     particle_radius,
                     shape_margin,
@@ -2563,13 +2307,13 @@ def evaluate_contact_energy(
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
                     data.soft_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                     target_support,
                     target_near,
                     True,
                 )
             value = weight * (
-                data.soft_edge_area[soft_edge] * near_rigid + data.rigid_edge_area[rigid_edge] * near_soft
+                data.soft_edge_area[soft_edge_index] * near_rigid + data.rigid_edge_area[rigid_edge_index] * near_soft
             )
         if family != 2:
             value *= stiffness
@@ -2583,8 +2327,8 @@ def evaluate_contact_energy(
 def ee_particle_source(
     soft_primitive_index: int,
     rigid_primitive_index: int,
-    shape: int,
-    particle: int,
+    shape_index: int,
+    particle_index: int,
     data: EspData,
     particle_q: wp.array[wp.vec3],
     rigid_positions: wp.array[wp.vec3],
@@ -2596,31 +2340,49 @@ def ee_particle_source(
     soft_contact_ke: float,
     partition: int,
     partitions: int,
+    use_friction: bool,
+    particle_q_prev: wp.array[wp.vec3],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    dt: float,
+    friction_epsilon: float,
+    shape_material_mu: wp.array[float],
+    soft_contact_mu: float,
+    shape_material_kd: wp.array[float],
+    soft_contact_kd: float,
 ):
     """Differentiate both EE sample directions with respect to a source particle."""
-    soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
-    rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
-    a, b = particle_q[soft_edge[0]], particle_q[soft_edge[1]]
-    c, d = rigid_positions[rigid_edge[0]], rigid_positions[rigid_edge[1]]
-    source_mask = int(soft_edge[0] == particle) | (int(soft_edge[1] == particle) << 1)
+    soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+    rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
+    a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
+    c, d = rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
+    source_mask = int(soft_edge_vertex_indices[0] == particle_index) | (
+        int(soft_edge_vertex_indices[1] == particle_index) << 1
+    )
     # The generating pair determines q, q_bar, w and their derivatives.
     pair = prepare_particle_ee_pair(a, b, c, d, source_mask, wp.vec3(), near)
     if pair.weight <= 0.0:
         return 0.0, wp.vec3(), wp.mat33()
     potential, gradient, parameter_gradient_sum, hessian = float(0.0), wp.vec3(), wp.vec2(), wp.mat33()
+    dissipative_gradient = wp.vec3()
+    dissipative_hessian = wp.mat33()
     for direction in range(2):
-        edge_list = soft_primitive_index
+        edge_list_index = soft_primitive_index
         if direction == 1:
-            edge_list = lists.soft_edge_count + rigid_primitive_index
-        for k in range(lists.starts[edge_list] + partition, lists.ends[edge_list], partitions):
-            face = lists.keys[k]
+            edge_list_index = lists.soft_edge_count + rigid_primitive_index
+        for entry_index in range(lists.starts[edge_list_index] + partition, lists.ends[edge_list_index], partitions):
+            triangle_index = lists.keys[entry_index]
             particle_mask = source_mask
-            target_shape = shape
+            target_shape_index = shape_index
             target_family, target_soft_primitive_index = 2, soft_primitive_index
             sample = wp.vec3(pair.soft_sample)
             if direction == 0:
-                triangle_vertex_indices = wp.vec3i(data.rigid_tri_indices[face])
-                target_shape = int(data.rigid_vertex_shapes[triangle_vertex_indices[0]])
+                triangle_vertex_indices = wp.vec3i(data.rigid_tri_indices[triangle_index])
+                target_shape_index = int(data.rigid_vertex_shapes[triangle_vertex_indices[0]])
                 ta, tb, tc = (
                     wp.vec3(rigid_positions[triangle_vertex_indices[0]]),
                     wp.vec3(rigid_positions[triangle_vertex_indices[1]]),
@@ -2631,12 +2393,12 @@ def ee_particle_source(
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
                     data.rigid_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                 )
                 source_area_factor = data.soft_edge_area[soft_primitive_index]
             else:
-                triangle_vertex_indices = wp.vec3i(data.soft_tri_indices[face])
-                target_family, target_soft_primitive_index = 1, face
+                triangle_vertex_indices = wp.vec3i(data.soft_tri_indices[triangle_index])
+                target_family, target_soft_primitive_index = 1, triangle_index
                 ta, tb, tc = (
                     wp.vec3(particle_q[triangle_vertex_indices[0]]),
                     wp.vec3(particle_q[triangle_vertex_indices[1]]),
@@ -2648,17 +2410,17 @@ def ee_particle_source(
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
                     data.soft_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                 )
                 source_area_factor = data.rigid_edge_area[rigid_primitive_index]
                 # One particle may be both source endpoint and target corner.
                 for corner in range(3):
-                    if triangle_vertex_indices[corner] == particle:
+                    if triangle_vertex_indices[corner] == particle_index:
                         particle_mask |= 1 << (4 + corner)
             support, target_near, stiffness = contact_support_and_stiffness(
                 target_family,
                 target_soft_primitive_index,
-                target_shape,
+                target_shape_index,
                 data,
                 particle_radius,
                 shape_margin,
@@ -2670,7 +2432,33 @@ def ee_particle_source(
             box_delta = wp.max(wp.max(lower - sample, sample - upper), wp.vec3())
             if wp.dot(box_delta, box_delta) > target_near * target_near:
                 continue
-            e, g, parameter_gradient, h = particle_ee_triangle_contribution(
+            source_vertex_indices = wp.vec3i(soft_edge_vertex_indices[0], soft_edge_vertex_indices[1], -1)
+            source_weights = wp.vec3(1.0 - pair.s, pair.s, 0.0)
+            if direction == 1:
+                source_vertex_indices = wp.vec3i(rigid_edge_vertex_indices[0], rigid_edge_vertex_indices[1], -1)
+                source_weights = wp.vec3(1.0 - pair.t, pair.t, 0.0)
+            sample_displacement, triangle_displacements = contact_displacements(
+                source_vertex_indices,
+                source_weights,
+                direction == 1,
+                triangle_vertex_indices,
+                data,
+                particle_q,
+                particle_q_prev,
+                rigid_positions,
+                shape_transform,
+                shape_body,
+                shape_scale,
+                shape_source_ptr,
+                body_q,
+                body_q_prev,
+                dt,
+            )
+            mu = float(0.0)
+            if use_friction:
+                mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
+            kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
+            e, g, parameter_gradient, h, dg, dh = particle_ee_triangle_contribution(
                 pair,
                 ta,
                 tb,
@@ -2682,14 +2470,24 @@ def ee_particle_source(
                 vertex_coefficients,
                 support,
                 target_near,
+                stiffness,
+                sample_displacement,
+                triangle_displacements,
+                mu,
+                kd,
+                dt,
+                friction_epsilon * dt,
             )
-            # A target's stiffness belongs inside the sum, before E = w*S.
-            scale = source_area_factor * stiffness
+            scale = source_area_factor
             potential += scale * e
             gradient += scale * g
             parameter_gradient_sum += scale * parameter_gradient
             hessian += scale * h
-    return finish_particle_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
+            dissipative_gradient += scale * dg
+            dissipative_hessian += scale * dh
+    energy, gradient, hessian = finish_particle_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
+    # Only the conservative block differentiates q and w. Dissipation freezes both.
+    return energy, gradient + pair.weight * dissipative_gradient, hessian + pair.weight * dissipative_hessian
 
 
 @wp.kernel(module="unique", enable_backward=False)
@@ -2714,8 +2512,6 @@ def accumulate_particle_contact_derivatives(
     partitions: int,
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    body_colors: wp.array[int],
     use_friction: bool,
     particle_q_prev: wp.array[wp.vec3],
     shape_transform: wp.array[wp.transform],
@@ -2726,13 +2522,8 @@ def accumulate_particle_contact_derivatives(
     friction_epsilon: float,
     shape_material_mu: wp.array[float],
     soft_contact_mu: float,
-    soft_contact_barycentric: wp.array[wp.vec3],
-    soft_contact_body_pos: wp.array[wp.vec3],
-    soft_contact_body_vel: wp.array[wp.vec3],
-    soft_contact_normal: wp.array[wp.vec3],
-    soft_contact_force_mask: wp.array[bool],
-    body_particle_contact_material_kd: wp.array[float],
-    body_qd: wp.array[wp.spatial_vector],
+    shape_material_kd: wp.array[float],
+    soft_contact_kd: float,
     esp_forces: wp.array2d[float],
     esp_hessians: wp.array3d[float],
     esp_error: wp.array[int],
@@ -2748,7 +2539,7 @@ def accumulate_particle_contact_derivatives(
         wp.atomic_or(esp_error, 0, 2)
         return
     for row_id in range(worker, soft_contact_count[0], worker_count):
-        shape = soft_contact_shape[row_id]
+        shape_index = soft_contact_shape[row_id]
         soft_primitive_index = soft_contact_primitive_index[row_id]
         rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
         family = _mesh_contact_family(
@@ -2757,38 +2548,6 @@ def accumulate_particle_contact_derivatives(
             soft_primitive_index,
             rigid_primitive_index,
         )
-        # Damping has its own row policy and must run before ESP exclusions,
-        # once per row rather than once per EE partition.
-        if partition == 0:
-            accumulate_contact_damping(
-                row_id,
-                data,
-                soft_contact_indices,
-                soft_contact_barycentric,
-                soft_contact_shape,
-                soft_contact_body_pos,
-                soft_contact_body_vel,
-                soft_contact_normal,
-                soft_contact_force_mask,
-                body_particle_contact_material_kd,
-                particle_q,
-                particle_q_prev,
-                particle_radius,
-                particle_colors,
-                shape_body,
-                shape_margin,
-                body_q,
-                body_q_prev,
-                body_qd,
-                body_com,
-                body_colors,
-                False,
-                color,
-                dt,
-                esp_forces,
-                esp_hessians,
-                esp_error,
-            )
         # Analytical/SDF, depth-recovery and disabled rows are not ESP quadrature samples.
         if family < 0:
             continue
@@ -2805,29 +2564,42 @@ def accumulate_particle_contact_derivatives(
         support, near, stiffness = contact_support_and_stiffness(
             family,
             soft_primitive_index,
-            shape,
+            shape_index,
             data,
             particle_radius,
             shape_margin,
             shape_material_ke,
             soft_contact_ke,
         )
-        # Zero support gives no VT/TV interaction or EE sample. Zero stiffness
-        # cancels the whole VT/TV row, but EE samples also evaluate other shapes
-        # with their own stiffness, so the generating shape's zero is not enough.
-        if support == 0 or (stiffness == 0 and family != 2):
+        # Zero support gives no interaction. Keep zero-stiffness rows for
+        # damping; EE samples also evaluate other shapes with their own material.
+        if support == 0:
             continue
         # Only EE neighborhood sums are partitioned; evaluate each VT/TV row once.
         if family < 2 and partition != 0:
             continue
-        # Friction processes the complete row, so accumulate it in one partition only.
-        if use_friction and partition == 0:
-            accumulate_contact_friction(
-                row_id,
-                family,
-                soft_primitive_index,
-                rigid_primitive_index,
-                shape,
+        mu = float(0.0)
+        if use_friction:
+            mu = wp.sqrt(soft_contact_mu * shape_material_mu[shape_index])
+        kd = 0.5 * (soft_contact_kd + shape_material_kd[shape_index])
+        if family == 0:
+            particle_index = soft_primitive_index
+            if color >= 0 and particle_colors[particle_index] != color:
+                continue
+            triangle_index = rigid_primitive_index
+            triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
+            edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
+                data.rigid_tri_indices,
+                data.rigid_adjacency.tri_edge_indices,
+                data.rigid_adjacency.edge_tri_indices,
+                data.rigid_vertex_term_coefficient,
+                triangle_index,
+            )
+            sample_displacement, triangle_displacements = contact_displacements(
+                wp.vec3i(particle_index, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                False,
+                triangle_vertex_indices,
                 data,
                 particle_q,
                 particle_q_prev,
@@ -2838,42 +2610,10 @@ def accumulate_particle_contact_derivatives(
                 shape_source_ptr,
                 body_q,
                 body_q_prev,
-                body_com,
-                particle_colors,
-                body_colors,
-                shape_material_mu,
-                soft_contact_mu,
-                particle_radius,
-                shape_margin,
-                shape_material_ke,
-                soft_contact_ke,
-                lists,
-                support,
-                near,
-                stiffness,
-                False,
-                color,
                 dt,
-                friction_epsilon * dt,
-                esp_forces,
-                esp_hessians,
-                esp_error,
-            )
-        if family == 0:
-            particle = soft_primitive_index
-            if color >= 0 and particle_colors[particle] != color:
-                continue
-            face = rigid_primitive_index
-            triangle_vertex_indices = data.rigid_tri_indices[face]
-            edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
-                data.rigid_tri_indices,
-                data.rigid_adjacency.tri_edge_indices,
-                data.rigid_adjacency.edge_tri_indices,
-                data.rigid_vertex_term_coefficient,
-                face,
             )
             e, g, h = particle_triangle(
-                particle_q[particle],
+                particle_q[particle_index],
                 rigid_positions[triangle_vertex_indices[0]],
                 rigid_positions[triangle_vertex_indices[1]],
                 rigid_positions[triangle_vertex_indices[2]],
@@ -2883,30 +2623,54 @@ def accumulate_particle_contact_derivatives(
                 support,
                 near,
                 False,
+                stiffness,
+                sample_displacement,
+                triangle_displacements,
+                mu,
+                kd,
+                dt,
+                friction_epsilon * dt,
             )
             accumulate_particle_block(
                 esp_forces,
                 esp_hessians,
-                particle,
-                stiffness * data.soft_vertex_quadrature_weight[particle],
+                particle_index,
+                data.soft_vertex_quadrature_weight[particle_index],
                 e,
                 g,
                 h,
                 esp_error,
             )
         elif family == 1:
-            face = soft_primitive_index
-            triangle_vertex_indices = data.soft_tri_indices[face]
+            triangle_index = soft_primitive_index
+            triangle_vertex_indices = data.soft_tri_indices[triangle_index]
             edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                 data.soft_tri_indices,
                 data.soft_adjacency.tri_edge_indices,
                 data.soft_adjacency.edge_tri_indices,
                 data.soft_vertex_term_coefficient,
-                face,
+                triangle_index,
+            )
+            sample_displacement, triangle_displacements = contact_displacements(
+                wp.vec3i(rigid_primitive_index, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                True,
+                triangle_vertex_indices,
+                data,
+                particle_q,
+                particle_q_prev,
+                rigid_positions,
+                shape_transform,
+                shape_body,
+                shape_scale,
+                shape_source_ptr,
+                body_q,
+                body_q_prev,
+                dt,
             )
             for corner in range(3):
-                particle = triangle_vertex_indices[corner]
-                if color >= 0 and particle_colors[particle] != color:
+                particle_index = triangle_vertex_indices[corner]
+                if color >= 0 and particle_colors[particle_index] != color:
                     continue
                 e, g, h = particle_triangle(
                     rigid_positions[rigid_primitive_index],
@@ -2919,38 +2683,45 @@ def accumulate_particle_contact_derivatives(
                     support,
                     near,
                     False,
+                    stiffness,
+                    sample_displacement,
+                    triangle_displacements,
+                    mu,
+                    kd,
+                    dt,
+                    friction_epsilon * dt,
                 )
                 accumulate_particle_block(
                     esp_forces,
                     esp_hessians,
-                    particle,
-                    stiffness * data.rigid_vertex_quadrature_weight[rigid_primitive_index],
+                    particle_index,
+                    data.rigid_vertex_quadrature_weight[rigid_primitive_index],
                     e,
                     g,
                     h,
                     esp_error,
                 )
         else:
-            soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
-            rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
+            soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+            rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
             _q, q_bar, weight = ee_quadrature_sample(
-                particle_q[soft_edge[0]],
-                particle_q[soft_edge[1]],
-                rigid_positions[rigid_edge[0]],
-                rigid_positions[rigid_edge[1]],
+                particle_q[soft_edge_vertex_indices[0]],
+                particle_q[soft_edge_vertex_indices[1]],
+                rigid_positions[rigid_edge_vertex_indices[0]],
+                rigid_positions[rigid_edge_vertex_indices[1]],
                 near,
             )
             if weight <= 0.0:
                 continue
             for endpoint in range(2):
-                particle = soft_edge[endpoint]
-                if color >= 0 and particle_colors[particle] != color:
+                particle_index = soft_edge_vertex_indices[endpoint]
+                if color >= 0 and particle_colors[particle_index] != color:
                     continue
                 e, g, h = ee_particle_source(
                     soft_primitive_index,
                     rigid_primitive_index,
-                    shape,
-                    particle,
+                    shape_index,
+                    particle_index,
                     data,
                     particle_q,
                     rigid_positions,
@@ -2962,18 +2733,38 @@ def accumulate_particle_contact_derivatives(
                     soft_contact_ke,
                     partition,
                     partitions,
+                    use_friction,
+                    particle_q_prev,
+                    shape_transform,
+                    shape_body,
+                    shape_scale,
+                    shape_source_ptr,
+                    body_q,
+                    body_q_prev,
+                    dt,
+                    friction_epsilon,
+                    shape_material_mu,
+                    soft_contact_mu,
+                    shape_material_kd,
+                    soft_contact_kd,
                 )
-                accumulate_particle_block(esp_forces, esp_hessians, particle, 1.0, e, g, h, esp_error)
+                accumulate_particle_block(esp_forces, esp_hessians, particle_index, 1.0, e, g, h, esp_error)
+            rigid_parameter = segment_parameter(
+                q_bar, rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
+            )
+            rigid_source_weights = wp.vec3(1.0 - rigid_parameter, rigid_parameter, 0.0)
             # Target-only particles cannot move q_bar or w. Use the simpler direct
             # triangle block and do not count source endpoints for a second time.
-            edge_list = lists.soft_edge_count + rigid_primitive_index
-            for k in range(lists.starts[edge_list] + partition, lists.ends[edge_list], partitions):
-                face = lists.keys[k]
-                triangle_vertex_indices = data.soft_tri_indices[face]
+            edge_list_index = lists.soft_edge_count + rigid_primitive_index
+            for entry_index in range(
+                lists.starts[edge_list_index] + partition, lists.ends[edge_list_index], partitions
+            ):
+                triangle_index = lists.keys[entry_index]
+                triangle_vertex_indices = data.soft_tri_indices[triangle_index]
                 target_support, target_near, target_ke = contact_support_and_stiffness(
                     1,
-                    face,
-                    shape,
+                    triangle_index,
+                    shape_index,
                     data,
                     particle_radius,
                     shape_margin,
@@ -2985,13 +2776,30 @@ def accumulate_particle_contact_derivatives(
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
                     data.soft_vertex_term_coefficient,
-                    face,
+                    triangle_index,
+                )
+                sample_displacement, triangle_displacements = contact_displacements(
+                    wp.vec3i(rigid_edge_vertex_indices[0], rigid_edge_vertex_indices[1], -1),
+                    rigid_source_weights,
+                    True,
+                    triangle_vertex_indices,
+                    data,
+                    particle_q,
+                    particle_q_prev,
+                    rigid_positions,
+                    shape_transform,
+                    shape_body,
+                    shape_scale,
+                    shape_source_ptr,
+                    body_q,
+                    body_q_prev,
+                    dt,
                 )
                 for corner in range(3):
-                    particle = triangle_vertex_indices[corner]
-                    if particle == soft_edge[0] or particle == soft_edge[1]:
+                    particle_index = triangle_vertex_indices[corner]
+                    if particle_index == soft_edge_vertex_indices[0] or particle_index == soft_edge_vertex_indices[1]:
                         continue
-                    if color >= 0 and particle_colors[particle] != color:
+                    if color >= 0 and particle_colors[particle_index] != color:
                         continue
                     e, g, h = particle_triangle(
                         q_bar,
@@ -3004,12 +2812,19 @@ def accumulate_particle_contact_derivatives(
                         target_support,
                         target_near,
                         True,
+                        target_ke,
+                        sample_displacement,
+                        triangle_displacements,
+                        mu,
+                        kd,
+                        dt,
+                        friction_epsilon * dt,
                     )
                     accumulate_particle_block(
                         esp_forces,
                         esp_hessians,
-                        particle,
-                        target_ke * weight * data.rigid_edge_area[rigid_primitive_index],
+                        particle_index,
+                        weight * data.rigid_edge_area[rigid_primitive_index],
                         e,
                         g,
                         h,
@@ -3021,8 +2836,8 @@ def accumulate_particle_contact_derivatives(
 def ee_body(
     soft_primitive_index: int,
     rigid_primitive_index: int,
-    shape: int,
-    body: int,
+    shape_index: int,
+    body_index: int,
     com: wp.vec3,
     data: EspData,
     particle_q: wp.array[wp.vec3],
@@ -3034,12 +2849,25 @@ def ee_body(
     shape_margin: wp.array[float],
     shape_material_ke: wp.array[float],
     soft_contact_ke: float,
+    use_friction: bool,
+    particle_q_prev: wp.array[wp.vec3],
+    shape_transform: wp.array[wp.transform],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    dt: float,
+    friction_epsilon: float,
+    shape_material_mu: wp.array[float],
+    soft_contact_mu: float,
+    shape_material_kd: wp.array[float],
+    soft_contact_kd: float,
 ):
     """Differentiate q, q_bar, w and all targets moved by the generating body."""
-    soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
-    rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
-    a, b = particle_q[soft_edge[0]], particle_q[soft_edge[1]]
-    c, d = rigid_positions[rigid_edge[0]], rigid_positions[rigid_edge[1]]
+    soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+    rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
+    a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
+    c, d = rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
     pair = prepare_body_ee_pair(a, b, c, d, 0, com, near)
     if pair.weight <= 0.0:
         return 0.0, wp.spatial_vector(), wp.spatial_matrix()
@@ -3049,20 +2877,22 @@ def ee_body(
         wp.vec2(),
         wp.spatial_matrix(),
     )
+    dissipative_gradient = wp.spatial_vector()
+    dissipative_hessian = wp.spatial_matrix()
     for direction in range(2):
-        edge_list = soft_primitive_index
+        edge_list_index = soft_primitive_index
         if direction == 1:
-            edge_list = lists.soft_edge_count + rigid_primitive_index
-        for k in range(lists.starts[edge_list], lists.ends[edge_list]):
-            face = lists.keys[k]
-            target_shape = shape
+            edge_list_index = lists.soft_edge_count + rigid_primitive_index
+        for entry_index in range(lists.starts[edge_list_index], lists.ends[edge_list_index]):
+            triangle_index = lists.keys[entry_index]
+            target_shape_index = shape_index
             target_family, target_soft_primitive_index = 2, soft_primitive_index
             sample = wp.vec3(pair.soft_sample)
             target_moves = bool(False)
             if direction == 0:
-                triangle_vertex_indices = data.rigid_tri_indices[face]
-                target_shape = int(data.rigid_vertex_shapes[triangle_vertex_indices[0]])
-                target_moves = shape_body[target_shape] == body
+                triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
+                target_shape_index = int(data.rigid_vertex_shapes[triangle_vertex_indices[0]])
+                target_moves = shape_body[target_shape_index] == body_index
                 ta, tb, tc = (
                     wp.vec3(rigid_positions[triangle_vertex_indices[0]]),
                     wp.vec3(rigid_positions[triangle_vertex_indices[1]]),
@@ -3073,12 +2903,12 @@ def ee_body(
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
                     data.rigid_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                 )
                 source_area_factor = data.soft_edge_area[soft_primitive_index]
             else:
-                triangle_vertex_indices = data.soft_tri_indices[face]
-                target_family, target_soft_primitive_index = 1, face
+                triangle_vertex_indices = data.soft_tri_indices[triangle_index]
+                target_family, target_soft_primitive_index = 1, triangle_index
                 ta, tb, tc = (
                     wp.vec3(particle_q[triangle_vertex_indices[0]]),
                     wp.vec3(particle_q[triangle_vertex_indices[1]]),
@@ -3090,13 +2920,13 @@ def ee_body(
                     data.soft_adjacency.tri_edge_indices,
                     data.soft_adjacency.edge_tri_indices,
                     data.soft_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                 )
                 source_area_factor = data.rigid_edge_area[rigid_primitive_index]
             support, target_near, stiffness = contact_support_and_stiffness(
                 target_family,
                 target_soft_primitive_index,
-                target_shape,
+                target_shape_index,
                 data,
                 particle_radius,
                 shape_margin,
@@ -3108,7 +2938,33 @@ def ee_body(
             box_delta = wp.max(wp.max(lower - sample, sample - upper), wp.vec3())
             if wp.dot(box_delta, box_delta) > target_near * target_near:
                 continue
-            e, g, parameter_gradient, h = body_ee_triangle_contribution(
+            source_vertex_indices = wp.vec3i(soft_edge_vertex_indices[0], soft_edge_vertex_indices[1], -1)
+            source_weights = wp.vec3(1.0 - pair.s, pair.s, 0.0)
+            if direction == 1:
+                source_vertex_indices = wp.vec3i(rigid_edge_vertex_indices[0], rigid_edge_vertex_indices[1], -1)
+                source_weights = wp.vec3(1.0 - pair.t, pair.t, 0.0)
+            sample_displacement, triangle_displacements = contact_displacements(
+                source_vertex_indices,
+                source_weights,
+                direction == 1,
+                triangle_vertex_indices,
+                data,
+                particle_q,
+                particle_q_prev,
+                rigid_positions,
+                shape_transform,
+                shape_body,
+                shape_scale,
+                shape_source_ptr,
+                body_q,
+                body_q_prev,
+                dt,
+            )
+            mu = float(0.0)
+            if use_friction:
+                mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
+            kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
+            e, g, parameter_gradient, h, dg, dh = body_ee_triangle_contribution(
                 pair,
                 ta,
                 tb,
@@ -3120,13 +2976,24 @@ def ee_body(
                 vertex_coefficients,
                 support,
                 target_near,
+                stiffness,
+                sample_displacement,
+                triangle_displacements,
+                mu,
+                kd,
+                dt,
+                friction_epsilon * dt,
             )
-            scale = source_area_factor * stiffness
+            scale = source_area_factor
             potential += scale * e
             gradient += scale * g
             parameter_gradient_sum += scale * parameter_gradient
             hessian += scale * h
-    return finish_body_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
+            dissipative_gradient += scale * dg
+            dissipative_hessian += scale * dh
+    energy, gradient, hessian = finish_body_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
+    # Only the conservative block differentiates q and w. Dissipation freezes both.
+    return energy, gradient + pair.weight * dissipative_gradient, hessian + pair.weight * dissipative_hessian
 
 
 @wp.kernel(module="unique", enable_backward=False)
@@ -3151,7 +3018,6 @@ def accumulate_body_contact_derivatives(
     soft_contact_ke: float,
     lists: EdgeTriangleListData,
     color: int,
-    particle_colors: wp.array[int],
     use_friction: bool,
     particle_q_prev: wp.array[wp.vec3],
     shape_transform: wp.array[wp.transform],
@@ -3162,13 +3028,8 @@ def accumulate_body_contact_derivatives(
     friction_epsilon: float,
     shape_material_mu: wp.array[float],
     soft_contact_mu: float,
-    soft_contact_barycentric: wp.array[wp.vec3],
-    soft_contact_body_pos: wp.array[wp.vec3],
-    soft_contact_body_vel: wp.array[wp.vec3],
-    soft_contact_normal: wp.array[wp.vec3],
-    soft_contact_force_mask: wp.array[bool],
-    body_particle_contact_material_kd: wp.array[float],
-    body_qd: wp.array[wp.spatial_vector],
+    shape_material_kd: wp.array[float],
+    soft_contact_kd: float,
     esp_forces: wp.array2d[float],
     esp_hessians: wp.array3d[float],
     esp_error: wp.array[int],
@@ -3183,7 +3044,7 @@ def accumulate_body_contact_derivatives(
         wp.atomic_or(esp_error, 0, 2)
         return
     for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
-        shape = soft_contact_shape[row_id]
+        shape_index = soft_contact_shape[row_id]
         soft_primitive_index = soft_contact_primitive_index[row_id]
         rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
         family = _mesh_contact_family(
@@ -3191,36 +3052,6 @@ def accumulate_body_contact_derivatives(
             soft_contact_rigid_indices[row_id],
             soft_primitive_index,
             rigid_primitive_index,
-        )
-        # Damping has its own row policy and must run before ESP exclusions.
-        accumulate_contact_damping(
-            row_id,
-            data,
-            soft_contact_indices,
-            soft_contact_barycentric,
-            soft_contact_shape,
-            soft_contact_body_pos,
-            soft_contact_body_vel,
-            soft_contact_normal,
-            soft_contact_force_mask,
-            body_particle_contact_material_kd,
-            particle_q,
-            particle_q_prev,
-            particle_radius,
-            particle_colors,
-            shape_body,
-            shape_margin,
-            body_q,
-            body_q_prev,
-            body_qd,
-            body_com,
-            body_colors,
-            True,
-            color,
-            dt,
-            esp_forces,
-            esp_hessians,
-            esp_error,
         )
         # Analytical/SDF, depth-recovery and disabled rows are not ESP quadrature samples.
         if family < 0:
@@ -3238,99 +3069,89 @@ def accumulate_body_contact_derivatives(
         support, near, stiffness = contact_support_and_stiffness(
             family,
             soft_primitive_index,
-            shape,
+            shape_index,
             data,
             particle_radius,
             shape_margin,
             shape_material_ke,
             soft_contact_ke,
         )
-        # Zero support gives no VT/TV interaction or EE sample. Zero stiffness
-        # cancels the whole VT/TV row, but EE samples also evaluate other shapes
-        # with their own stiffness, so the generating shape's zero is not enough.
-        if support == 0 or (stiffness == 0 and family != 2):
+        # Zero support gives no interaction. Keep zero-stiffness rows for
+        # damping; EE samples also evaluate other shapes with their own material.
+        if support == 0:
             continue
-        body = shape_body[shape]
+        body_index = shape_body[shape_index]
+        mu = float(0.0)
         if use_friction:
-            accumulate_contact_friction(
-                row_id,
-                family,
-                soft_primitive_index,
-                rigid_primitive_index,
-                shape,
-                data,
-                particle_q,
-                particle_q_prev,
-                rigid_positions,
-                shape_transform,
-                shape_body,
-                shape_scale,
-                shape_source_ptr,
-                body_q,
-                body_q_prev,
-                body_com,
-                particle_colors,
-                body_colors,
-                shape_material_mu,
-                soft_contact_mu,
-                particle_radius,
-                shape_margin,
-                shape_material_ke,
-                soft_contact_ke,
-                lists,
-                support,
-                near,
-                stiffness,
-                True,
-                color,
-                dt,
-                friction_epsilon * dt,
-                esp_forces,
-                esp_hessians,
-                esp_error,
-            )
+            mu = wp.sqrt(soft_contact_mu * shape_material_mu[shape_index])
+        kd = 0.5 * (soft_contact_kd + shape_material_kd[shape_index])
         if family == 2:
-            soft_edge = data.soft_edge_vertex_indices[soft_primitive_index]
-            rigid_edge = data.rigid_edge_vertex_indices[rigid_primitive_index]
+            soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+            rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
             q, _qb, weight = ee_quadrature_sample(
-                particle_q[soft_edge[0]],
-                particle_q[soft_edge[1]],
-                rigid_positions[rigid_edge[0]],
-                rigid_positions[rigid_edge[1]],
+                particle_q[soft_edge_vertex_indices[0]],
+                particle_q[soft_edge_vertex_indices[1]],
+                rigid_positions[rigid_edge_vertex_indices[0]],
+                rigid_positions[rigid_edge_vertex_indices[1]],
                 near,
             )
             if weight <= 0.0:
                 continue
+            soft_parameter = segment_parameter(
+                q, particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
+            )
+            soft_source_weights = wp.vec3(1.0 - soft_parameter, soft_parameter, 0.0)
             # A different target body moves only its target triangle: q and w
             # do not depend on it. Evaluate its ordinary rigid triangle block.
-            edge_list = soft_primitive_index
-            for k in range(lists.starts[edge_list], lists.ends[edge_list]):
-                face = lists.keys[k]
-                triangle_vertex_indices = data.rigid_tri_indices[face]
-                target_shape = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
-                target_body = shape_body[target_shape]
-                if target_body < 0 or target_body == body:
+            edge_list_index = soft_primitive_index
+            for entry_index in range(lists.starts[edge_list_index], lists.ends[edge_list_index]):
+                triangle_index = lists.keys[entry_index]
+                triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
+                target_shape_index = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
+                target_body_index = shape_body[target_shape_index]
+                if target_body_index < 0 or target_body_index == body_index:
                     continue
-                if color >= 0 and body_colors[target_body] != color:
+                if color >= 0 and body_colors[target_body_index] != color:
                     continue
                 target_support, target_near, target_ke = contact_support_and_stiffness(
                     2,
                     soft_primitive_index,
-                    target_shape,
+                    target_shape_index,
                     data,
                     particle_radius,
                     shape_margin,
                     shape_material_ke,
                     soft_contact_ke,
                 )
-                target_com = wp.transform_point(body_q[target_body], body_com[target_body])
+                target_com = wp.transform_point(body_q[target_body_index], body_com[target_body_index])
                 edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                     data.rigid_tri_indices,
                     data.rigid_adjacency.tri_edge_indices,
                     data.rigid_adjacency.edge_tri_indices,
                     data.rigid_vertex_term_coefficient,
-                    face,
+                    triangle_index,
                 )
+                sample_displacement, triangle_displacements = contact_displacements(
+                    wp.vec3i(soft_edge_vertex_indices[0], soft_edge_vertex_indices[1], -1),
+                    soft_source_weights,
+                    False,
+                    triangle_vertex_indices,
+                    data,
+                    particle_q,
+                    particle_q_prev,
+                    rigid_positions,
+                    shape_transform,
+                    shape_body,
+                    shape_scale,
+                    shape_source_ptr,
+                    body_q,
+                    body_q_prev,
+                    dt,
+                )
+                target_mu = float(0.0)
+                if use_friction:
+                    target_mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
+                target_kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
                 e, g, h = body_triangle(
                     q,
                     rigid_positions[triangle_vertex_indices[0]],
@@ -3343,24 +3164,31 @@ def accumulate_body_contact_derivatives(
                     target_support,
                     target_near,
                     True,
+                    target_ke,
+                    sample_displacement,
+                    triangle_displacements,
+                    target_mu,
+                    target_kd,
+                    dt,
+                    friction_epsilon * dt,
                 )
                 accumulate_body_block(
                     esp_forces,
                     esp_hessians,
-                    target_body,
-                    target_ke * weight * data.soft_edge_area[soft_primitive_index],
+                    target_body_index,
+                    weight * data.soft_edge_area[soft_primitive_index],
                     e,
                     g,
                     h,
                     esp_error,
                 )
-            if body >= 0 and (color < 0 or body_colors[body] == color):
-                com = wp.transform_point(body_q[body], body_com[body])
+            if body_index >= 0 and (color < 0 or body_colors[body_index] == color):
+                com = wp.transform_point(body_q[body_index], body_com[body_index])
                 e, g, h = ee_body(
                     soft_primitive_index,
                     rigid_primitive_index,
-                    shape,
-                    body,
+                    shape_index,
+                    body_index,
                     com,
                     data,
                     particle_q,
@@ -3372,21 +3200,51 @@ def accumulate_body_contact_derivatives(
                     shape_margin,
                     shape_material_ke,
                     soft_contact_ke,
+                    use_friction,
+                    particle_q_prev,
+                    shape_transform,
+                    shape_scale,
+                    shape_source_ptr,
+                    body_q,
+                    body_q_prev,
+                    dt,
+                    friction_epsilon,
+                    shape_material_mu,
+                    soft_contact_mu,
+                    shape_material_kd,
+                    soft_contact_kd,
                 )
-                accumulate_body_block(esp_forces, esp_hessians, body, 1.0, e, g, h, esp_error)
+                accumulate_body_block(esp_forces, esp_hessians, body_index, 1.0, e, g, h, esp_error)
             continue
-        if body < 0 or (color >= 0 and body_colors[body] != color):
+        if body_index < 0 or (color >= 0 and body_colors[body_index] != color):
             continue
-        com = wp.transform_point(body_q[body], body_com[body])
+        com = wp.transform_point(body_q[body_index], body_com[body_index])
         if family == 0:
-            face = rigid_primitive_index
-            triangle_vertex_indices = data.rigid_tri_indices[face]
+            triangle_index = rigid_primitive_index
+            triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
             edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                 data.rigid_tri_indices,
                 data.rigid_adjacency.tri_edge_indices,
                 data.rigid_adjacency.edge_tri_indices,
                 data.rigid_vertex_term_coefficient,
-                face,
+                triangle_index,
+            )
+            sample_displacement, triangle_displacements = contact_displacements(
+                wp.vec3i(soft_primitive_index, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                False,
+                triangle_vertex_indices,
+                data,
+                particle_q,
+                particle_q_prev,
+                rigid_positions,
+                shape_transform,
+                shape_body,
+                shape_scale,
+                shape_source_ptr,
+                body_q,
+                body_q_prev,
+                dt,
             )
             e, g, h = body_triangle(
                 particle_q[soft_primitive_index],
@@ -3400,17 +3258,41 @@ def accumulate_body_contact_derivatives(
                 support,
                 near,
                 False,
+                stiffness,
+                sample_displacement,
+                triangle_displacements,
+                mu,
+                kd,
+                dt,
+                friction_epsilon * dt,
             )
             scale = data.soft_vertex_quadrature_weight[soft_primitive_index]
         elif family == 1:
-            face = soft_primitive_index
-            triangle_vertex_indices = data.soft_tri_indices[face]
+            triangle_index = soft_primitive_index
+            triangle_vertex_indices = data.soft_tri_indices[triangle_index]
             edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                 data.soft_tri_indices,
                 data.soft_adjacency.tri_edge_indices,
                 data.soft_adjacency.edge_tri_indices,
                 data.soft_vertex_term_coefficient,
-                face,
+                triangle_index,
+            )
+            sample_displacement, triangle_displacements = contact_displacements(
+                wp.vec3i(rigid_primitive_index, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                True,
+                triangle_vertex_indices,
+                data,
+                particle_q,
+                particle_q_prev,
+                rigid_positions,
+                shape_transform,
+                shape_body,
+                shape_scale,
+                shape_source_ptr,
+                body_q,
+                body_q_prev,
+                dt,
             )
             e, g, h = body_triangle(
                 rigid_positions[rigid_primitive_index],
@@ -3424,9 +3306,16 @@ def accumulate_body_contact_derivatives(
                 support,
                 near,
                 False,
+                stiffness,
+                sample_displacement,
+                triangle_displacements,
+                mu,
+                kd,
+                dt,
+                friction_epsilon * dt,
             )
             scale = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
-        accumulate_body_block(esp_forces, esp_hessians, body, stiffness * scale, e, g, h, esp_error)
+        accumulate_body_block(esp_forces, esp_hessians, body_index, scale, e, g, h, esp_error)
 
 
 def create_esp_data(
@@ -3568,7 +3457,6 @@ def launch_contact_blocks(
     block_dim: int = 32,
     partitions: int = 1,
     use_friction: bool = False,
-    body_particle_contact_material_kd: wp.array[float] | None = None,
     particle_q_prev: wp.array[wp.vec3] | None = None,
     body_q_prev: wp.array[wp.transform] | None = None,
     dt: float = 0.0,
@@ -3646,8 +3534,6 @@ def launch_contact_blocks(
                     partitions,
                     model.shape_body,
                     state.body_q,
-                    model.body_com,
-                    model.body_colors,
                     use_friction,
                     particle_q_prev,
                     model.shape_transform,
@@ -3658,13 +3544,8 @@ def launch_contact_blocks(
                     friction_epsilon,
                     model.shape_material_mu,
                     model.soft_contact_mu,
-                    contacts.soft_contact_barycentric,
-                    contacts.soft_contact_body_pos,
-                    contacts.soft_contact_body_vel,
-                    contacts.soft_contact_normal,
-                    contacts.soft_contact_force_mask,
-                    body_particle_contact_material_kd,
-                    state.body_qd,
+                    model.shape_material_kd,
+                    model.soft_contact_kd,
                 ],
                 outputs=[esp_forces, esp_hessians, esp_error],
                 device=model.device,
@@ -3695,7 +3576,6 @@ def launch_contact_blocks(
                     model.soft_contact_ke,
                     lists,
                     color,
-                    model.particle_colors,
                     use_friction,
                     particle_q_prev,
                     model.shape_transform,
@@ -3706,13 +3586,8 @@ def launch_contact_blocks(
                     friction_epsilon,
                     model.shape_material_mu,
                     model.soft_contact_mu,
-                    contacts.soft_contact_barycentric,
-                    contacts.soft_contact_body_pos,
-                    contacts.soft_contact_body_vel,
-                    contacts.soft_contact_normal,
-                    contacts.soft_contact_force_mask,
-                    body_particle_contact_material_kd,
-                    state.body_qd,
+                    model.shape_material_kd,
+                    model.soft_contact_kd,
                 ],
                 outputs=[esp_forces, esp_hessians, esp_error],
                 device=model.device,

@@ -597,7 +597,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 Interior tetrahedral vertices have zero weight and no mesh-contact force, friction, or
                 damping; their analytical-shape contacts are unchanged. Complete boundary triangles must
                 be supplied for tetrahedral solids. Point weights are fixed, not inferred from positions.
-                Damping retains the existing row geometry, material kd, and OGC force mask.
+                Conservative force, friction, and damping share each ESP sample/feature contact.
                 Friction sums signed per-primitive ESP loads. Uses unnormalized
                 vertex and adaptive EE quadrature in float32. Each evaluation computes
                 a complete 3x3 particle or 6x6 body block. Conservative Hessians are exact selected-branch derivatives,
@@ -624,8 +624,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 the arithmetic mean of ``model.soft_contact_ke`` and the rigid shape's material ke,
                 multiplying the area-weighted, dimensionless ESP potential without additional scaling.
                 ESP does not use per-row AVBD penalty ramping: different coefficients on neighboring
-                triangle rows would break cancellation of their shared feature terms. Damping and
-                analytical contact retain their existing parameters.
+                triangle rows would break cancellation of their shared feature terms.
+                Damping uses the native approach-only normal damper at each ESP feature, with
+                the arithmetic mean of soft kd and the actual target shape's kd. It uses the
+                same signed incidence and fixed quadrature weights as friction, not the OGC row mask.
+                Analytical contact retains its existing law and parameters.
                 Each friction term uses its own closest point, normal, material slip, and load from
                 its distance-potential derivative, with signed incidence, rest-area, and quadrature weights.
                 Friction geometry, loads, interpolation, and weights are frozen during differentiation
@@ -2541,7 +2544,6 @@ class SolverVBD(SolverBase, CouplingInterface):
             block_dim=self._esp_block_dim,
             partitions=partitions,
             use_friction=self.model.soft_contact_mu > 0.0 and dt > 0.0,
-            body_particle_contact_material_kd=self.body_particle_contact_material_kd,
             particle_q_prev=self.particle_q_prev,
             body_q_prev=self.body_q_prev if self.model.body_count else None,
             dt=dt,

@@ -856,11 +856,15 @@ def test_edge_probes(device):
         # rows. Reversing the imposed slip reverses every primitive's friction.
         ep, fp, plus = probe.evaluate(probe.rest_triangle_np[:2], support, 1.0, friction_slip=(0.001, 0, 0))
         em, fm, minus = probe.evaluate(probe.rest_triangle_np[:2], support, 1.0, friction_slip=(-0.001, 0, 0))
-        assert probe.solver.body_particle_contact_material_kd.shape[0] >= probe.contacts.soft_contact_max
-        np.testing.assert_array_equal(probe.solver.body_particle_contact_material_kd.numpy(), 0)
+        assert probe.model.soft_contact_kd == 0
+        np.testing.assert_array_equal(probe.model.shape_material_kd.numpy(), 0)
         np.testing.assert_allclose(ep, em)
         np.testing.assert_allclose(fp, fm)
-        np.testing.assert_allclose(plus["friction_force"], -minus["friction_force"], rtol=2e-5, atol=1e-6)
+        # The overlay subtracts the conservative FP32 total to display friction.
+        # Check F(+slip) = 2*F(0) - F(-slip) at the total-force scale: rounding
+        # that subtraction can dominate a small friction component. Independent
+        # per-feature friction checks live in test_solver_vbd_esp_friction.py.
+        np.testing.assert_allclose(fp + plus["friction_force"], fm - minus["friction_force"], rtol=2e-5, atol=1e-6)
         assert np.sum(plus["friction_force"][:, 0]) < 0
         print(f"EE {SCENES[scene]}: signed per-primitive opposing-slip friction PASS", flush=True)
         # Same endpoints/topology and rest weights, but a cutoff below the gap:
