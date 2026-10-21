@@ -72,10 +72,10 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
                     ta, tb, tc, ids, area = c, d, rt, wp.vec3i(2, 3, 4), scalar(0.018)
                     if direction == 1:
                         ta, tb, tc, ids, area = a, b, st, wp.vec3i(0, 1, 5), scalar(0.024)
-                    particle_mask = source_mask
+                    particle_derivative_mask = source_mask
                     for corner in range(3):
                         if ids[corner] == selected_vertex:
-                            particle_mask |= 1 << (corner + 4)
+                            particle_derivative_mask |= 1 << (corner + 4)
                     e, g, parameter_gradient, h, _dissipative_gradient, _dissipative_hessian = triangle_contribution(
                         pair,
                         ta,
@@ -83,7 +83,7 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
                         tc,
                         direction == 0,
                         direction == 0,
-                        particle_mask,
+                        particle_derivative_mask,
                         edges,
                         vertices,
                         scalar(1.0),
@@ -99,13 +99,13 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
                 ta, tb, tc, ids, area = c, d, rt, wp.vec3i(2, 3, 4), scalar(0.018)
                 if direction == 1:
                     ta, tb, tc, ids, area = a, b, st, wp.vec3i(0, 1, 5), scalar(0.024)
-                particle_mask = int(0)
+                particle_derivative_mask = int(0)
                 for i in range(7):
                     original = i
                     if i >= 4:
                         original = ids[i - 4]
                     if original == selected_vertex:
-                        particle_mask |= 1 << i
+                        particle_derivative_mask |= 1 << i
                 e, g, h = evaluate_direct(
                     a,
                     b,
@@ -115,7 +115,7 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
                     tb,
                     tc,
                     direction == 0,
-                    particle_mask,
+                    particle_derivative_mask,
                     com,
                     edges,
                     vertices,

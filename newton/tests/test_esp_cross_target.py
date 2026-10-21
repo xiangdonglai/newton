@@ -292,7 +292,11 @@ class TestEspCrossTarget(unittest.TestCase):
                     fp, hp = solver._esp_particle_forces.numpy().copy(), solver._esp_particle_hessians.numpy().copy()
                     fb, hb = solver._esp_body_forces.numpy().copy(), solver._esp_body_hessians.numpy().copy()
                     owners = model.shape_body.numpy()[solver._esp_data.rigid_vertex_shapes.numpy()]
-                    for particle in (0, 1, 3, 4, 5):
+                    # 0/1 generate the EE sample; 2 is their triangle's other
+                    # corner; 3/4/5 belong to a separate target patch. Check all
+                    # six so target-only derivatives and endpoint exclusion
+                    # are tested against the independent energy, not each other.
+                    for particle in range(model.particle_count):
                         direction = rng.normal(size=3)
                         direction /= np.linalg.norm(direction)
                         step = 2e-7

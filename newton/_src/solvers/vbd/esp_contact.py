@@ -675,9 +675,14 @@ def triangle_energy(
     return result
 
 
+# Endpoint mollifier epsilon from the ESP supplement, S9, Eq. (S5).
+_EE_ENDPOINT_EPS = wp.constant(0.01)
+
+
 @wp.func
 def ee_endpoint_weight(excess: float, distance_sq: float) -> float:
-    x = wp.clamp(excess / (0.01 * distance_sq), 0.0, 1.0)
+    """Evaluate one endpoint factor from supplement S9, Eq. (S5)."""
+    x = wp.clamp(excess / (_EE_ENDPOINT_EPS * distance_sq), 0.0, 1.0)
     return x * (2.0 - x)
 
 
@@ -1198,13 +1203,14 @@ def _make_ee_block_functions(size: int):
     Only the solve-block size varies: particle and body functions share the
     same float32 formulas without padding 3D blocks or duplicating the derivation.
 
-    For one selected particle/body coordinate vector z, closest parameters
-    s,t satisfy g=(u.r, v.r)=0, where r is the edge-point difference and
-    u,v its derivatives with respect to s,t. With y=(z,s,t) and
-    T=[I; ds/dz; dt/dz], the final scalar energy F=w*sum(area*P) obeys
+    X collects the selected particle's 3 position DoFs, or the selected
+    body's 6 DoFs (COM translation followed by world rotation).
+    Closest parameters s,t satisfy g=(u.r, v.r)=0, where r is the edge-point
+    difference and u,v its derivatives with respect to s,t. With y=(X,s,t)
+    and T=[I; ds/dX; dt/dX], the final scalar energy F=w*sum(area*P) obeys
 
-        grad(E) = T.T * grad_y(F)
-        H(E) = T.T * (H_y(F) - lambda_s*H_y(g_s)
+        dE/dX = T.T * grad_y(F)
+        d2E/dX2 = T.T * (H_y(F) - lambda_s*H_y(g_s)
                                     - lambda_t*H_y(g_t)) * T,
         lambda = transpose(dg/d(s,t))^(-1) * dF/d(s,t).
 
@@ -1231,35 +1237,70 @@ def _make_ee_block_functions(size: int):
         fixed numerical origin during differentiation. s/t are the interior
         closest parameters on the soft/rigid edges. Their gradients and the
         constraint Jacobians implement the explicit implicit-function
-        formula stated above. log_weight_* are partial derivatives restricted
-        to the first-order motion (z,s(z),t(z)); finish_ee_pair supplies the
-        remaining closest-parameter curvature for the FINAL energy.
+        formula stated above. Derivative names state the quantity and variable:
+        dudX means du/dX; a dst suffix means partial derivatives with respect
+        to (s,t), holding X fixed. The _no_st_curvature suffix excludes terms
+        involving d²s/dX² and d²t/dX²; finish_ee_pair adds their contribution
+        to the final energy Hessian.
         """
 
+        # World position a, held fixed as the numerical origin during differentiation.
         origin: wp.vec3
+        # Seven offsets in world axes, with a as origin. Initially:
+        # positions = [0, b-a, c-a, d-a, 0, 0, 0]
+        # Each triangle evaluation fills rows 4..6 with
+        # [target_a-a, target_b-a, target_c-a] in a local copy.
         positions: positions_type
+        # Selected body's COM minus origin; unused by the particle-only formulas.
         com: wp.vec3
+        # Bits 0..3 select occurrences of the differentiated particle in (a,b,c,d).
+        # Body formulas ignore this mask and move c,d together instead.
+        particle_derivative_mask: int
+        # u=b-a=dq/ds, using the same rounded axis as the closest-parameter solve.
+        u: wp.vec3
+        # v=c-d=d(q-q_bar)/dt: opposite to the rigid edge's c-to-d direction.
+        v: wp.vec3
+        # Interior soft-edge parameter: q=(1-s)*a+s*b.
         s: float
+        # Interior rigid-edge parameter: q_bar=(1-t)*c+t*d.
         t: float
-        ds: vector
-        dt: vector
-        r00: float
-        r01: float
-        r11: float
-        weight: float
-        log_weight_gradient: vector
-        log_weight_parameters: wp.vec2
-        log_weight_hessian: matrix
-        particle_mask: int
-        residual_jacobian: jacobian
-        soft_axis_jacobian: jacobian
-        rigid_axis_jacobian: jacobian
-        soft_axis: wp.vec3
-        rigid_axis: wp.vec3
-        # Centered sample values for early rejection; their motion is still
-        # differentiated through s/t in each triangle's energy contribution.
+        # q-origin: centered soft closest point, also used for early distance rejection.
         soft_sample: wp.vec3
+        # q_bar-origin: centered rigid closest point, also used for early distance rejection.
         rigid_sample: wp.vec3
+        # EE quadrature weight: near-distance factor times four endpoint factors;
+        # zero marks an inactive pair. Source-area factors are not included.
+        weight: float
+        # Decompose the edge directions u=b-a and v=c-d using perpendicular
+        # unit vectors e0 along u and e1 in the plane spanned by u,v:
+        #     u = R00*e0,   v = R01*e0 + R11*e1.
+        # Equivalently, [u v] = Q*R, where Q=[e0 e1] and
+        # R=[[R00, R01], [0, R11]]. This is a thin QR decomposition:
+        # Q is 3x2 with orthonormal columns; R is 2x2 and upper triangular.
+        # Solving with R avoids the cancellation-prone determinant |u|^2|v|^2-(u.v)^2.
+        # Soft-edge length: R00=|u|.
+        R00: float
+        R01: float
+        R11: float
+        # Gradients ds/dX and dt/dX, accounting for how the closest pair changes with X.
+        dsdX: vector
+        dtdX: vector
+        # 3-by-size Jacobian d(q-q_bar)/dX with s,t held fixed.
+        drdX_fixed_st: jacobian
+        # 3-by-size Jacobian du/dX of the soft edge direction.
+        dudX: jacobian
+        # 3-by-size Jacobian dv/dX of the reversed rigid edge direction.
+        dvdX: jacobian
+        # Gradient of log(weight) with respect to X, including ds/dX and dt/dX.
+        dlogwdX: vector
+        # Partial derivatives of log(weight) with respect to (s,t), at fixed X.
+        dlogwdst: wp.vec2
+        # T.T * [d²(log w)/d(X,s,t)²] * T, with T=[I; ds/dX; dt/dX].
+        # The middle matrix treats X, s, t as independent variables,
+        # temporarily ignoring the dependence of s and t on X.
+        # Omits terms involving d²s/dX² and d²t/dX²; finish_ee_pair includes
+        # their contribution when assembling the final energy Hessian.
+        d2logwdX2_no_st_curvature: matrix
 
     @wp.func
     def position_sum(positions: positions_type, coefficients: vec7):
@@ -1267,15 +1308,19 @@ def _make_ee_block_functions(size: int):
 
     @wp.func
     def motion_jacobian(
-        positions: positions_type, coefficients: vec7, particle_mask: int, target_moves_with_body: bool, com: wp.vec3
+        positions: positions_type,
+        coefficients: vec7,
+        particle_derivative_mask: int,
+        target_moves_with_body: bool,
+        com: wp.vec3,
     ):
-        """Physical motion of sum_i coefficients[i]*x_i, at fixed coefficients."""
+        """Differentiate sum_i coefficients[i]*x_i at fixed coefficients."""
         coefficient_sum, offset = float(0.0), wp.vec3()
         for i in range(7):
-            moves = (particle_mask & (1 << i)) != 0
+            differentiate_position = (particle_derivative_mask & (1 << i)) != 0
             if wp.static(size == 6):
-                moves = i == 2 or i == 3 or (i >= 4 and target_moves_with_body)
-            if moves:
+                differentiate_position = i == 2 or i == 3 or (i >= 4 and target_moves_with_body)
+            if differentiate_position:
                 coefficient_sum += coefficients[i]
                 offset += coefficients[i] * (positions[i] - com)
         result = jacobian()
@@ -1310,53 +1355,79 @@ def _make_ee_block_functions(size: int):
     @wp.func
     def residual_second(
         positions: positions_type,
-        coefficients: vec7,
-        coefficient_s: vec7,
-        coefficient_t: vec7,
-        ds: vector,
-        dt: vector,
+        residual_coefficients: vec7,
+        residual_coefficients_s: vec7,
+        residual_coefficients_t: vec7,
+        dsdX: vector,
+        dtdX: vector,
         normal: wp.vec3,
-        particle_mask: int,
+        particle_derivative_mask: int,
         target_moves_with_body: bool,
         com: wp.vec3,
     ):
         # The only extra second derivatives are mixed x-s and x-t terms:
         # r=sum_i c_i(s,t)x_i; c_i is linear in s,t.
-        js = motion_jacobian(positions, coefficient_s, particle_mask, target_moves_with_body, com)
-        jt = motion_jacobian(positions, coefficient_t, particle_mask, target_moves_with_body, com)
+        js = motion_jacobian(positions, residual_coefficients_s, particle_derivative_mask, target_moves_with_body, com)
+        jt = motion_jacobian(positions, residual_coefficients_t, particle_derivative_mask, target_moves_with_body, com)
         gs, gt = wp.transpose(js) * normal, wp.transpose(jt) * normal
         return (
-            residual_curvature(positions, coefficients, normal, target_moves_with_body, com)
-            + wp.outer(gs, ds)
-            + wp.outer(ds, gs)
-            + wp.outer(gt, dt)
-            + wp.outer(dt, gt)
+            residual_curvature(positions, residual_coefficients, normal, target_moves_with_body, com)
+            + wp.outer(gs, dsdX)
+            + wp.outer(dsdX, gs)
+            + wp.outer(gt, dtdX)
+            + wp.outer(dtdX, gt)
         )
 
     @wp.func
-    def feature_distance(
+    def feature_distance_derivatives(
         positions: positions_type,
         source_coefficients: vec7,
-        coefficient_s: vec7,
-        coefficient_t: vec7,
+        source_coefficients_s: vec7,
+        source_coefficients_t: vec7,
         target_vertex_slots: wp.vec3i,
         dimension: int,
-        ds: vector,
-        dt: vector,
-        particle_mask: int,
+        dsdX: vector,
+        dtdX: vector,
+        particle_derivative_mask: int,
         target_moves_with_body: bool,
         com: wp.vec3,
     ):
-        """Return D, total first derivative, partial (s,t) derivative, reduced H.
+        """Compute squared distance D and its particle/body derivatives.
 
-        D is the minimized squared distance to a point/edge/triangle.
-        Eliminate its closest parameters with the Schur complement, projecting
-        before squaring to avoid cancellation of large tangential derivatives.
+        X is the selected particle's 3 position coordinates or the body's 6
+        COM-translation/world-rotation coordinates (size=3 or 6). For dimension=0/1/2, D
+        is the squared distance from the source sample to the closest point
+        on a target vertex/edge/triangle. Account for that closest point
+        sliding along the target; project before squaring to avoid cancellation
+        of large tangential derivatives.
         target_vertex_slots index the local positions matrix, not model vertices.
         dimension=-1 evaluates |source_coefficients·positions|² with no target subtraction.
+        The _s/_t suffixes denote partial derivatives of source_coefficients
+        with respect to s/t, holding endpoint positions fixed.
+
+        Returns:
+            distance_squared: Scalar D=dot(r,r), not distance or contact energy.
+            gradient: Length-size gradient dD/dX, including the supplied
+                ds/dX and dt/dX and accounting for the closest target point.
+            parameter_gradient: Two partial derivatives (dD/ds, dD/dt) at
+                fixed X. These are not the supplied ds/dX and dt/dX.
+            hessian: Size-by-size second-derivative contribution including
+                first derivatives ds/dX and dt/dX, but excluding
+                parameter_gradient[0]*d²s/dX² + parameter_gradient[1]*d²t/dX².
+                finish_ee_pair handles these parameter-curvature terms when
+                assembling the final energy Hessian.
+            residual_coefficients: Seven weights on positions giving source
+                minus closest target point. They include the negative target
+                barycentric weights; dimension=-1 leaves source_coefficients
+                unchanged. Reused for relative material displacement.
+            r: Three-component source-minus-target vector in world axes
+                (the supplied residual itself when dimension=-1).
+            fixed_jacobian: 3-by-size derivative of r with respect to X,
+                holding s,t and the target barycentric weights fixed. Used
+                for the fixed-contact-geometry friction/damping calculation.
         """
         p = position_sum(positions, source_coefficients)
-        coefficients = source_coefficients
+        residual_coefficients = source_coefficients
         closest_vertex_slots, dim = target_vertex_slots, dimension
         barycentric = wp.vec3(1.0, 0.0, 0.0)
         if dim == 2:
@@ -1397,21 +1468,23 @@ def _make_ee_block_functions(size: int):
             else:
                 barycentric = wp.vec3(1.0 - t, t, 0.0)
         for i in range(dim + 1):
-            coefficients[closest_vertex_slots[i]] -= barycentric[i]
-        residual = position_sum(positions, coefficients)
-        axis_s, axis_t = position_sum(positions, coefficient_s), position_sum(positions, coefficient_t)
-        partial_parameters = 2.0 * wp.vec2(wp.dot(axis_s, residual), wp.dot(axis_t, residual))
-        fixed_jacobian = motion_jacobian(positions, coefficients, particle_mask, target_moves_with_body, com)
-        j = fixed_jacobian + wp.outer(axis_s, ds) + wp.outer(axis_t, dt)
+            residual_coefficients[closest_vertex_slots[i]] -= barycentric[i]
+        r = position_sum(positions, residual_coefficients)
+        axis_s, axis_t = position_sum(positions, source_coefficients_s), position_sum(positions, source_coefficients_t)
+        partial_parameters = 2.0 * wp.vec2(wp.dot(axis_s, r), wp.dot(axis_t, r))
+        fixed_jacobian = motion_jacobian(
+            positions, residual_coefficients, particle_derivative_mask, target_moves_with_body, com
+        )
+        j = fixed_jacobian + wp.outer(axis_s, dsdX) + wp.outer(axis_t, dtdX)
         second = residual_second(
             positions,
-            coefficients,
-            coefficient_s,
-            coefficient_t,
-            ds,
-            dt,
-            residual,
-            particle_mask,
+            residual_coefficients,
+            source_coefficients_s,
+            source_coefficients_t,
+            dsdX,
+            dtdX,
+            r,
+            particle_derivative_mask,
             target_moves_with_body,
             com,
         )
@@ -1425,8 +1498,8 @@ def _make_ee_block_functions(size: int):
             basis0 = axis0 / length0
             along0 = wp.transpose(j) * basis0
             change0 = (
-                wp.transpose(motion_jacobian(positions, edge0, particle_mask, target_moves_with_body, com))
-                * residual
+                wp.transpose(motion_jacobian(positions, edge0, particle_derivative_mask, target_moves_with_body, com))
+                * r
                 / length0
             )
             perpendicular = j - wp.outer(basis0, along0)
@@ -1438,23 +1511,25 @@ def _make_ee_block_functions(size: int):
                 axis1 = position_sum(positions, edge1)
                 normal = wp.normalize(wp.cross(axis0, axis1))
                 basis1 = wp.cross(normal, basis0)
-                r01, r11 = wp.dot(basis0, axis1), wp.dot(basis1, axis1)
+                R01, R11 = wp.dot(basis0, axis1), wp.dot(basis1, axis1)
                 along1 = wp.transpose(j) * basis1
                 change1 = (
-                    wp.transpose(motion_jacobian(positions, edge1, particle_mask, target_moves_with_body, com))
-                    * residual
-                    - r01 * change0
-                ) / r11
+                    wp.transpose(
+                        motion_jacobian(positions, edge1, particle_derivative_mask, target_moves_with_body, com)
+                    )
+                    * r
+                    - R01 * change0
+                ) / R11
                 perpendicular -= wp.outer(basis1, along1)
                 correction += wp.outer(along1, change1) + wp.outer(change1, along1) + wp.outer(change1, change1)
             squared = wp.transpose(perpendicular) * perpendicular - correction
         return (
-            wp.dot(residual, residual),
-            2.0 * wp.transpose(j) * residual,
+            wp.dot(r, r),
+            2.0 * wp.transpose(j) * r,
             partial_parameters,
             2.0 * (squared + second),
-            coefficients,
-            residual,
+            residual_coefficients,
+            r,
             fixed_jacobian,
         )
 
@@ -1465,9 +1540,9 @@ def _make_ee_block_functions(size: int):
         s: float,
         t: float,
         endpoint_offset: float,
-        ds: vector,
-        dt: vector,
-        particle_mask: int,
+        dsdX: vector,
+        dtdX: vector,
+        particle_derivative_mask: int,
         com: wp.vec3,
     ):
         """Analytical derivatives of the stable endpoint excess.
@@ -1479,19 +1554,19 @@ def _make_ee_block_functions(size: int):
         own = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         other = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
         # Use the directly evaluated small offset; its derivative is still
-        # -ds or -dt because the endpoint parameter is constant (zero or one).
+        # -dsdX or -dtdX because the endpoint parameter is constant (zero or one).
         h, other_parameter = endpoint_offset, t
-        gh, go = -ds, dt
+        gh, go = -dsdX, dtdX
         zh, zo = wp.vec2(-1.0, 0.0), wp.vec2(0.0, 1.0)
         if endpoint >= 2:
             own, other = other, own
             other_parameter = s
-            gh, go = -dt, ds
+            gh, go = -dtdX, dsdX
             zh, zo = wp.vec2(0.0, -1.0), wp.vec2(1.0, 0.0)
         u, v = position_sum(positions, own), position_sum(positions, other)
         value, projection = ee_endpoint_excess(h, other_parameter, u, v)
-        ju = motion_jacobian(positions, own, particle_mask, False, com)
-        jv = motion_jacobian(positions, other, particle_mask, False, com)
+        ju = motion_jacobian(positions, own, particle_derivative_mask, False, com)
+        jv = motion_jacobian(positions, other, particle_derivative_mask, False, com)
 
         if projection <= 0.0 or projection >= 1.0:
             # The opposite closest point is a fixed endpoint. The excess is
@@ -1500,7 +1575,9 @@ def _make_ee_block_functions(size: int):
             tangent = h * u + k * v
             j = h * ju + k * jv + wp.outer(u, gh) + wp.outer(v, go)
             cs, ct = zh[0] * own + zo[0] * other, zh[1] * own + zo[1] * other
-            second = residual_second(positions, h * own + k * other, cs, ct, ds, dt, tangent, particle_mask, False, com)
+            second = residual_second(
+                positions, h * own + k * other, cs, ct, dsdX, dtdX, tangent, particle_derivative_mask, False, com
+            )
             return (
                 value,
                 2.0 * wp.transpose(j) * tangent,
@@ -1543,21 +1620,69 @@ def _make_ee_block_functions(size: int):
         )
 
     @wp.func
+    def particle_ee_jacobians(s: float, t: float, particle_derivative_mask: int):
+        """Return dr/dX, du/dX, dv/dX for a particle position X, at fixed s,t.
+
+        r=(1-s)*a+s*b-(1-t)*c-t*d, u=b-a, v=c-d. Mask bits 0..3
+        identify which endpoints are X; multiple bits may select the same
+        particle. Each indicator gives da/dX=diff_a*I, and likewise for b,c,d.
+        """
+        diff_a = float((particle_derivative_mask & 1) != 0)
+        diff_b = float((particle_derivative_mask & 2) != 0)
+        diff_c = float((particle_derivative_mask & 4) != 0)
+        diff_d = float((particle_derivative_mask & 8) != 0)
+        identity = wp.identity(n=3, dtype=float)
+        drdX_fixed_st = ((1.0 - s) * diff_a + s * diff_b - (1.0 - t) * diff_c - t * diff_d) * identity
+        dudX = (diff_b - diff_a) * identity
+        dvdX = (diff_c - diff_d) * identity
+        return drdX_fixed_st, dudX, dvdX
+
+    @wp.func
+    def body_ee_jacobians(c: wp.vec3, d: wp.vec3, com: wp.vec3, t: float):
+        """Return dr/dX, dv/dX for X=[COM translation, world rotation].
+
+        Hold s,t fixed. Only c,d belong to this body, so du/dX=0,
+        dr/dX=[-I, skew(q_bar-COM)], and dv/dX=[0, -skew(c-d)].
+        c,d,com must use the same coordinate frame and numerical origin.
+        """
+        # Keep the COM-relative endpoint arithmetic used by the remaining
+        # derivative calculations to preserve their float32 rounding.
+        c_offset = c - com
+        d_offset = d - com
+        rigid_sample_offset = (1.0 - t) * c_offset + t * d_offset
+        residual_rotation = wp.skew(rigid_sample_offset)
+        v_rotation = -wp.skew(c_offset - d_offset)
+        drdX_fixed_st, dvdX = jacobian(), jacobian()
+        for i in range(3):
+            drdX_fixed_st[i, i] = -1.0
+            for j in range(3):
+                drdX_fixed_st[i, j + 3] = residual_rotation[i, j]
+                dvdX[i, j + 3] = v_rotation[i, j]
+        return drdX_fixed_st, dvdX
+
+    @wp.func
     def prepare_ee_pair(
         a: wp.vec3,
         b: wp.vec3,
         c: wp.vec3,
         d: wp.vec3,
-        particle_mask: int,
+        particle_derivative_mask: int,
         com_world: wp.vec3,
         near: float,
     ):
         """Compute shared closest parameters, weight, and implicit coefficients.
 
-        (a,b) is soft, (c,d) is rigid. Particle mask bits 0..3 identify which
+        (a,b) is soft, (c,d) is rigid. particle_derivative_mask bits 0..3 identify which
         endpoint is the selected particle; zero also allows a target-only
         particle. For a body block, c/d move about com_world. Target vertices
         do not enter this calculation. A zero weight marks an inactive pair.
+
+        X is the selected particle's 3 position coordinates or the body's 6
+        COM-translation/world-rotation coordinates. With closest points q and
+        q_bar, r=q-q_bar, D=dot(r,r), and xi=2*sqrt(D)/near. The EE weight w
+        is the distance step S times four endpoint factors. Names such as
+        dDdX and dxidD specify both the quantity and differentiation variable;
+        dst denotes partial derivatives with respect to (s,t), holding X fixed.
         """
         pair = EdgePairCoefficients()
         positions = positions_type()
@@ -1573,130 +1698,156 @@ def _make_ee_block_functions(size: int):
         t = wp.dot(ee_cross(u, c - a), cross) / denominator
         if s <= 0.0 or s >= 1.0 or t <= 0.0 or t >= 1.0:
             return pair
-        soft = vec7(1.0 - s, s, 0.0, 0.0, 0.0, 0.0, 0.0)
-        rigid = vec7(0.0, 0.0, 1.0 - t, t, 0.0, 0.0, 0.0)
-        soft_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        rigid_t = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
-        coefficients, coefficient_s, coefficient_t = soft - rigid, soft_s, -rigid_t
-        residual = position_sum(positions, coefficients)
-        distance_sq = wp.dot(residual, residual)
-        if distance_sq <= 0.0 or distance_sq >= near * near:
+        # Coefficients multiply the seven rows of positions. These interpolate
+        # q-origin and q_bar-origin; their difference gives r=q-q_bar.
+        soft_sample_coefficients = vec7(1.0 - s, s, 0.0, 0.0, 0.0, 0.0, 0.0)
+        rigid_sample_coefficients = vec7(0.0, 0.0, 1.0 - t, t, 0.0, 0.0, 0.0)
+        residual_coefficients = soft_sample_coefficients - rigid_sample_coefficients
+        # Partial derivatives of those residual coefficients, at fixed endpoints:
+        # dr/ds=b-a=u; dr/dt=c-d=v (note the rigid-side sign).
+        residual_coefficients_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        residual_coefficients_t = vec7(0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0)
+        # r=q-q_bar; D is their squared distance, not the distance itself.
+        r = position_sum(positions, residual_coefficients)
+        D = wp.dot(r, r)
+        if D <= 0.0 or D >= near * near:
             return pair
 
         # Squaring and square root can round differently at the cutoff.
         # In particular D<near² does not imply 2*sqrt(D)/near<2.
         # Reject a zero cubic weight BEFORE any logarithmic divisions.
-        x = 2.0 * wp.sqrt(distance_sq) / near
-        weight, dw, ddw = float(0.0), float(0.0), float(0.0)
-        if x < 1.0:
-            weight = 1.0 - 1.5 * x * x + 0.75 * x * x * x
-            dw, ddw = -3.0 * x + 2.25 * x * x, -3.0 + 4.5 * x
+        xi = 2.0 * wp.sqrt(D) / near
+        weight, dSdxi, d2Sdxi2 = float(0.0), float(0.0), float(0.0)
+        # Here weight is only S(d), the paper's distance step (supplement S9).
+        # Evaluate it in the normalized distance xi; dSdxi and d2Sdxi2 are
+        # derivatives with respect to xi, not D or X. The four-endpoint loop
+        # multiplies in mu later, giving w=S(d)*mu.
+        if xi < 1.0:
+            weight = 1.0 - 1.5 * xi * xi + 0.75 * xi * xi * xi
+            dSdxi, d2Sdxi2 = -3.0 * xi + 2.25 * xi * xi, -3.0 + 4.5 * xi
         else:
-            gap = 2.0 - x
-            weight, dw, ddw = gap * gap * gap / 4.0, -0.75 * gap * gap, 1.5 * gap
+            gap = 2.0 - xi
+            weight, dSdxi, d2Sdxi2 = gap * gap * gap / 4.0, -0.75 * gap * gap, 1.5 * gap
         if weight <= 0.0:
             return pair
 
         # Solve the two closest-parameter equations using a 3x2 QR, without
         # forming a Gram determinant that loses tiny but representable angles.
-        r00 = wp.length(u)
-        basis0 = u / r00
-        basis1 = wp.cross(cross / wp.sqrt(denominator), basis0)
-        r01, r11 = wp.dot(basis0, v), wp.dot(basis1, v)
-        j_fixed = motion_jacobian(positions, coefficients, particle_mask, False, com)
-        js = motion_jacobian(positions, coefficient_s, particle_mask, False, com)
-        jt = motion_jacobian(positions, coefficient_t, particle_mask, False, com)
-        change0 = wp.transpose(js) * residual / r00
-        change1 = (wp.transpose(jt) * residual - r01 * change0) / r11
-        dt = -(wp.transpose(j_fixed) * basis1 + change1) / r11
-        ds = -(wp.transpose(j_fixed) * basis0 + change0 + r01 * dt) / r00
-        distance_sq, gd, zd, hd, _coefficients, _residual, _fixed_jacobian = feature_distance(
-            positions,
-            coefficients,
-            coefficient_s,
-            coefficient_t,
-            wp.vec3i(-1),
-            -1,
-            ds,
-            dt,
-            particle_mask,
-            False,
-            com,
+        pair.R00 = wp.length(u)
+        e0 = u / pair.R00
+        e1 = wp.cross(cross / wp.sqrt(denominator), e0)
+        pair.R01 = wp.dot(e0, v)
+        pair.R11 = wp.dot(e1, v)
+        # Differentiate r=(1-s)*a+s*b-(1-t)*c-t*d, u=b-a, v=c-d,
+        # holding s,t fixed here. The numerical origin stays fixed as well:
+        # positions[0]==0 does NOT mean that da/dX is zero.
+        # Warp requires local variables when unpacking multiple return values.
+        if wp.static(size == 3):
+            drdX_fixed_st, dudX, dvdX = particle_ee_jacobians(s, t, particle_derivative_mask)
+        else:
+            drdX_fixed_st, dvdX = body_ee_jacobians(positions[2], positions[3], com, t)
+            dudX = jacobian()  # The soft edge is independent of this body.
+        pair.drdX_fixed_st = drdX_fixed_st
+        pair.dudX = dudX
+        pair.dvdX = dvdX
+        # Keep these small Jacobians for finish_ee_pair: combining weighted
+        # axes there avoids subtracting large, nearly equal Hessians.
+
+        # Interior closest points satisfy dot(e0,r)=dot(e1,r)=0.
+        # Differentiating gives (de_i/dX).T*r + (dr/dX).T*e_i = 0.
+        # de0dX_dot_r/de1dX_dot_r are those first terms; the full dr/dX is
+        # drdX_fixed_st + u*dsdX.T + v*dtdX.T. Substitution gives the
+        # triangular solve below: first find dtdX, then dsdX.
+        de0dX_dot_r = wp.transpose(pair.dudX) * r / pair.R00
+        de1dX_dot_r = (wp.transpose(pair.dvdX) * r - pair.R01 * de0dX_dot_r) / pair.R11
+        dtdX = -(wp.transpose(pair.drdX_fixed_st) * e1 + de1dX_dot_r) / pair.R11
+        dsdX = -(wp.transpose(pair.drdX_fixed_st) * e0 + de0dX_dot_r + pair.R01 * dtdX) / pair.R00
+        D, dDdX, dDdst, d2DdX2_no_st_curvature, _residual_coefficients, _r, _drdX_fixed_st = (
+            feature_distance_derivatives(
+                positions,
+                residual_coefficients,
+                residual_coefficients_s,
+                residual_coefficients_t,
+                wp.vec3i(-1),
+                -1,
+                dsdX,
+                dtdX,
+                particle_derivative_mask,
+                False,
+                com,
+            )
         )
 
-        # Explicit log-weight derivatives; final w*P derivatives are assembled
-        # once below. No generic multiply/divide derivative machinery is used.
-        dx = 1.0 / (near * wp.sqrt(distance_sq))
-        ddx = -0.5 * dx / distance_sq
-        log_first = dw * dx / weight
-        log_second = (ddw * dx * dx + dw * ddx) / weight - log_first * log_first
-        log_gradient, log_parameters = log_first * gd, log_first * zd
-        log_hessian = log_first * hd + log_second * wp.outer(gd, gd)
+        # Differentiate log(S) with respect to D, then X and (s,t).
+        # All _no_st_curvature matrices omit terms involving d²s/dX² and
+        # d²t/dX²; finish_ee_pair adds them for the final energy w*P.
+        dxidD = 1.0 / (near * wp.sqrt(D))
+        d2xidD2 = -0.5 * dxidD / D
+        dlogSdD = dSdxi * dxidD / weight
+        d2logSdD2 = (d2Sdxi2 * dxidD * dxidD + dSdxi * d2xidD2) / weight - dlogSdD * dlogSdD
+        pair.dlogwdX = dlogSdD * dDdX
+        pair.dlogwdst = dlogSdD * dDdst
+        pair.d2logwdX2_no_st_curvature = dlogSdD * d2DdX2_no_st_curvature + d2logSdD2 * wp.outer(dDdX, dDdX)
+        inv_eps = wp.static(1.0 / _EE_ENDPOINT_EPS)
         for endpoint in range(4):
             # Constant endpoint factors need no derivatives. Use the same
             # nonnegative excess formula as the cached sample/value path.
+            # h is this endpoint's parameter minus its edge's closest parameter.
             h = ee_endpoint_parameter_offset(endpoint, a, b, c, d)
             other_parameter, own_axis, other_axis = t, u, -v
             if endpoint >= 2:
                 other_parameter, own_axis, other_axis = s, -v, u
-            excess_value, _projection = ee_endpoint_excess(h, other_parameter, own_axis, other_axis)
-            excess = 100.0 * excess_value / distance_sq
-            if excess >= 1.0:
+            # Delta=d_endpoint²-D, where d_endpoint is the distance from this
+            # endpoint to the opposite segment. Evaluate the excess directly
+            # to avoid subtracting nearly equal squared distances.
+            Delta, _projection = ee_endpoint_excess(h, other_parameter, own_axis, other_axis)
+            # Eq. (S5): z=Delta/(eps*D); the endpoint factor reaches one at z=1.
+            z = inv_eps * Delta / D
+            if z >= 1.0:
                 continue
-            if excess <= 0.0:
+            if z <= 0.0:
                 return pair
-            if excess < 1.0:
-                delta, ge, ze, he = endpoint_excess_derivatives(
-                    positions, endpoint, s, t, h, ds, dt, particle_mask, com
+            if z < 1.0:
+                Delta, dDeltadX, dDeltadst, d2DeltadX2_no_st_curvature = endpoint_excess_derivatives(
+                    positions, endpoint, s, t, h, dsdX, dtdX, particle_derivative_mask, com
                 )
-                # z=100*delta/D. Differentiate delta itself, not ep-D.
-                ratio = delta / distance_sq
-                ge_scaled, gd_scaled = ge / distance_sq, gd / distance_sq
-                gz = 100.0 * (ge_scaled - ratio * gd_scaled)
-                zz = 100.0 * (ze / distance_sq - ratio * (zd / distance_sq))
-                hz = 100.0 * (
-                    he / distance_sq
-                    - ratio * (hd / distance_sq)
-                    - wp.outer(ge_scaled, gd_scaled)
-                    - wp.outer(gd_scaled, ge_scaled)
-                    + 2.0 * ratio * wp.outer(gd_scaled, gd_scaled)
+                # z=Delta/(eps*D); differentiate this quotient explicitly.
+                Delta_over_D = Delta / D
+                dDeltadX_over_D, dDdX_over_D = dDeltadX / D, dDdX / D
+                dzdX = inv_eps * (dDeltadX_over_D - Delta_over_D * dDdX_over_D)
+                dzdst = inv_eps * (dDeltadst / D - Delta_over_D * (dDdst / D))
+                d2zdX2_no_st_curvature = inv_eps * (
+                    d2DeltadX2_no_st_curvature / D
+                    - Delta_over_D * (d2DdX2_no_st_curvature / D)
+                    - wp.outer(dDeltadX_over_D, dDdX_over_D)
+                    - wp.outer(dDdX_over_D, dDeltadX_over_D)
+                    + 2.0 * Delta_over_D * wp.outer(dDdX_over_D, dDdX_over_D)
                 )
-                factor = excess * (2.0 - excess)
-                first = 2.0 * (1.0 - excess) / factor
-                second = -2.0 / factor - first * first
-                log_gradient += first * gz
-                log_parameters += first * zz
-                log_hessian += first * hz + second * wp.outer(gz, gz)
-                weight *= factor
+                # Add derivatives of log(mu_endpoint) to log(w).
+                mu_endpoint = z * (2.0 - z)
+                dlogmudz = 2.0 * (1.0 - z) / mu_endpoint
+                d2logmudz2 = -2.0 / mu_endpoint - dlogmudz * dlogmudz
+                pair.dlogwdX += dlogmudz * dzdX
+                pair.dlogwdst += dlogmudz * dzdst
+                pair.d2logwdX2_no_st_curvature += dlogmudz * d2zdX2_no_st_curvature + d2logmudz2 * wp.outer(dzdX, dzdX)
+                weight *= mu_endpoint
 
         pair.origin = a
         pair.positions = positions
         pair.com = com
         pair.s = s
         pair.t = t
-        pair.ds = ds
-        pair.dt = dt
-        pair.r00 = r00
-        pair.r01 = r01
-        pair.r11 = r11
+        pair.dsdX = dsdX
+        pair.dtdX = dtdX
+        # Only mark the pair active after every endpoint factor is valid.
         pair.weight = weight
-        pair.log_weight_gradient = log_gradient
-        pair.log_weight_parameters = log_parameters
-        pair.log_weight_hessian = log_hessian
 
-        # Cache the small source Jacobians, not two separately formed Hessians.
-        # For nearly parallel edges those Hessians can be individually large;
-        # combine their weighted axes first in finish_ee_pair to avoid subtracting
-        # large matrices whose final result is small.
-        pair.particle_mask = particle_mask
-        pair.residual_jacobian = j_fixed
-        pair.soft_axis_jacobian = js
-        pair.rigid_axis_jacobian = jt
+        pair.particle_derivative_mask = particle_derivative_mask
         # Reuse the exact rounded axes used in the closest-parameter solve.
-        pair.soft_axis = u
-        pair.rigid_axis = v
-        pair.soft_sample = position_sum(positions, soft)
-        pair.rigid_sample = position_sum(positions, rigid)
+        pair.u = u
+        pair.v = v
+        pair.soft_sample = position_sum(positions, soft_sample_coefficients)
+        pair.rigid_sample = position_sum(positions, rigid_sample_coefficients)
         return pair
 
     @wp.func
@@ -1707,7 +1858,7 @@ def _make_ee_block_functions(size: int):
         target_c: wp.vec3,
         target_is_rigid: bool,
         target_moves_with_body: bool,
-        particle_mask: int,
+        particle_derivative_mask: int,
         edge_coefficients: wp.vec3,
         vertex_coefficients: wp.vec3,
         support: float,
@@ -1736,10 +1887,6 @@ def _make_ee_block_functions(size: int):
         positions[4] = target_a - pair.origin
         positions[5] = target_b - pair.origin
         positions[6] = target_c - pair.origin
-        soft = vec7(1.0 - pair.s, pair.s, 0.0, 0.0, 0.0, 0.0, 0.0)
-        rigid = vec7(0.0, 0.0, 1.0 - pair.t, pair.t, 0.0, 0.0, 0.0)
-        soft_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        rigid_t = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
         sample = pair.soft_sample if target_is_rigid else pair.rigid_sample
         lower = wp.min(wp.min(positions[4], positions[5]), positions[6])
         upper = wp.max(wp.max(positions[4], positions[5]), positions[6])
@@ -1747,10 +1894,18 @@ def _make_ee_block_functions(size: int):
         if pair.weight <= 0.0 or wp.dot(box_delta, box_delta) > near * near:
             return 0.0, vector(), wp.vec2(), matrix(), vector(), matrix()
 
-        # P_near = +face -sum(weight_edge*edge) +sum(weight_vertex*vertex).
-        source_coefficients, param_s, param_t = rigid, vec7(), rigid_t
+        # Select only the source sample needed for this target triangle.
+        # q depends on s; q_bar depends on t, with dq_bar/dt=d-c=-v.
         if target_is_rigid:
-            source_coefficients, param_s, param_t = soft, soft_s, vec7()
+            source_coefficients = vec7(1.0 - pair.s, pair.s, 0.0, 0.0, 0.0, 0.0, 0.0)
+            source_coefficients_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            source_coefficients_t = vec7()
+        else:
+            source_coefficients = vec7(0.0, 0.0, 1.0 - pair.t, pair.t, 0.0, 0.0, 0.0)
+            source_coefficients_s = vec7()
+            source_coefficients_t = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
+
+        # P_near = +face -sum(weight_edge*edge) +sum(weight_vertex*vertex).
         potential, gp, zp, hp = float(0.0), vector(), wp.vec2(), matrix()
         dissipative_gradient, dissipative_hessian = vector(), matrix()
         for feature_index in range(7):
@@ -1762,18 +1917,20 @@ def _make_ee_block_functions(size: int):
                 if feature_index % 2 == 0:
                     dim, coefficient = 0, vertex_coefficients[corner]
             if coefficient != 0.0:
-                value, gradient, parameters, hessian, coefficients, residual, fixed_jacobian = feature_distance(
-                    positions,
-                    source_coefficients,
-                    param_s,
-                    param_t,
-                    target_vertex_slots,
-                    dim,
-                    pair.ds,
-                    pair.dt,
-                    particle_mask,
-                    target_moves_with_body,
-                    pair.com,
+                value, gradient, parameters, hessian, residual_coefficients, r, fixed_jacobian = (
+                    feature_distance_derivatives(
+                        positions,
+                        source_coefficients,
+                        source_coefficients_s,
+                        source_coefficients_t,
+                        target_vertex_slots,
+                        dim,
+                        pair.dsdX,
+                        pair.dtdX,
+                        particle_derivative_mask,
+                        target_moves_with_body,
+                        pair.com,
+                    )
                 )
                 # Every edge/vertex lies in its triangle. If the face term is
                 # outside near support, all six remaining terms contribute zero.
@@ -1786,10 +1943,10 @@ def _make_ee_block_functions(size: int):
                 # exactly as the native friction/damping local approximation.
                 relative_displacement = sample_displacement
                 for corner in range(3):
-                    relative_displacement += coefficients[4 + corner] * triangle_displacements[corner]
+                    relative_displacement += residual_coefficients[4 + corner] * triangle_displacements[corner]
                 normal = wp.normalize(wp.cross(target_b - target_a, target_c - target_a))
                 if distance > 0.0:
-                    normal = residual / distance
+                    normal = r / distance
                 friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
                     normal, distance, first, relative_displacement, near, stiffness, mu, kd, dt, smoothing
                 )
@@ -1821,50 +1978,52 @@ def _make_ee_block_functions(size: int):
         zp: wp.vec2,
         hp: matrix,
     ):
-        """Finish E=w*S and its exact selected-block derivatives once per pair.
+        """Finish E=w*P and its exact selected-block derivatives once per pair.
 
-        gp/hp are derivatives of the area-weighted sum S along first-order
+        gp/hp are derivatives of the area-weighted potential P along first-order
         closest-parameter motion. zp is its partial derivative wrt (s,t).
-        H(E) = w H(S) + S H(w) + grad(w)grad(S)^T + grad(S)grad(w)^T,
+        H(E) = w H(P) + P H(w) + grad(w)grad(P)^T + grad(P)grad(w)^T,
         followed by the explicit implicit-function correction for s/t curvature.
         """
-        weight, log_gradient = pair.weight, pair.log_weight_gradient
+        weight, dlogwdX = pair.weight, pair.dlogwdX
         energy = weight * potential
-        gradient = weight * (gp + potential * log_gradient)
+        gradient = weight * (gp + potential * dlogwdX)
         hessian = weight * (
             hp
-            + wp.outer(log_gradient, gp)
-            + wp.outer(gp, log_gradient)
-            + potential * (pair.log_weight_hessian + wp.outer(log_gradient, log_gradient))
+            + wp.outer(dlogwdX, gp)
+            + wp.outer(gp, dlogwdX)
+            + potential * (pair.d2logwdX2_no_st_curvature + wp.outer(dlogwdX, dlogwdX))
         )
 
-        # Final implicit correction accounts for the curvature of s(z),t(z).
+        # Final implicit correction accounts for the curvature of s(X),t(X).
         # It is applied to scalar ENERGY, rather than building sample Hessians.
         if weight <= 0.0:
             return 0.0, vector(), matrix()
-        partial = weight * (zp + potential * pair.log_weight_parameters)
-        l1 = (partial[1] - pair.r01 * partial[0] / pair.r00) / (pair.r11 * pair.r11)
-        l0 = partial[0] / (pair.r00 * pair.r00) - pair.r01 * l1 / pair.r00
+        partial = weight * (zp + potential * pair.dlogwdst)
+        l1 = (partial[1] - pair.R01 * partial[0] / pair.R00) / (pair.R11 * pair.R11)
+        l0 = partial[0] / (pair.R00 * pair.R00) - pair.R01 * l1 / pair.R00
         positions = pair.positions
-        coefficients = vec7(1.0 - pair.s, pair.s, pair.t - 1.0, -pair.t, 0.0, 0.0, 0.0)
-        coefficient_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        coefficient_t = vec7(0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0)
-        u, v = pair.soft_axis, pair.rigid_axis
-        residual = position_sum(positions, coefficients)
-        moved_residual = pair.residual_jacobian + wp.outer(u, pair.ds) + wp.outer(v, pair.dt)
-        weighted_axis_j = l0 * pair.soft_axis_jacobian + l1 * pair.rigid_axis_jacobian
-        correction = wp.transpose(weighted_axis_j) * moved_residual
+        residual_coefficients = vec7(1.0 - pair.s, pair.s, pair.t - 1.0, -pair.t, 0.0, 0.0, 0.0)
+        residual_coefficients_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        residual_coefficients_t = vec7(0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0)
+        u, v = pair.u, pair.v
+        r = position_sum(positions, residual_coefficients)
+        drdX = pair.drdX_fixed_st + wp.outer(u, pair.dsdX) + wp.outer(v, pair.dtdX)
+        weighted_axis_j = l0 * pair.dudX + l1 * pair.dvdX
+        correction = wp.transpose(weighted_axis_j) * drdX
         hessian -= correction + wp.transpose(correction)
-        hessian -= residual_curvature(positions, l0 * coefficient_s + l1 * coefficient_t, residual, False, pair.com)
+        hessian -= residual_curvature(
+            positions, l0 * residual_coefficients_s + l1 * residual_coefficients_t, r, False, pair.com
+        )
         hessian -= residual_second(
             positions,
-            coefficients,
-            coefficient_s,
-            coefficient_t,
-            pair.ds,
-            pair.dt,
+            residual_coefficients,
+            residual_coefficients_s,
+            residual_coefficients_t,
+            pair.dsdX,
+            pair.dtdX,
             l0 * u + l1 * v,
-            pair.particle_mask,
+            pair.particle_derivative_mask,
             False,
             pair.com,
         )
@@ -2355,6 +2514,7 @@ def ee_particle_source(
     rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
     a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
     c, d = rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
+    # 0b01 if particle_index is the first endpoint, 0b10 if the second.
     source_mask = int(soft_edge_vertex_indices[0] == particle_index) | (
         int(soft_edge_vertex_indices[1] == particle_index) << 1
     )
@@ -2371,7 +2531,7 @@ def ee_particle_source(
             edge_list_index = lists.soft_edge_count + rigid_primitive_index
         for entry_index in range(lists.starts[edge_list_index] + partition, lists.ends[edge_list_index], partitions):
             triangle_index = lists.keys[entry_index]
-            particle_mask = source_mask
+            particle_derivative_mask = source_mask
             target_shape_index = shape_index
             target_family, target_soft_primitive_index = 2, soft_primitive_index
             sample = wp.vec3(pair.soft_sample)
@@ -2411,7 +2571,7 @@ def ee_particle_source(
                 # One particle may be both source endpoint and target corner.
                 for corner in range(3):
                     if triangle_vertex_indices[corner] == particle_index:
-                        particle_mask |= 1 << (4 + corner)
+                        particle_derivative_mask |= 1 << (4 + corner)
             support, target_near, stiffness = contact_support_and_stiffness(
                 target_family,
                 target_soft_primitive_index,
@@ -2460,7 +2620,7 @@ def ee_particle_source(
                 tc,
                 direction == 0,
                 False,
-                particle_mask,
+                particle_derivative_mask,
                 edge_coefficients,
                 vertex_coefficients,
                 support,
@@ -2492,6 +2652,128 @@ def ee_particle_source(
         for j in range(3):
             wp.atomic_add(esp_hessians, particle_index, i, j, hessian[i, j])
     return energy
+
+
+@wp.func
+def ee_particle_targets(
+    rigid_primitive_index: int,
+    shape_index: int,
+    soft_edge_vertex_indices: wp.vec2i,
+    rigid_edge_vertex_indices: wp.vec2i,
+    q_bar: wp.vec3,
+    weight: float,
+    data: EspData,
+    particle_q: wp.array[wp.vec3],
+    rigid_positions: wp.array[wp.vec3],
+    particle_colors: wp.array[int],
+    lists: EdgeTriangleListData,
+    particle_radius: wp.array[float],
+    shape_margin: wp.array[float],
+    shape_material_ke: wp.array[float],
+    soft_contact_ke: float,
+    partition: int,
+    partitions: int,
+    color: int,
+    particle_q_prev: wp.array[wp.vec3],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    dt: float,
+    friction_epsilon: float,
+    mu: float,
+    kd: float,
+    esp_forces: wp.array2d[float],
+    esp_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
+) -> None:
+    """Accumulate EE contributions to soft target vertices other than the source endpoints.
+
+    Traverse nearby soft triangles for the rigid-edge sample ``q_bar``. For each
+    target vertex, differentiate rigid_edge_area * weight * P_near(q_bar) with
+    respect to that vertex's position. These vertices cannot move the generating
+    edges, so ``q_bar`` and ``weight`` stay fixed. The generating soft edge's two
+    endpoints are excluded: ``ee_particle_source`` already handles their full
+    derivatives, including changes to the sample positions and weight.
+
+    Reuse the caller's sample and endpoint indices. Each partition visits its
+    own list entries, and only vertices of the selected color receive outputs.
+    Friction/damping use the same per-feature displacements as the other paths.
+    """
+    rigid_parameter = segment_parameter(
+        q_bar, rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
+    )
+    rigid_source_weights = wp.vec3(1.0 - rigid_parameter, rigid_parameter, 0.0)
+    edge_list_index = lists.soft_edge_count + rigid_primitive_index
+    for entry_index in range(lists.starts[edge_list_index] + partition, lists.ends[edge_list_index], partitions):
+        triangle_index = lists.keys[entry_index]
+        triangle_vertex_indices = data.soft_tri_indices[triangle_index]
+        target_support, target_near, target_ke = contact_support_and_stiffness(
+            1,
+            triangle_index,
+            shape_index,
+            data,
+            particle_radius,
+            shape_margin,
+            shape_material_ke,
+            soft_contact_ke,
+        )
+        edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
+            data.soft_tri_indices,
+            data.soft_adjacency.tri_edge_indices,
+            data.soft_adjacency.edge_tri_indices,
+            data.soft_vertex_term_coefficient,
+            triangle_index,
+        )
+        sample_displacement, triangle_displacements = contact_displacements(
+            wp.vec3i(rigid_edge_vertex_indices[0], rigid_edge_vertex_indices[1], -1),
+            rigid_source_weights,
+            True,
+            triangle_vertex_indices,
+            data,
+            particle_q,
+            particle_q_prev,
+            rigid_positions,
+            shape_transform,
+            shape_body,
+            shape_scale,
+            shape_source_ptr,
+            body_q,
+            body_q_prev,
+            dt,
+        )
+        for corner in range(3):
+            particle_index = triangle_vertex_indices[corner]
+            if particle_index == soft_edge_vertex_indices[0] or particle_index == soft_edge_vertex_indices[1]:
+                continue
+            if color >= 0 and particle_colors[particle_index] != color:
+                continue
+            particle_triangle(
+                q_bar,
+                particle_q[triangle_vertex_indices[0]],
+                particle_q[triangle_vertex_indices[1]],
+                particle_q[triangle_vertex_indices[2]],
+                corner + 1,
+                edge_coefficients,
+                vertex_coefficients,
+                target_support,
+                target_near,
+                True,
+                particle_index,
+                weight * data.rigid_edge_area[rigid_primitive_index],
+                esp_forces,
+                esp_hessians,
+                esp_error,
+                target_ke,
+                sample_displacement,
+                triangle_displacements,
+                mu,
+                kd,
+                dt,
+                friction_epsilon * dt,
+            )
 
 
 @wp.kernel(module="unique", enable_backward=False)
@@ -2707,6 +2989,7 @@ def accumulate_particle_contact_derivatives(
             )
             if weight <= 0.0:
                 continue
+            # Generating-edge endpoints: differentiate sample positions and weight too.
             for endpoint in range(2):
                 particle_index = soft_edge_vertex_indices[endpoint]
                 if color >= 0 and particle_colors[particle_index] != color:
@@ -2745,82 +3028,41 @@ def accumulate_particle_contact_derivatives(
                     esp_hessians,
                     esp_error,
                 )
-            rigid_parameter = segment_parameter(
-                q_bar, rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
+            # Other soft target vertices: hold q_bar and weight fixed.
+            ee_particle_targets(
+                rigid_primitive_index,
+                shape_index,
+                soft_edge_vertex_indices,
+                rigid_edge_vertex_indices,
+                q_bar,
+                weight,
+                data,
+                particle_q,
+                rigid_positions,
+                particle_colors,
+                lists,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
+                partition,
+                partitions,
+                color,
+                particle_q_prev,
+                shape_transform,
+                shape_body,
+                shape_scale,
+                shape_source_ptr,
+                body_q,
+                body_q_prev,
+                dt,
+                friction_epsilon,
+                mu,
+                kd,
+                esp_forces,
+                esp_hessians,
+                esp_error,
             )
-            rigid_source_weights = wp.vec3(1.0 - rigid_parameter, rigid_parameter, 0.0)
-            # Target-only particles cannot move q_bar or w. Use the simpler direct
-            # triangle block and do not count source endpoints for a second time.
-            edge_list_index = lists.soft_edge_count + rigid_primitive_index
-            for entry_index in range(
-                lists.starts[edge_list_index] + partition, lists.ends[edge_list_index], partitions
-            ):
-                triangle_index = lists.keys[entry_index]
-                triangle_vertex_indices = data.soft_tri_indices[triangle_index]
-                target_support, target_near, target_ke = contact_support_and_stiffness(
-                    1,
-                    triangle_index,
-                    shape_index,
-                    data,
-                    particle_radius,
-                    shape_margin,
-                    shape_material_ke,
-                    soft_contact_ke,
-                )
-                edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
-                    data.soft_tri_indices,
-                    data.soft_adjacency.tri_edge_indices,
-                    data.soft_adjacency.edge_tri_indices,
-                    data.soft_vertex_term_coefficient,
-                    triangle_index,
-                )
-                sample_displacement, triangle_displacements = contact_displacements(
-                    wp.vec3i(rigid_edge_vertex_indices[0], rigid_edge_vertex_indices[1], -1),
-                    rigid_source_weights,
-                    True,
-                    triangle_vertex_indices,
-                    data,
-                    particle_q,
-                    particle_q_prev,
-                    rigid_positions,
-                    shape_transform,
-                    shape_body,
-                    shape_scale,
-                    shape_source_ptr,
-                    body_q,
-                    body_q_prev,
-                    dt,
-                )
-                for corner in range(3):
-                    particle_index = triangle_vertex_indices[corner]
-                    if particle_index == soft_edge_vertex_indices[0] or particle_index == soft_edge_vertex_indices[1]:
-                        continue
-                    if color >= 0 and particle_colors[particle_index] != color:
-                        continue
-                    particle_triangle(
-                        q_bar,
-                        particle_q[triangle_vertex_indices[0]],
-                        particle_q[triangle_vertex_indices[1]],
-                        particle_q[triangle_vertex_indices[2]],
-                        corner + 1,
-                        edge_coefficients,
-                        vertex_coefficients,
-                        target_support,
-                        target_near,
-                        True,
-                        particle_index,
-                        weight * data.rigid_edge_area[rigid_primitive_index],
-                        esp_forces,
-                        esp_hessians,
-                        esp_error,
-                        target_ke,
-                        sample_displacement,
-                        triangle_displacements,
-                        mu,
-                        kd,
-                        dt,
-                        friction_epsilon * dt,
-                    )
 
 
 @wp.func

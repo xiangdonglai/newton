@@ -252,10 +252,10 @@ def make_endpoint_excess_probe(scalar):
                 vec3(points[row, 3]),
             )
             other = pair.t
-            own_axis, other_axis = vec3(pair.soft_axis), -pair.rigid_axis
+            own_axis, other_axis = vec3(pair.u), -pair.v
             if endpoint >= 2:
                 other = pair.s
-                own_axis, other_axis = -pair.rigid_axis, vec3(pair.soft_axis)
+                own_axis, other_axis = -pair.v, vec3(pair.u)
             value, _projection = endpoint_excess(h, other, own_axis, other_axis)
             excesses[row, endpoint] = wp.float64(scalar(100.0) * value / distance_sq)
 
