@@ -15,6 +15,7 @@ import warp as wp
 from numpy.typing import NDArray
 from warp.fem.linalg import symmetric_eigenvalues_qr
 
+from ...geometry.kernels import closest_point_line_segment
 from ...utils.mesh import MeshAdjacency, MeshAdjacencyData
 from .rigid_vbd_kernels import compute_projected_isotropic_friction
 
@@ -520,26 +521,26 @@ def segment_distance_squared_value(p: wp.vec3, a: wp.vec3, b: wp.vec3) -> float:
     edge_vector = b - a
     length_sq = wp.dot(edge_vector, edge_vector)
     t = wp.dot(p - a, edge_vector) / length_sq
-    delta = p - a
+    r = p - a
     if t >= 1.0:
-        delta = p - b
+        r = p - b
     elif t > 0.0:
-        delta = p - (a + t * edge_vector)
-        delta -= edge_vector * (wp.dot(delta, edge_vector) / length_sq)
-    return wp.dot(delta, delta)
+        r = p - (a + t * edge_vector)
+        r -= edge_vector * (wp.dot(r, edge_vector) / length_sq)
+    return wp.dot(r, r)
 
 
 @wp.func
 def triangle_distance_squared_value(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> float:
     """Find the squared distance to the face interior or closest boundary edge."""
     ab, ac = b - a, c - a
-    normal = wp.cross(ab, ac)
-    normal_sq = wp.dot(normal, normal)
-    projected = p - normal * (wp.dot(p - a, normal) / normal_sq)
-    u = wp.dot(wp.cross(projected - a, ac), normal) / normal_sq
-    v = wp.dot(wp.cross(ab, projected - a), normal) / normal_sq
+    cross = wp.cross(ab, ac)
+    cross_sq = wp.dot(cross, cross)
+    projected = p - cross * (wp.dot(p - a, cross) / cross_sq)
+    u = wp.dot(wp.cross(projected - a, ac), cross) / cross_sq
+    v = wp.dot(wp.cross(ab, projected - a), cross) / cross_sq
     if u > 0.0 and v > 0.0 and u + v < 1.0:
-        signed_distance = wp.dot(normal / wp.sqrt(normal_sq), p - a)
+        signed_distance = wp.dot(cross / wp.sqrt(cross_sq), p - a)
         return signed_distance * signed_distance
     return wp.min(
         segment_distance_squared_value(p, a, b),
@@ -549,9 +550,9 @@ def triangle_distance_squared_value(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.ve
 
 @wp.func
 def barrier_coefficients(distance: float, support: float, near: float, near_only: bool):
-    """Return b(d), b'(d), b''(d), with a C2 Taylor extension below 10 um.
+    """Return b(d), db/dd, d²b/dd²; d is distance, not squared distance D.
 
-    Like native contact, the extension bounds the barrier curvature.
+    A C2 Taylor extension below 10 um bounds curvature, like native contact.
     It is a finite contact potential, not a penetration-free barrier.
     Scale the join down for tiny supports; apply the EE window afterwards.
     """
@@ -564,29 +565,29 @@ def barrier_coefficients(distance: float, support: float, near: float, near_only
     ratio = evaluated_distance / support
     gap = 1.0 - ratio
     energy = -gap * gap * wp.log(ratio)
-    first = (2.0 * gap * wp.log(ratio) - gap * gap / ratio) / support
-    second = (-2.0 * wp.log(ratio) + 4.0 * gap / ratio + gap * gap / (ratio * ratio)) / (support * support)
+    dbdd = (2.0 * gap * wp.log(ratio) - gap * gap / ratio) / support
+    d2bdd2 = (-2.0 * wp.log(ratio) + 4.0 * gap / ratio + gap * gap / (ratio * ratio)) / (support * support)
     if distance < d_min:
         offset = distance - d_min
-        energy += first * offset + 0.5 * second * offset * offset
-        first += second * offset
+        energy += dbdd * offset + 0.5 * d2bdd2 * offset * offset
+        dbdd += d2bdd2 * offset
     if near_only:
         t = 2.0 * distance / near - 1.0
         if t > 0.0:
             s = 1.0 - t
             window = s * s * s * (1.0 + 3.0 * t + 6.0 * t * t)
-            first_window = -60.0 * t * t * s * s / near
-            second_window = -240.0 * t * s * (1.0 - 2.0 * t) / (near * near)
-            second = second * window + 2.0 * first * first_window + energy * second_window
-            first = first * window + energy * first_window
+            dwindowdd = -60.0 * t * t * s * s / near
+            d2windowdd2 = -240.0 * t * s * (1.0 - 2.0 * t) / (near * near)
+            d2bdd2 = d2bdd2 * window + 2.0 * dbdd * dwindowdd + energy * d2windowdd2
+            dbdd = dbdd * window + energy * dwindowdd
             energy *= window
-    return energy, first, second
+    return energy, dbdd, d2bdd2
 
 
 @wp.func
 def barrier_energy(distance_sq: float, support: float, near_cutoff: float, near_only: bool) -> float:
     """Use exactly the same continued energy as the derivative kernels."""
-    energy, _first, _second = barrier_coefficients(wp.sqrt(distance_sq), support, near_cutoff, near_only)
+    energy, _dbdd, _d2bdd2 = barrier_coefficients(wp.sqrt(distance_sq), support, near_cutoff, near_only)
     return energy
 
 
@@ -668,9 +669,9 @@ def triangle_energy(
                 segment_distance_squared_value(p, edge_start, edge_end), support, near_cutoff, near_only
             )
         if vertex_term_coefficient[triangle_vertex_indices[corner]] != 0.0:
-            delta = p - start
+            r = p - start
             result += vertex_term_coefficient[triangle_vertex_indices[corner]] * barrier_energy(
-                wp.dot(delta, delta), support, near_cutoff, near_only
+                wp.dot(r, r), support, near_cutoff, near_only
             )
     return result
 
@@ -680,10 +681,13 @@ _EE_ENDPOINT_EPS = wp.constant(0.01)
 
 
 @wp.func
-def ee_endpoint_weight(excess: float, distance_sq: float) -> float:
-    """Evaluate one endpoint factor from supplement S9, Eq. (S5)."""
-    x = wp.clamp(excess / (_EE_ENDPOINT_EPS * distance_sq), 0.0, 1.0)
-    return x * (2.0 - x)
+def ee_endpoint_weight(Delta: float, D: float) -> float:
+    """Eq. (S5): mu=z*(2-z), z=clamp(Delta/(eps*D),0,1).
+
+    D is EE distance squared; Delta is endpoint-to-segment distance squared minus D.
+    """
+    z = wp.clamp(Delta / (_EE_ENDPOINT_EPS * D), 0.0, 1.0)
+    return z * (2.0 - z)
 
 
 @wp.func_native("return ::fmaf(a, b, c);")
@@ -707,7 +711,7 @@ def ee_endpoint_excess(h: float, other_parameter: float, own_axis: wp.vec3, othe
 
     For interior EE samples, the closest residual is perpendicular to both
     axes. Pythagoras therefore gives
-        excess = h² |own_axis x other_axis|² / |other_axis|²
+        Delta = h² |own_axis x other_axis|² / |other_axis|²
                + |other_axis|² (projection - clamp(projection,0,1))².
     The second term accounts for a finite opposite segment. Both terms are
     nonnegative; neither subtracts two nearly equal squared distances.
@@ -716,8 +720,8 @@ def ee_endpoint_excess(h: float, other_parameter: float, own_axis: wp.vec3, othe
     cross = ee_cross(own_axis, other_axis)
     projection = other_parameter + h * wp.dot(own_axis, other_axis) / length_sq
     outside = projection - wp.clamp(projection, 0.0, 1.0)
-    excess = h * h * (wp.dot(cross, cross) / length_sq) + outside * outside * length_sq
-    return excess, projection
+    Delta = h * h * (wp.dot(cross, cross) / length_sq) + outside * outside * length_sq
+    return Delta, projection
 
 
 @wp.func
@@ -729,13 +733,13 @@ def ee_endpoint_parameter_offset(endpoint: int, a: wp.vec3, b: wp.vec3, c: wp.ve
     rounded parameter from one would lose. The weight formula is unchanged.
     Called only for a nonparallel, interior EE pair.
     """
-    u, v = b - a, d - c
-    normal = ee_cross(u, v)
+    u, rigid_axis = b - a, d - c
+    cross = ee_cross(u, rigid_axis)
     if endpoint < 2:
         origin = a if endpoint == 0 else b
-        return -wp.dot(ee_cross(c - origin, v), normal) / wp.dot(normal, normal)
+        return -wp.dot(ee_cross(c - origin, rigid_axis), cross) / wp.dot(cross, cross)
     origin = c if endpoint == 2 else d
-    return -wp.dot(ee_cross(origin - a, u), normal) / wp.dot(normal, normal)
+    return -wp.dot(ee_cross(origin - a, u), cross) / wp.dot(cross, cross)
 
 
 @wp.func
@@ -746,32 +750,35 @@ def ee_quadrature_sample(
     d: wp.vec3,
     near_cutoff: float,
 ) -> tuple[wp.vec3, wp.vec3, float]:
-    """Compute the two interior EE sample positions and their quadrature weight."""
-    u, v = b - a, d - c
-    normal = ee_cross(u, v)
-    normal_sq = wp.dot(normal, normal)
+    """Compute the two interior EE sample positions and their quadrature weight.
+
+    rigid_axis=d-c follows the rigid edge; the derivative formulas use v=c-d.
+    """
+    u, rigid_axis = b - a, d - c
+    cross = ee_cross(u, rigid_axis)
+    cross_sq = wp.dot(cross, cross)
     q, q_bar, weight = a, c, float(0.0)
-    if normal_sq > 0.0:
-        s = wp.dot(ee_cross(c - a, v), normal) / normal_sq
-        t = wp.dot(ee_cross(c - a, u), normal) / normal_sq
+    if cross_sq > 0.0:
+        s = wp.dot(ee_cross(c - a, rigid_axis), cross) / cross_sq
+        t = wp.dot(ee_cross(c - a, u), cross) / cross_sq
         if s > 0.0 and s < 1.0 and t > 0.0 and t < 1.0:
-            q, q_bar = a + s * u, c + t * v
-            delta = q - q_bar
-            distance_sq = wp.dot(delta, delta)
-            if distance_sq > 0.0 and distance_sq < near_cutoff * near_cutoff:
+            q, q_bar = a + s * u, c + t * rigid_axis
+            r = q - q_bar
+            D = wp.dot(r, r)
+            if D > 0.0 and D < near_cutoff * near_cutoff:
                 endpoint_weight = float(1.0)
                 for endpoint in range(4):
                     h = ee_endpoint_parameter_offset(endpoint, a, b, c, d)
-                    other, own_axis, other_axis = t, u, v
+                    other, own_axis, other_axis = t, u, rigid_axis
                     if endpoint >= 2:
-                        other, own_axis, other_axis = s, v, u
-                    excess, _projection = ee_endpoint_excess(h, other, own_axis, other_axis)
-                    endpoint_weight *= ee_endpoint_weight(excess, distance_sq)
-                x = wp.sqrt(distance_sq) * (2.0 / near_cutoff)
-                remaining = 2.0 - x
+                        other, own_axis, other_axis = s, rigid_axis, u
+                    Delta, _projection = ee_endpoint_excess(h, other, own_axis, other_axis)
+                    endpoint_weight *= ee_endpoint_weight(Delta, D)
+                xi = wp.sqrt(D) * (2.0 / near_cutoff)
+                remaining = 2.0 - xi
                 distance_weight = 0.25 * remaining * remaining * remaining
-                if x < 1.0:
-                    distance_weight = 1.0 - 1.5 * x * x + 0.75 * x * x * x
+                if xi < 1.0:
+                    distance_weight = 1.0 - 1.5 * xi * xi + 0.75 * xi * xi * xi
                 weight = distance_weight * endpoint_weight
     return q, q_bar, weight
 
@@ -831,13 +838,13 @@ def triangle_feature_geometry(
     """
     ab, ac = b - a, c - a
     cross = wp.cross(ab, ac)
-    area_sq = wp.dot(cross, cross)
-    plane_normal = cross / wp.sqrt(area_sq)
+    cross_sq = wp.dot(cross, cross)
+    plane_normal = cross / wp.sqrt(cross_sq)
     if feature_index == 0:
         signed_distance = wp.dot(point - a, plane_normal)
         projected = point - signed_distance * plane_normal
-        u = wp.dot(wp.cross(projected - a, ac), cross) / area_sq
-        v = wp.dot(wp.cross(ab, projected - a), cross) / area_sq
+        u = wp.dot(wp.cross(projected - a, ac), cross) / cross_sq
+        v = wp.dot(wp.cross(ab, projected - a), cross) / cross_sq
         if u > 0.0 and v > 0.0 and u + v < 1.0:
             normal = plane_normal if signed_distance >= 0.0 else -plane_normal
             return wp.vec3(1.0 - u - v, u, v), normal, wp.abs(signed_distance), 2, -1
@@ -852,10 +859,11 @@ def triangle_feature_geometry(
                 start, end = b, c
             elif candidate == 2:
                 start, end = c, a
-            t = segment_parameter(point, start, end)
-            delta = point - start - t * (end - start)
-            if wp.dot(delta, delta) < closest_distance_sq:
-                corner, closest_distance_sq = candidate, wp.dot(delta, delta)
+            # Project in the edge's local frame to avoid rounding a world-space point.
+            offset = point - start
+            r = offset - closest_point_line_segment(wp.vec3(), end - start, offset)
+            if wp.dot(r, r) < closest_distance_sq:
+                corner, closest_distance_sq = candidate, wp.dot(r, r)
     start, end = a, b
     if corner == 1:
         start, end = b, c
@@ -863,7 +871,7 @@ def triangle_feature_geometry(
         start, end = c, a
     barycentric = wp.vec3()
     dimension = int(0)
-    delta = point - start
+    r = point - start
     if feature_index > 0 and feature_index % 2 == 0:
         barycentric[corner] = 1.0
     else:
@@ -871,16 +879,16 @@ def triangle_feature_geometry(
         barycentric[corner] = 1.0 - t
         barycentric[(corner + 1) % 3] = t
         if t >= 1.0:
-            delta = point - end
+            r = point - end
         elif t > 0.0:
             dimension = 1
             edge_vector = end - start
-            delta -= t * edge_vector
-            delta -= (wp.dot(delta, edge_vector) / wp.dot(edge_vector, edge_vector)) * edge_vector
-    distance = wp.length(delta)
+            r -= t * edge_vector
+            r -= (wp.dot(r, edge_vector) / wp.dot(edge_vector, edge_vector)) * edge_vector
+    distance = wp.length(r)
     normal = plane_normal
     if distance > 0.0:
-        normal = delta / distance
+        normal = r / distance
     return barycentric, normal, distance, dimension, corner
 
 
@@ -895,18 +903,18 @@ def feature_particle_derivatives(
     distance: float,
     dimension: int,
     edge_corner: int,
-    first: float,
-    second: float,
+    dbdd: float,
+    d2bdd2: float,
 ):
-    """Differentiate one feature potential B(d) with respect to one vertex position.
+    """Differentiate one feature potential b(d) with respect to one vertex position.
 
     d is the distance from the sample point to the selected triangle feature.
-    ``first`` and ``second`` are dB/dd and d2B/dd2, supplied by
+    ``dbdd`` and ``d2bdd2`` are db/dd and d²b/dd², supplied by
     ``barrier_coefficients``: derivatives with respect to distance, not position.
 
     ``derivative_vertex_slot`` selects the three Cartesian coordinates x:
-    0 = sample point, 1 = a, 2 = b, 3 = c. Return gradient dB/dx (vec3) and
-    Hessian d2B/dx2 (mat33), holding the other three positions fixed.
+    0 = sample point, 1 = a, 2 = b, 3 = c. Return gradient db/dx (vec3) and
+    Hessian d2b/dx2 (mat33), holding the other three positions fixed.
     This is one diagonal vertex block, not the full four-vertex Hessian.
     Closest-point and normal changes are included on the selected smooth branch;
     the supplied barycentric coordinates and normal describe its current geometry.
@@ -918,14 +926,14 @@ def feature_particle_derivatives(
     coefficient = float(1.0)
     if derivative_vertex_slot > 0:
         coefficient = -barycentric[derivative_vertex_slot - 1]
-    nn = wp.outer(normal, normal)
-    gradient = coefficient * first * normal
+    normal_outer = wp.outer(normal, normal)
+    gradient = coefficient * dbdd * normal
     if dimension == 2:
         ab, ac = b - a, c - a
         cross = wp.cross(ab, ac)
-        area_sq = wp.dot(cross, cross)
-        reciprocal_ab = wp.cross(ac, cross) / area_sq
-        reciprocal_ac = wp.cross(cross, ab) / area_sq
+        cross_sq = wp.dot(cross, cross)
+        reciprocal_ab = wp.cross(ac, cross) / cross_sq
+        reciprocal_ac = wp.cross(cross, ab) / cross_sq
         reciprocal = wp.vec3()
         if derivative_vertex_slot == 1:
             reciprocal = -reciprocal_ab - reciprocal_ac
@@ -933,12 +941,12 @@ def feature_particle_derivatives(
             reciprocal = reciprocal_ab
         elif derivative_vertex_slot == 3:
             reciprocal = reciprocal_ac
-        hessian = (coefficient * coefficient * second - distance * first * wp.dot(reciprocal, reciprocal)) * nn
-        hessian -= coefficient * first * (wp.outer(reciprocal, normal) + wp.outer(normal, reciprocal))
+        hessian = (coefficient * coefficient * d2bdd2 - distance * dbdd * wp.dot(reciprocal, reciprocal)) * normal_outer
+        hessian -= coefficient * dbdd * (wp.outer(reciprocal, normal) + wp.outer(normal, reciprocal))
         return gradient, hessian
     tangent_curvature = float(0.0)
     if distance > 0.0:
-        tangent_curvature = first / distance
+        tangent_curvature = dbdd / distance
     perpendicular = wp.identity(n=3, dtype=float)
     hessian = wp.mat33()
     if dimension == 1:
@@ -948,15 +956,17 @@ def feature_particle_derivatives(
         elif edge_corner == 2:
             edge_vector = a - c
         length_sq = wp.dot(edge_vector, edge_vector)
-        k = float(
+        edge_derivative_coefficient = float(
             int(derivative_vertex_slot == (edge_corner + 1) % 3 + 1) - int(derivative_vertex_slot == edge_corner + 1)
         )
         perpendicular -= wp.outer(edge_vector, edge_vector) / length_sq
-        hessian -= (first * coefficient * k / length_sq) * (
+        hessian -= (dbdd * coefficient * edge_derivative_coefficient / length_sq) * (
             wp.outer(edge_vector, normal) + wp.outer(normal, edge_vector)
         )
-        hessian -= (first * distance * k * k / length_sq) * nn
-    hessian += coefficient * coefficient * (second * nn + tangent_curvature * (perpendicular - nn))
+        hessian -= (
+            dbdd * distance * edge_derivative_coefficient * edge_derivative_coefficient / length_sq
+        ) * normal_outer
+    hessian += coefficient * coefficient * (d2bdd2 * normal_outer + tangent_curvature * (perpendicular - normal_outer))
     return gradient, hessian
 
 
@@ -964,7 +974,7 @@ def feature_particle_derivatives(
 def feature_friction_and_damping(
     normal: wp.vec3,
     distance: float,
-    first: float,
+    dbdd: float,
     relative_displacement: wp.vec3,
     support: float,
     stiffness: float,
@@ -980,12 +990,14 @@ def feature_friction_and_damping(
     Hessian is its derivative with geometry and normal load held fixed.
     Callers map these derivatives to the selected vertex/body and apply the
     signed feature coefficient and fixed quadrature weight.
+    dbdd is the conservative barrier derivative with respect to distance;
+    -stiffness*dbdd supplies the unsigned feature's normal load.
     """
     gradient, hessian = wp.vec3(), wp.mat33()
     if dt > 0.0:
         if mu != 0.0 and stiffness != 0.0:
             force, hessian = compute_projected_isotropic_friction(
-                mu, -stiffness * first, normal, relative_displacement, smoothing
+                mu, -stiffness * dbdd, normal, relative_displacement, smoothing
             )
             gradient = -force
         normal_displacement = wp.dot(normal, relative_displacement)
@@ -1024,10 +1036,10 @@ def particle_triangle(
     """Accumulate one triangle's weighted force/Hessian for a particle; return its energy.
 
     With d_feature the distance from ``point`` to that triangle feature:
-        E(point, a, b, c) = stiffness * [B(d_face)
-            - sum(edge_coefficient * B(d_edge))
-            + sum(vertex_coefficient * B(d_vertex))].
-    B is the barrier from ``barrier_coefficients``, including the near-distance
+        E(point, a, b, c) = stiffness * [b(d_face)
+            - sum(edge_coefficient * b(d_edge))
+            + sum(vertex_coefficient * b(d_vertex))].
+    b is the barrier from ``barrier_coefficients``, including the near-distance
     window when ``near_only`` is true.
 
     ``derivative_vertex_slot`` selects the three Cartesian coordinates x:
@@ -1060,22 +1072,22 @@ def particle_triangle(
         if coefficient == 0.0:
             continue
         barycentric, normal, distance, dimension, edge_corner = triangle_feature_geometry(point, a, b, c, feature_index)
-        value, first, second = barrier_coefficients(distance, support, near, near_only)
+        barrier_value, dbdd, d2bdd2 = barrier_coefficients(distance, support, near, near_only)
         conservative_gradient, conservative_hessian = feature_particle_derivatives(
-            a, b, c, derivative_vertex_slot, barycentric, normal, distance, dimension, edge_corner, first, second
+            a, b, c, derivative_vertex_slot, barycentric, normal, distance, dimension, edge_corner, dbdd, d2bdd2
         )
-        energy += coefficient * stiffness * value
+        energy += coefficient * stiffness * barrier_value
         gradient += coefficient * stiffness * conservative_gradient
         hessian += coefficient * stiffness * conservative_hessian
         relative_displacement = sample_displacement - wp.transpose(triangle_displacements) * barycentric
         friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
-            normal, distance, first, relative_displacement, cutoff, stiffness, mu, kd, dt, smoothing
+            normal, distance, dbdd, relative_displacement, cutoff, stiffness, mu, kd, dt, smoothing
         )
-        motion_coefficient = float(1.0)
+        derivative_coefficient = float(1.0)
         if derivative_vertex_slot > 0:
-            motion_coefficient = -barycentric[derivative_vertex_slot - 1]
-        gradient += coefficient * motion_coefficient * friction_damping_gradient
-        hessian += coefficient * motion_coefficient * motion_coefficient * friction_damping_hessian
+            derivative_coefficient = -barycentric[derivative_vertex_slot - 1]
+        gradient += coefficient * derivative_coefficient * friction_damping_gradient
+        hessian += coefficient * derivative_coefficient * derivative_coefficient * friction_damping_hessian
     if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
         wp.atomic_or(esp_error, 0, 4)
         return scale * energy
@@ -1093,7 +1105,7 @@ def body_triangle(
     b: wp.vec3,
     c: wp.vec3,
     com: wp.vec3,
-    triangle_moves: bool,
+    differentiate_triangle: bool,
     edge_coefficients: wp.vec3,
     vertex_coefficients: wp.vec3,
     support: float,
@@ -1116,6 +1128,8 @@ def body_triangle(
 
     Conservative rigid-motion invariance maps the point gradient/Hessian by
     J=[-I,skew(point-com)] when the triangle moves, or [I,-skew] otherwise.
+    differentiate_triangle is true when the triangle belongs to the selected
+    body; otherwise the sample point does. It does not test the body's velocity.
     Dissipative terms instead use each feature's actual rigid material point
     and J^T H J, without the conservative rotation-curvature correction.
     Add -scale*gradient and scale*hessian to output row ``body_index`` and
@@ -1139,19 +1153,19 @@ def body_triangle(
         if coefficient == 0.0:
             continue
         barycentric, normal, distance, dimension, edge_corner = triangle_feature_geometry(point, a, b, c, feature_index)
-        value, first, second = barrier_coefficients(distance, support, near, near_only)
+        barrier_value, dbdd, d2bdd2 = barrier_coefficients(distance, support, near, near_only)
         feature_gradient, feature_hessian = feature_particle_derivatives(
-            a, b, c, 0, barycentric, normal, distance, dimension, edge_corner, first, second
+            a, b, c, 0, barycentric, normal, distance, dimension, edge_corner, dbdd, d2bdd2
         )
-        energy += coefficient * stiffness * value
+        energy += coefficient * stiffness * barrier_value
         conservative_gradient += coefficient * stiffness * feature_gradient
         conservative_hessian += coefficient * stiffness * feature_hessian
         relative_displacement = sample_displacement - wp.transpose(triangle_displacements) * barycentric
         friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
-            normal, distance, first, relative_displacement, cutoff, stiffness, mu, kd, dt, smoothing
+            normal, distance, dbdd, relative_displacement, cutoff, stiffness, mu, kd, dt, smoothing
         )
         rigid_point, body_gradient = point, friction_damping_gradient
-        if triangle_moves:
+        if differentiate_triangle:
             rigid_point = barycentric[0] * a + barycentric[1] * b + barycentric[2] * c
             body_gradient = -friction_damping_gradient
         arm = rigid_point - com
@@ -1166,7 +1180,7 @@ def body_triangle(
                 jj = axis_j if j < 3 else wp.cross(axis_j, arm)
                 hessian[i, j] += coefficient * wp.dot(ji, friction_damping_hessian * jj)
     offset = point - com
-    sign = -1.0 if triangle_moves else 1.0
+    sign = -1.0 if differentiate_triangle else 1.0
     for i in range(3):
         ei = wp.vec3()
         ei[i] = float(1.0)
@@ -1179,7 +1193,7 @@ def body_triangle(
             rotation_j = sign * wp.cross(ej, offset)
             hessian[i, j] += conservative_hessian[i, j]
             mixed = sign * wp.dot(ei, conservative_hessian * rotation_j)
-            if triangle_moves:
+            if differentiate_triangle:
                 mixed += wp.dot(conservative_gradient, wp.cross(ej, ei))
             hessian[i, j + 3] += mixed
             hessian[j + 3, i] += mixed
@@ -1207,12 +1221,13 @@ def _make_ee_block_functions(size: int):
     body's 6 DoFs (COM translation followed by world rotation).
     Closest parameters s,t satisfy g=(u.r, v.r)=0, where r is the edge-point
     difference and u,v its derivatives with respect to s,t. With y=(X,s,t)
-    and T=[I; ds/dX; dt/dX], the final scalar energy F=w*sum(area*P) obeys
+    and T=[I; ds/dX; dt/dX], the final energy E=w*P,
+    P=sum(area*triangle_P), obeys
 
-        dE/dX = T.T * grad_y(F)
-        d2E/dX2 = T.T * (H_y(F) - lambda_s*H_y(g_s)
+        dE/dX = T.T * grad_y(E)
+        d2E/dX2 = T.T * (H_y(E) - lambda_s*H_y(g_s)
                                     - lambda_t*H_y(g_t)) * T,
-        lambda = transpose(dg/d(s,t))^(-1) * dF/d(s,t).
+        lambda = transpose(dg/d(s,t))^(-1) * dE/d(s,t).
 
     Prepare source coefficients once, sum target triangle contributions,
     then finish this correction once. Inputs are ordinary positions, not
@@ -1254,7 +1269,7 @@ def _make_ee_block_functions(size: int):
         # Selected body's COM minus origin; unused by the particle-only formulas.
         com: wp.vec3
         # Bits 0..3 select occurrences of the differentiated particle in (a,b,c,d).
-        # Body formulas ignore this mask and move c,d together instead.
+        # Body formulas ignore this mask; c,d belong to the selected body.
         particle_derivative_mask: int
         # u=b-a=dq/ds, using the same rounded axis as the closest-parameter solve.
         u: wp.vec3
@@ -1311,7 +1326,7 @@ def _make_ee_block_functions(size: int):
         positions: positions_type,
         coefficients: vec7,
         particle_derivative_mask: int,
-        target_moves_with_body: bool,
+        target_on_selected_body: bool,
         com: wp.vec3,
     ):
         """Differentiate sum_i coefficients[i]*x_i at fixed coefficients."""
@@ -1319,7 +1334,7 @@ def _make_ee_block_functions(size: int):
         for i in range(7):
             differentiate_position = (particle_derivative_mask & (1 << i)) != 0
             if wp.static(size == 6):
-                differentiate_position = i == 2 or i == 3 or (i >= 4 and target_moves_with_body)
+                differentiate_position = i == 2 or i == 3 or (i >= 4 and target_on_selected_body)
             if differentiate_position:
                 coefficient_sum += coefficients[i]
                 offset += coefficients[i] * (positions[i] - com)
@@ -1336,20 +1351,23 @@ def _make_ee_block_functions(size: int):
 
     @wp.func
     def residual_curvature(
-        positions: positions_type, coefficients: vec7, normal: wp.vec3, target_moves_with_body: bool, com: wp.vec3
+        positions: positions_type, coefficients: vec7, direction: wp.vec3, target_on_selected_body: bool, com: wp.vec3
     ):
-        """Exact rotation curvature of normal·sum_i coefficients[i]*x_i."""
+        """Body-rotation Hessian of direction·sum_i coefficients[i]*x_i.
+
+        direction is held fixed and need not be a unit normal.
+        """
         result = matrix()
         if wp.static(size == 6):
             offset = wp.vec3()
             for i in range(7):
-                if i == 2 or i == 3 or (i >= 4 and target_moves_with_body):
+                if i == 2 or i == 3 or (i >= 4 and target_on_selected_body):
                     offset += coefficients[i] * (positions[i] - com)
             for i in range(3):
                 for j in range(3):
-                    result[i + 3, j + 3] = 0.5 * (offset[i] * normal[j] + normal[i] * offset[j])
+                    result[i + 3, j + 3] = 0.5 * (offset[i] * direction[j] + direction[i] * offset[j])
                     if i == j:
-                        result[i + 3, j + 3] -= wp.dot(offset, normal)
+                        result[i + 3, j + 3] -= wp.dot(offset, direction)
         return result
 
     @wp.func
@@ -1360,22 +1378,36 @@ def _make_ee_block_functions(size: int):
         residual_coefficients_t: vec7,
         dsdX: vector,
         dtdX: vector,
-        normal: wp.vec3,
+        direction: wp.vec3,
         particle_derivative_mask: int,
-        target_moves_with_body: bool,
+        target_on_selected_body: bool,
         com: wp.vec3,
     ):
+        """Return sum_i direction[i]*d²r[i]/dX², excluding s/t second derivatives.
+
+        r is the weighted position sum. X has 3 particle or 6 body coordinates.
+        direction is held fixed; it need not be a unit normal.
+        Body rotation curvature and mixed position/parameter terms remain;
+        finish_ee_pair adds the missing d²s/dX² and d²t/dX² terms once.
+        """
         # The only extra second derivatives are mixed x-s and x-t terms:
         # r=sum_i c_i(s,t)x_i; c_i is linear in s,t.
-        js = motion_jacobian(positions, residual_coefficients_s, particle_derivative_mask, target_moves_with_body, com)
-        jt = motion_jacobian(positions, residual_coefficients_t, particle_derivative_mask, target_moves_with_body, com)
-        gs, gt = wp.transpose(js) * normal, wp.transpose(jt) * normal
+        d2rdsdX = motion_jacobian(
+            positions, residual_coefficients_s, particle_derivative_mask, target_on_selected_body, com
+        )
+        d2rdtdX = motion_jacobian(
+            positions, residual_coefficients_t, particle_derivative_mask, target_on_selected_body, com
+        )
+        d2rdsdX_dot_direction, d2rdtdX_dot_direction = (
+            wp.transpose(d2rdsdX) * direction,
+            wp.transpose(d2rdtdX) * direction,
+        )
         return (
-            residual_curvature(positions, residual_coefficients, normal, target_moves_with_body, com)
-            + wp.outer(gs, dsdX)
-            + wp.outer(dsdX, gs)
-            + wp.outer(gt, dtdX)
-            + wp.outer(dtdX, gt)
+            residual_curvature(positions, residual_coefficients, direction, target_on_selected_body, com)
+            + wp.outer(d2rdsdX_dot_direction, dsdX)
+            + wp.outer(dsdX, d2rdsdX_dot_direction)
+            + wp.outer(d2rdtdX_dot_direction, dtdX)
+            + wp.outer(dtdX, d2rdtdX_dot_direction)
         )
 
     @wp.func
@@ -1389,7 +1421,7 @@ def _make_ee_block_functions(size: int):
         dsdX: vector,
         dtdX: vector,
         particle_derivative_mask: int,
-        target_moves_with_body: bool,
+        target_on_selected_body: bool,
         com: wp.vec3,
     ):
         """Compute squared distance D and its particle/body derivatives.
@@ -1422,7 +1454,7 @@ def _make_ee_block_functions(size: int):
                 unchanged. Reused for relative material displacement.
             r: Three-component source-minus-target vector in world axes
                 (the supplied residual itself when dimension=-1).
-            fixed_jacobian: 3-by-size derivative of r with respect to X,
+            drdX_fixed_parameters: 3-by-size derivative of r with respect to X,
                 holding s,t and the target barycentric weights fixed. Used
                 for the fixed-contact-geometry friction/damping calculation.
         """
@@ -1437,9 +1469,9 @@ def _make_ee_block_functions(size: int):
                 positions[closest_vertex_slots[2]],
             )
             cross = wp.cross(b - a, c - a)
-            area_sq = wp.dot(cross, cross)
-            u = wp.dot(wp.cross(p - a, c - a), cross) / area_sq
-            v = wp.dot(wp.cross(b - a, p - a), cross) / area_sq
+            cross_sq = wp.dot(cross, cross)
+            u = wp.dot(wp.cross(p - a, c - a), cross) / cross_sq
+            v = wp.dot(wp.cross(b - a, p - a), cross) / cross_sq
             if u > 0.0 and v > 0.0 and u + v < 1.0:
                 barycentric = wp.vec3(1.0 - u - v, u, v)
             else:
@@ -1447,36 +1479,40 @@ def _make_ee_block_functions(size: int):
                 for corner in range(3):
                     start_slot, end_slot = closest_vertex_slots[corner], closest_vertex_slots[(corner + 1) % 3]
                     edge_vector = positions[end_slot] - positions[start_slot]
-                    t = wp.clamp(
-                        wp.dot(p - positions[start_slot], edge_vector) / wp.dot(edge_vector, edge_vector), 0.0, 1.0
-                    )
-                    delta = p - positions[start_slot] - t * edge_vector
-                    if wp.dot(delta, delta) < closest_distance_sq:
+                    offset = p - positions[start_slot]
+                    candidate_r = offset - closest_point_line_segment(wp.vec3(), edge_vector, offset)
+                    if wp.dot(candidate_r, candidate_r) < closest_distance_sq:
                         closest_distance_sq, closest_start_slot, closest_end_slot = (
-                            wp.dot(delta, delta),
+                            wp.dot(candidate_r, candidate_r),
                             start_slot,
                             end_slot,
                         )
                 closest_vertex_slots, dim = wp.vec3i(closest_start_slot, closest_end_slot, -1), 1
         if dim == 1:
+            # Keep the unregularized parameter here: a collapsed edge must not
+            # silently become a valid endpoint via segment_parameter's zero fallback.
             edge_vector = positions[closest_vertex_slots[1]] - positions[closest_vertex_slots[0]]
-            t = wp.dot(p - positions[closest_vertex_slots[0]], edge_vector) / wp.dot(edge_vector, edge_vector)
-            if t <= 0.0:
+            target_parameter = wp.dot(p - positions[closest_vertex_slots[0]], edge_vector) / wp.dot(
+                edge_vector, edge_vector
+            )
+            if target_parameter <= 0.0:
                 dim = 0
-            elif t >= 1.0:
+            elif target_parameter >= 1.0:
                 closest_vertex_slots, dim = wp.vec3i(closest_vertex_slots[1], -1, -1), 0
             else:
-                barycentric = wp.vec3(1.0 - t, t, 0.0)
+                barycentric = wp.vec3(1.0 - target_parameter, target_parameter, 0.0)
         for i in range(dim + 1):
             residual_coefficients[closest_vertex_slots[i]] -= barycentric[i]
         r = position_sum(positions, residual_coefficients)
-        axis_s, axis_t = position_sum(positions, source_coefficients_s), position_sum(positions, source_coefficients_t)
-        partial_parameters = 2.0 * wp.vec2(wp.dot(axis_s, r), wp.dot(axis_t, r))
-        fixed_jacobian = motion_jacobian(
-            positions, residual_coefficients, particle_derivative_mask, target_moves_with_body, com
+        drds, drdt = position_sum(positions, source_coefficients_s), position_sum(positions, source_coefficients_t)
+        dDdst = 2.0 * wp.vec2(wp.dot(drds, r), wp.dot(drdt, r))
+        drdX_fixed_parameters = motion_jacobian(
+            positions, residual_coefficients, particle_derivative_mask, target_on_selected_body, com
         )
-        j = fixed_jacobian + wp.outer(axis_s, dsdX) + wp.outer(axis_t, dtdX)
-        second = residual_second(
+        # Include the source sample's ds/dX,dt/dX, but keep the target's
+        # barycentric weights fixed here. Its vertices can still depend on X.
+        drdX_fixed_barycentric = drdX_fixed_parameters + wp.outer(drds, dsdX) + wp.outer(drdt, dtdX)
+        r_dot_d2rdX2_no_st_curvature = residual_second(
             positions,
             residual_coefficients,
             source_coefficients_s,
@@ -1485,52 +1521,68 @@ def _make_ee_block_functions(size: int):
             dtdX,
             r,
             particle_derivative_mask,
-            target_moves_with_body,
+            target_on_selected_body,
             com,
         )
-        squared = wp.transpose(j) * j
+        distance_curvature = wp.transpose(drdX_fixed_barycentric) * drdX_fixed_barycentric
         if dim > 0:
-            edge0 = vec7()
-            edge0[closest_vertex_slots[0]] = float(1.0)
-            edge0[closest_vertex_slots[1]] = -1.0
-            axis0 = position_sum(positions, edge0)
-            length0 = wp.length(axis0)
-            basis0 = axis0 / length0
-            along0 = wp.transpose(j) * basis0
-            change0 = (
-                wp.transpose(motion_jacobian(positions, edge0, particle_derivative_mask, target_moves_with_body, com))
+            # The target closest point can slide on an edge/face. Remove its
+            # tangential contribution before squaring, and include basis rotation.
+            edge0_coefficients = vec7()
+            edge0_coefficients[closest_vertex_slots[0]] = float(1.0)
+            edge0_coefficients[closest_vertex_slots[1]] = -1.0
+            edge0 = position_sum(positions, edge0_coefficients)
+            R00 = wp.length(edge0)
+            e0 = edge0 / R00
+            drdX_dot_e0 = wp.transpose(drdX_fixed_barycentric) * e0
+            de0dX_dot_r = (
+                wp.transpose(
+                    motion_jacobian(
+                        positions, edge0_coefficients, particle_derivative_mask, target_on_selected_body, com
+                    )
+                )
                 * r
-                / length0
+                / R00
             )
-            perpendicular = j - wp.outer(basis0, along0)
-            correction = wp.outer(along0, change0) + wp.outer(change0, along0) + wp.outer(change0, change0)
+            drdX_perpendicular = drdX_fixed_barycentric - wp.outer(e0, drdX_dot_e0)
+            correction = (
+                wp.outer(drdX_dot_e0, de0dX_dot_r)
+                + wp.outer(de0dX_dot_r, drdX_dot_e0)
+                + wp.outer(de0dX_dot_r, de0dX_dot_r)
+            )
             if dim == 2:
-                edge1 = vec7()
-                edge1[closest_vertex_slots[0]] = float(1.0)
-                edge1[closest_vertex_slots[2]] = -1.0
-                axis1 = position_sum(positions, edge1)
-                normal = wp.normalize(wp.cross(axis0, axis1))
-                basis1 = wp.cross(normal, basis0)
-                R01, R11 = wp.dot(basis0, axis1), wp.dot(basis1, axis1)
-                along1 = wp.transpose(j) * basis1
-                change1 = (
+                edge1_coefficients = vec7()
+                edge1_coefficients[closest_vertex_slots[0]] = float(1.0)
+                edge1_coefficients[closest_vertex_slots[2]] = -1.0
+                edge1 = position_sum(positions, edge1_coefficients)
+                normal = wp.normalize(wp.cross(edge0, edge1))
+                e1 = wp.cross(normal, e0)
+                R01, R11 = wp.dot(e0, edge1), wp.dot(e1, edge1)
+                drdX_dot_e1 = wp.transpose(drdX_fixed_barycentric) * e1
+                de1dX_dot_r = (
                     wp.transpose(
-                        motion_jacobian(positions, edge1, particle_derivative_mask, target_moves_with_body, com)
+                        motion_jacobian(
+                            positions, edge1_coefficients, particle_derivative_mask, target_on_selected_body, com
+                        )
                     )
                     * r
-                    - R01 * change0
+                    - R01 * de0dX_dot_r
                 ) / R11
-                perpendicular -= wp.outer(basis1, along1)
-                correction += wp.outer(along1, change1) + wp.outer(change1, along1) + wp.outer(change1, change1)
-            squared = wp.transpose(perpendicular) * perpendicular - correction
+                drdX_perpendicular -= wp.outer(e1, drdX_dot_e1)
+                correction += (
+                    wp.outer(drdX_dot_e1, de1dX_dot_r)
+                    + wp.outer(de1dX_dot_r, drdX_dot_e1)
+                    + wp.outer(de1dX_dot_r, de1dX_dot_r)
+                )
+            distance_curvature = wp.transpose(drdX_perpendicular) * drdX_perpendicular - correction
         return (
             wp.dot(r, r),
-            2.0 * wp.transpose(j) * r,
-            partial_parameters,
-            2.0 * (squared + second),
+            2.0 * wp.transpose(drdX_fixed_barycentric) * r,
+            dDdst,
+            2.0 * (distance_curvature + r_dot_d2rdX2_no_st_curvature),
             residual_coefficients,
             r,
-            fixed_jacobian,
+            drdX_fixed_parameters,
         )
 
     @wp.func
@@ -1545,78 +1597,103 @@ def _make_ee_block_functions(size: int):
         particle_derivative_mask: int,
         com: wp.vec3,
     ):
-        """Analytical derivatives of the stable endpoint excess.
+        """Return Delta, dDelta/dX, dDelta/d(s,t), and its reduced Hessian.
 
-        Return value, total gradient, partial (s,t) gradient, and T.T H_y T.
-        As with triangle terms, finish_ee_pair adds s/t curvature once for the
-        final energy. No derivative-carrying geometry or AD operations.
+        Delta is endpoint-to-segment distance squared minus EE distance squared.
+        X is the selected particle/body coordinate vector; the (s,t) partial
+        holds X fixed. The Hessian omits terms involving d²s/dX² and d²t/dX²,
+        which finish_ee_pair adds once for the final energy.
         """
-        own = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        other = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
+        own_axis_coefficients = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        other_axis_coefficients = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
         # Use the directly evaluated small offset; its derivative is still
         # -dsdX or -dtdX because the endpoint parameter is constant (zero or one).
         h, other_parameter = endpoint_offset, t
-        gh, go = -dsdX, dtdX
-        zh, zo = wp.vec2(-1.0, 0.0), wp.vec2(0.0, 1.0)
+        dhdX, d_other_parameter_dX = -dsdX, dtdX
+        dhdst, d_other_parameter_dst = wp.vec2(-1.0, 0.0), wp.vec2(0.0, 1.0)
         if endpoint >= 2:
-            own, other = other, own
+            own_axis_coefficients, other_axis_coefficients = other_axis_coefficients, own_axis_coefficients
             other_parameter = s
-            gh, go = -dtdX, dsdX
-            zh, zo = wp.vec2(0.0, -1.0), wp.vec2(1.0, 0.0)
-        u, v = position_sum(positions, own), position_sum(positions, other)
-        value, projection = ee_endpoint_excess(h, other_parameter, u, v)
-        ju = motion_jacobian(positions, own, particle_derivative_mask, False, com)
-        jv = motion_jacobian(positions, other, particle_derivative_mask, False, com)
+            dhdX, d_other_parameter_dX = -dtdX, dsdX
+            dhdst, d_other_parameter_dst = wp.vec2(0.0, -1.0), wp.vec2(1.0, 0.0)
+        own_axis, other_axis = (
+            position_sum(positions, own_axis_coefficients),
+            position_sum(positions, other_axis_coefficients),
+        )
+        Delta, projection = ee_endpoint_excess(h, other_parameter, own_axis, other_axis)
+        d_own_axis_dX = motion_jacobian(positions, own_axis_coefficients, particle_derivative_mask, False, com)
+        d_other_axis_dX = motion_jacobian(positions, other_axis_coefficients, particle_derivative_mask, False, com)
 
         if projection <= 0.0 or projection >= 1.0:
             # The opposite closest point is a fixed endpoint. The excess is
-            # |h*u + (other_parameter-boundary)*v|², with no large normal gap.
-            k = other_parameter - wp.clamp(projection, 0.0, 1.0)
-            tangent = h * u + k * v
-            j = h * ju + k * jv + wp.outer(u, gh) + wp.outer(v, go)
-            cs, ct = zh[0] * own + zo[0] * other, zh[1] * own + zo[1] * other
-            second = residual_second(
-                positions, h * own + k * other, cs, ct, dsdX, dtdX, tangent, particle_derivative_mask, False, com
+            # |h*own_axis + other_offset*other_axis|², with no large normal gap.
+            other_offset = other_parameter - wp.clamp(projection, 0.0, 1.0)
+            tangent = h * own_axis + other_offset * other_axis
+            dtangentdX = (
+                h * d_own_axis_dX
+                + other_offset * d_other_axis_dX
+                + wp.outer(own_axis, dhdX)
+                + wp.outer(other_axis, d_other_parameter_dX)
+            )
+            tangent_coefficients_s, tangent_coefficients_t = (
+                dhdst[0] * own_axis_coefficients + d_other_parameter_dst[0] * other_axis_coefficients,
+                dhdst[1] * own_axis_coefficients + d_other_parameter_dst[1] * other_axis_coefficients,
+            )
+            tangent_dot_d2tangentdX2_no_st_curvature = residual_second(
+                positions,
+                h * own_axis_coefficients + other_offset * other_axis_coefficients,
+                tangent_coefficients_s,
+                tangent_coefficients_t,
+                dsdX,
+                dtdX,
+                tangent,
+                particle_derivative_mask,
+                False,
+                com,
             )
             return (
-                value,
-                2.0 * wp.transpose(j) * tangent,
-                2.0 * (wp.dot(u, tangent) * zh + wp.dot(v, tangent) * zo),
-                2.0 * (wp.transpose(j) * j + second),
+                Delta,
+                2.0 * wp.transpose(dtangentdX) * tangent,
+                2.0 * (wp.dot(own_axis, tangent) * dhdst + wp.dot(other_axis, tangent) * d_other_parameter_dst),
+                2.0 * (wp.transpose(dtangentdX) * dtangentdX + tangent_dot_d2tangentdX2_no_st_curvature),
             )
 
-        # Interior projection: excess=h² K, K=|u x v|²/|v|².
+        # Interior projection: Delta=h²*K, K=C/L, where
+        # C=|own_axis x other_axis|² and L=|other_axis|².
         # Differentiate that quotient directly, retaining the small cross
-        # product instead of forming |u|²-(u.v)²/|v|².
-        cross = ee_cross(u, v)
-        length_sq = wp.dot(v, v)
-        cross_j = jacobian()
+        # product instead of subtracting nearly equal squared lengths.
+        cross = ee_cross(own_axis, other_axis)
+        L = wp.dot(other_axis, other_axis)
+        dcrossdX = jacobian()
         mixed = matrix()
         for i in range(size):
-            ui, vi = wp.transpose(ju)[i], wp.transpose(jv)[i]
-            column = wp.cross(ui, v) + wp.cross(u, vi)
+            ui, vi = wp.transpose(d_own_axis_dX)[i], wp.transpose(d_other_axis_dX)[i]
+            column = wp.cross(ui, other_axis) + wp.cross(own_axis, vi)
             for axis in range(3):
-                cross_j[axis, i] = column[axis]
+                dcrossdX[axis, i] = column[axis]
             for j in range(size):
-                uj, vj = wp.transpose(ju)[j], wp.transpose(jv)[j]
+                uj, vj = wp.transpose(d_own_axis_dX)[j], wp.transpose(d_other_axis_dX)[j]
                 mixed[i, j] = wp.dot(cross, wp.cross(ui, vj) + wp.cross(uj, vi))
-        gn = 2.0 * wp.transpose(cross_j) * cross
-        hn = 2.0 * (
-            wp.transpose(cross_j) * cross_j
+        dCdX = 2.0 * wp.transpose(dcrossdX) * cross
+        d2CdX2 = 2.0 * (
+            wp.transpose(dcrossdX) * dcrossdX
             + mixed
-            + residual_curvature(positions, own, wp.cross(v, cross), False, com)
-            + residual_curvature(positions, other, wp.cross(cross, u), False, com)
+            + residual_curvature(positions, own_axis_coefficients, wp.cross(other_axis, cross), False, com)
+            + residual_curvature(positions, other_axis_coefficients, wp.cross(cross, own_axis), False, com)
         )
-        gl = 2.0 * wp.transpose(jv) * v
-        hl = 2.0 * (wp.transpose(jv) * jv + residual_curvature(positions, other, v, False, com))
-        k = wp.dot(cross, cross) / length_sq
-        gk = (gn - k * gl) / length_sq
-        hk = (hn - k * hl - wp.outer(gk, gl) - wp.outer(gl, gk)) / length_sq
+        dLdX = 2.0 * wp.transpose(d_other_axis_dX) * other_axis
+        d2LdX2 = 2.0 * (
+            wp.transpose(d_other_axis_dX) * d_other_axis_dX
+            + residual_curvature(positions, other_axis_coefficients, other_axis, False, com)
+        )
+        K = wp.dot(cross, cross) / L
+        dKdX = (dCdX - K * dLdX) / L
+        d2KdX2 = (d2CdX2 - K * d2LdX2 - wp.outer(dKdX, dLdX) - wp.outer(dLdX, dKdX)) / L
         return (
-            value,
-            h * h * gk + 2.0 * h * k * gh,
-            2.0 * h * k * zh,
-            h * h * hk + 2.0 * h * (wp.outer(gh, gk) + wp.outer(gk, gh)) + 2.0 * k * wp.outer(gh, gh),
+            Delta,
+            h * h * dKdX + 2.0 * h * K * dhdX,
+            2.0 * h * K * dhdst,
+            h * h * d2KdX2 + 2.0 * h * (wp.outer(dhdX, dKdX) + wp.outer(dKdX, dhdX)) + 2.0 * K * wp.outer(dhdX, dhdX),
         )
 
     @wp.func
@@ -1857,7 +1934,7 @@ def _make_ee_block_functions(size: int):
         target_b: wp.vec3,
         target_c: wp.vec3,
         target_is_rigid: bool,
-        target_moves_with_body: bool,
+        target_on_selected_body: bool,
         particle_derivative_mask: int,
         edge_coefficients: wp.vec3,
         vertex_coefficients: wp.vec3,
@@ -1871,16 +1948,18 @@ def _make_ee_block_functions(size: int):
         dt: float = 0.0,
         smoothing: float = 0.0,
     ):
-        """Return P_f, its total first derivative, (s,t) partial, and reduced H.
+        """Return P, dP/dX, dP/d(s,t), reduced d²P/dX², and dissipation derivatives.
 
-        This does NOT multiply by the EE weight or finish the implicit Hessian.
+        P is this triangle's signed feature sum, including stiffness, not w*P.
+        X is the selected particle/body coordinate vector. The (s,t) partial
+        holds X fixed; the reduced Hessian omits s/t second derivatives.
         Sum these four outputs with their source-area factors over triangles
         and both sample directions, then call finish_ee_pair once. The last
         two outputs are dissipative blocks with fixed sample/weight; add them
         AFTER finishing the conservative derivatives, multiplied by pair.weight.
         Particle mask bits 4..6 include repeated identities in the triangle.
-        For a body block, the generating rigid edge moves with that body;
-        target_moves_with_body says whether this target triangle does too.
+        For a body block, the generating rigid edge belongs to that body;
+        target_on_selected_body says whether this target triangle does too.
         The sample direction is independent of target body ownership.
         """
         positions = pair.positions
@@ -1906,7 +1985,7 @@ def _make_ee_block_functions(size: int):
             source_coefficients_t = vec7(0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
 
         # P_near = +face -sum(weight_edge*edge) +sum(weight_vertex*vertex).
-        potential, gp, zp, hp = float(0.0), vector(), wp.vec2(), matrix()
+        P, dPdX, dPdst, d2PdX2_no_st_curvature = float(0.0), vector(), wp.vec2(), matrix()
         dissipative_gradient, dissipative_hessian = vector(), matrix()
         for feature_index in range(7):
             target_vertex_slots, dim, coefficient = wp.vec3i(4, 5, 6), int(2), float(1.0)
@@ -1917,7 +1996,7 @@ def _make_ee_block_functions(size: int):
                 if feature_index % 2 == 0:
                     dim, coefficient = 0, vertex_coefficients[corner]
             if coefficient != 0.0:
-                value, gradient, parameters, hessian, residual_coefficients, r, fixed_jacobian = (
+                D, dDdX, dDdst, d2DdX2_no_st_curvature, residual_coefficients, r, drdX_fixed_parameters = (
                     feature_distance_derivatives(
                         positions,
                         source_coefficients,
@@ -1928,18 +2007,18 @@ def _make_ee_block_functions(size: int):
                         pair.dsdX,
                         pair.dtdX,
                         particle_derivative_mask,
-                        target_moves_with_body,
+                        target_on_selected_body,
                         pair.com,
                     )
                 )
                 # Every edge/vertex lies in its triangle. If the face term is
                 # outside near support, all six remaining terms contribute zero.
-                if feature_index == 0 and value >= near * near:
+                if feature_index == 0 and D >= near * near:
                     return 0.0, vector(), wp.vec2(), matrix(), vector(), matrix()
-                distance = wp.sqrt(value)
-                energy, first, second = barrier_coefficients(distance, support, near, True)
+                distance = wp.sqrt(D)
+                barrier_value, dbdd, d2bdd2 = barrier_coefficients(distance, support, near, True)
                 # Reuse the closest feature's material weights and normal.
-                # fixed_jacobian excludes sample/closest-parameter derivatives,
+                # drdX_fixed_parameters excludes sample/closest-parameter derivatives,
                 # exactly as the native friction/damping local approximation.
                 relative_displacement = sample_displacement
                 for corner in range(3):
@@ -1948,60 +2027,59 @@ def _make_ee_block_functions(size: int):
                 if distance > 0.0:
                     normal = r / distance
                 friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
-                    normal, distance, first, relative_displacement, near, stiffness, mu, kd, dt, smoothing
+                    normal, distance, dbdd, relative_displacement, near, stiffness, mu, kd, dt, smoothing
                 )
-                dissipative_gradient += coefficient * wp.transpose(fixed_jacobian) * friction_damping_gradient
+                dissipative_gradient += coefficient * wp.transpose(drdX_fixed_parameters) * friction_damping_gradient
                 dissipative_hessian += (
-                    coefficient * wp.transpose(fixed_jacobian) * friction_damping_hessian * fixed_jacobian
+                    coefficient * wp.transpose(drdX_fixed_parameters) * friction_damping_hessian * drdX_fixed_parameters
                 )
                 # Do not materialize b_DD ~ 1/d^4: it overflows FP32 well
                 # before the final energy Hessian ~ 1/d^2 does. Form the
                 # distance gradient first, then multiply bounded quantities.
-                distance_gradient = gradient / (2.0 * distance)
-                radial_curvature = second - first / distance
-                first /= 2.0 * distance
-                potential += coefficient * stiffness * energy
-                gp += coefficient * stiffness * first * gradient
-                zp += coefficient * stiffness * first * parameters
-                hp += (
-                    coefficient
-                    * stiffness
-                    * (first * hessian + radial_curvature * wp.outer(distance_gradient, distance_gradient))
+                dddX = dDdX / (2.0 * distance)
+                radial_curvature = d2bdd2 - dbdd / distance
+                dbdD = dbdd / (2.0 * distance)
+                P += coefficient * stiffness * barrier_value
+                dPdX += coefficient * stiffness * dbdD * dDdX
+                dPdst += coefficient * stiffness * dbdD * dDdst
+                d2PdX2_no_st_curvature += (
+                    coefficient * stiffness * (dbdD * d2DdX2_no_st_curvature + radial_curvature * wp.outer(dddX, dddX))
                 )
-        return potential, gp, zp, hp, dissipative_gradient, dissipative_hessian
+        return P, dPdX, dPdst, d2PdX2_no_st_curvature, dissipative_gradient, dissipative_hessian
 
     @wp.func
     def finish_ee_pair(
         pair: EdgePairCoefficients,
-        potential: float,
-        gp: vector,
-        zp: wp.vec2,
-        hp: matrix,
+        P: float,
+        dPdX: vector,
+        dPdst: wp.vec2,
+        d2PdX2_no_st_curvature: matrix,
     ):
         """Finish E=w*P and its exact selected-block derivatives once per pair.
 
-        gp/hp are derivatives of the area-weighted potential P along first-order
-        closest-parameter motion. zp is its partial derivative wrt (s,t).
+        dPdX includes ds/dX and dt/dX. dPdst is partial at fixed X.
+        d2PdX2_no_st_curvature excludes d²s/dX² and d²t/dX² terms.
         H(E) = w H(P) + P H(w) + grad(w)grad(P)^T + grad(P)grad(w)^T,
         followed by the explicit implicit-function correction for s/t curvature.
         """
         weight, dlogwdX = pair.weight, pair.dlogwdX
-        energy = weight * potential
-        gradient = weight * (gp + potential * dlogwdX)
+        energy = weight * P
+        gradient = weight * (dPdX + P * dlogwdX)
         hessian = weight * (
-            hp
-            + wp.outer(dlogwdX, gp)
-            + wp.outer(gp, dlogwdX)
-            + potential * (pair.d2logwdX2_no_st_curvature + wp.outer(dlogwdX, dlogwdX))
+            d2PdX2_no_st_curvature
+            + wp.outer(dlogwdX, dPdX)
+            + wp.outer(dPdX, dlogwdX)
+            + P * (pair.d2logwdX2_no_st_curvature + wp.outer(dlogwdX, dlogwdX))
         )
 
         # Final implicit correction accounts for the curvature of s(X),t(X).
         # It is applied to scalar ENERGY, rather than building sample Hessians.
         if weight <= 0.0:
             return 0.0, vector(), matrix()
-        partial = weight * (zp + potential * pair.dlogwdst)
-        l1 = (partial[1] - pair.R01 * partial[0] / pair.R00) / (pair.R11 * pair.R11)
-        l0 = partial[0] / (pair.R00 * pair.R00) - pair.R01 * l1 / pair.R00
+        dEdst = weight * (dPdst + P * pair.dlogwdst)
+        # Solve [u,v].T*[u,v] * lagrange = dE/d(s,t) using the stored QR.
+        lagrange_t = (dEdst[1] - pair.R01 * dEdst[0] / pair.R00) / (pair.R11 * pair.R11)
+        lagrange_s = dEdst[0] / (pair.R00 * pair.R00) - pair.R01 * lagrange_t / pair.R00
         positions = pair.positions
         residual_coefficients = vec7(1.0 - pair.s, pair.s, pair.t - 1.0, -pair.t, 0.0, 0.0, 0.0)
         residual_coefficients_s = vec7(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -2009,11 +2087,11 @@ def _make_ee_block_functions(size: int):
         u, v = pair.u, pair.v
         r = position_sum(positions, residual_coefficients)
         drdX = pair.drdX_fixed_st + wp.outer(u, pair.dsdX) + wp.outer(v, pair.dtdX)
-        weighted_axis_j = l0 * pair.dudX + l1 * pair.dvdX
-        correction = wp.transpose(weighted_axis_j) * drdX
+        weighted_axis_jacobian = lagrange_s * pair.dudX + lagrange_t * pair.dvdX
+        correction = wp.transpose(weighted_axis_jacobian) * drdX
         hessian -= correction + wp.transpose(correction)
         hessian -= residual_curvature(
-            positions, l0 * residual_coefficients_s + l1 * residual_coefficients_t, r, False, pair.com
+            positions, lagrange_s * residual_coefficients_s + lagrange_t * residual_coefficients_t, r, False, pair.com
         )
         hessian -= residual_second(
             positions,
@@ -2022,7 +2100,7 @@ def _make_ee_block_functions(size: int):
             residual_coefficients_t,
             pair.dsdX,
             pair.dtdX,
-            l0 * u + l1 * v,
+            lagrange_s * u + lagrange_t * v,
             pair.particle_derivative_mask,
             False,
             pair.com,
@@ -2522,7 +2600,7 @@ def ee_particle_source(
     pair = prepare_particle_ee_pair(a, b, c, d, source_mask, wp.vec3(), near)
     if pair.weight <= 0.0:
         return 0.0
-    potential, gradient, parameter_gradient_sum, hessian = float(0.0), wp.vec3(), wp.vec2(), wp.mat33()
+    P, dPdX, dPdst, d2PdX2_no_st_curvature = float(0.0), wp.vec3(), wp.vec2(), wp.mat33()
     dissipative_gradient = wp.vec3()
     dissipative_hessian = wp.mat33()
     for direction in range(2):
@@ -2613,7 +2691,14 @@ def ee_particle_source(
             if use_friction:
                 mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
             kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
-            e, g, parameter_gradient, h, dg, dh = particle_ee_triangle_contribution(
+            (
+                triangle_P,
+                d_triangle_P_dX,
+                d_triangle_P_dst,
+                d2_triangle_P_dX2_no_st_curvature,
+                friction_damping_gradient,
+                friction_damping_hessian,
+            ) = particle_ee_triangle_contribution(
                 pair,
                 ta,
                 tb,
@@ -2633,14 +2718,13 @@ def ee_particle_source(
                 dt,
                 friction_epsilon * dt,
             )
-            scale = source_area_factor
-            potential += scale * e
-            gradient += scale * g
-            parameter_gradient_sum += scale * parameter_gradient
-            hessian += scale * h
-            dissipative_gradient += scale * dg
-            dissipative_hessian += scale * dh
-    energy, gradient, hessian = finish_particle_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
+            P += source_area_factor * triangle_P
+            dPdX += source_area_factor * d_triangle_P_dX
+            dPdst += source_area_factor * d_triangle_P_dst
+            d2PdX2_no_st_curvature += source_area_factor * d2_triangle_P_dX2_no_st_curvature
+            dissipative_gradient += source_area_factor * friction_damping_gradient
+            dissipative_hessian += source_area_factor * friction_damping_hessian
+    energy, gradient, hessian = finish_particle_ee_pair(pair, P, dPdX, dPdst, d2PdX2_no_st_curvature)
     # Only the conservative block differentiates q and w. Dissipation freezes both.
     gradient += pair.weight * dissipative_gradient
     hessian += pair.weight * dissipative_hessian
@@ -3111,7 +3195,7 @@ def ee_body(
     pair = prepare_body_ee_pair(a, b, c, d, 0, com, near)
     if pair.weight <= 0.0:
         return 0.0
-    potential, gradient, parameter_gradient_sum, hessian = (
+    P, dPdX, dPdst, d2PdX2_no_st_curvature = (
         float(0.0),
         wp.spatial_vector(),
         wp.vec2(),
@@ -3128,11 +3212,11 @@ def ee_body(
             target_shape_index = shape_index
             target_family, target_soft_primitive_index = 2, soft_primitive_index
             sample = wp.vec3(pair.soft_sample)
-            target_moves = bool(False)
+            target_on_selected_body = bool(False)
             if direction == 0:
                 triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
                 target_shape_index = int(data.rigid_vertex_shapes[triangle_vertex_indices[0]])
-                target_moves = shape_body[target_shape_index] == body_index
+                target_on_selected_body = shape_body[target_shape_index] == body_index
                 ta, tb, tc = (
                     wp.vec3(rigid_positions[triangle_vertex_indices[0]]),
                     wp.vec3(rigid_positions[triangle_vertex_indices[1]]),
@@ -3204,13 +3288,20 @@ def ee_body(
             if use_friction:
                 mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
             kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
-            e, g, parameter_gradient, h, dg, dh = body_ee_triangle_contribution(
+            (
+                triangle_P,
+                d_triangle_P_dX,
+                d_triangle_P_dst,
+                d2_triangle_P_dX2_no_st_curvature,
+                friction_damping_gradient,
+                friction_damping_hessian,
+            ) = body_ee_triangle_contribution(
                 pair,
                 ta,
                 tb,
                 tc,
                 direction == 0,
-                target_moves,
+                target_on_selected_body,
                 0,
                 edge_coefficients,
                 vertex_coefficients,
@@ -3224,14 +3315,13 @@ def ee_body(
                 dt,
                 friction_epsilon * dt,
             )
-            scale = source_area_factor
-            potential += scale * e
-            gradient += scale * g
-            parameter_gradient_sum += scale * parameter_gradient
-            hessian += scale * h
-            dissipative_gradient += scale * dg
-            dissipative_hessian += scale * dh
-    energy, gradient, hessian = finish_body_ee_pair(pair, potential, gradient, parameter_gradient_sum, hessian)
+            P += source_area_factor * triangle_P
+            dPdX += source_area_factor * d_triangle_P_dX
+            dPdst += source_area_factor * d_triangle_P_dst
+            d2PdX2_no_st_curvature += source_area_factor * d2_triangle_P_dX2_no_st_curvature
+            dissipative_gradient += source_area_factor * friction_damping_gradient
+            dissipative_hessian += source_area_factor * friction_damping_hessian
+    energy, gradient, hessian = finish_body_ee_pair(pair, P, dPdX, dPdst, d2PdX2_no_st_curvature)
     # Only the conservative block differentiates q and w. Dissipation freezes both.
     gradient += pair.weight * dissipative_gradient
     hessian += pair.weight * dissipative_hessian

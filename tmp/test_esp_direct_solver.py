@@ -59,6 +59,13 @@ class TestEspDirectSolver(unittest.TestCase):
                 model.soft_contact_ke = 1
                 model.shape_material_ke.fill_(1)
                 state = model.state()
+                # Keep this cross-precision Hessian comparison off feature boundaries.
+                # Otherwise the center vertex lies exactly over the box's face diagonal:
+                # CUDA FP32 selects a face interior where FP64 selects an edge, whose
+                # selected-branch distance Hessians need not agree at that boundary.
+                particle_q_np = state.particle_q.numpy()
+                particle_q_np[:, :2] += np.array([0.000123, 0.000271], dtype=np.float32)
+                state.particle_q.assign(particle_q_np)
                 blocks = EspVbdBlockEvaluator(model, pipeline, state)
                 blocks.assemble(state)
                 blocks.check()
