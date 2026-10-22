@@ -43,6 +43,12 @@ class TestEspDirectSolver(unittest.TestCase):
             names |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
             self.assertFalse(forbidden & names, (name, forbidden & names))
         self.assertFalse(hasattr(direct, "get_esp_kernels"))
+        # The numerical fix uses explicit closest-parameter Hessians, not the
+        # old implicit multiplier correction or a retained comparison variant.
+        factory_source = inspect.getsource(direct._make_ee_block_functions)
+        self.assertIn("closest_parameter_derivatives(", factory_source)
+        self.assertIn("dEdst[0] * pair.d2sdX2 + dEdst[1] * pair.d2tdX2", factory_source)
+        self.assertNotIn("lagrange_s", factory_source)
         launch_source = inspect.getsource(direct.launch_contact_blocks)
         self.assertIn("accumulate_particle_contact_derivatives,", launch_source)
         self.assertIn("accumulate_body_contact_derivatives,", launch_source)

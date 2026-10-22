@@ -14,12 +14,22 @@ from functools import cache
 import numpy as np
 import torch  # noqa: TID253 -- Optional independent test oracle.
 import warp as wp
+from esp_autodiff import ee_sample as torch_ee_sample
 from esp_chain_solver_reference import make_esp_derivative_functions
 from esp_direct_ee_per_triangle_reference import make_direct_ee_formulas
 from esp_ee_implicit_formulas import ee_energy_derivatives, rigid_body_block
 from test_esp_ee_implicit_formulas import fixtures, torch_body_energy, torch_energy
 
 from newton._src.solvers.vbd import esp_contact
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def quadrature_weights(points: wp.array[wp.vec3], output: wp.array[float]):
+    """Exercise the value path used by target-only blocks and viewer markers."""
+    _q, _q_bar, weight = esp_contact.ee_quadrature_sample(points[0], points[1], points[2], points[3], 0.15)
+    output[0] = weight
+    pair = esp_contact.prepare_particle_ee_pair(points[0], points[1], points[2], points[3], 1, wp.vec3(), 0.15)
+    output[1] = pair.weight
 
 
 @cache
@@ -175,6 +185,76 @@ def evaluate_blocks(positions, selected, size, scalar, device, *, direct=None, n
 
 
 class TestEspDirectEE(unittest.TestCase):
+    def test_rotated_near_parallel_blocks(self):
+        """Retain accurate derivatives when nearly parallel edges are not axis-aligned.
+
+        The angle-1e-4 and angle-1e-6 first rotations were also checked against
+        80-digit scalar energy derivatives in ctx/2026-10-21-ee-hessian-methods.
+        Quantize coordinates before evaluating the independent reference, so
+        arithmetic error is not confused with a change of input geometry.
+        """
+        rng = np.random.default_rng(411)
+        cases = []
+        for angle in (1e-4, 1e-6, 1e-8, 5e-3, 9.99e-3, 1.001e-2, 2e-2, 0.0999, 0.101, 0.2):
+            for rotation_index in range(3):
+                rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+                base = fixtures()["near_parallel_0.0001"].copy()
+                base[:2, 2] = angle * 0.01
+                base[2:4, 1] = (-angle / 2, angle / 2)
+                # Include both sides of the arithmetic-only frame-selection
+                # boundary; it must not introduce a force/Hessian discontinuity.
+                points = (base @ rotation.T).astype(np.float32).astype(np.float64)
+                cases.append((angle, str(rotation_index), points))
+        for index in (0, 3, 6):
+            angle, label, original = cases[index]
+            for reverse_soft, reverse_rigid in ((True, False), (False, True), (True, True)):
+                points = original.copy()
+                if reverse_soft:
+                    points[[0, 1]] = points[[1, 0]]
+                if reverse_rigid:
+                    points[[2, 3]] = points[[3, 2]]
+                cases.append((angle, f"{label}-reversed-{reverse_soft}-{reverse_rigid}", points))
+        for angle, rotation_index, points in cases:
+            x = torch.tensor(points, dtype=torch.float64, requires_grad=True)
+            energy = torch_energy(x)
+            gradient = torch.autograd.grad(energy, x)[0].detach().numpy()
+            hessian = torch.autograd.functional.hessian(torch_energy, x).detach().numpy()
+            motion = torch.zeros(6, dtype=torch.float64, requires_grad=True)
+            body_energy = torch_body_energy(motion, points)
+            body_gradient = torch.autograd.grad(body_energy, motion)[0].detach().numpy()
+            body_hessian = (
+                torch.autograd.functional.hessian(lambda y, points=points: torch_body_energy(y, points), motion)
+                .detach()
+                .numpy()
+            )
+            for device in wp.get_devices():
+                weights = wp.empty(2, dtype=float, device=device)
+                wp.launch(
+                    quadrature_weights,
+                    1,
+                    inputs=[wp.array(points, dtype=wp.vec3, device=device)],
+                    outputs=[weights],
+                    device=device,
+                )
+                expected_weight = float(torch_ee_sample(*x[:4], 0.15)[2].detach())
+                with self.subTest(angle=angle, rotation=rotation_index, device=str(device), path="quadrature value"):
+                    self.assert_close(weights.numpy(), np.full(2, expected_weight), 3e-4)
+                for size in (3, 6):
+                    for selected in range(6) if size == 3 else (-1,):
+                        with self.subTest(
+                            angle=angle, rotation=rotation_index, device=str(device), size=size, selected=selected
+                        ):
+                            expected = (float(body_energy.detach()), body_gradient, body_hessian)
+                            if size == 3:
+                                expected = (
+                                    float(energy.detach()),
+                                    gradient[selected],
+                                    hessian[selected, :, selected, :],
+                                )
+                            actual = evaluate_blocks(points[None], [selected], size, wp.float32, device)
+                            for got, want in zip(actual, expected, strict=True):
+                                self.assert_close(got[0], want, 3e-4)
+
     def test_captured_endpoint_cancellation(self):
         """Retain the positive EE term lost by FP32 distance subtraction."""
         # Exact saved FP32 state: closest rigid sample is 40.5 nm from c,

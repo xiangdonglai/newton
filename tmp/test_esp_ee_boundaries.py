@@ -246,16 +246,16 @@ def make_endpoint_excess_probe(scalar):
             # their FP32 rounding can choose different sides of this branch.
             h = esp_contact.ee_endpoint_parameter_offset(
                 endpoint,
-                vec3(points[row, 0]),
-                vec3(points[row, 1]),
-                vec3(points[row, 2]),
-                vec3(points[row, 3]),
+                pair.positions[0],
+                pair.positions[1],
+                pair.positions[2],
+                pair.positions[3],
             )
             other = pair.t
-            own_axis, other_axis = vec3(pair.u), -pair.v
+            own_axis, other_axis = pair.positions[1], pair.positions[3] - pair.positions[2]
             if endpoint >= 2:
                 other = pair.s
-                own_axis, other_axis = -pair.v, vec3(pair.u)
+                own_axis, other_axis = other_axis, own_axis
             value, _projection = endpoint_excess(h, other, own_axis, other_axis)
             excesses[row, endpoint] = wp.float64(scalar(100.0) * value / distance_sq)
 
@@ -378,9 +378,12 @@ def make_predicate_probe(scalar):
             scalar(0.15),
         )
         positions = pair.positions
-        positions[4] = vec3(points[row, 4]) - pair.origin
-        positions[5] = vec3(points[row, 5]) - pair.origin
-        positions[6] = vec3(points[row, 6]) - pair.origin
+        for corner in range(3):
+            point = vec3(points[row, 4 + corner])
+            positions[4 + corner] = wp.transpose(pair.rotation) * (point - pair.endpoints_world[0])
+            for endpoint in range(4):
+                if point == pair.endpoints_world[endpoint]:
+                    positions[4 + corner] = positions[endpoint]
         soft = vec7(scalar(1) - pair.s, pair.s, scalar(0), scalar(0), scalar(0), scalar(0), scalar(0))
         rigid = vec7(scalar(0), scalar(0), scalar(1) - pair.t, pair.t, scalar(0), scalar(0), scalar(0))
         for direction in range(2):
