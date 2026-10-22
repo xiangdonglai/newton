@@ -1217,18 +1217,6 @@ def _make_ee_block_functions(size: int):
     Only the solve-block size varies: particle and body functions share the
     same float32 formulas without padding 3D blocks or duplicating the derivation.
 
-    X collects the selected particle's 3 position DoFs, or the selected
-    body's 6 DoFs (COM translation followed by world rotation).
-    Closest parameters s,t satisfy g=(u.r, v.r)=0, where r is the edge-point
-    difference and u,v its derivatives with respect to s,t. With y=(X,s,t)
-    and T=[I; ds/dX; dt/dX], the final energy E=w*P,
-    P=sum(area*triangle_P), obeys
-
-        dE/dX = T.T * grad_y(E)
-        d2E/dX2 = T.T * (H_y(E) - lambda_s*H_y(g_s)
-                                    - lambda_t*H_y(g_t)) * T,
-        lambda = transpose(dg/d(s,t))^(-1) * dE/d(s,t).
-
     Prepare source coefficients once, sum target triangle contributions,
     then finish this correction once. Inputs are ordinary positions, not
     derivative-carrying geometry. Explicit residual Jacobians and small
@@ -2063,6 +2051,8 @@ def _make_ee_block_functions(size: int):
         followed by the explicit implicit-function correction for s/t curvature.
         """
         weight, dlogwdX = pair.weight, pair.dlogwdX
+        if weight <= 0.0:
+            return 0.0, vector(), matrix()
         energy = weight * P
         gradient = weight * (dPdX + P * dlogwdX)
         hessian = weight * (
@@ -2072,10 +2062,18 @@ def _make_ee_block_functions(size: int):
             + P * (pair.d2logwdX2_no_st_curvature + wp.outer(dlogwdX, dlogwdX))
         )
 
-        # Final implicit correction accounts for the curvature of s(X),t(X).
-        # It is applied to scalar ENERGY, rather than building sample Hessians.
-        if weight <= 0.0:
-            return 0.0, vector(), matrix()
+        # We still need E_s H(s) + E_t H(t), where E_s,E_t are partials at
+        # fixed X and H denotes d²/dX². For interior closest points,
+        # u^T r = v^T r = 0, with u=b-a, v=c-d, r=q-q_bar=a-c+s*u+t*v.
+        # The solve below chooses h=lambda_s*u+lambda_t*v so that
+        # h^T u=E_s and h^T v=E_t. Holding lambda fixed and differentiating
+        # h^T r=0 twice gives:
+        #   0 = J_h^T J_r + J_r^T J_h + sum_i r_i H(h_i) + sum_i h_i H(r_i).
+        # Write H(r_i)=H_other(r_i)+u_i H(s)+v_i H(t), where H_other omits
+        # only the second derivatives of s,t. Thus the missing terms equal
+        #   -[J_h^T J_r + J_r^T J_h + sum_i r_i H(h_i) + sum_i h_i H_other(r_i)].
+        # J_h,J_r are total X derivatives (J_r includes ds/dX and dt/dX).
+        # The three subtractions below evaluate these three groups in order.
         dEdst = weight * (dPdst + P * pair.dlogwdst)
         # Solve [u,v].T*[u,v] * lagrange = dE/d(s,t) using the stored QR.
         lagrange_t = (dEdst[1] - pair.R01 * dEdst[0] / pair.R00) / (pair.R11 * pair.R11)
@@ -2110,8 +2108,8 @@ def _make_ee_block_functions(size: int):
     return prepare_ee_pair, ee_triangle_contribution, finish_ee_pair
 
 
-prepare_particle_ee_pair, particle_ee_triangle_contribution, finish_particle_ee_pair = _make_ee_block_functions(3)
-prepare_body_ee_pair, body_ee_triangle_contribution, finish_body_ee_pair = _make_ee_block_functions(6)
+prepare_particle_ee_pair, particle_ee_triangle_contribution, particle_finish_ee_pair = _make_ee_block_functions(3)
+prepare_body_ee_pair, body_ee_triangle_contribution, body_finish_ee_pair = _make_ee_block_functions(6)
 
 
 @wp.func
@@ -2587,29 +2585,57 @@ def ee_particle_source(
 
     Area factors and position-dependent EE weights are included before writing
     to ``particle_index``. Return the conservative energy; no extra scale is applied.
+
+    Let X be the selected particle's position. The potential including both sample
+    directions (q, q_bar) is E(X) = w(X)P(X), with
+    P(X) = sum_τ A_τ P_τ(X, s(X), t(X)). A_τ is the fixed source-area factor.
+    (1) particle_ee_triangle_contribution returns each triangle's P_τ, dP_τ/dX,
+        ∂P_τ/∂(s,t), and d2P_τ/dX2_no_st_curvature.
+    (2) particle_finish_ee_pair completes the conservative energy derivatives:
+        E = wP,
+        dE/dX = P dw/dX + w dP/dX,
+        d²E/dX² = P d²w/dX² + w d²P/dX² -> (corrected from no st curvature)
+                  + (dw/dX)(dP/dX)^T + (dP/dX)(dw/dX)^T.
+
+    Here ∂/∂X holds s,t fixed, whereas d/dX includes s(X),t(X).
+    With column gradients s_X = ds/dX and t_X = dt/dX, the chain rule gives:
+
+        dP/dX = ∂P/∂X + (∂P/∂s) s_X + (∂P/∂t) t_X,
+
+        d²P/dX² = ∂²P/∂X²
+                  + (∂²P/∂X∂s) s_X^T + s_X (∂²P/∂X∂s)^T
+                  + (∂²P/∂X∂t) t_X^T + t_X (∂²P/∂X∂t)^T
+                  + (∂²P/∂s²) s_X s_X^T + (∂²P/∂t²) t_X t_X^T
+                  + (∂²P/∂s∂t) (s_X t_X^T + t_X s_X^T)
+                  + (∂P/∂s) d²s/dX² + (∂P/∂t) d²t/dX².
+
+    d2PdX2_no_st_curvature contains all terms EXCEPT the last line. It already
+    includes ds/dX, dt/dX and the mixed terms. Similar concepts apply to w & E.
     """
     soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
     rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
     a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
     c, d = rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
     # 0b01 if particle_index is the first endpoint, 0b10 if the second.
-    source_mask = int(soft_edge_vertex_indices[0] == particle_index) | (
+    particle_derivative_mask = int(soft_edge_vertex_indices[0] == particle_index) | (
         int(soft_edge_vertex_indices[1] == particle_index) << 1
     )
     # The generating pair determines q, q_bar, w and their derivatives.
-    pair = prepare_particle_ee_pair(a, b, c, d, source_mask, wp.vec3(), near)
+    pair = prepare_particle_ee_pair(a, b, c, d, particle_derivative_mask, wp.vec3(), near)
     if pair.weight <= 0.0:
         return 0.0
     P, dPdX, dPdst, d2PdX2_no_st_curvature = float(0.0), wp.vec3(), wp.vec2(), wp.mat33()
     dissipative_gradient = wp.vec3()
     dissipative_hessian = wp.mat33()
+    # direction 0: q against rigid objects, direction 1: q_bar against soft objects
     for direction in range(2):
         edge_list_index = soft_primitive_index
         if direction == 1:
             edge_list_index = lists.soft_edge_count + rigid_primitive_index
         for entry_index in range(lists.starts[edge_list_index] + partition, lists.ends[edge_list_index], partitions):
             triangle_index = lists.keys[entry_index]
-            particle_derivative_mask = source_mask
+            # Target-corner bits belong only to this triangle, not the previous one.
+            particle_derivative_mask_copy = particle_derivative_mask
             target_shape_index = shape_index
             target_family, target_soft_primitive_index = 2, soft_primitive_index
             sample = wp.vec3(pair.soft_sample)
@@ -2649,7 +2675,7 @@ def ee_particle_source(
                 # One particle may be both source endpoint and target corner.
                 for corner in range(3):
                     if triangle_vertex_indices[corner] == particle_index:
-                        particle_derivative_mask |= 1 << (4 + corner)
+                        particle_derivative_mask_copy |= 1 << (4 + corner)
             support, target_near, stiffness = contact_support_and_stiffness(
                 target_family,
                 target_soft_primitive_index,
@@ -2705,7 +2731,7 @@ def ee_particle_source(
                 tc,
                 direction == 0,
                 False,
-                particle_derivative_mask,
+                particle_derivative_mask_copy,
                 edge_coefficients,
                 vertex_coefficients,
                 support,
@@ -2724,7 +2750,7 @@ def ee_particle_source(
             d2PdX2_no_st_curvature += source_area_factor * d2_triangle_P_dX2_no_st_curvature
             dissipative_gradient += source_area_factor * friction_damping_gradient
             dissipative_hessian += source_area_factor * friction_damping_hessian
-    energy, gradient, hessian = finish_particle_ee_pair(pair, P, dPdX, dPdst, d2PdX2_no_st_curvature)
+    energy, gradient, hessian = particle_finish_ee_pair(pair, P, dPdX, dPdst, d2PdX2_no_st_curvature)
     # Only the conservative block differentiates q and w. Dissipation freezes both.
     gradient += pair.weight * dissipative_gradient
     hessian += pair.weight * dissipative_hessian
@@ -2925,6 +2951,9 @@ def accumulate_particle_contact_derivatives(
         if family > 2:
             wp.atomic_or(esp_error, 0, 8)
             continue
+        # Only EE neighborhood sums are partitioned; evaluate each VT/TV row once.
+        if family < 2 and partition != 0:
+            continue
         # Zero-weight vertices are excluded from ESP mesh contact.
         if family == 0 and (data.soft_vertex_quadrature_weight[soft_primitive_index] == 0.0):
             continue
@@ -2944,9 +2973,6 @@ def accumulate_particle_contact_derivatives(
         # Zero support gives no interaction. Keep zero-stiffness rows for
         # damping; EE samples also evaluate other shapes with their own material.
         if support == 0:
-            continue
-        # Only EE neighborhood sums are partitioned; evaluate each VT/TV row once.
-        if family < 2 and partition != 0:
             continue
         mu = float(0.0)
         if use_friction:
@@ -3321,7 +3347,7 @@ def ee_body(
             d2PdX2_no_st_curvature += source_area_factor * d2_triangle_P_dX2_no_st_curvature
             dissipative_gradient += source_area_factor * friction_damping_gradient
             dissipative_hessian += source_area_factor * friction_damping_hessian
-    energy, gradient, hessian = finish_body_ee_pair(pair, P, dPdX, dPdst, d2PdX2_no_st_curvature)
+    energy, gradient, hessian = body_finish_ee_pair(pair, P, dPdX, dPdst, d2PdX2_no_st_curvature)
     # Only the conservative block differentiates q and w. Dissipation freezes both.
     gradient += pair.weight * dissipative_gradient
     hessian += pair.weight * dissipative_hessian

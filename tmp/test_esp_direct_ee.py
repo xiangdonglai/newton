@@ -37,11 +37,11 @@ def make_comparison_kernel(size, scalar, direct=True, near=0.15):
     if size == 3:
         prepare_pair = esp_contact.prepare_particle_ee_pair
         triangle_contribution = esp_contact.particle_ee_triangle_contribution
-        finish_pair = esp_contact.finish_particle_ee_pair
+        finish_pair = esp_contact.particle_finish_ee_pair
     else:
         prepare_pair = esp_contact.prepare_body_ee_pair
         triangle_contribution = esp_contact.body_ee_triangle_contribution
-        finish_pair = esp_contact.finish_body_ee_pair
+        finish_pair = esp_contact.body_finish_ee_pair
     create_point, triangle, samples, *_ = make_esp_derivative_functions(size, scalar)
 
     @wp.kernel(module="unique", enable_backward=False)

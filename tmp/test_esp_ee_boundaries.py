@@ -47,11 +47,11 @@ def make_target_probe(size, scalar, baseline):
     elif size == 3:
         prepare = esp_contact.prepare_particle_ee_pair
         triangle = esp_contact.particle_ee_triangle_contribution
-        finish = esp_contact.finish_particle_ee_pair
+        finish = esp_contact.particle_finish_ee_pair
     else:
         prepare = esp_contact.prepare_body_ee_pair
         triangle = esp_contact.body_ee_triangle_contribution
-        finish = esp_contact.finish_body_ee_pair
+        finish = esp_contact.body_finish_ee_pair
     vec3 = wp.types.vector(length=3, dtype=scalar)
 
     @wp.kernel(module="unique", enable_backward=False)
