@@ -5,8 +5,11 @@
 
 SolverVBD owns evaluation buffers and launch scheduling. The standalone
 diagnostic evaluator lives in tmp and calls these same mathematical functions.
+Edge-edge rows have three selectable treatments, see EE_QUADRATURE_MODES; the
+per-process switch _EE_QUADRATURE (NEWTON_ESP_EE_QUADRATURE at import) selects one.
 """
 
+import os
 import warnings
 from typing import TYPE_CHECKING
 
@@ -37,6 +40,53 @@ def _contact_worker_count(contact_capacity: int, device: wp.Device, partitions: 
     if partitions < 1:
         raise ValueError("ESP partitions must be positive")
     return max(1, min(contact_capacity, (512 * sm_count + partitions - 1) // partitions))
+
+
+# How edge-edge (EE) contact rows enter the ESP energy. SolverVBD selects one
+# choice at construction; each choice compiles its own kernels, so the default
+# production code path is unchanged by the alternatives.
+EE_QUADRATURE_UNNORMALIZED = 0
+"""Adaptive EE samples with the paper's Eq. (9) weights, without per-face normalization (author's option 1)."""
+EE_QUADRATURE_NORMALIZED = 1
+"""Adaptive EE samples whose near-field weights are normalized per source face, as in the paper's quadrature.
+
+For each source face f with rest area A_f, three fixed vertex samples of weight 1/6 and
+the adaptive EE samples q on its edges with weights w(q):
+
+    E_near,f = A_f * (sum_v (1/6) P_near(v) + sum_q w(q) P_near(q)) / (1/2 + sum_q w(q)),
+
+while the far field keeps its fixed-vertex quadrature. Without active EE samples this is
+exactly the unnormalized energy. Forces are exact derivatives of this energy, including the
+denominator; the solve Hessian is exact per contact row and omits second-order coupling between
+different rows of the same face.
+"""
+EE_QUADRATURE_OGC = 2
+"""Edge rows go through Newton's native rigid-soft contact kernels; ESP evaluates VT/TV rows only.
+
+The native path applies Newton's OGC contact-set filter (``soft_contact_force_mask``: closest
+points interior to both edges and a separation inside both edges' normal cones), its penalty or
+log-barrier law on the segment distance, and its AVBD ramping. The solver clears the force mask
+of the VT/TV rows of ESP shapes (restrict_force_mask_to_edge_rows) and passes no ESP shape mask
+to the native kernels, so they evaluate exactly the edge rows (EE and edge-depth recovery) of
+those shapes. ESP kernels skip EE rows here, so the ESP energy excludes them. The edge-target
+lists are still built but unused. This mode is for comparing formulations.
+"""
+EE_QUADRATURE_MODES = {
+    "unnormalized": EE_QUADRATURE_UNNORMALIZED,
+    "normalized": EE_QUADRATURE_NORMALIZED,
+    "ogc": EE_QUADRATURE_OGC,
+}
+_EE_QUADRATURE_ENV = "NEWTON_ESP_EE_QUADRATURE"
+_ee_quadrature_name = os.environ.get(_EE_QUADRATURE_ENV, "unnormalized")
+if _ee_quadrature_name not in EE_QUADRATURE_MODES:
+    raise ValueError(f"{_EE_QUADRATURE_ENV}={_ee_quadrature_name!r}: use one of {sorted(EE_QUADRATURE_MODES)}")
+_EE_QUADRATURE = wp.constant(EE_QUADRATURE_MODES[_ee_quadrature_name])
+"""The EE formulation compiled into this process's kernels, like _PROJECT_ESP_HESSIAN_TO_PSD.
+
+Set NEWTON_ESP_EE_QUADRATURE to "unnormalized" (default), "normalized" or "ogc" before
+importing newton, or edit this constant. Kernels branch on it with wp.static, so the
+default path compiles none of the other modes' code. One mode per process.
+"""
 
 
 @wp.func
@@ -96,6 +146,37 @@ class EspData:
     rigid_edge_area: wp.array[float]
     total_edge_count: int
     """All soft edges plus participating rigid mesh edges, independent of detected contacts."""
+    soft_tri_area: wp.array[float]
+    """Rest area of each soft triangle; used only by normalized EE quadrature."""
+    rigid_tri_area: wp.array[float]
+    """Scaled rest area of each shared rigid triangle; used only by normalized EE quadrature."""
+    particle_world: wp.array[int]
+    """World of each particle; selects the FaceQuadratureSums slot of rigid faces shared by every world."""
+    rigid_face_sum_offset: wp.array[int]
+    """First FaceQuadratureSums slot of each rigid face; see face_sum_index."""
+    rigid_face_sum_world_stride: wp.array[int]
+    """1 for rigid faces of shapes shared by every world (one slot per world), else 0."""
+    face_sum_count: int
+    """Total FaceQuadratureSums slots: soft faces, then rigid face slots."""
+
+
+@wp.struct
+class FaceQuadratureSums:
+    """Per-source-face near-field sums for EE_QUADRATURE_NORMALIZED; soft faces first, then rigid face slots.
+
+    numerator[f] = sum over f's fixed vertex samples of (1/6) * ke * P_near(v)
+                 + sum over adaptive EE samples q on f's edges of w(q) * ke * P_near(q)
+    weight[f]    = 1/2 + sum over those EE samples of w(q)
+
+    A rigid face of a shape shared by every world (shape_world < 0) has one slot per world,
+    selected by the world of the row's soft primitive, so worlds stay independent; other
+    rigid faces have one slot. See face_sum_index. accumulate_face_quadrature rebuilds both
+    arrays from the current positions before each normalized evaluation; the other modes
+    never read them.
+    """
+
+    numerator: wp.array[float]
+    weight: wp.array[float]
 
 
 @wp.struct
@@ -1269,17 +1350,224 @@ def body_triangle(
     return scale * energy
 
 
+@wp.func
+def ee_sample_potentials(
+    soft_primitive_index: int,
+    rigid_primitive_index: int,
+    shape_index: int,
+    q: wp.vec3,
+    q_bar: wp.vec3,
+    data: EspData,
+    particle_q: wp.array[wp.vec3],
+    rigid_positions: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    shape_margin: wp.array[float],
+    shape_material_ke: wp.array[float],
+    soft_contact_ke: float,
+    lists: EdgeTriangleListData,
+) -> tuple[float, float]:
+    """Return the stiffness-weighted near potentials of q against rigid targets and q_bar against soft targets.
+
+    Each target triangle uses its own shape's support and stiffness, exactly as the
+    derivative kernels do. Source area factors and the EE weight are applied by the caller.
+    """
+    near_rigid, near_soft = float(0.0), float(0.0)
+    for entry_index in range(lists.starts[soft_primitive_index], lists.ends[soft_primitive_index]):
+        triangle_index = lists.keys[entry_index]
+        triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
+        target_shape_index = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
+        target_support, target_near, target_ke = contact_support_and_stiffness(
+            2,
+            soft_primitive_index,
+            target_shape_index,
+            data,
+            particle_radius,
+            shape_margin,
+            shape_material_ke,
+            soft_contact_ke,
+        )
+        near_rigid += target_ke * triangle_energy(
+            q,
+            rigid_positions[triangle_vertex_indices[0]],
+            rigid_positions[triangle_vertex_indices[1]],
+            rigid_positions[triangle_vertex_indices[2]],
+            data.rigid_tri_indices,
+            data.rigid_edge_vertex_indices,
+            data.rigid_adjacency.tri_edge_indices,
+            data.rigid_adjacency.edge_tri_indices,
+            data.rigid_vertex_term_coefficient,
+            triangle_index,
+            target_support,
+            target_near,
+            True,
+        )
+    edge_list_index = lists.soft_edge_count + rigid_primitive_index
+    for entry_index in range(lists.starts[edge_list_index], lists.ends[edge_list_index]):
+        triangle_index = lists.keys[entry_index]
+        triangle_vertex_indices = data.soft_tri_indices[triangle_index]
+        target_support, target_near, target_ke = contact_support_and_stiffness(
+            1,
+            triangle_index,
+            shape_index,
+            data,
+            particle_radius,
+            shape_margin,
+            shape_material_ke,
+            soft_contact_ke,
+        )
+        near_soft += target_ke * triangle_energy(
+            q_bar,
+            particle_q[triangle_vertex_indices[0]],
+            particle_q[triangle_vertex_indices[1]],
+            particle_q[triangle_vertex_indices[2]],
+            data.soft_tri_indices,
+            data.soft_edge_vertex_indices,
+            data.soft_adjacency.tri_edge_indices,
+            data.soft_adjacency.edge_tri_indices,
+            data.soft_vertex_term_coefficient,
+            triangle_index,
+            target_support,
+            target_near,
+            True,
+        )
+    return near_rigid, near_soft
+
+
+@wp.func
+def face_sum_index(face: int, is_rigid: bool, soft_vertex_index: int, data: EspData) -> int:
+    """Return the FaceQuadratureSums slot of a source face.
+
+    Soft faces use their own index. A rigid face uses its offset plus, for shapes shared
+    by every world, the world of ``soft_vertex_index`` (a vertex of the row's soft
+    primitive), so rows from different worlds never share sums. Particles without a
+    world (-1) use slot 0.
+    """
+    if not is_rigid:
+        return face
+    world_slot = wp.max(data.particle_world[soft_vertex_index], 0)
+    return data.rigid_face_sum_offset[face] + world_slot * data.rigid_face_sum_world_stride[face]
+
+
+@wp.func
+def normalized_vertex_near_weight(
+    vertex_index: int,
+    is_rigid: bool,
+    soft_vertex_index: int,
+    data: EspData,
+    face_sums: FaceQuadratureSums,
+    far_weight: float,
+) -> float:
+    """Return a fixed vertex sample's near-field weight under per-face normalization.
+
+    sum over incident faces f of (A_f / 3) * (1/2) / W_f, which equals the fixed weight
+    A_v / 3 when no EE sample is active on those faces. A vertex without incident
+    triangles (a point particle) keeps ``far_weight``. ``soft_vertex_index`` selects the
+    world slot of rigid faces; see face_sum_index.
+    """
+    v_adj_tris = data.rigid_adjacency.v_adj_tris if is_rigid else data.soft_adjacency.v_adj_tris
+    v_adj_tris_offsets = data.rigid_adjacency.v_adj_tris_offsets if is_rigid else data.soft_adjacency.v_adj_tris_offsets
+    tri_area = data.rigid_tri_area if is_rigid else data.soft_tri_area
+    start, end = v_adj_tris_offsets[vertex_index], v_adj_tris_offsets[vertex_index + 1]
+    if start == end:
+        return far_weight
+    weight = float(0.0)
+    # v_adj_tris stores (triangle, corner) pairs.
+    for entry in range(start, end, 2):
+        face = v_adj_tris[entry]
+        weight += tri_area[face] / (6.0 * face_sums.weight[face_sum_index(face, is_rigid, soft_vertex_index, data)])
+    return weight
+
+
+@wp.func
+def normalized_edge_coefficients(
+    edge_index: int,
+    is_rigid: bool,
+    soft_vertex_index: int,
+    data: EspData,
+    face_sums: FaceQuadratureSums,
+) -> wp.vec4:
+    """Return (alpha, beta, gamma, delta) for an adaptive EE sample generated on this edge.
+
+    With the edge's incident faces f, rest areas A_f, and current sums N_f, W_f::
+
+        alpha = sum A_f / W_f        replaces the unnormalized area factor 2 * sum A_f
+        beta  = sum A_f N_f / W_f^2  multiplies -dw/dX (gradient) and -d2w/dX2 (Hessian)
+        gamma = sum A_f / W_f^2      multiplies -(dw dP^T + dP dw^T) in the Hessian
+        delta = sum A_f N_f / W_f^3  multiplies 2 dw dw^T in the Hessian
+
+    P is this sample's unweighted target potential and w its weight. These are the
+    derivatives of sum_f A_f N_f / W_f with the other rows' contributions to N_f, W_f fixed.
+    ``soft_vertex_index`` selects the world slot of rigid faces; see face_sum_index.
+    """
+    edge_tri_indices = data.rigid_adjacency.edge_tri_indices if is_rigid else data.soft_adjacency.edge_tri_indices
+    tri_area = data.rigid_tri_area if is_rigid else data.soft_tri_area
+    result = wp.vec4()
+    for side in range(2):
+        face = edge_tri_indices[edge_index, side]
+        if face >= 0:
+            area = tri_area[face]
+            slot = face_sum_index(face, is_rigid, soft_vertex_index, data)
+            inverse_weight = 1.0 / face_sums.weight[slot]
+            numerator = face_sums.numerator[slot]
+            result += wp.vec4(
+                area * inverse_weight,
+                area * numerator * inverse_weight * inverse_weight,
+                area * inverse_weight * inverse_weight,
+                area * numerator * inverse_weight * inverse_weight * inverse_weight,
+            )
+    return result
+
+
+@wp.func
+def add_vertex_face_sums(
+    vertex_index: int,
+    is_rigid: bool,
+    soft_vertex_index: int,
+    near_value: float,
+    data: EspData,
+    face_sums: FaceQuadratureSums,
+):
+    """Add a fixed vertex sample's stiffness-weighted near potential, with weight 1/6, to its faces' slots."""
+    v_adj_tris = data.rigid_adjacency.v_adj_tris if is_rigid else data.soft_adjacency.v_adj_tris
+    v_adj_tris_offsets = data.rigid_adjacency.v_adj_tris_offsets if is_rigid else data.soft_adjacency.v_adj_tris_offsets
+    for entry in range(v_adj_tris_offsets[vertex_index], v_adj_tris_offsets[vertex_index + 1], 2):
+        slot = face_sum_index(v_adj_tris[entry], is_rigid, soft_vertex_index, data)
+        wp.atomic_add(face_sums.numerator, slot, near_value / 6.0)
+
+
+@wp.func
+def add_edge_face_sums(
+    edge_index: int,
+    is_rigid: bool,
+    soft_vertex_index: int,
+    weight: float,
+    near_value: float,
+    data: EspData,
+    face_sums: FaceQuadratureSums,
+):
+    """Add an adaptive EE sample's weighted near potential and its weight to the edge's faces' slots."""
+    edge_tri_indices = data.rigid_adjacency.edge_tri_indices if is_rigid else data.soft_adjacency.edge_tri_indices
+    for side in range(2):
+        face = edge_tri_indices[edge_index, side]
+        if face >= 0:
+            slot = face_sum_index(face, is_rigid, soft_vertex_index, data)
+            wp.atomic_add(face_sums.numerator, slot, weight * near_value)
+            wp.atomic_add(face_sums.weight, slot, weight)
+
+
 def _make_ee_block_functions(size: int):
     """Direct EE energy derivatives, specialized to a native 3D/6D block.
 
-    Only the solve-block size varies: particle and body functions share the
-    same float32 formulas without padding 3D blocks or duplicating the derivation.
+    Only the solve-block size varies: particle and body functions share the same float32
+    formulas without padding 3D blocks or duplicating the derivation. EE branches follow
+    the per-process _EE_QUADRATURE switch and compile only that mode.
 
     For each selected particle/body block (and each particle partition), prepare
     pair coefficients, sum that partition's target triangle contributions, then
     finish the derivatives. Bodies use the full triangle lists. Inputs are ordinary
     positions; closest-parameter quotients and feature distances are differentiated
-    explicitly, without AD.
+    explicitly, without AD. EE_QUADRATURE_NORMALIZED reads the per-face sums to
+    reweight the same derivatives; EE_QUADRATURE_OGC never reaches these functions.
     """
     if size not in (3, 6):
         raise ValueError("Use a 3-coordinate particle or 6-coordinate rigid block")
@@ -2207,6 +2495,7 @@ def _make_ee_block_functions(size: int):
         rigid_positions: wp.array[wp.vec3],
         shape_body: wp.array[int],
         lists: EdgeTriangleListData,
+        face_sums: FaceQuadratureSums,
         near: float,
         particle_radius: wp.array[float],
         shape_margin: wp.array[float],
@@ -2254,6 +2543,11 @@ def _make_ee_block_functions(size: int):
             d²E/dX² = P d²w/dX² + w d²P/dX²
                       + (dw/dX)(dP/dX)^T + (dP/dX)(dw/dX)^T.
 
+        Under EE_QUADRATURE_NORMALIZED the fixed area factors A_τ become the
+        per-direction coefficients alpha of normalized_edge_coefficients, and the
+        finished derivatives receive that row's quotient terms in w (beta, gamma, delta);
+        ``face_sums`` is read only in that mode.
+
         Here ∂/∂X holds s,t fixed, whereas d/dX includes s(X),t(X).
         With column gradients s_X = ds/dX and t_X = dt/dX, the chain rule gives:
 
@@ -2270,6 +2564,8 @@ def _make_ee_block_functions(size: int):
         includes ds/dX, dt/dX and the mixed terms. Similar concepts apply to w & E.
         Finishing is linear in the triangle sums, so each partition can finish its
         partial sum independently and atomically add the world-coordinate result.
+        The normalized beta and delta terms depend on w alone, not on the partial
+        sums, so partition 0 applies them once.
         """
         soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
         rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
@@ -2286,6 +2582,22 @@ def _make_ee_block_functions(size: int):
         if pair.weight <= 0.0:
             return 0.0
         origin = pair.endpoints_world[0]
+        # Source area factor per sample direction: fixed edge areas, or the
+        # normalized coefficients (alpha, beta, gamma, delta) of each generating edge.
+        soft_area_factor = data.soft_edge_area[soft_primitive_index]
+        rigid_area_factor = data.rigid_edge_area[rigid_primitive_index]
+        if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+            soft_coefficients = normalized_edge_coefficients(
+                soft_primitive_index, False, soft_edge_vertex_indices[0], data, face_sums
+            )
+            rigid_coefficients = normalized_edge_coefficients(
+                rigid_primitive_index, True, soft_edge_vertex_indices[0], data, face_sums
+            )
+            soft_area_factor = soft_coefficients[0]
+            rigid_area_factor = rigid_coefficients[0]
+            # Unscaled per-direction sums, for this row's quotient terms.
+            P_soft, dPdX_soft, dPdst_soft, d2PdX2_soft_no_st_curvature = float(0.0), vector(), wp.vec2(), matrix()
+            P_rigid, dPdX_rigid, dPdst_rigid, d2PdX2_rigid_no_st_curvature = float(0.0), vector(), wp.vec2(), matrix()
         P, dPdX, dPdst, d2PdX2_no_st_curvature = float(0.0), vector(), wp.vec2(), matrix()
         dissipative_gradient = vector()
         dissipative_hessian = matrix()
@@ -2321,7 +2633,7 @@ def _make_ee_block_functions(size: int):
                         data.rigid_vertex_term_coefficient,
                         triangle_index,
                     )
-                    source_area_factor = data.soft_edge_area[soft_primitive_index]
+                    source_area_factor = soft_area_factor
                 else:
                     triangle_vertex_indices = wp.vec3i(data.soft_tri_indices[triangle_index])
                     target_family, target_soft_primitive_index = 1, triangle_index
@@ -2338,7 +2650,7 @@ def _make_ee_block_functions(size: int):
                         data.soft_vertex_term_coefficient,
                         triangle_index,
                     )
-                    source_area_factor = data.rigid_edge_area[rigid_primitive_index]
+                    source_area_factor = rigid_area_factor
                     if wp.static(size == 3):
                         # One particle may be both source endpoint and target corner.
                         for corner in range(3):
@@ -2418,9 +2730,40 @@ def _make_ee_block_functions(size: int):
                 d2PdX2_no_st_curvature += source_area_factor * d2_triangle_P_dX2_no_st_curvature
                 dissipative_gradient += source_area_factor * friction_damping_gradient
                 dissipative_hessian += source_area_factor * friction_damping_hessian
+                if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                    if direction == 0:
+                        P_soft += triangle_P
+                        dPdX_soft += d_triangle_P_dX
+                        dPdst_soft += d_triangle_P_dst
+                        d2PdX2_soft_no_st_curvature += d2_triangle_P_dX2_no_st_curvature
+                    else:
+                        P_rigid += triangle_P
+                        dPdX_rigid += d_triangle_P_dX
+                        dPdst_rigid += d_triangle_P_dst
+                        d2PdX2_rigid_no_st_curvature += d2_triangle_P_dX2_no_st_curvature
         energy, gradient, hessian = finish_ee_pair(
             pair, P, dPdX, dPdst, d2PdX2_no_st_curvature, dissipative_gradient, dissipative_hessian
         )
+        if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+            # Derivatives of sum_f A_f N_f / W_f through this row's weight w, with the
+            # other rows' sums fixed: finish_ee_pair with P=1 differentiates w alone, and
+            # with each direction's unscaled P it gives that direction's d(wP)/dX.
+            _weight, dwdX, d2wdX2 = finish_ee_pair(pair, 1.0, vector(), wp.vec2(), matrix())
+            _soft_energy, dwP_soft_dX, _soft_hessian = finish_ee_pair(
+                pair, P_soft, dPdX_soft, dPdst_soft, d2PdX2_soft_no_st_curvature
+            )
+            _rigid_energy, dwP_rigid_dX, _rigid_hessian = finish_ee_pair(
+                pair, P_rigid, dPdX_rigid, dPdst_rigid, d2PdX2_rigid_no_st_curvature
+            )
+            # The gamma terms are linear in this partition's d(wP) and sum over partitions;
+            # the beta and delta terms depend on w alone, so only partition 0 applies them.
+            hessian -= soft_coefficients[2] * (wp.outer(dwP_soft_dX, dwdX) + wp.outer(dwdX, dwP_soft_dX))
+            hessian -= rigid_coefficients[2] * (wp.outer(dwP_rigid_dX, dwdX) + wp.outer(dwdX, dwP_rigid_dX))
+            if partition == 0:
+                beta = soft_coefficients[1] + rigid_coefficients[1]
+                gradient -= beta * dwdX
+                hessian -= beta * d2wdX2
+                hessian += (2.0 * (soft_coefficients[3] + rigid_coefficients[3])) * wp.outer(dwdX, dwdX)
         if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
             wp.atomic_or(esp_error, 0, 4)
             return energy
@@ -2697,6 +3040,7 @@ def evaluate_contact_energy(
     shape_material_ke: wp.array[float],
     soft_contact_ke: float,
     lists: EdgeTriangleListData,
+    face_sums: FaceQuadratureSums,
     # Outputs: vertex-quadrature energy, EE energy, and persistent errors.
     esp_energy: wp.array[float],
     esp_error: wp.array[int],
@@ -2755,7 +3099,8 @@ def evaluate_contact_energy(
             # VT: soft vertex against a rigid triangle.
             triangle_index = rigid_primitive_index
             triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
-            value = data.soft_vertex_quadrature_weight[soft_primitive_index] * triangle_energy(
+            quadrature_weight = data.soft_vertex_quadrature_weight[soft_primitive_index]
+            value = quadrature_weight * triangle_energy(
                 particle_q[soft_primitive_index],
                 rigid_positions[triangle_vertex_indices[0]],
                 rigid_positions[triangle_vertex_indices[1]],
@@ -2770,11 +3115,32 @@ def evaluate_contact_energy(
                 near_cutoff,
                 False,
             )
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                # Only the near field is renormalized; the far field keeps the fixed vertex weight.
+                near_weight = normalized_vertex_near_weight(
+                    soft_primitive_index, False, soft_primitive_index, data, face_sums, quadrature_weight
+                )
+                value += (near_weight - quadrature_weight) * triangle_energy(
+                    particle_q[soft_primitive_index],
+                    rigid_positions[triangle_vertex_indices[0]],
+                    rigid_positions[triangle_vertex_indices[1]],
+                    rigid_positions[triangle_vertex_indices[2]],
+                    data.rigid_tri_indices,
+                    data.rigid_edge_vertex_indices,
+                    data.rigid_adjacency.tri_edge_indices,
+                    data.rigid_adjacency.edge_tri_indices,
+                    data.rigid_vertex_term_coefficient,
+                    triangle_index,
+                    support,
+                    near_cutoff,
+                    True,
+                )
         elif family == 1:
             # TV: rigid vertex against a soft triangle.
             triangle_index = soft_primitive_index
             triangle_vertex_indices = data.soft_tri_indices[triangle_index]
-            value = data.rigid_vertex_quadrature_weight[rigid_primitive_index] * triangle_energy(
+            quadrature_weight = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
+            value = quadrature_weight * triangle_energy(
                 rigid_positions[rigid_primitive_index],
                 particle_q[triangle_vertex_indices[0]],
                 particle_q[triangle_vertex_indices[1]],
@@ -2789,8 +3155,177 @@ def evaluate_contact_energy(
                 near_cutoff,
                 False,
             )
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                near_weight = normalized_vertex_near_weight(
+                    rigid_primitive_index,
+                    True,
+                    data.soft_tri_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                    quadrature_weight,
+                )
+                value += (near_weight - quadrature_weight) * triangle_energy(
+                    rigid_positions[rigid_primitive_index],
+                    particle_q[triangle_vertex_indices[0]],
+                    particle_q[triangle_vertex_indices[1]],
+                    particle_q[triangle_vertex_indices[2]],
+                    data.soft_tri_indices,
+                    data.soft_edge_vertex_indices,
+                    data.soft_adjacency.tri_edge_indices,
+                    data.soft_adjacency.edge_tri_indices,
+                    data.soft_vertex_term_coefficient,
+                    triangle_index,
+                    support,
+                    near_cutoff,
+                    True,
+                )
         else:
-            # EE: weight * (W_soft P_near(q, rigid) + W_rigid P_near(q_bar, soft)).
+            soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
+            rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
+            a, b = particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
+            c, d = rigid_positions[rigid_edge_vertex_indices[0]], rigid_positions[rigid_edge_vertex_indices[1]]
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_OGC):
+                # The native rigid-soft contact kernels evaluate EE rows in this mode.
+                continue
+            # EE: weight * (A_soft P_near(q, rigid) + A_rigid P_near(q_bar, soft)).
+            q, q_bar, weight = ee_quadrature_sample(a, b, c, d, near_cutoff)
+            if weight <= 0.0:
+                continue
+            near_rigid, near_soft = ee_sample_potentials(
+                soft_primitive_index,
+                rigid_primitive_index,
+                shape_index,
+                q,
+                q_bar,
+                data,
+                particle_q,
+                rigid_positions,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
+                lists,
+            )
+            soft_area_factor = data.soft_edge_area[soft_primitive_index]
+            rigid_area_factor = data.rigid_edge_area[rigid_primitive_index]
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                soft_area_factor = normalized_edge_coefficients(
+                    soft_primitive_index,
+                    False,
+                    data.soft_edge_vertex_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                )[0]
+                rigid_area_factor = normalized_edge_coefficients(
+                    rigid_primitive_index,
+                    True,
+                    data.soft_edge_vertex_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                )[0]
+            value = weight * (soft_area_factor * near_rigid + rigid_area_factor * near_soft)
+        if family != 2:
+            value *= stiffness
+        if not wp.isfinite(value):
+            wp.atomic_or(esp_error, 0, 4)
+        else:
+            wp.atomic_add(esp_energy, int(family == 2), value)
+
+
+@wp.kernel
+def accumulate_face_quadrature(
+    worker_count: int,
+    soft_contact_count: wp.array[int],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_primitive_index: wp.array[int],
+    soft_contact_rigid_primitive_index: wp.array[int],
+    soft_contact_rigid_indices: wp.array[wp.vec3i],
+    soft_contact_shape: wp.array[int],
+    data: EspData,
+    particle_q: wp.array[wp.vec3],
+    rigid_positions: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    shape_margin: wp.array[float],
+    shape_material_ke: wp.array[float],
+    soft_contact_ke: float,
+    lists: EdgeTriangleListData,
+    face_sums: FaceQuadratureSums,
+) -> None:
+    """EE_QUADRATURE_NORMALIZED pass 1: per-face near-field numerators and weights at the current positions.
+
+    Visit each contact row once, with the same row selection as evaluate_contact_energy,
+    and add its fixed vertex samples (weight 1/6) or adaptive EE samples (weight w) to
+    their source faces. face_sums.weight must hold 1/2 and face_sums.numerator zero
+    before the launch. Overflow, list and family errors are reported by the kernel that
+    follows this pass, not here.
+    """
+    if soft_contact_count[0] > soft_contact_indices.shape[0] or lists.error[0] != 0:
+        return
+    for row_id in range(wp.tid(), soft_contact_count[0], worker_count):
+        shape_index = soft_contact_shape[row_id]
+        soft_primitive_index = soft_contact_primitive_index[row_id]
+        rigid_primitive_index = soft_contact_rigid_primitive_index[row_id]
+        family = _mesh_contact_family(
+            soft_contact_indices[row_id],
+            soft_contact_rigid_indices[row_id],
+            soft_primitive_index,
+            rigid_primitive_index,
+        )
+        if family < 0 or family > 2:
+            continue
+        if family == 0 and data.soft_vertex_quadrature_weight[soft_primitive_index] == 0.0:
+            continue
+        if family == 2 and data.soft_edge_area[soft_primitive_index] == 0.0:
+            continue
+        support, near_cutoff, stiffness = contact_support_and_stiffness(
+            family,
+            soft_primitive_index,
+            shape_index,
+            data,
+            particle_radius,
+            shape_margin,
+            shape_material_ke,
+            soft_contact_ke,
+        )
+        if support == 0.0 or (stiffness == 0.0 and family != 2):
+            continue
+        if family == 0:
+            triangle_vertex_indices = data.rigid_tri_indices[rigid_primitive_index]
+            near_value = stiffness * triangle_energy(
+                particle_q[soft_primitive_index],
+                rigid_positions[triangle_vertex_indices[0]],
+                rigid_positions[triangle_vertex_indices[1]],
+                rigid_positions[triangle_vertex_indices[2]],
+                data.rigid_tri_indices,
+                data.rigid_edge_vertex_indices,
+                data.rigid_adjacency.tri_edge_indices,
+                data.rigid_adjacency.edge_tri_indices,
+                data.rigid_vertex_term_coefficient,
+                rigid_primitive_index,
+                support,
+                near_cutoff,
+                True,
+            )
+            add_vertex_face_sums(soft_primitive_index, False, soft_primitive_index, near_value, data, face_sums)
+        elif family == 1:
+            triangle_vertex_indices = data.soft_tri_indices[soft_primitive_index]
+            near_value = stiffness * triangle_energy(
+                rigid_positions[rigid_primitive_index],
+                particle_q[triangle_vertex_indices[0]],
+                particle_q[triangle_vertex_indices[1]],
+                particle_q[triangle_vertex_indices[2]],
+                data.soft_tri_indices,
+                data.soft_edge_vertex_indices,
+                data.soft_adjacency.tri_edge_indices,
+                data.soft_adjacency.edge_tri_indices,
+                data.soft_vertex_term_coefficient,
+                soft_primitive_index,
+                support,
+                near_cutoff,
+                True,
+            )
+            add_vertex_face_sums(rigid_primitive_index, True, triangle_vertex_indices[0], near_value, data, face_sums)
+        else:
             soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
             rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
             q, q_bar, weight = ee_quadrature_sample(
@@ -2802,75 +3337,27 @@ def evaluate_contact_energy(
             )
             if weight <= 0.0:
                 continue
-            soft_edge_index, rigid_edge_index = soft_primitive_index, rigid_primitive_index
-            near_rigid, near_soft = float(0.0), float(0.0)
-            for entry_index in range(lists.starts[soft_edge_index], lists.ends[soft_edge_index]):
-                triangle_index = lists.keys[entry_index]
-                triangle_vertex_indices = data.rigid_tri_indices[triangle_index]
-                target_shape_index = data.rigid_vertex_shapes[triangle_vertex_indices[0]]
-                target_support, target_near, target_ke = contact_support_and_stiffness(
-                    family,
-                    soft_primitive_index,
-                    target_shape_index,
-                    data,
-                    particle_radius,
-                    shape_margin,
-                    shape_material_ke,
-                    soft_contact_ke,
-                )
-                near_rigid += target_ke * triangle_energy(
-                    q,
-                    rigid_positions[triangle_vertex_indices[0]],
-                    rigid_positions[triangle_vertex_indices[1]],
-                    rigid_positions[triangle_vertex_indices[2]],
-                    data.rigid_tri_indices,
-                    data.rigid_edge_vertex_indices,
-                    data.rigid_adjacency.tri_edge_indices,
-                    data.rigid_adjacency.edge_tri_indices,
-                    data.rigid_vertex_term_coefficient,
-                    triangle_index,
-                    target_support,
-                    target_near,
-                    True,
-                )
-            edge_list_index = lists.soft_edge_count + rigid_edge_index
-            for entry_index in range(lists.starts[edge_list_index], lists.ends[edge_list_index]):
-                triangle_index = lists.keys[entry_index]
-                triangle_vertex_indices = data.soft_tri_indices[triangle_index]
-                target_support, target_near, target_ke = contact_support_and_stiffness(
-                    1,
-                    triangle_index,
-                    shape_index,
-                    data,
-                    particle_radius,
-                    shape_margin,
-                    shape_material_ke,
-                    soft_contact_ke,
-                )
-                near_soft += target_ke * triangle_energy(
-                    q_bar,
-                    particle_q[triangle_vertex_indices[0]],
-                    particle_q[triangle_vertex_indices[1]],
-                    particle_q[triangle_vertex_indices[2]],
-                    data.soft_tri_indices,
-                    data.soft_edge_vertex_indices,
-                    data.soft_adjacency.tri_edge_indices,
-                    data.soft_adjacency.edge_tri_indices,
-                    data.soft_vertex_term_coefficient,
-                    triangle_index,
-                    target_support,
-                    target_near,
-                    True,
-                )
-            value = weight * (
-                data.soft_edge_area[soft_edge_index] * near_rigid + data.rigid_edge_area[rigid_edge_index] * near_soft
+            near_rigid, near_soft = ee_sample_potentials(
+                soft_primitive_index,
+                rigid_primitive_index,
+                shape_index,
+                q,
+                q_bar,
+                data,
+                particle_q,
+                rigid_positions,
+                particle_radius,
+                shape_margin,
+                shape_material_ke,
+                soft_contact_ke,
+                lists,
             )
-        if family != 2:
-            value *= stiffness
-        if not wp.isfinite(value):
-            wp.atomic_or(esp_error, 0, 4)
-        else:
-            wp.atomic_add(esp_energy, int(family == 2), value)
+            add_edge_face_sums(
+                soft_primitive_index, False, soft_edge_vertex_indices[0], weight, near_rigid, data, face_sums
+            )
+            add_edge_face_sums(
+                rigid_primitive_index, True, soft_edge_vertex_indices[0], weight, near_soft, data, face_sums
+            )
 
 
 @wp.func
@@ -2881,6 +3368,7 @@ def ee_particle_targets(
     rigid_edge_vertex_indices: wp.vec2i,
     q_bar: wp.vec3,
     weight: float,
+    source_area_factor: float,
     data: EspData,
     particle_q: wp.array[wp.vec3],
     rigid_positions: wp.array[wp.vec3],
@@ -2911,8 +3399,9 @@ def ee_particle_targets(
     """Accumulate EE contributions to soft target vertices other than the source endpoints.
 
     Traverse nearby soft triangles for the rigid-edge sample ``q_bar``. For each
-    target vertex, differentiate rigid_edge_area * weight * P_near(q_bar) with
-    respect to that vertex's position. These vertices cannot move the generating
+    target vertex, differentiate source_area_factor * weight * P_near(q_bar) with
+    respect to that vertex's position; the factor is the rigid edge's area, or its
+    normalized coefficient alpha. These vertices cannot move the generating
     edges, so ``q_bar`` and ``weight`` stay fixed. The generating soft edge's two
     endpoints are excluded: ``ee_particle_source`` already handles their full
     derivatives, including changes to the sample positions and weight.
@@ -2981,7 +3470,7 @@ def ee_particle_targets(
                 target_near,
                 True,
                 particle_index,
-                weight * data.rigid_edge_area[rigid_primitive_index],
+                weight * source_area_factor,
                 esp_forces,
                 esp_hessians,
                 esp_error,
@@ -3013,6 +3502,7 @@ def accumulate_particle_contact_derivatives(
     shape_material_ke: wp.array[float],
     soft_contact_ke: float,
     lists: EdgeTriangleListData,
+    face_sums: FaceQuadratureSums,
     color: int,
     partitions: int,
     shape_body: wp.array[int],
@@ -3117,6 +3607,7 @@ def accumulate_particle_contact_derivatives(
                 body_q_prev,
                 dt,
             )
+            quadrature_weight = data.soft_vertex_quadrature_weight[particle_index]
             particle_triangle(
                 particle_q[particle_index],
                 rigid_positions[triangle_vertex_indices[0]],
@@ -3129,7 +3620,7 @@ def accumulate_particle_contact_derivatives(
                 near,
                 False,
                 particle_index,
-                data.soft_vertex_quadrature_weight[particle_index],
+                quadrature_weight,
                 esp_forces,
                 esp_hessians,
                 esp_error,
@@ -3141,9 +3632,49 @@ def accumulate_particle_contact_derivatives(
                 dt,
                 friction_epsilon * dt,
             )
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                # Only the near field is renormalized: add (near weight - fixed weight) times b_near.
+                near_weight = normalized_vertex_near_weight(
+                    particle_index, False, particle_index, data, face_sums, quadrature_weight
+                )
+                particle_triangle(
+                    particle_q[particle_index],
+                    rigid_positions[triangle_vertex_indices[0]],
+                    rigid_positions[triangle_vertex_indices[1]],
+                    rigid_positions[triangle_vertex_indices[2]],
+                    0,
+                    edge_coefficients,
+                    vertex_coefficients,
+                    support,
+                    near,
+                    True,
+                    particle_index,
+                    near_weight - quadrature_weight,
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
+                    stiffness,
+                    sample_displacement,
+                    triangle_displacements,
+                    mu,
+                    kd,
+                    dt,
+                    friction_epsilon * dt,
+                )
         elif family == 1:  # TV
             triangle_index = soft_primitive_index
             triangle_vertex_indices = data.soft_tri_indices[triangle_index]
+            quadrature_weight = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
+            near_weight = quadrature_weight
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                near_weight = normalized_vertex_near_weight(
+                    rigid_primitive_index,
+                    True,
+                    data.soft_tri_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                    quadrature_weight,
+                )
             edge_coefficients, vertex_coefficients = triangle_feature_coefficients(
                 data.soft_tri_indices,
                 data.soft_adjacency.tri_edge_indices,
@@ -3184,7 +3715,7 @@ def accumulate_particle_contact_derivatives(
                     near,
                     False,
                     particle_index,
-                    data.rigid_vertex_quadrature_weight[rigid_primitive_index],
+                    quadrature_weight,
                     esp_forces,
                     esp_hessians,
                     esp_error,
@@ -3196,9 +3727,37 @@ def accumulate_particle_contact_derivatives(
                     dt,
                     friction_epsilon * dt,
                 )
+                if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                    particle_triangle(
+                        rigid_positions[rigid_primitive_index],
+                        particle_q[triangle_vertex_indices[0]],
+                        particle_q[triangle_vertex_indices[1]],
+                        particle_q[triangle_vertex_indices[2]],
+                        corner + 1,
+                        edge_coefficients,
+                        vertex_coefficients,
+                        support,
+                        near,
+                        True,
+                        particle_index,
+                        near_weight - quadrature_weight,
+                        esp_forces,
+                        esp_hessians,
+                        esp_error,
+                        stiffness,
+                        sample_displacement,
+                        triangle_displacements,
+                        mu,
+                        kd,
+                        dt,
+                        friction_epsilon * dt,
+                    )
         else:  # EE
             soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
             rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_OGC):
+                # The native rigid-soft contact kernels evaluate EE rows in this mode.
+                continue
             _q, q_bar, weight = ee_quadrature_sample(
                 particle_q[soft_edge_vertex_indices[0]],
                 particle_q[soft_edge_vertex_indices[1]],
@@ -3208,6 +3767,15 @@ def accumulate_particle_contact_derivatives(
             )
             if weight <= 0.0:
                 continue
+            rigid_area_factor = data.rigid_edge_area[rigid_primitive_index]
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                rigid_area_factor = normalized_edge_coefficients(
+                    rigid_primitive_index,
+                    True,
+                    data.soft_edge_vertex_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                )[0]
             # Generating-edge endpoints: differentiate sample positions and weight too.
             for endpoint in range(2):
                 particle_index = soft_edge_vertex_indices[endpoint]
@@ -3226,6 +3794,7 @@ def accumulate_particle_contact_derivatives(
                     rigid_positions,
                     shape_body,
                     lists,
+                    face_sums,
                     near,
                     particle_radius,
                     shape_margin,
@@ -3256,6 +3825,7 @@ def accumulate_particle_contact_derivatives(
                 rigid_edge_vertex_indices,
                 q_bar,
                 weight,
+                rigid_area_factor,
                 data,
                 particle_q,
                 rigid_positions,
@@ -3306,6 +3876,7 @@ def accumulate_body_contact_derivatives(
     shape_material_ke: wp.array[float],
     soft_contact_ke: float,
     lists: EdgeTriangleListData,
+    face_sums: FaceQuadratureSums,
     color: int,
     use_friction: bool,
     particle_q_prev: wp.array[wp.vec3],
@@ -3375,6 +3946,9 @@ def accumulate_body_contact_derivatives(
             mu = wp.sqrt(soft_contact_mu * shape_material_mu[shape_index])
         kd = 0.5 * (soft_contact_kd + shape_material_kd[shape_index])
         if family == 2:
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_OGC):
+                # The native rigid-soft contact kernels evaluate EE rows in this mode.
+                continue
             soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
             rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
             q, _qb, weight = ee_quadrature_sample(
@@ -3386,6 +3960,15 @@ def accumulate_body_contact_derivatives(
             )
             if weight <= 0.0:
                 continue
+            soft_area_factor = data.soft_edge_area[soft_primitive_index]
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                soft_area_factor = normalized_edge_coefficients(
+                    soft_primitive_index,
+                    False,
+                    data.soft_edge_vertex_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                )[0]
             soft_parameter = segment_parameter(
                 q, particle_q[soft_edge_vertex_indices[0]], particle_q[soft_edge_vertex_indices[1]]
             )
@@ -3454,7 +4037,7 @@ def accumulate_body_contact_derivatives(
                     target_near,
                     True,
                     target_body_index,
-                    weight * data.soft_edge_area[soft_primitive_index],
+                    weight * soft_area_factor,
                     esp_forces,
                     esp_hessians,
                     esp_error,
@@ -3482,6 +4065,7 @@ def accumulate_body_contact_derivatives(
                     rigid_positions,
                     shape_body,
                     lists,
+                    face_sums,
                     near,
                     particle_radius,
                     shape_margin,
@@ -3535,6 +4119,7 @@ def accumulate_body_contact_derivatives(
                 body_q_prev,
                 dt,
             )
+            quadrature_weight = data.soft_vertex_quadrature_weight[soft_primitive_index]
             body_triangle(
                 particle_q[soft_primitive_index],
                 rigid_positions[triangle_vertex_indices[0]],
@@ -3548,7 +4133,7 @@ def accumulate_body_contact_derivatives(
                 near,
                 False,
                 body_index,
-                data.soft_vertex_quadrature_weight[soft_primitive_index],
+                quadrature_weight,
                 esp_forces,
                 esp_hessians,
                 esp_error,
@@ -3560,6 +4145,36 @@ def accumulate_body_contact_derivatives(
                 dt,
                 friction_epsilon * dt,
             )
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                # Only the near field is renormalized: add (near weight - fixed weight) times b_near.
+                near_weight = normalized_vertex_near_weight(
+                    soft_primitive_index, False, soft_primitive_index, data, face_sums, quadrature_weight
+                )
+                body_triangle(
+                    particle_q[soft_primitive_index],
+                    rigid_positions[triangle_vertex_indices[0]],
+                    rigid_positions[triangle_vertex_indices[1]],
+                    rigid_positions[triangle_vertex_indices[2]],
+                    com,
+                    True,
+                    edge_coefficients,
+                    vertex_coefficients,
+                    support,
+                    near,
+                    True,
+                    body_index,
+                    near_weight - quadrature_weight,
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
+                    stiffness,
+                    sample_displacement,
+                    triangle_displacements,
+                    mu,
+                    kd,
+                    dt,
+                    friction_epsilon * dt,
+                )
         elif family == 1:
             triangle_index = soft_primitive_index
             triangle_vertex_indices = data.soft_tri_indices[triangle_index]
@@ -3587,6 +4202,7 @@ def accumulate_body_contact_derivatives(
                 body_q_prev,
                 dt,
             )
+            quadrature_weight = data.rigid_vertex_quadrature_weight[rigid_primitive_index]
             body_triangle(
                 rigid_positions[rigid_primitive_index],
                 particle_q[triangle_vertex_indices[0]],
@@ -3600,7 +4216,7 @@ def accumulate_body_contact_derivatives(
                 near,
                 False,
                 body_index,
-                data.rigid_vertex_quadrature_weight[rigid_primitive_index],
+                quadrature_weight,
                 esp_forces,
                 esp_hessians,
                 esp_error,
@@ -3612,6 +4228,40 @@ def accumulate_body_contact_derivatives(
                 dt,
                 friction_epsilon * dt,
             )
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                near_weight = normalized_vertex_near_weight(
+                    rigid_primitive_index,
+                    True,
+                    data.soft_tri_indices[soft_primitive_index][0],
+                    data,
+                    face_sums,
+                    quadrature_weight,
+                )
+                body_triangle(
+                    rigid_positions[rigid_primitive_index],
+                    particle_q[triangle_vertex_indices[0]],
+                    particle_q[triangle_vertex_indices[1]],
+                    particle_q[triangle_vertex_indices[2]],
+                    com,
+                    False,
+                    edge_coefficients,
+                    vertex_coefficients,
+                    support,
+                    near,
+                    True,
+                    body_index,
+                    near_weight - quadrature_weight,
+                    esp_forces,
+                    esp_hessians,
+                    esp_error,
+                    stiffness,
+                    sample_displacement,
+                    triangle_displacements,
+                    mu,
+                    kd,
+                    dt,
+                    friction_epsilon * dt,
+                )
 
 
 def create_esp_data(
@@ -3697,6 +4347,22 @@ def create_esp_data(
         data.rigid_vertex_term_coefficient = wp.array(rigid_vertex_term_coefficient_np, dtype=float)
         data.rigid_vertex_quadrature_weight = wp.array(rigid_vertex_quadrature_weight_np, dtype=float)
         data.rigid_edge_area = wp.array(rigid_edge_area_np, dtype=float)
+        # Rest areas per face, for the per-face normalization of EE_QUADRATURE_NORMALIZED.
+        data.soft_tri_area = wp.array(tri_areas_np, dtype=float)
+        data.rigid_tri_area = wp.array(rigid_tri_areas_np.astype(np.float32), dtype=float)
+        # FaceQuadratureSums slots: one per soft face; one per rigid face, or one per world
+        # for rigid faces of shapes shared by every world, so that worlds stay independent.
+        data.particle_world = model.particle_world
+        world_slots = max(int(model.world_count), 1)
+        rigid_face_shape_np = pipeline.rigid_mesh_vertex_shapes.numpy()[rigid_tri_indices_np[:, 0]]
+        shape_world_np = model.shape_world.numpy() if model.shape_world is not None else np.empty(0, dtype=np.int32)
+        shared_face_np = (shape_world_np[rigid_face_shape_np] < 0) & (world_slots > 1)
+        slots_per_face_np = np.where(shared_face_np, world_slots, 1).astype(np.int64)
+        data.rigid_face_sum_offset = wp.array(
+            (len(soft_tri_indices_np) + np.cumsum(slots_per_face_np) - slots_per_face_np).astype(np.int32), dtype=int
+        )
+        data.rigid_face_sum_world_stride = wp.array(shared_face_np.astype(np.int32), dtype=int)
+        data.face_sum_count = len(soft_tri_indices_np) + int(slots_per_face_np.sum())
 
     particle_radius_np = model.particle_radius.numpy()
     shape_margin_np = model.shape_margin.numpy()[rigid_shape_indices_np]
@@ -3736,6 +4402,58 @@ def create_esp_data(
     return data
 
 
+def create_face_quadrature_sums(data: EspData, device: wp.Device | str) -> FaceQuadratureSums:
+    """Allocate the per-face sums read by EE_QUADRATURE_NORMALIZED; see FaceQuadratureSums for the slot layout."""
+    sums = FaceQuadratureSums()
+    count = data.face_sum_count
+    with wp.ScopedDevice(device):
+        sums.numerator = wp.zeros(count, dtype=float)
+        sums.weight = wp.full(count, 0.5, dtype=float)
+    return sums
+
+
+_EMPTY_FACE_SUMS: dict[str, FaceQuadratureSums] = {}
+
+
+def _empty_face_sums(device: wp.Device) -> FaceQuadratureSums:
+    """Return zero-length sums for the modes that never read them; one per device for stable capture."""
+    key = str(device)
+    if key not in _EMPTY_FACE_SUMS:
+        sums = FaceQuadratureSums()
+        with wp.ScopedDevice(device):
+            sums.numerator = wp.zeros(0, dtype=float)
+            sums.weight = wp.zeros(0, dtype=float)
+        _EMPTY_FACE_SUMS[key] = sums
+    return _EMPTY_FACE_SUMS[key]
+
+
+@wp.kernel(enable_backward=False)
+def restrict_force_mask_to_edge_rows(
+    soft_contact_count: wp.array[int],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_shape: wp.array[int],
+    esp_shape_mask: wp.array[bool],
+    force_mask: wp.array[bool],
+):
+    """EE_QUADRATURE_OGC: leave only the edge rows of ESP shapes to the native contact kernels.
+
+    ESP evaluates the VT/TV rows of its shapes, so their force-mask bits are cleared. Edge
+    rows (EE and edge-depth recovery; soft corners (v0, v1, -1)) keep Newton's OGC filter
+    decision and are evaluated by the native rigid-soft contact kernels, which receive no
+    ESP shape mask in this mode. Rows of other shapes are untouched. Idempotent, so the
+    solver runs it after every detection's filter_soft_mesh_contacts.
+    """
+    row = wp.tid()
+    if row >= wp.min(soft_contact_count[0], soft_contact_indices.shape[0]):
+        return
+    shape_index = soft_contact_shape[row]
+    if shape_index < 0 or not esp_shape_mask[shape_index]:
+        return
+    corners = soft_contact_indices[row]
+    if corners[1] < 0 or corners[2] >= 0:
+        force_mask[row] = False
+
+
 def launch_contact_blocks(
     model: "Model",
     state: "State",
@@ -3757,6 +4475,7 @@ def launch_contact_blocks(
     body_q_prev: wp.array[wp.transform] | None = None,
     dt: float = 0.0,
     friction_epsilon: float = 0.0,
+    face_sums: "FaceQuadratureSums | None" = None,
 ) -> None:
     """Launch one solve side's derivatives or energy, without host count reads.
 
@@ -3767,8 +4486,16 @@ def launch_contact_blocks(
     Particle workers may split each EE row's target-triangle lists; body
     and energy evaluation always use one worker per row. All evaluate EE
     samples directly, without a separate preparation pass or sample buffer.
+    Under EE_QUADRATURE_NORMALIZED (the per-process _EE_QUADRATURE switch) the launch
+    first rebuilds ``face_sums`` with one unpartitioned row pass, so it must be supplied
+    the sums from create_face_quadrature_sums. Under EE_QUADRATURE_OGC no EE row is
+    evaluated here; see restrict_force_mask_to_edge_rows.
     """
     worker_count = _contact_worker_count(contacts.soft_contact_max, model.device, partitions)
+    if face_sums is None:
+        if _EE_QUADRATURE == EE_QUADRATURE_NORMALIZED:
+            raise ValueError("EE_QUADRATURE_NORMALIZED requires face_sums from create_face_quadrature_sums")
+        face_sums = _empty_face_sums(model.device)
     with wp.ScopedDevice(model.device):
         energy_only = block_kind == _ENERGY_ONLY
         # Clear this evaluation's outputs once.
@@ -3777,6 +4504,34 @@ def launch_contact_blocks(
         else:
             esp_forces.zero_()
             esp_hessians.zero_()
+        if _EE_QUADRATURE == EE_QUADRATURE_NORMALIZED:
+            # Pass 1: per-face near-field sums at the current positions, one worker per row.
+            face_sums.numerator.zero_()
+            face_sums.weight.fill_(0.5)
+            wp.launch(
+                accumulate_face_quadrature,
+                dim=_contact_worker_count(contacts.soft_contact_max, model.device),
+                block_dim=block_dim,
+                inputs=[
+                    _contact_worker_count(contacts.soft_contact_max, model.device),
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_indices,
+                    contacts.soft_contact_primitive_index,
+                    contacts.soft_contact_rigid_primitive_index,
+                    contacts.soft_contact_rigid_indices,
+                    contacts.soft_contact_shape,
+                    data,
+                    state.particle_q,
+                    rigid_positions,
+                    model.particle_radius,
+                    model.shape_margin,
+                    model.shape_material_ke,
+                    model.soft_contact_ke,
+                    lists,
+                    face_sums,
+                ],
+                device=model.device,
+            )
         # Workers stride over active rows; unused capacity is never visited.
         if energy_only:
             wp.launch(
@@ -3799,6 +4554,7 @@ def launch_contact_blocks(
                     model.shape_material_ke,
                     model.soft_contact_ke,
                     lists,
+                    face_sums,
                 ],
                 outputs=[esp_energy, esp_error],
                 device=model.device,
@@ -3826,6 +4582,7 @@ def launch_contact_blocks(
                     model.shape_material_ke,
                     model.soft_contact_ke,
                     lists,
+                    face_sums,
                     color,
                     partitions,
                     model.shape_body,
@@ -3871,6 +4628,7 @@ def launch_contact_blocks(
                     model.shape_material_ke,
                     model.soft_contact_ke,
                     lists,
+                    face_sums,
                     color,
                     use_friction,
                     particle_q_prev,

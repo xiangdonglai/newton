@@ -598,8 +598,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                 damping; their analytical-shape contacts are unchanged. Complete boundary triangles must
                 be supplied for tetrahedral solids. Point weights are fixed, not inferred from positions.
                 Conservative force, friction, and damping share each ESP sample/feature contact.
-                Friction sums signed per-primitive ESP loads. Uses unnormalized
-                vertex and adaptive EE quadrature in float32. Each evaluation computes
+                Friction sums signed per-primitive ESP loads. Uses fixed vertex quadrature and, by
+                default, unnormalized adaptive EE quadrature in float32; the per-process switch
+                ``NEWTON_ESP_EE_QUADRATURE`` (``esp_contact._EE_QUADRATURE``, see
+                ``esp_contact.EE_QUADRATURE_MODES``) compiles the normalized EE quadrature
+                instead, or ``"ogc"``, which leaves the edge rows of ESP shapes to the native
+                rigid-soft contact kernels (Newton's OGC row filter, native force law and AVBD
+                ramping) while ESP keeps the VT/TV rows. Each evaluation computes
                 a complete 3x3 particle or 6x6 body block. Conservative Hessians are exact selected-branch derivatives,
                 not PSD-projected by default; the local experimental projection switch is in esp_contact.py.
                 The scalar barrier uses a C2 Taylor extension below min(10 micrometers, support/4).
@@ -627,7 +632,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 triangle rows would break cancellation of their shared feature terms.
                 Damping uses the native approach-only normal damper at each ESP feature, with
                 the arithmetic mean of soft kd and the actual target shape's kd. It uses the
-                same signed incidence and fixed quadrature weights as friction, not the OGC row mask.
+                same signed incidence and fixed quadrature weights as friction, not the OGC row mask
+                (except that the ``"ogc"`` EE treatment hands edge rows to the native kernels).
                 Analytical contact retains its existing law and parameters.
                 Each friction term uses its own closest point, normal, material slip, and load from
                 its distance-potential derivative, with signed incidence, rest-area, and quadrature weights.
@@ -992,6 +998,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_soft_contact_use_esp = bool(rigid_soft_contact_use_esp)
         self._esp_data = None
         self._esp_shape_mask = None
+        self._esp_native_shape_mask = None
         self._joint_mode_deprecation_warned = False
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -2480,6 +2487,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise ValueError("ESP does not yet support gradient taping")
         with wp.ScopedDevice(self.device):
             self._esp_data = esp_contact.create_esp_data(self.model, self.collision_pipeline)
+            # Per-face near-field sums; rebuilt before each evaluation by the normalized mode only.
+            self._esp_face_sums = (
+                esp_contact.create_face_quadrature_sums(self._esp_data, self.device)
+                if esp_contact._EE_QUADRATURE == esp_contact.EE_QUADRATURE_NORMALIZED
+                else None
+            )
             # Current world positions in ESP's rigid vertex order; refreshed as bodies move.
             self._esp_rigid_positions = wp.empty(self._esp_data.rigid_local_positions.shape[0], dtype=wp.vec3)
             # Nearby target triangles per source edge, plus scratch storage for sorting those lists.
@@ -2505,6 +2518,33 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._esp_static_positions_initialized = False
             # Mesh shapes handled by ESP, excluded from the native rigid-soft force calculation.
             self._esp_shape_mask = wp.array(self.collision_pipeline.rigid_mesh_triangle_offsets_np >= 0, dtype=bool)
+            # With the OGC EE treatment the native kernels keep the edge rows of these shapes:
+            # they get no shape mask, and _restrict_esp_force_mask clears the VT/TV rows instead.
+            self._esp_native_shape_mask = (
+                None if esp_contact._EE_QUADRATURE == esp_contact.EE_QUADRATURE_OGC else self._esp_shape_mask
+            )
+
+    def _restrict_esp_force_mask(self, contacts):
+        """EE_QUADRATURE_OGC: native kernels evaluate only the edge rows of ESP shapes; idempotent."""
+        if (
+            self._esp_data is None
+            or esp_contact._EE_QUADRATURE != esp_contact.EE_QUADRATURE_OGC
+            or contacts is None
+            or contacts.soft_contact_force_mask is None
+        ):
+            return
+        wp.launch(
+            esp_contact.restrict_force_mask_to_edge_rows,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                contacts.soft_contact_count,
+                contacts.soft_contact_indices,
+                contacts.soft_contact_shape,
+                self._esp_shape_mask,
+            ],
+            outputs=[contacts.soft_contact_force_mask],
+            device=self.device,
+        )
 
     def _accumulate_esp_contacts(
         self, state, block_kind, color=-1, *, partitions=1, refresh_rigid_positions=True, dt=0.0
@@ -2548,6 +2588,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             body_q_prev=self.body_q_prev if self.model.body_count else None,
             dt=dt,
             friction_epsilon=self.friction_epsilon,
+            face_sums=self._esp_face_sums,
         )
 
     def _add_esp_particle_contacts(
@@ -2803,6 +2844,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             # Select force rows without removing geometry needed for penetration prevention.
             # No-op once this detection's force mask has been computed.
             filter_soft_mesh_contacts(self.model, state_in, contacts)
+            self._restrict_esp_force_mask(contacts)
 
         if control is None:
             control = self.model.control(clone_variables=False)
@@ -3226,6 +3268,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         if run_rigid_collision:
             self._run_rigid_collision(state, dt)
             filter_soft_mesh_contacts(self.model, state, self._pipeline_contacts)
+            self._restrict_esp_force_mask(self._pipeline_contacts)
         if run_soft_self_collision:
             self._collision_detection_penetration_free(state, reset_reference=False)
 
@@ -4061,7 +4104,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.soft_contact_normal,
                     model.shape_margin,
                     contacts.soft_contact_barycentric,
-                    self._esp_shape_mask,
+                    self._esp_native_shape_mask,
                 ]
                 if self._particle_contact_use_gather:
                     # Deterministic modes: one thread per colored particle, no output atomics.
@@ -4371,7 +4414,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_particle_contact_buffer_pre_alloc,
                         self.body_particle_contact_counts,
                         self.body_particle_contact_indices,
-                        self._esp_shape_mask,
+                        self._esp_native_shape_mask,
                     ],
                     outputs=[
                         self.body_forces,

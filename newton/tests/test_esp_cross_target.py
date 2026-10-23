@@ -15,13 +15,19 @@ from newton.tests.test_solver_vbd_esp import contact_primitive_indices_np
 from newton.tests.test_solver_vbd_esp_friction import friction_blocks, numpy_closest_points, numpy_damping_blocks
 
 
-def make_cross_target_case(device, *, shared_body=False, mixed_radii=False):
-    """A crossing pair of finite edges, another rigid face, and another soft patch."""
+def make_cross_target_case(device, *, shared_body=False, mixed_radii=False, rigid_normal_up=False):
+    """A crossing pair of finite edges, another rigid face, and another soft patch.
+
+    ``rigid_normal_up`` winds the crossed rigid triangle so its normal faces the cloth; ESP does
+    not care, but Newton's OGC row filter treats the cloth as outside only then.
+    """
     builder = newton.ModelBuilder(gravity=wp.vec3())
     rigid_triangles = [
         [[0, -0.1, 0], [0, 0.1, 0], [0.08, 0.03, -0.06]],
         [[-0.06, -0.05, -0.0003], [0.07, -0.05, -0.0003], [0.01, 0.08, -0.0003]],
     ]
+    if rigid_normal_up:
+        rigid_triangles[0] = [rigid_triangles[0][k] for k in (0, 2, 1)]
     body_a = builder.add_body(mass=1.0)
     for i, triangle in enumerate(rigid_triangles):
         body = body_a if i == 0 or shared_body else builder.add_body(mass=1.0)
@@ -119,6 +125,16 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
     These four separate triangles have boundary edges/vertices. Under the existing
     open-surface ESP convention their potential is just the positive face term.
     """
+    weight, on_rigid, on_soft = reference_ee_terms(model, solver, row, shape, soft, rigid, omit_extra=omit_extra)
+    data = solver._esp_data
+    se, re = row[1:]
+    return weight * (
+        float(data.soft_edge_area.numpy()[se]) * on_rigid + float(data.rigid_edge_area.numpy()[re]) * on_soft
+    )
+
+
+def reference_ee_terms(model, solver, row, shape, soft, rigid, *, omit_extra=False):
+    """Return the EE sample weight and the unweighted near potentials of q against rigid and q_bar against soft."""
     data = solver._esp_data
     se, re = row[1:]
     a, b = soft[data.soft_edge_vertex_indices.numpy()[se]]
@@ -126,7 +142,7 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
     u, v = b - a, d - c
     s, t = np.linalg.lstsq(np.column_stack((u, -v)), c - a, rcond=None)[0]
     if not (0 < s < 1 and 0 < t < 1):
-        return 0.0
+        return 0.0, 0.0, 0.0
     q, qb = a + s * u, c + t * v
     distance_sq = np.dot(q - qb, q - qb)
     radii = model.particle_radius.numpy()
@@ -135,7 +151,7 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
     near = 0.05 * (radius + float(margins[shape]))
     ratio = 2 * np.sqrt(distance_sq) / near
     if ratio >= 2:
-        return 0.0
+        return 0.0, 0.0, 0.0
     weight = 1 - 1.5 * ratio**2 + 0.75 * ratio**3 if ratio < 1 else 0.25 * (2 - ratio) ** 3
     for p, start, end in ((a, c, d), (b, c, d), (c, a, b), (d, a, b)):
         closest = start + np.clip(np.dot(p - start, end - start) / np.dot(end - start, end - start), 0, 1) * (
@@ -167,9 +183,7 @@ def reference_energy(model, solver, row, shape, soft, rigid, *, omit_extra=False
         for ids in data.soft_tri_indices.numpy()
         if not omit_extra or ids[0] < 3
     )
-    return weight * (
-        float(data.soft_edge_area.numpy()[se]) * on_rigid + float(data.rigid_edge_area.numpy()[re]) * on_soft
-    )
+    return weight, on_rigid, on_soft
 
 
 def rotated(points, center, delta):
