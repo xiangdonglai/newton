@@ -59,7 +59,7 @@ def reference_energies(
 
     Use float64 and least-squares closest-point solves instead of the Warp
     kernels' cross-product formulas. Return vertex (P, P_near) values
-    and bidirectional [P_fixed, P_ee].
+    and bidirectional [P_fixed, P_ee] with unnormalized Toolkit A_f/9 weights.
     """
 
     def segment_closest(point, a, b):
@@ -79,8 +79,9 @@ def reference_energies(
             second = (-2 * np.log(ratio) + 4 * gap / ratio + gap**2 / ratio**2) / support**2
             offset = distance - threshold
             total += first * offset + 0.5 * second * offset**2
-        x = np.clip(2 * distance / near_cutoff - 1, 0, 1)
-        return np.array([total, (1 - x) ** 3 * (1 + 3 * x + 6 * x**2) * total])
+        y = np.clip(6 * distance / near_cutoff - 3, 0, 3)
+        H = sum(c * max(y - knot, 0) ** 3 for knot, c in enumerate((1, -3, 3, -1))) / 6
+        return np.array([total, (1 - H) * total])
 
     def point_potential(point, vertices_np, triangle_indices_np):
         def term(closest):
@@ -136,10 +137,10 @@ def reference_energies(
         )
         vertex_area, edge_area = np.zeros(len(vertices_np)), {}
         for face, area in zip(triangle_indices_np, tri_areas_np, strict=True):
-            vertex_area[face] += area / 3
+            vertex_area[face] += area / 9
             for a, b in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])]:
                 edge = tuple(sorted((a, b)))
-                edge_area[edge] = edge_area.get(edge, 0.0) + 2 * area
+                edge_area[edge] = edge_area.get(edge, 0.0) + area / 9
         return vertex_area, edge_area
 
     cloth_vertices_np = np.asarray(cloth_vertices_np, dtype=np.float64)

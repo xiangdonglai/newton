@@ -8,8 +8,8 @@
     uv run --no-sync python tmp/test_esp_normalized.py --benchmark --device cuda:0
 
 Tests include an independent float64 PyTorch scalar-energy reference, complete
-vertex gradients, finite differences and selected Hessian blocks. Only the
-local prototype changes normalization. Existing SolverVBD remains the baseline.
+vertex gradients, finite differences and selected Hessian blocks. The local
+prototype uses the same weights and near/far window as production SolverVBD.
 No timing results should be collected while a viewer/other GPU job is running.
 """
 
@@ -97,12 +97,12 @@ class TorchNormalizedEsp:
         numerators, weights, far_values = [], [], []
         for side, surface in enumerate(reference.surfaces):
             for face, vertices in enumerate(surface["faces"]):
-                numerator, W, far = zero, zero + 0.5, zero
+                numerator, W, far = zero, zero + 3.0, zero
                 for vertex in vertices:
                     near, far_at_vertex = vertex_potentials[side][vertex]
                     if constant_potential is not None:
                         near, far_at_vertex = zero + constant_potential, zero
-                    numerator = numerator + near / 6
+                    numerator = numerator + near
                     far = far + far_at_vertex / 3
                 for edge in surface["face_edges"][face]:
                     for weight, sample_potential in edge_samples[side][edge]:
@@ -120,7 +120,7 @@ class TorchNormalizedEsp:
 
         N, W, far = self.face_values(positions, constant_potential=constant_potential)
         areas = torch.as_tensor(self.tri_areas_np, dtype=positions.dtype, device=positions.device)
-        return (areas * (N / W if normalized else 2 * N)).sum() + (areas * far).sum()
+        return (areas / 9 * (N / W + far if normalized else N + 3 * far)).sum()
 
 
 def make_probe(device="cpu", *, height_offset=0.0, tilt=0.0):
@@ -158,7 +158,7 @@ def wrench(experiment, forces_np, com_np):
 
 class TestNormalizedEsp(unittest.TestCase):
     def test_unnormalized_baseline_and_devices(self):
-        """Compare the unchanged model and CPU/CUDA normalized energies and forces."""
+        """Compare against production unnormalized output, and CPU/CUDA normalized energies and forces."""
         cpu_result = None
         for device in wp.get_devices():
             _fixture, experiment, baseline = make_probe(device)
@@ -258,7 +258,7 @@ class TestNormalizedEsp(unittest.TestCase):
         np.testing.assert_allclose(finite_hessian_np / hessian_scale, hessian_np / hessian_scale, rtol=0, atol=0.02)
 
     def test_constant_potential_and_inactive_ee(self):
-        """Preserve constant face integrals and reduce to existing quadrature without EE."""
+        """Check Toolkit's outer scale for constants and the factor of three without EE."""
         import torch
 
         _, experiment, _ = make_probe()
@@ -266,7 +266,7 @@ class TestNormalizedEsp(unittest.TestCase):
         x = torch.tensor(positions(experiment), dtype=torch.float64, requires_grad=True)
         constant_energy = reference(x, constant_potential=2.3)
         gradient = torch.autograd.grad(constant_energy, x)[0]
-        self.assertAlmostEqual(constant_energy.item(), 2.3 * experiment.tri_areas_np.astype(float).sum(), places=12)
+        self.assertAlmostEqual(constant_energy.item(), 2.3 * experiment.tri_areas_np.astype(float).sum() / 9, places=12)
         np.testing.assert_allclose(gradient.numpy(), 0, atol=1e-10)
         # Move beyond near support, but retain ordinary vertex contact forces.
         _, experiment, _ = make_probe(height_offset=0.003)
@@ -274,9 +274,9 @@ class TestNormalizedEsp(unittest.TestCase):
         for normalized in (False, True):
             experiment.assemble(normalized=normalized)
             results.append(experiment.result())
-        np.testing.assert_array_equal(experiment.weight_sum.numpy(), 0.5)
-        np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-6)
-        np.testing.assert_allclose(results[0][1], results[1][1], rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(experiment.weight_sum.numpy(), 3.0)
+        np.testing.assert_allclose(results[0][0] / 3, results[1][0], rtol=1e-6)
+        np.testing.assert_allclose(results[0][1] / 3, results[1][1], rtol=1e-6, atol=1e-6)
 
     def test_graph_capture(self):
         """Replay both passes without host contact reads or accumulating old sums."""

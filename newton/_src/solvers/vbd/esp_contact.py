@@ -43,22 +43,27 @@ def _contact_worker_count(contact_capacity: int, device: wp.Device, partitions: 
 
 
 # How edge-edge (EE) contact rows enter the ESP energy. SolverVBD selects one
-# choice at construction; each choice compiles its own kernels, so the default
-# production code path is unchanged by the alternatives.
+# choice per process before import; each choice compiles its own kernels.
 EE_QUADRATURE_UNNORMALIZED = 0
-"""Adaptive EE samples with the paper's Eq. (9) weights, without per-face normalization (author's option 1)."""
-EE_QUADRATURE_NORMALIZED = 1
-"""Adaptive EE samples whose near-field weights are normalized per source face, as in the paper's quadrature.
+"""Toolkit's A_f/9 outer weights and unit vertex weights, without per-face normalization.
 
-For each source face f with rest area A_f, three fixed vertex samples of weight 1/6 and
+Adaptive EE samples still evaluate only the near potential. Unlike this mode, Toolkit's
+use_near_far=False also removes the near/far split and evaluates the full potential at EE samples.
+"""
+EE_QUADRATURE_NORMALIZED = 1
+"""Adaptive EE samples with IPC Toolkit's per-face quadrature weights.
+
+For each source face f with rest area A_f, three fixed vertex samples of weight 1 and
 the adaptive EE samples q on its edges with weights w(q):
 
-    E_near,f = A_f * (sum_v (1/6) P_near(v) + sum_q w(q) P_near(q)) / (1/2 + sum_q w(q)),
+    E_f = (A_f/9) * [(sum_v P_near(v) + sum_q w(q) P_near(q)) / (3 + sum_q w(q))
+                    + sum_v P_far(v) / 3].
 
-while the far field keeps its fixed-vertex quadrature. Without active EE samples this is
-exactly the unnormalized energy. Forces are exact derivatives of this energy, including the
-denominator; the solve Hessian is exact per contact row and omits second-order coupling between
-different rows of the same face.
+A_f/9 is Toolkit's outer scaling convention, not a factor required by the paper.
+Without active EE samples, surface energy is one third of the unnormalized mode.
+Newton's small-distance Taylor continuation and per-feature friction/damping laws remain.
+Forces include denominator derivatives; the solve Hessian is exact per contact row and
+omits second-order coupling between different rows of the same face.
 """
 EE_QUADRATURE_OGC = 2
 """Edge rows go through Newton's native rigid-soft contact kernels; ESP evaluates VT/TV rows only.
@@ -139,9 +144,9 @@ class EspData:
     rigid_vertex_term_coefficient: wp.array[float]
     """Same target correction on the rigid surface; not a source quadrature weight."""
     soft_vertex_quadrature_weight: wp.array[float]
-    """Source weight multiplying the complete triangle_energy result: area / 3, unit for points, zero inside solids."""
+    """Source vertex weight: sum A_f/9 (normalized far: A_f/27), unit for points, zero inside solids. Native-EE mode uses A_f/3."""
     rigid_vertex_quadrature_weight: wp.array[float]
-    """Source quadrature weight: sum of incident scaled rigid triangle areas / 3."""
+    """Same mode-dependent source vertex weight on the rigid surface, using scaled rest areas."""
     soft_edge_area: wp.array[float]
     rigid_edge_area: wp.array[float]
     total_edge_count: int
@@ -164,9 +169,9 @@ class EspData:
 class FaceQuadratureSums:
     """Per-source-face near-field sums for EE_QUADRATURE_NORMALIZED; soft faces first, then rigid face slots.
 
-    numerator[f] = sum over f's fixed vertex samples of (1/6) * ke * P_near(v)
+    numerator[f] = sum over f's fixed vertex samples of ke * P_near(v)
                  + sum over adaptive EE samples q on f's edges of w(q) * ke * P_near(q)
-    weight[f]    = 1/2 + sum over those EE samples of w(q)
+    weight[f]    = 3 + sum over those EE samples of w(q)
 
     A rigid face of a shape shared by every world (shape_world < 0) has one slot per world,
     selected by the world of the row's soft primitive, so worlds stay independent; other
@@ -570,8 +575,14 @@ def _compute_surface_weights(
     # Source area weights multiply the whole potential; see triangle_energy's final atomic_add.
     vertex_quadrature_weight_np = np.zeros(vertex_count, dtype=np.float32)
     edge_area_np = np.zeros(len(edge_vertex_indices_np), dtype=np.float32)
-    np.add.at(vertex_quadrature_weight_np, triangle_indices_np.ravel(), np.repeat(tri_areas_np / 3, 3))
-    np.add.at(edge_area_np, mesh_adjacency.tri_edge_indices.ravel(), np.repeat(2 * tri_areas_np, 3))
+    # Each mode stores the fixed vertex coefficient here; normalized near weights
+    # are computed from current face sums later. Preserve the native-EE comparison.
+    vertex_divisor = 27.0 if _EE_QUADRATURE == EE_QUADRATURE_NORMALIZED else 9.0
+    edge_factor = 1.0 / 9.0
+    if _EE_QUADRATURE == EE_QUADRATURE_OGC:
+        vertex_divisor, edge_factor = 3.0, 2.0
+    np.add.at(vertex_quadrature_weight_np, triangle_indices_np.ravel(), np.repeat(tri_areas_np / vertex_divisor, 3))
+    np.add.at(edge_area_np, mesh_adjacency.tri_edge_indices.ravel(), np.repeat(edge_factor * tri_areas_np, 3))
     return vertex_term_coefficient_np, vertex_quadrature_weight_np, edge_area_np
 
 
@@ -652,16 +663,24 @@ def barrier_coefficients(distance: float, support: float, near: float, near_only
         offset = distance - d_min
         energy += dbdd * offset + 0.5 * d2bdd2 * offset * offset
         dbdd += d2bdd2 * offset
-    if near_only:
-        t = 2.0 * distance / near - 1.0
-        if t > 0.0:
-            s = 1.0 - t
-            window = s * s * s * (1.0 + 3.0 * t + 6.0 * t * t)
-            dwindowdd = -60.0 * t * t * s * s / near
-            d2windowdd2 = -240.0 * t * s * (1.0 - 2.0 * t) / (near * near)
-            d2bdd2 = d2bdd2 * window + 2.0 * dbdd * dwindowdd + energy * d2windowdd2
-            dbdd = dbdd * window + energy * dwindowdd
-            energy *= window
+    if near_only and distance > 0.5 * near:
+        # Toolkit's piecewise-cubic C2 window decreases from 1 to 0 on
+        # [near/2, near]. x runs from -3 to 0; H is the complementary far window.
+        x = (distance - near) * (6.0 / near)
+        H, dHdx, d2Hdx2 = float(0.0), float(0.0), float(0.0)
+        if x <= -2.0:
+            y = x + 3.0
+            H, dHdx, d2Hdx2 = y * y * y / 6.0, y * y / 2.0, y
+        elif x <= -1.0:
+            H = (((-2.0 * x - 9.0) * x - 9.0) * x + 3.0) / 6.0
+            dHdx, d2Hdx2 = -(x * x + 3.0 * x + 1.5), -3.0 - 2.0 * x
+        else:
+            H, dHdx, d2Hdx2 = x * x * x / 6.0 + 1.0, x * x / 2.0, x
+        window = 1.0 - H
+        dwindowdd, d2windowdd2 = -dHdx * 6.0 / near, -d2Hdx2 * 36.0 / (near * near)
+        d2bdd2 = d2bdd2 * window + 2.0 * dbdd * dwindowdd + energy * d2windowdd2
+        dbdd = dbdd * window + energy * dwindowdd
+        energy *= window
     return energy, dbdd, d2bdd2
 
 
@@ -706,7 +725,7 @@ def triangle_energy(
 
     This function computes and returns only E_v, with p=v and f'=(a,b,c).
     The caller handles the contact rows, stiffness, source rest-area weight
-    vertex_quadrature_weight[v] = A_v/3, and accumulation. A_v is the sum
+    vertex_quadrature_weight[v] = A_v/9 (normalized far: A_v/27), and accumulation. A_v is the sum
     of rest areas incident to source v. Point-only soft particles instead
     use weight 1; volume-interior particles with no surface triangles use 0.
 
@@ -1459,8 +1478,8 @@ def normalized_vertex_near_weight(
 ) -> float:
     """Return a fixed vertex sample's near-field weight under per-face normalization.
 
-    sum over incident faces f of (A_f / 3) * (1/2) / W_f, which equals the fixed weight
-    A_v / 3 when no EE sample is active on those faces. A vertex without incident
+    Sum over incident faces f of A_f / (9 W_f), with W_f = 3 + sum_q w(q).
+    This equals the far weight A_v / 27 when no EE sample is active. A vertex without incident
     triangles (a point particle) keeps ``far_weight``. ``soft_vertex_index`` selects the
     world slot of rigid faces; see face_sum_index.
     """
@@ -1474,7 +1493,7 @@ def normalized_vertex_near_weight(
     # v_adj_tris stores (triangle, corner) pairs.
     for entry in range(start, end, 2):
         face = v_adj_tris[entry]
-        weight += tri_area[face] / (6.0 * face_sums.weight[face_sum_index(face, is_rigid, soft_vertex_index, data)])
+        weight += tri_area[face] / (9.0 * face_sums.weight[face_sum_index(face, is_rigid, soft_vertex_index, data)])
     return weight
 
 
@@ -1488,15 +1507,15 @@ def normalized_edge_coefficients(
 ) -> wp.vec4:
     """Return (alpha, beta, gamma, delta) for an adaptive EE sample generated on this edge.
 
-    With the edge's incident faces f, rest areas A_f, and current sums N_f, W_f::
+    With the edge's incident faces f, outer weights a_f = A_f/9, and current sums N_f, W_f::
 
-        alpha = sum A_f / W_f        replaces the unnormalized area factor 2 * sum A_f
-        beta  = sum A_f N_f / W_f^2  multiplies -dw/dX (gradient) and -d2w/dX2 (Hessian)
-        gamma = sum A_f / W_f^2      multiplies -(dw dP^T + dP dw^T) in the Hessian
-        delta = sum A_f N_f / W_f^3  multiplies 2 dw dw^T in the Hessian
+        alpha = sum a_f / W_f       replaces the unnormalized outer weight sum a_f
+        beta  = sum a_f N_f / W_f^2 multiplies -dw/dX (gradient) and -d2w/dX2 (Hessian)
+        gamma = sum a_f / W_f^2     multiplies -(dw dP^T + dP dw^T) in the Hessian
+        delta = sum a_f N_f / W_f^3 multiplies 2 dw dw^T in the Hessian
 
     P is this sample's unweighted target potential and w its weight. These are the
-    derivatives of sum_f A_f N_f / W_f with the other rows' contributions to N_f, W_f fixed.
+    derivatives of sum_f a_f N_f / W_f with the other rows' contributions to N_f, W_f fixed.
     ``soft_vertex_index`` selects the world slot of rigid faces; see face_sum_index.
     """
     edge_tri_indices = data.rigid_adjacency.edge_tri_indices if is_rigid else data.soft_adjacency.edge_tri_indices
@@ -1505,7 +1524,7 @@ def normalized_edge_coefficients(
     for side in range(2):
         face = edge_tri_indices[edge_index, side]
         if face >= 0:
-            area = tri_area[face]
+            area = tri_area[face] / 9.0
             slot = face_sum_index(face, is_rigid, soft_vertex_index, data)
             inverse_weight = 1.0 / face_sums.weight[slot]
             numerator = face_sums.numerator[slot]
@@ -1527,12 +1546,12 @@ def add_vertex_face_sums(
     data: EspData,
     face_sums: FaceQuadratureSums,
 ):
-    """Add a fixed vertex sample's stiffness-weighted near potential, with weight 1/6, to its faces' slots."""
+    """Add a unit-weight vertex sample's stiffness-weighted near potential to its faces' slots."""
     v_adj_tris = data.rigid_adjacency.v_adj_tris if is_rigid else data.soft_adjacency.v_adj_tris
     v_adj_tris_offsets = data.rigid_adjacency.v_adj_tris_offsets if is_rigid else data.soft_adjacency.v_adj_tris_offsets
     for entry in range(v_adj_tris_offsets[vertex_index], v_adj_tris_offsets[vertex_index + 1], 2):
         slot = face_sum_index(v_adj_tris[entry], is_rigid, soft_vertex_index, data)
-        wp.atomic_add(face_sums.numerator, slot, near_value / 6.0)
+        wp.atomic_add(face_sums.numerator, slot, near_value)
 
 
 @wp.func
@@ -3254,8 +3273,8 @@ def accumulate_face_quadrature(
     """EE_QUADRATURE_NORMALIZED pass 1: per-face near-field numerators and weights at the current positions.
 
     Visit each contact row once, with the same row selection as evaluate_contact_energy,
-    and add its fixed vertex samples (weight 1/6) or adaptive EE samples (weight w) to
-    their source faces. face_sums.weight must hold 1/2 and face_sums.numerator zero
+    and add its fixed vertex samples (weight 1) or adaptive EE samples (weight w) to
+    their source faces. face_sums.weight must hold 3 and face_sums.numerator zero
     before the launch. Overflow, list and family errors are reported by the kernel that
     follows this pass, not here.
     """
@@ -4311,7 +4330,7 @@ def create_esp_data(
             point_only_mask_np[soft_mesh_adjacency.tet_indices.ravel()] = False
         soft_vertex_quadrature_weight_np[point_only_mask_np] = 1.0
         # Final source quadrature weights (not the target vertex_term_coefficient):
-        # - In surface triangles: sum of incident rest-triangle areas / 3.
+        # - In surface triangles: sum of A_f/9; normalized far A_f/27; native-EE comparison A_f/3.
         # - In tetrahedra but no supplied surface triangle: 0 (excluded from ESP mesh contact).
         # - In neither triangles nor tetrahedra: 1, including standalone and spring/edge-only particles.
         particle_world_np = model.particle_world.numpy()
@@ -4408,7 +4427,7 @@ def create_face_quadrature_sums(data: EspData, device: wp.Device | str) -> FaceQ
     count = data.face_sum_count
     with wp.ScopedDevice(device):
         sums.numerator = wp.zeros(count, dtype=float)
-        sums.weight = wp.full(count, 0.5, dtype=float)
+        sums.weight = wp.full(count, 3.0, dtype=float)
     return sums
 
 
@@ -4507,7 +4526,7 @@ def launch_contact_blocks(
         if _EE_QUADRATURE == EE_QUADRATURE_NORMALIZED:
             # Pass 1: per-face near-field sums at the current positions, one worker per row.
             face_sums.numerator.zero_()
-            face_sums.weight.fill_(0.5)
+            face_sums.weight.fill_(3.0)
             wp.launch(
                 accumulate_face_quadrature,
                 dim=_contact_worker_count(contacts.soft_contact_max, model.device),

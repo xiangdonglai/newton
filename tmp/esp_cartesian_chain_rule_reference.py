@@ -91,23 +91,23 @@ def triangle_distance_squared(points):
 
 
 def barrier_coefficients(d, support, near, near_only):
-    """Return b(d), b'(d), b''(d), using the paper's optional near window."""
+    """Return b(d), b'(d), b''(d), using the current cubic near window."""
     r = d / support
     gap = 1 - r
     value = -gap * gap * np.log(r)
     first = (2 * gap * np.log(r) - gap * gap / r) / support
     second = (-2 * np.log(r) + 4 * gap / r + gap * gap / r**2) / support**2
-    if near_only:
-        t = 2 * d / near - 1
-        if t > 0:
-            window = (1 - t) ** 3 * (1 + 3 * t + 6 * t * t)
-            dw = -30 * t * t * (1 - t) ** 2 * (2 / near)
-            ddw = -60 * t * (1 - t) * (1 - 2 * t) * (2 / near) ** 2
-            value, first, second = (
-                value * window,
-                first * window + value * dw,
-                second * window + 2 * first * dw + value * ddw,
-            )
+    if near_only and d > 0.5 * near:
+        powers = np.maximum(6 * d / near - 3 - np.arange(4), 0)
+        coefficients = np.array([1, -3, 3, -1])
+        window = 1 - powers**3 @ coefficients / 6
+        dw = -(powers**2 @ coefficients) / 2 * (6 / near)
+        ddw = -(powers @ coefficients) * (6 / near) ** 2
+        value, first, second = (
+            value * window,
+            first * window + value * dw,
+            second * window + 2 * first * dw + value * ddw,
+        )
     return value, first, second
 
 

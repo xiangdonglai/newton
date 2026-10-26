@@ -12,7 +12,12 @@ import newton
 from newton._src.solvers.vbd import esp_contact
 from newton.solvers import SolverVBD
 from newton.tests.test_solver_vbd_esp import contact_primitive_indices_np
-from newton.tests.test_solver_vbd_esp_friction import friction_blocks, numpy_closest_points, numpy_damping_blocks
+from newton.tests.test_solver_vbd_esp_friction import (
+    friction_blocks,
+    numpy_closest_points,
+    numpy_damping_blocks,
+    numpy_near_window,
+)
 
 
 def make_cross_target_case(device, *, shared_body=False, mixed_radii=False, rigid_normal_up=False):
@@ -168,8 +173,7 @@ def reference_ee_terms(model, solver, row, shape, soft, rigid, *, omit_extra=Fal
             return 0.0
         r = distance / support
         value = -((1 - r) ** 2) * np.log(r)
-        x = np.clip(2 * distance / cutoff - 1, 0, 1)
-        value *= (1 - x) ** 3 * (1 + 3 * x + 6 * x * x)
+        value *= numpy_near_window(distance, cutoff)
         return value * 0.5 * (model.soft_contact_ke + float(ke[target_shape]))
 
     rigid_shapes = data.rigid_vertex_shapes.numpy()

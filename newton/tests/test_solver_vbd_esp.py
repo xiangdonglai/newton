@@ -842,8 +842,10 @@ class TestVbdEsp(unittest.TestCase):
                     self.assertEqual(getattr(data.soft_adjacency, name).ptr, getattr(adjacency, name).ptr)
                 expected_v = np.zeros(model.particle_count, dtype=np.float32)
                 expected_e = np.zeros(model.edge_count, dtype=np.float32)
-                np.add.at(expected_v, model.tri_indices.numpy().ravel(), np.repeat(areas / 3, 3))
-                np.add.at(expected_e, adjacency.tri_edge_indices.numpy().ravel(), np.repeat(2 * areas, 3))
+                vertex_divisor = {"unnormalized": 9, "normalized": 27, "ogc": 3}[esp_contact._ee_quadrature_name]
+                edge_factor = 2.0 if esp_contact._ee_quadrature_name == "ogc" else 1.0 / 9.0
+                np.add.at(expected_v, model.tri_indices.numpy().ravel(), np.repeat(areas / vertex_divisor, 3))
+                np.add.at(expected_e, adjacency.tri_edge_indices.numpy().ravel(), np.repeat(edge_factor * areas, 3))
                 np.testing.assert_array_equal(data.soft_vertex_quadrature_weight.numpy(), expected_v)
                 np.testing.assert_array_equal(data.soft_edge_area.numpy(), expected_e)
                 np.testing.assert_array_equal(model.tri_areas.numpy(), areas)

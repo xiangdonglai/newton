@@ -592,8 +592,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 nonintersecting manifold meshes, and complete query buffers. Analytical shapes retain their
                 existing force law. ESP owns mesh elasticity, friction, and damping; native kernels skip
                 all rows against these meshes, without a native-force fallback. Soft surface vertices use
-                incident rest-area / 3 weights. Particles belonging to neither triangles nor tetrahedra
-                use unit point weights, including particles connected only by springs or edges.
+                incident rest-area / 9 weights (normalized far field: / 27). Particles belonging to neither
+                triangles nor tetrahedra use unit point weights, including particles connected only by springs or edges.
                 Interior tetrahedral vertices have zero weight and no mesh-contact force, friction, or
                 damping; their analytical-shape contacts are unchanged. Complete boundary triangles must
                 be supplied for tetrahedral solids. Point weights are fixed, not inferred from positions.
@@ -604,7 +604,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ``esp_contact.EE_QUADRATURE_MODES``) compiles the normalized EE quadrature
                 instead, or ``"ogc"``, which leaves the edge rows of ESP shapes to the native
                 rigid-soft contact kernels (Newton's OGC row filter, native force law and AVBD
-                ramping) while ESP keeps the VT/TV rows. Each evaluation computes
+                ramping) while ESP keeps the VT/TV rows with their original area / 3 weights.
+                The two ESP quadrature modes use IPC Toolkit's area / 9 outer scale and unit
+                vertex sample weights, plus its piecewise-cubic near/far window. The unnormalized
+                mode retains near-only EE sampling; it is not Toolkit's unsplit unnormalized option.
+                Each evaluation computes
                 a complete 3x3 particle or 6x6 body block. Conservative Hessians are exact selected-branch derivatives,
                 not PSD-projected by default; the local experimental projection switch is in esp_contact.py.
                 The scalar barrier uses a C2 Taylor extension below min(10 micrometers, support/4).

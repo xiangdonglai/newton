@@ -105,6 +105,12 @@ def numpy_closest_points(point, triangle):
     return np.array([face, *edges, *triangle])
 
 
+def numpy_near_window(distance, near):
+    """Evaluate the cubic-spline window independently through truncated powers."""
+    y = np.clip(6 * distance / near - 3, 0, 3)
+    return 1 - sum(c * max(y - knot, 0) ** 3 for knot, c in enumerate((1, -3, 3, -1))) / 6
+
+
 def numpy_barrier(distance, near_only):
     """Evaluate the positive-distance scalar potential, without production helpers."""
     if distance >= 0.2 or (near_only and distance >= 0.05):
@@ -112,8 +118,7 @@ def numpy_barrier(distance, near_only):
     r = distance / 0.2
     energy = -((1 - r) ** 2) * np.log(r)
     if near_only and distance > 0.025:
-        t = 2 * distance / 0.05 - 1
-        energy *= (1 - t) ** 3 * (1 + 3 * t + 6 * t * t)
+        energy *= numpy_near_window(distance, 0.05)
     return energy
 
 

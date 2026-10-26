@@ -17,6 +17,8 @@ from esp_normalized import NormalizedEsp
 from test_esp_body_viewer import rotated_pose
 from view_esp_force_field import PRESETS, BodyForceProbe, EdgeForceProbe, ForceProbe, evaluate_body_ogc
 
+from newton._src.solvers.vbd import esp_contact
+
 
 def finite_force(evaluate, positions_np, step):
     """Differentiate a scalar energy with centered coordinate differences."""
@@ -174,6 +176,50 @@ class TestToolkitViewer(unittest.TestCase):
                 )
                 np.testing.assert_allclose(ours[0], expected[0], rtol=5e-6, atol=1e-9)
                 np.testing.assert_allclose(ours[1] / scale, expected[1] / scale, rtol=0, atol=1e-5)
+
+    @unittest.skipUnless(
+        esp_contact._ee_quadrature_name == "normalized", "run with NEWTON_ESP_EE_QUADRATURE=normalized"
+    )
+    def test_production_normalized_toolkit(self):
+        """Compare SolverVBD's energy, all particle forces and body wrench directly to Toolkit.
+
+        Poses exercise active EE, the near/far window and inactive support. Gaps stay
+        above Newton's retained 10 um continuation, where the two laws intentionally differ.
+        """
+        for scene, support in ((0, 0.03), (1, 0.06)):
+            probe = BodyForceProbe(scene, "cpu")
+            for dz, tilt in ((0, 0), (0.0001, 0), (0.0005, 0.01), (0.001, -0.01), (0.003, 0), (0.05, 0)):
+                pose_np = rotated_pose(
+                    probe.initial_transform_np, probe.initial_transform_np[:3, 3], (1, 0, 0), float(tilt)
+                )
+                pose_np[2, 3] += dz
+                expected_energy, expected_force, expected_torque, info = probe.evaluate(pose_np, support, method=5)
+                _, toolkit_forces_np = probe.toolkit.evaluate(info["positions"], probe.vertices_np, support, 1)
+                solver = probe.solver
+                solver._refresh_body_particle_contact_state(probe.contacts, refresh=True)
+                for kind in (esp_contact._PARTICLE_BLOCKS, esp_contact._BODY_BLOCKS, esp_contact._ENERGY_ONLY):
+                    solver._accumulate_esp_contacts(probe.state, kind, dt=0.0)
+                solver.check_esp_contacts()
+                actual_energy = float(solver._esp_energy.numpy().sum())
+                actual_wrench = solver._esp_body_forces.numpy()[probe.body_index]
+                expected_wrench = np.r_[expected_force, expected_torque]
+                scale = max(np.max(np.abs(expected_wrench)), 1e-6)
+                np.testing.assert_allclose(actual_energy, expected_energy, rtol=5e-6, atol=1e-9)
+                np.testing.assert_allclose(actual_wrench / scale, expected_wrench / scale, rtol=0, atol=1e-5)
+                expected_particles = toolkit_forces_np[len(info["positions"]) :]
+                scale_particles = max(np.max(np.abs(expected_particles)), 1e-6)
+                np.testing.assert_allclose(
+                    solver._esp_particle_forces.numpy() / scale_particles,
+                    expected_particles / scale_particles,
+                    rtol=0,
+                    atol=1e-5,
+                )
+                print(
+                    f"PRODUCTION/TOOLKIT scene={scene} dz={dz} tilt={tilt} "
+                    f"E={actual_energy:.9g}/{expected_energy:.9g} "
+                    f"wrench_error={np.max(np.abs(actual_wrench - expected_wrench)) / scale:.3g}",
+                    flush=True,
+                )
 
     def test_point_matching_below_continuation(self):
         """Matched P has the raw log barrier, unlike production's 10 um continuation.

@@ -115,7 +115,21 @@ def barrier_from_squared_distance(
         )
         offset = root - threshold
         total = chain(d, e0 + g0 * offset + wp.float64(0.5) * h0 * offset * offset, g0 + h0 * offset, h0)
-    if near_only:
+    if near_only and use_continuation:
+        # Current scene checks use the cubic window; keep the historical
+        # singular/quintic reference below for archived derivative experiments.
+        if root > wp.float64(0.5) * near_cutoff:
+            y = wp.float64(6.0) * root / near_cutoff - wp.float64(3.0)
+            H, dHdy, d2Hdy2 = wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)
+            coefficients = wp.vec4d(wp.float64(1.0), wp.float64(-3.0), wp.float64(3.0), wp.float64(-1.0))
+            for knot in range(4):
+                t = wp.max(y - wp.float64(knot), wp.float64(0.0))
+                H += coefficients[knot] * t * t * t / wp.float64(6.0)
+                dHdy += coefficients[knot] * t * t / wp.float64(2.0)
+                d2Hdy2 += coefficients[knot] * t
+            scale = wp.float64(6.0) / near_cutoff
+            total = multiply(total, chain(d, wp.float64(1.0) - H, -dHdy * scale, -d2Hdy2 * scale * scale))
+    elif near_only:
         x = d * (wp.float64(2.0) / near_cutoff) - wp.vec4d(
             wp.float64(1.0), wp.float64(0.0), wp.float64(0.0), wp.float64(0.0)
         )

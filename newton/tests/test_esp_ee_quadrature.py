@@ -50,7 +50,7 @@ def edge_faces_np(tri_indices_np, edge_np):
 
 
 def normalized_reference_energy(model, solver, row, shape, soft, rigid):
-    """Per-face normalized EE energy of the fixture's single row: sum_f A_f w P_f / (1/2 + w)."""
+    """Evaluate the single-row reference with Toolkit weights: sum_f (A_f/9) w P_f / (3 + w)."""
     weight, on_rigid, on_soft = reference_ee_terms(model, solver, row, shape, soft, rigid)
     if weight == 0.0:
         return 0.0
@@ -60,7 +60,7 @@ def normalized_reference_energy(model, solver, row, shape, soft, rigid):
     rigid_faces = edge_faces_np(data.rigid_tri_indices.numpy(), data.rigid_edge_vertex_indices.numpy()[re])
     soft_area = float(data.soft_tri_area.numpy()[soft_faces].sum())
     rigid_area = float(data.rigid_tri_area.numpy()[rigid_faces].sum())
-    return weight * (soft_area * on_rigid + rigid_area * on_soft) / (0.5 + weight)
+    return weight * (soft_area * on_rigid + rigid_area * on_soft) / (9.0 * (3.0 + weight))
 
 
 def evaluate_blocks(solver, state, *, dt=0.0):
@@ -71,7 +71,77 @@ def evaluate_blocks(solver, state, *, dt=0.0):
     return tuple(getattr(solver, "_esp_" + name).numpy().copy() for name in BLOCK_NAMES)
 
 
+def prepare_no_ee_case(device, isolated_particle):
+    """Prepare a surface or unit-weight point with tangential slip and approaching motion."""
+    model, pipeline, solver = make_case(device, dynamic=True, isolated_particle=isolated_particle)
+    model.soft_contact_mu = 1.0
+    model.shape_material_mu.fill_(0.25)
+    model.soft_contact_kd = 5.0
+    model.shape_material_kd.fill_(5.0)
+    state = model.state()
+    pipeline.collide(state, solver.contacts)
+    solver._refresh_body_particle_contact_state(solver.contacts, True)
+    solver.particle_q_prev.assign(state.particle_q.numpy() - np.array([0.0001, 0, -0.0001], dtype=np.float32))
+    solver.body_q_prev.assign(state.body_q)
+    return solver, state
+
+
+@wp.kernel
+def barrier_probe(distances: wp.array[float], near_only: bool, output: wp.array[wp.vec3]):
+    """Read the production barrier value and its two distance derivatives."""
+    i = wp.tid()
+    value, first, second = esp_contact.barrier_coefficients(distances[i], 0.2, 0.05, near_only)
+    output[i] = wp.vec3(value, first, second)
+
+
 class TestEspEeQuadrature(unittest.TestCase):
+    def test_cubic_window_and_continuation(self):
+        """Check the cubic window's values/derivatives at joins and retain finite small-distance continuation."""
+        distances_np = np.array(
+            [0, 1e-6, 1e-5, 0.01, 0.025, 0.027, 0.05 * 2 / 3, 0.037, 0.05 * 5 / 6, 0.046, 0.05, 0.2],
+            dtype=np.float32,
+        )
+        d = distances_np.astype(np.float64)
+        evaluated_d = np.maximum(d, 1e-5)
+        ratio = evaluated_d / 0.2
+        gap = 1 - ratio
+        value = -(gap**2) * np.log(ratio)
+        first = (2 * gap * np.log(ratio) - gap**2 / ratio) / 0.2
+        second = (-2 * np.log(ratio) + 4 * gap / ratio + gap**2 / ratio**2) / 0.2**2
+        offset = np.minimum(d - 1e-5, 0)
+        value += first * offset + 0.5 * second * offset**2
+        first += second * offset
+        full_np = np.column_stack((value, first, second))
+        full_np[d >= 0.2] = 0
+        # Independent truncated-power representation of the cubic spline's CDF.
+        y = np.clip(6 * d / 0.05 - 3, 0, 3)
+        powers = np.maximum(y[:, None] - np.arange(4), 0)
+        coefficients = np.array([1, -3, 3, -1])
+        window = 1 - powers**3 @ coefficients / 6
+        first_window = -(powers**2 @ coefficients) / 2 * (6 / 0.05)
+        second_window = -(powers @ coefficients) * (6 / 0.05) ** 2
+        near_np = np.column_stack(
+            (
+                value * window,
+                first * window + value * first_window,
+                second * window + 2 * first * first_window + value * second_window,
+            )
+        )
+        near_np[d >= 0.05] = 0
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                output = wp.empty(len(d), dtype=wp.vec3)
+                for near_only, expected in ((False, full_np), (True, near_np)):
+                    wp.launch(
+                        barrier_probe,
+                        dim=len(d),
+                        inputs=[wp.array(distances_np, dtype=float), near_only],
+                        outputs=[output],
+                    )
+                    actual = output.numpy()
+                    self.assertTrue(np.isfinite(actual).all())
+                    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=0.003)
+
     def test_mode_selection(self):
         """The per-process switch follows NEWTON_ESP_EE_QUADRATURE; only the normalized mode allocates face sums."""
         self.assertEqual(
@@ -103,8 +173,8 @@ class TestEspEeQuadrature(unittest.TestCase):
             self.assertIsNone(solver._esp_face_sums)
 
     @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
-    def test_normalized_matches_unnormalized_without_ee(self):
-        """Beyond the near cutoff the per-face sums stay at their fixed values and the modes coincide.
+    def test_normalized_surface_scale_without_ee(self):
+        """Check A_f/27 vertex weights against the default mode's A_f/9 when EE is inactive.
 
         The default-mode blocks come from the parent process through NEWTON_ESP_EE_TEST_REFERENCE.
         """
@@ -113,22 +183,22 @@ class TestEspEeQuadrature(unittest.TestCase):
             self.skipTest("run through test_other_modes_in_subprocesses for the default-mode reference")
         references = np.load(reference_path)
         for device in wp.get_devices():
-            with self.subTest(device=str(device)), wp.ScopedDevice(device):
-                # The triangle floats 3 mm above the box: far-field VT contact only,
-                # since the near cutoff is 5 percent of the 5 mm support.
-                model, pipeline, solver = make_case(device, dynamic=True)
-                state = model.state()
-                pipeline.collide(state, solver.contacts)
-                solver._refresh_body_particle_contact_state(solver.contacts, True)
-                results = evaluate_blocks(solver, state)
-                np.testing.assert_array_equal(solver._esp_face_sums.weight.numpy(), 0.5)
-                np.testing.assert_array_equal(solver._esp_face_sums.numerator.numpy(), 0.0)
-                self.assertGreater(results[0][0], 0.0)
-                self.assertEqual(results[0][1], 0.0)
-                for name, actual in zip(BLOCK_NAMES, results, strict=True):
-                    reference = references[reference_key(device, name)]
-                    scale = max(1.0, np.abs(reference).max())
-                    np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-6)
+            for isolated in (False, True):
+                with self.subTest(device=str(device), isolated=isolated), wp.ScopedDevice(device):
+                    # Far-field VT contact only: no adaptive EE normalization, but
+                    # friction/damping must receive the same source coefficient.
+                    solver, state = prepare_no_ee_case(device, isolated)
+                    for dt in (0.0, 0.01):
+                        results = evaluate_blocks(solver, state, dt=dt)
+                        np.testing.assert_array_equal(solver._esp_face_sums.weight.numpy(), 3.0)
+                        np.testing.assert_array_equal(solver._esp_face_sums.numerator.numpy(), 0.0)
+                        self.assertGreater(results[0][0], 0.0)
+                        self.assertEqual(results[0][1], 0.0)
+                        for name, actual in zip(BLOCK_NAMES, results, strict=True):
+                            key = reference_key(device, f"{isolated}_{dt}_{name}")
+                            reference = references[key] / (1.0 if isolated else 3.0)
+                            scale = max(1.0, np.abs(reference).max())
+                            np.testing.assert_allclose(actual / scale, reference / scale, rtol=0, atol=2e-6)
 
     @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
     def test_normalized_energy_and_derivatives(self):
@@ -148,7 +218,7 @@ class TestEspEeQuadrature(unittest.TestCase):
                     energy, fp, hp, fb, hb = evaluate_blocks(solver, state)
                     self.assertEqual(energy[0], 0.0)
                     np.testing.assert_allclose(energy[1], reference, rtol=2e-6)
-                    self.assertGreater(solver._esp_face_sums.weight.numpy().max(), 0.5)
+                    self.assertGreater(solver._esp_face_sums.weight.numpy().max(), 3.0)
                     for particle in range(model.particle_count):
                         direction = rng.normal(size=3)
                         direction /= np.linalg.norm(direction)
@@ -304,11 +374,11 @@ class TestEspEeQuadrature(unittest.TestCase):
                         # One slot per soft face, then one slot per world for the shared rigid face.
                         self.assertEqual(data.face_sum_count, soft_faces + 2)
                         weights = solver._esp_face_sums.weight.numpy()
-                        self.assertGreater(weights[soft_faces], 0.5)
+                        self.assertGreater(weights[soft_faces], 3.0)
                         if remove_world_1:
-                            self.assertEqual(weights[soft_faces + 1], 0.5)
+                            self.assertEqual(weights[soft_faces + 1], 3.0)
                         else:
-                            self.assertGreater(weights[soft_faces + 1], 0.5)
+                            self.assertGreater(weights[soft_faces + 1], 3.0)
                 if MODE != "ogc":
                     self.assertGreater(snapshots[0][0][1], 0.0, "Exercise active EE rows")
                 self.assertGreater(np.abs(snapshots[0][1]).max(), 0.0)
@@ -382,18 +452,17 @@ class TestEspEeQuadrature(unittest.TestCase):
             references = {}
             for device in wp.get_devices():
                 with wp.ScopedDevice(device):
-                    model, pipeline, solver = make_case(device, dynamic=True)
-                    state = model.state()
-                    pipeline.collide(state, solver.contacts)
-                    solver._refresh_body_particle_contact_state(solver.contacts, True)
-                    for name, block in zip(BLOCK_NAMES, evaluate_blocks(solver, state), strict=True):
-                        references[reference_key(device, name)] = block
+                    for isolated in (False, True):
+                        solver, state = prepare_no_ee_case(device, isolated)
+                        for dt in (0.0, 0.01):
+                            for name, block in zip(BLOCK_NAMES, evaluate_blocks(solver, state, dt=dt), strict=True):
+                                references[reference_key(device, f"{isolated}_{dt}_{name}")] = block
             np.savez(reference_path, **references)
             warning_args = newton.tests.unittest_utils.get_strict_warning_args()
             required = {
                 "normalized": (
                     "test_normalized_energy_and_derivatives",
-                    "test_normalized_matches_unnormalized_without_ee",
+                    "test_normalized_surface_scale_without_ee",
                 ),
                 "ogc": ("test_ogc_ee_rows_native",),
             }

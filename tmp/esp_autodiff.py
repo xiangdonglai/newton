@@ -79,11 +79,10 @@ def barrier(delta, support, near_cutoff, near_only):
         ratio = d / support
         total = -((1 - ratio) ** 2) * torch.log(ratio)
     if near_only:
-        x = d * (2 / near_cutoff) - 1
-        if x >= 1:
-            return d_sq * 0
-        if x > 0:
-            total = total * (1 - x) ** 3 * (1 + 3 * x + 6 * x**2)
+        if d > 0.5 * near_cutoff:
+            y = 6 * d / near_cutoff - 3
+            H = sum(c * torch.clamp(y - knot, min=0) ** 3 for knot, c in enumerate((1, -3, 3, -1))) / 6
+            total = total * (1 - H)
     return total
 
 

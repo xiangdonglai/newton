@@ -7,9 +7,10 @@ Run checks/comparisons with ``uv run --no-sync python tmp/test_esp_normalized.py
 Pass 1 visits detection rows to assemble per-source-face N, W and far energy.
 Pass 2 revisits the same rows to differentiate the weighted quotient N/W,
 including dW. Both directions reuse target-triangle lists and production
-geometry/EE derivatives. toolkit_convention=True matches Toolkit's A/9 outer
-weights, unit fixed samples, raw log barrier and cubic near/far window. False
-retains the original experiment for its independent Torch regression tests.
+geometry/EE derivatives. Both options use Toolkit's A/9 outer weights, unit
+fixed samples and cubic near/far window. toolkit_convention=True uses Toolkit's
+raw log barrier; False retains Newton's small-distance continuation and matches
+production normalized ESP on uniform-support meshes.
 
 Outputs are conservative vertex forces, not VBD Hessian blocks. The exact
 normalized Hessian couples samples sharing a face; it is checked separately
@@ -250,7 +251,6 @@ def source_force_coefficients(
     source_primitive_index: int,
     is_edge: bool,
     normalized: bool,
-    toolkit_convention: bool,
     data: esp.EspData,
     tri_areas: wp.array[float],
     near_numerator: wp.array[float],
@@ -258,10 +258,9 @@ def source_force_coefficients(
 ):
     """Return coefficients of dN, -dW and the fixed-vertex far-potential gradient.
 
-    outer/W*dN - outer*N/W^2*dW for every incident face. Toolkit matching uses
-    outer=A/9 and fixed vertex weight 1; the original experiment uses A and
-    1/6. EE numerator samples include their variable weight w in both cases.
-    Unnormalized mode is exactly 2*A*dN, with no denominator derivative.
+    outer/W*dN - outer*N/W^2*dW for every incident face, with outer=A/9 and
+    fixed vertex weight 1. Unnormalized mode omits the normalization divisions
+    and their derivatives, but retains near-only adaptive EE samples.
     """
     edge_tri_indices = (
         data.rigid_adjacency.edge_tri_indices if source_is_rigid else data.soft_adjacency.edge_tri_indices
@@ -284,18 +283,15 @@ def source_force_coefficients(
             face = v_adj_tris[entry]
         if face >= 0:
             face += face_offset
-            area = tri_areas[face] * (1.0 / 9.0 if toolkit_convention else 1.0)
+            area = tri_areas[face] / 9.0
             W = weight_sum[face]
-            vertex_weight = 1.0 / 6.0
-            if toolkit_convention:
-                vertex_weight = 1.0
             if is_edge:
-                coefficients[0] += area / W if normalized else 2.0 * area
+                coefficients[0] += area / W if normalized else area
                 if normalized:
                     coefficients[1] += area * near_numerator[face] / (W * W)
             else:
-                coefficients[0] += area * vertex_weight / W if normalized else area / 3.0
-                coefficients[2] += area / 3.0
+                coefficients[0] += area / W if normalized else area
+                coefficients[2] += area / 3.0 if normalized else area
     return coefficients
 
 
@@ -345,9 +341,9 @@ def accumulate_face_quadrature(
                 family == 1,
                 source_vertex,
                 False,
-                near_value if toolkit_convention else near_value / 6.0,
+                near_value,
                 0.0,
-                (full - near_value) / (27.0 if toolkit_convention else 3.0),
+                (full - near_value) / 27.0,
                 data,
                 tri_areas,
                 near_numerator,
@@ -462,7 +458,6 @@ def accumulate_normalized_forces(
                 source_vertex,
                 False,
                 normalized,
-                toolkit_convention,
                 data,
                 tri_areas,
                 near_numerator,
@@ -489,10 +484,10 @@ def accumulate_normalized_forces(
                 soft_edge[0], soft_edge[1], rigid_offset + rigid_edge[0], rigid_offset + rigid_edge[1]
             )
             soft_coefficients = source_force_coefficients(
-                False, soft_primitive, True, normalized, toolkit_convention, data, tri_areas, near_numerator, weight_sum
+                False, soft_primitive, True, normalized, data, tri_areas, near_numerator, weight_sum
             )
             rigid_coefficients = source_force_coefficients(
-                True, rigid_primitive, True, normalized, toolkit_convention, data, tri_areas, near_numerator, weight_sum
+                True, rigid_primitive, True, normalized, data, tri_areas, near_numerator, weight_sum
             )
             # One derivative solve per endpoint, covering both sample directions
             # and any target triangle that also contains this same endpoint.
@@ -613,17 +608,14 @@ def sum_face_energy(
     weight_sum: wp.array[float],
     far_energy: wp.array[float],
     normalized: bool,
-    toolkit_convention: bool,
     energy: wp.array[float],
 ):
     face = wp.tid()
-    near = tri_areas[face] * near_numerator[face] * 2.0
+    near = tri_areas[face] * near_numerator[face] / 9.0
     if normalized:
-        near = tri_areas[face] * near_numerator[face] / weight_sum[face]
-        if toolkit_convention:
-            near /= 9.0
+        near /= weight_sum[face]
     wp.atomic_add(energy, 0, near)
-    wp.atomic_add(energy, 1, far_energy[face])
+    wp.atomic_add(energy, 1, far_energy[face] * (1.0 if normalized else 3.0))
 
 
 class NormalizedEsp:
@@ -682,7 +674,7 @@ class NormalizedEsp:
         if self.toolkit_convention and not normalized:
             raise ValueError("Toolkit-matched conventions are only used for the normalized local comparison")
         self.near_numerator.zero_()
-        self.weight_sum.fill_(3.0 if self.toolkit_convention else 0.5)
+        self.weight_sum.fill_(3.0)
         self.far_energy.zero_()
         self.energy.zero_()
         self.forces.zero_()
@@ -732,7 +724,6 @@ class NormalizedEsp:
                     self.weight_sum,
                     self.far_energy,
                     normalized,
-                    self.toolkit_convention,
                 ],
                 outputs=[self.energy],
                 device=self.device,
