@@ -77,6 +77,10 @@ class Scene:
         raise NotImplementedError
 
     # -- task sequences ---------------------------------------------------
+    def initialization_keyframes(self, start_pos, start_quat) -> list:
+        """Optional approach waypoints before a scripted task, starting at the spawn TCP pose."""
+        return []
+
     def sequences(self, home_pos, home_quat) -> dict:
         """Return a name -> :class:`~newton.exp.controllers.sequences.Sequence` map."""
         raise NotImplementedError

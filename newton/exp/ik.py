@@ -17,6 +17,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+import newton
 import newton.ik as ik
 
 from .robots import find_label_index, set_gripper_q
@@ -70,6 +71,15 @@ class IKController:
     def set_target(self, pos: wp.vec3, quat: wp.vec4):
         self.pos_obj.set_target_position(0, pos)
         self.rot_obj.set_target_rotation(0, quat)
+
+    def current_pose(self):
+        """Compute the world TCP pose for the current IK joint coordinates (host arrays)."""
+        state = self.model.state()
+        newton.eval_fk(self.model, self.joint_q.flatten(), self.model.joint_qd, state)
+        link_pose = wp.transform(*state.body_q.numpy()[self.pos_obj.link_index])
+        pos = wp.transform_point(link_pose, self.pos_obj.link_offset)
+        quat = wp.transform_get_rotation(link_pose) * self.rot_obj.link_offset_rotation
+        return np.array(pos, dtype=np.float64), np.array(quat, dtype=np.float64)
 
     def set_finger(self, width: float):
         self.finger_pos_buf.fill_(float(width))

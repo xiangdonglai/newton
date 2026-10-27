@@ -28,6 +28,13 @@ Available scenes:
 | `soft_cube_slope` | `avbd` | `slide` |
 
 Use `--scene <name> --solver <name> --help` for each combination's options.
+For `grasp_avbd_cloth`, both scripted sequences first withdraw from the cloth
+with the spawn orientation, raise and turn the hand clear of the sheet, then
+approach the punch-ready pose. This adds 1.3 simulation seconds; `quick_punch`
+then settles for 0.5 seconds and keeps its original 0.3 m jab over 0.2 seconds.
+Use `--sequence hold` to inspect the approach without punching. The waypoints
+live in `GraspAVBDClothScene.initialization_keyframes`.
+
 The three scenes without a robot require `--control state_machine`.
 `cloth_twist` keeps the donor's per-substep geometric audit and writes it with
 `--self-contact-results path.csv`. Its audit and the slope measurements run

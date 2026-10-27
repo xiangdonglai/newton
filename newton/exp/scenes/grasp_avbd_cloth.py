@@ -8,8 +8,9 @@ Ports the world layout of IsaacLab ``Isaac-Grasp-AVBD-Cloth-Direct-v0``: a
 it hangs in front of the arm, plus the Franka at its default ready pose and the
 home/hover EE pose taken from the env's ``_ee_tf``.
 
-Provides a scripted ``quick_punch`` sequence (jab the IK target +0.3 m in Y over
-a short interval) plus a ``hold`` placeholder (pair with ``--solver avbd``, the
+Both scripted sequences approach home from the near side of the cloth before
+turning the hand. ``quick_punch`` then jabs the IK target +0.3 m in Y over a
+short interval; ``hold`` stays at home (pair with ``--solver avbd``, the
 monolithic VBD solver the IsaacLab task uses).
 """
 
@@ -170,6 +171,22 @@ class GraspAVBDClothScene(Scene):
     # -- task -------------------------------------------------------------
     def home_pose(self):
         return np.array(HOME_POS, dtype=np.float64), np.array(HOME_QUAT, dtype=np.float64)
+
+    def initialization_keyframes(self, start_pos, start_quat):
+        home, q = self.home_pose()
+        # The spawn fingers are below the cloth. Withdraw to the near side
+        # before raising/turning the hand to keep that sweep away from the sheet.
+        retreat = np.array(start_pos, copy=True)
+        retreat[0] = min(retreat[0], home[0] - 0.2)
+        retreat[1] = home[1] - 0.15
+        turn = retreat.copy()
+        turn[2] = home[2]
+        return [
+            Keyframe(0.0, start_pos, start_quat, GRIP_OPEN),  # anchor the first interpolation
+            Keyframe(0.4, retreat, start_quat, GRIP_OPEN),
+            Keyframe(0.5, turn, q, GRIP_OPEN),
+            Keyframe(0.4, home, q, GRIP_OPEN),
+        ]
 
     def sequences(self, home_pos, home_quat):
         home = np.asarray(home_pos)

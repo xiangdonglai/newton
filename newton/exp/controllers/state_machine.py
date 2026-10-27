@@ -13,6 +13,7 @@ import warp as wp
 
 from . import register
 from .base import Controller
+from .sequences import KeyframeSequence
 
 
 @register
@@ -29,8 +30,13 @@ class StateMachineController(Controller):
         name = getattr(args, "sequence", None) or exp.scene.default_sequence
         if name not in sequences:
             raise KeyError(f"Unknown sequence {name!r} for scene {exp.scene.key!r}; available: {sorted(sequences)}")
+        sequence = sequences[name]
+        if exp.ik is not None:
+            approach = exp.scene.initialization_keyframes(*exp.ik.current_pose())
+            if approach:
+                sequence = KeyframeSequence([*approach, *sequence.keyframes])
         print(f"[state_machine] scene={exp.scene.key!r} sequence={name!r}")
-        return cls(sequences[name], name)
+        return cls(sequence, name)
 
     @classmethod
     def add_args(cls, parser):

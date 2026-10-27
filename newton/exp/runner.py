@@ -163,22 +163,22 @@ class Experiment:
 
         self.controller = make_controller(args.control, args, self)
         self.graph = None
-        # Stage a sensible control target before graph capture so the capture
-        # warm-up drives toward home (not toward the zero config).
-        self._stage_home_target()
+        # Use the controller's first waypoint during warm-up and graph capture,
+        # including any approach before the scene's home pose.
+        self._stage_initial_target()
         # One-time solver warm-up. SolverVBD's AVBD joint penalties ramp from
         # k_start (<< ke) across frames and are never re-seeded, so a cold solver
         # leaves the arm's joints nearly free and it collapses under gravity on
         # the very first frame (dragging the cloth/cube with it). Step a few
         # times to ramp the penalties, then restore the clean spawn state:
-        # reset() keeps the warmed penalties (its reset_internal is a no-op for
-        # the monolithic VBD solver).
+        # reset() clears joint history while keeping the warmed penalties in
+        # the monolithic VBD strategy.
         warmup_steps = int(getattr(self.strategy, "warmup_steps", 0)) if self.scene.has_robot else 0
         for _ in range(warmup_steps):
             self.step()
         if warmup_steps:
             self.reset()
-            self._stage_home_target()
+            self._stage_initial_target()
         if self.measure_penetration:
             num_frames = int(getattr(args, "num_frames", 0) or 0)
             finite_frame_run = args.viewer != "gl" or bool(args.headless) or bool(args.record)
@@ -300,14 +300,13 @@ class Experiment:
         if self.device.is_cuda:
             wp.synchronize_device()
 
-    def _stage_home_target(self):
-        """Solve IK to the home pose and write it as the control target."""
+    def _stage_initial_target(self):
+        """Solve IK to the controller's initial pose and write its control target."""
         if self.ik is None:
             return
-        self.ik.set_target(
-            wp.vec3(*[float(x) for x in self.home_pos]),
-            wp.vec4(*[float(x) for x in self.home_quat]),
-        )
+        pos, quat, finger = self.controller.update(0.0, self.frame_dt)
+        self.ik.set_target(pos, quat)
+        self.ik.set_finger(finger)
         self.ik.solve()
         self.ik.write_control(self.control)
 

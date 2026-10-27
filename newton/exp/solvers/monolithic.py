@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 
+import warp as wp
+
 import newton
 from newton.solvers import SolverVBD
 
@@ -171,6 +173,14 @@ class MonolithicAvbdStrategy(SolverStrategy):
         # IsaacLab's VBD manager rebuilds the particle BVH once per step.
         if hasattr(solver, "rebuild_bvh"):
             solver.rebuild_bvh(state)
+
+    def reset_internal(self, state, device):
+        # Rebaseline joint angles and clear dual history after restoring the
+        # spawn pose. Keep warmed penalties so the arm is supported immediately.
+        joint_penalty_k = wp.clone(self.solver.joint_penalty_k) if self.solver.model.joint_count else None
+        self.solver.reset(state, flags=0)
+        if joint_penalty_k is not None:
+            wp.copy(self.solver.joint_penalty_k, joint_penalty_k)
 
     @classmethod
     def add_args(cls, parser):
