@@ -35,6 +35,11 @@ then settles for 0.5 seconds and keeps its original 0.3 m jab over 0.2 seconds.
 Use `--sequence hold` to inspect the approach without punching. The waypoints
 live in `GraspAVBDClothScene.initialization_keyframes`.
 
+For `pick_avbd_cube`, a 0.9-second approach turns the hand at its spawn height
+before lowering to the original hover pose. Both `pick` and `hold` use it to
+avoid knocking the cube sideways during startup; the cube still settles under
+gravity. The grasp and lift sequence is unchanged.
+
 The three scenes without a robot require `--control state_machine`.
 `cloth_twist` keeps the donor's per-substep geometric audit and writes it with
 `--self-contact-results path.csv`. Its audit and the slope measurements run

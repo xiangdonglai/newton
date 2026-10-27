@@ -187,6 +187,16 @@ class PickAVBDCubeScene(Scene):
     def home_pose(self):
         return np.array(HOME_POS, dtype=np.float64), np.array(HOME_QUAT, dtype=np.float64)
 
+    def initialization_keyframes(self, start_pos, start_quat):
+        home, q = self.home_pose()
+        # Turn above the cube before lowering to hover. Jumping directly to
+        # home can swing the hand and fingers through the cube during startup.
+        return [
+            Keyframe(0.0, start_pos, start_quat, GRIP_OPEN),
+            Keyframe(0.4, start_pos, q, GRIP_OPEN),
+            Keyframe(0.5, home, q, GRIP_OPEN),
+        ]
+
     def sequences(self, home_pos, home_quat):
         home = np.asarray(home_pos)
         q = np.asarray(home_quat)
