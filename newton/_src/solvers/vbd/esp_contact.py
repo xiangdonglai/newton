@@ -7,6 +7,8 @@ SolverVBD owns evaluation buffers and launch scheduling. The standalone
 diagnostic evaluator lives in tmp and calls these same mathematical functions.
 Edge-edge rows have three selectable treatments, see EE_QUADRATURE_MODES; the
 per-process switch _EE_QUADRATURE (NEWTON_ESP_EE_QUADRATURE at import) selects one.
+The scalar barrier's small-distance continuation is the per-process switch
+_BARRIER_CONTINUATION (NEWTON_ESP_BARRIER at import: "continued" or "raw").
 """
 
 import os
@@ -92,6 +94,17 @@ Set NEWTON_ESP_EE_QUADRATURE to "unnormalized" (default), "normalized" or "ogc" 
 importing newton, or edit this constant. Kernels branch on it with wp.static, so the
 default path compiles none of the other modes' code. One mode per process.
 """
+
+# Scalar barrier below min(10 um, support/4): "continued" (default) uses the C2 Taylor extension of
+# barrier_coefficients, "raw" evaluates the original -(1 - d/s)^2 log(d/s), which is singular at d = 0
+# like IPC Toolkit's NormalizedClampedLogBarrier. One process compiles one choice.
+_BARRIER_ENV = "NEWTON_ESP_BARRIER"
+BARRIER_MODES = ("continued", "raw")
+_barrier_name = os.environ.get(_BARRIER_ENV, "continued")
+if _barrier_name not in BARRIER_MODES:
+    raise ValueError(f"{_BARRIER_ENV}={_barrier_name!r}: use one of {BARRIER_MODES}")
+_BARRIER_CONTINUATION = wp.constant(_barrier_name == "continued")
+"""Whether the scalar barrier is continued below 10 um (NEWTON_ESP_BARRIER=continued, the default) or raw."""
 
 
 @wp.func
@@ -644,25 +657,30 @@ def triangle_distance_squared_value(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.ve
 def barrier_coefficients(distance: float, support: float, near: float, near_only: bool):
     """Return b(d), db/dd, d²b/dd²; d is distance, not squared distance D.
 
-    A C2 Taylor extension below 10 um bounds curvature, like native contact.
-    It is a finite contact potential, not a penetration-free barrier.
-    Scale the join down for tiny supports; apply the EE window afterwards.
+    With _BARRIER_CONTINUATION (NEWTON_ESP_BARRIER=continued, the default) a C2 Taylor
+    extension below 10 um bounds curvature, like native contact: a finite contact potential,
+    not a penetration-free barrier. The join scales down for tiny supports. NEWTON_ESP_BARRIER=raw
+    keeps the original barrier, which is singular at d = 0. ``near_only`` applies IPC Toolkit's
+    piecewise-cubic near window afterwards.
     """
     if not wp.isfinite(distance):
         return wp.nan, wp.nan, wp.nan
     if distance >= support or (near_only and distance >= near):
         return 0.0, 0.0, 0.0
-    d_min = wp.min(1.0e-5, 0.25 * support)
+    d_min = float(0.0)
+    if wp.static(_BARRIER_CONTINUATION):
+        d_min = wp.min(1.0e-5, 0.25 * support)
     evaluated_distance = wp.max(distance, d_min)
     ratio = evaluated_distance / support
     gap = 1.0 - ratio
     energy = -gap * gap * wp.log(ratio)
     dbdd = (2.0 * gap * wp.log(ratio) - gap * gap / ratio) / support
     d2bdd2 = (-2.0 * wp.log(ratio) + 4.0 * gap / ratio + gap * gap / (ratio * ratio)) / (support * support)
-    if distance < d_min:
-        offset = distance - d_min
-        energy += dbdd * offset + 0.5 * d2bdd2 * offset * offset
-        dbdd += d2bdd2 * offset
+    if wp.static(_BARRIER_CONTINUATION):
+        if distance < d_min:
+            offset = distance - d_min
+            energy += dbdd * offset + 0.5 * d2bdd2 * offset * offset
+            dbdd += d2bdd2 * offset
     if near_only and distance > 0.5 * near:
         # Toolkit's piecewise-cubic C2 window decreases from 1 to 0 on
         # [near/2, near]. x runs from -3 to 0; H is the complementary far window.

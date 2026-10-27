@@ -611,7 +611,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 Each evaluation computes
                 a complete 3x3 particle or 6x6 body block. Conservative Hessians are exact selected-branch derivatives,
                 not PSD-projected by default; the local experimental projection switch is in esp_contact.py.
-                The scalar barrier uses a C2 Taylor extension below min(10 micrometers, support/4).
+                The scalar barrier uses a C2 Taylor extension below min(10 micrometers, support/4)
+                unless the per-process switch ``NEWTON_ESP_BARRIER=raw`` selects the original barrier.
                 At exact point/edge coincidence, a one-sided incident-face normal and finite normal curvature
                 are used instead of undefined distance derivatives. This does not provide mesh penetration recovery.
                 Nonfinite or non-descent rigid solve steps are retried with a diagonally regularized Hessian;

@@ -27,6 +27,8 @@ from newton.tests.test_solver_vbd_esp import make_case
 MODES = ("unnormalized", "normalized", "ogc")
 MODE = next(name for name, code in esp_contact.EE_QUADRATURE_MODES.items() if code == esp_contact._EE_QUADRATURE)
 """The formulation compiled into this process."""
+CONTINUED = bool(esp_contact._BARRIER_CONTINUATION)
+"""Whether this process compiled the continued barrier (NEWTON_ESP_BARRIER=continued, the default)."""
 BLOCK_NAMES = ("energy", "particle_forces", "particle_hessians", "body_forces", "body_hessians")
 REFERENCE_ENV = "NEWTON_ESP_EE_TEST_REFERENCE"
 """Default-mode blocks saved by test_other_modes_in_subprocesses for the normalized subprocess."""
@@ -71,6 +73,33 @@ def evaluate_blocks(solver, state, *, dt=0.0):
     return tuple(getattr(solver, "_esp_" + name).numpy().copy() for name in BLOCK_NAMES)
 
 
+def toolkit_reference(model, solver, state, support, stiffness):
+    """IPC Toolkit's normalized ESP for the current positions: energy, soft forces, rigid vertex forces.
+
+    Both patches are one CollisionMesh; make_vertex_patches_filter keeps soft-rigid pairs only.
+    Positions double as rest positions, which is exact here: the fixtures are at rest and the
+    toolkit's area weights are rest areas. Requires the ``ipctk`` bindings of the sibling checkout.
+    """
+    import ipctk  # noqa: PLC0415
+
+    data = solver._esp_data
+    soft = state.particle_q.numpy().astype(np.float64)
+    rigid = solver._esp_rigid_positions.numpy().astype(np.float64)
+    positions = np.vstack((soft, rigid))
+    faces = np.vstack((data.soft_tri_indices.numpy(), data.rigid_tri_indices.numpy() + len(soft))).astype(int)
+    edges = np.array(sorted({tuple(sorted((int(f[i]), int(f[(i + 1) % 3])))) for f in faces for i in range(3)}))
+    mesh = ipctk.CollisionMesh(positions, edges, faces)
+    mesh.can_collide = ipctk.make_vertex_patches_filter((np.arange(len(positions)) >= len(soft)).astype(int))
+    mesh.init_adjacencies()
+    params = ipctk.ESPParameters(support, 0.05, 1, True, ipctk.ESPParameters.IntegrationType.NORMAL)
+    collisions = ipctk.ESPCollisions()
+    collisions.build(mesh, positions, params)
+    potential = ipctk.ESPPotential(params, True)
+    energy = stiffness * potential(collisions, mesh, positions)
+    forces = -stiffness * np.asarray(potential.gradient(collisions, mesh, positions)).reshape(-1, 3)
+    return energy, forces[: len(soft)], forces[len(soft) :]
+
+
 def prepare_no_ee_case(device, isolated_particle):
     """Prepare a surface or unit-weight point with tangential slip and approaching motion."""
     model, pipeline, solver = make_case(device, dynamic=True, isolated_particle=isolated_particle)
@@ -96,19 +125,25 @@ def barrier_probe(distances: wp.array[float], near_only: bool, output: wp.array[
 
 class TestEspEeQuadrature(unittest.TestCase):
     def test_cubic_window_and_continuation(self):
-        """Check the cubic window's values/derivatives at joins and retain finite small-distance continuation."""
+        """Check the cubic window's values/derivatives at joins and the compiled barrier below 10 um.
+
+        NEWTON_ESP_BARRIER=continued (the default) continues the barrier with a C2 Taylor extension
+        below 10 um; "raw" keeps the singular original, so that process skips the zero-distance sample.
+        """
         distances_np = np.array(
             [0, 1e-6, 1e-5, 0.01, 0.025, 0.027, 0.05 * 2 / 3, 0.037, 0.05 * 5 / 6, 0.046, 0.05, 0.2],
             dtype=np.float32,
         )
+        if not CONTINUED:
+            distances_np = distances_np[1:]
         d = distances_np.astype(np.float64)
-        evaluated_d = np.maximum(d, 1e-5)
+        evaluated_d = np.maximum(d, 1e-5) if CONTINUED else d
         ratio = evaluated_d / 0.2
         gap = 1 - ratio
         value = -(gap**2) * np.log(ratio)
         first = (2 * gap * np.log(ratio) - gap**2 / ratio) / 0.2
         second = (-2 * np.log(ratio) + 4 * gap / ratio + gap**2 / ratio**2) / 0.2**2
-        offset = np.minimum(d - 1e-5, 0)
+        offset = np.minimum(d - 1e-5, 0) if CONTINUED else np.zeros_like(d)
         value += first * offset + 0.5 * second * offset**2
         first += second * offset
         full_np = np.column_stack((value, first, second))
@@ -149,6 +184,7 @@ class TestEspEeQuadrature(unittest.TestCase):
             esp_contact._EE_QUADRATURE,
         )
         self.assertEqual(sorted(esp_contact.EE_QUADRATURE_MODES), sorted(MODES))
+        self.assertEqual(os.environ.get("NEWTON_ESP_BARRIER", "continued") == "continued", CONTINUED)
         model, _pipeline, solver = make_case("cpu", dynamic=True)
         if MODE == "normalized":
             # One world: one slot per soft face and per rigid face.
@@ -171,6 +207,62 @@ class TestEspEeQuadrature(unittest.TestCase):
                 )
         else:
             self.assertIsNone(solver._esp_face_sums)
+
+    @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
+    def test_normalized_matches_toolkit(self):
+        """Match IPC Toolkit's ESPPotential(use_near_far=True) energy, soft forces and body wrenches.
+
+        Needs the sibling checkout's ``ipctk`` bindings; CPU only, since the toolkit is CPU float64.
+        """
+        try:
+            import ipctk  # noqa: F401, PLC0415
+        except ImportError:
+            self.skipTest("ipctk is not installed in this interpreter")
+        with wp.ScopedDevice("cpu"):
+            cases = []
+            for shared_body in (False, True):
+                model, solver, state, _row, _shape = make_cross_target_case(
+                    "cpu", shared_body=shared_body, uniform_material=True
+                )
+                # The fixture keeps its one generating EE row; the toolkit sees every pair, so restore them.
+                solver.collision_pipeline.collide(state, solver.contacts)
+                solver._refresh_body_particle_contact_state(solver.contacts, True)
+                cases.append((f"cross shared_body={shared_body}", model, solver, state))
+            # Interior edges and vertices on both sides: a cloth grid over the closed box.
+            model, pipeline, solver = make_case("cpu", dynamic=True, grid=True, gap=0.00012)
+            model.shape_material_ke.fill_(1.0)
+            model.shape_margin.fill_(0.0)
+            model.soft_contact_ke = 1.0
+            state = model.state()
+            pipeline.collide(state, solver.contacts)
+            solver._refresh_body_particle_contact_state(solver.contacts, True)
+            cases.append(("grid over box", model, solver, state))
+            for label, model, solver, state in cases:
+                with self.subTest(case=label):
+                    radii = model.particle_radius.numpy()
+                    self.assertTrue(np.all(radii == radii[0]) and np.all(model.shape_margin.numpy() == 0.0))
+                    support = float(radii[0])
+                    energy, fp, _hp, fb, _hb = evaluate_blocks(solver, state)
+                    self.assertGreater(energy[0], 0.0)
+                    self.assertGreater(energy[1], 0.0, "exercise active EE samples")
+                    reference_energy, soft_forces, rigid_forces = toolkit_reference(model, solver, state, support, 1.0)
+                    np.testing.assert_allclose(energy.sum(), reference_energy, rtol=2e-5)
+                    scale = np.abs(soft_forces).max()
+                    np.testing.assert_allclose(fp / scale, soft_forces / scale, rtol=0, atol=3e-5)
+                    owners = model.shape_body.numpy()[solver._esp_data.rigid_vertex_shapes.numpy()]
+                    rigid = solver._esp_rigid_positions.numpy().astype(np.float64)
+                    for body in range(model.body_count):
+                        ids = owners == body
+                        center = np.array(
+                            wp.transform_point(
+                                wp.transform(*state.body_q.numpy()[body]), wp.vec3(*model.body_com.numpy()[body])
+                            )
+                        )
+                        wrench = np.r_[
+                            rigid_forces[ids].sum(0), np.cross(rigid[ids] - center, rigid_forces[ids]).sum(0)
+                        ]
+                        scale = max(np.abs(wrench).max(), 1e-12)
+                        np.testing.assert_allclose(fb[body] / scale, wrench / scale, rtol=0, atol=3e-5)
 
     @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
     def test_normalized_surface_scale_without_ee(self):
@@ -459,17 +551,24 @@ class TestEspEeQuadrature(unittest.TestCase):
                                 references[reference_key(device, f"{isolated}_{dt}_{name}")] = block
             np.savez(reference_path, **references)
             warning_args = newton.tests.unittest_utils.get_strict_warning_args()
-            required = {
-                "normalized": (
-                    "test_normalized_energy_and_derivatives",
-                    "test_normalized_surface_scale_without_ee",
+            # (label, environment, tests that must run there rather than be skipped)
+            runs = [
+                (
+                    "normalized",
+                    {"NEWTON_ESP_EE_QUADRATURE": "normalized"},
+                    ("test_normalized_energy_and_derivatives", "test_normalized_surface_scale_without_ee"),
                 ),
-                "ogc": ("test_ogc_ee_rows_native",),
-            }
-            for mode in MODES[1:]:
+                ("ogc", {"NEWTON_ESP_EE_QUADRATURE": "ogc"}, ("test_ogc_ee_rows_native",)),
+                (
+                    "normalized, raw barrier",
+                    {"NEWTON_ESP_EE_QUADRATURE": "normalized", "NEWTON_ESP_BARRIER": "raw"},
+                    ("test_cubic_window_and_continuation", "test_normalized_energy_and_derivatives"),
+                ),
+            ]
+            for mode, overrides, required in runs:
                 with self.subTest(mode=mode):
                     env = os.environ.copy()
-                    env["NEWTON_ESP_EE_QUADRATURE"] = mode
+                    env.update(overrides)
                     env[REFERENCE_ENV] = reference_path
                     result = subprocess.run(
                         [sys.executable, *warning_args, "-m", "unittest", "-v", "newton.tests.test_esp_ee_quadrature"],
@@ -482,7 +581,7 @@ class TestEspEeQuadrature(unittest.TestCase):
                     report = f"{mode} subprocess\nstdout:\n{result.stdout}\nstderr:\n{result.stderr[-8000:]}"
                     self.assertEqual(result.returncode, 0, msg=report)
                     # The mode-gated tests must have run there, not been skipped.
-                    for name in required[mode]:
+                    for name in required:
                         self.assertEqual(verbose_status(result.stderr, name), "ok", msg=report)
 
 

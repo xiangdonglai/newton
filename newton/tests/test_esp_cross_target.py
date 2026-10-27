@@ -20,11 +20,15 @@ from newton.tests.test_solver_vbd_esp_friction import (
 )
 
 
-def make_cross_target_case(device, *, shared_body=False, mixed_radii=False, rigid_normal_up=False):
+def make_cross_target_case(
+    device, *, shared_body=False, mixed_radii=False, rigid_normal_up=False, uniform_material=False
+):
     """A crossing pair of finite edges, another rigid face, and another soft patch.
 
     ``rigid_normal_up`` winds the crossed rigid triangle so its normal faces the cloth; ESP does
     not care, but Newton's OGC row filter treats the cloth as outside only then.
+    ``uniform_material`` gives every shape unit stiffness and zero margin and the soft side unit
+    stiffness, so one support and one stiffness describe the whole scene (IPC Toolkit comparisons).
     """
     builder = newton.ModelBuilder(gravity=wp.vec3())
     rigid_triangles = [
@@ -39,7 +43,12 @@ def make_cross_target_case(device, *, shared_body=False, mixed_radii=False, rigi
         builder.add_shape_mesh(
             body,
             mesh=newton.Mesh(vertices=triangle, indices=[0, 1, 2]),
-            cfg=builder.ShapeConfig(ke=2.0 + 5.0 * i, kd=0.0, mu=0.25 + 0.25 * i, margin=0.002 * i),
+            cfg=builder.ShapeConfig(
+                ke=1.0 if uniform_material else 2.0 + 5.0 * i,
+                kd=0.0,
+                mu=0.25 + 0.25 * i,
+                margin=0.0 if uniform_material else 0.002 * i,
+            ),
         )
     soft_triangles = [
         # Tilt away from the generating edge. A flat triangle would put q_bar's
@@ -63,7 +72,7 @@ def make_cross_target_case(device, *, shared_body=False, mixed_radii=False, rigi
     model = builder.finalize(device=device)
     if mixed_radii:
         model.particle_radius.assign(np.array([0.095, 0.099, 0.103, 0.090, 0.094, 0.098], dtype=np.float32))
-    model.soft_contact_ke, model.soft_contact_mu = 3.0, 1.0
+    model.soft_contact_ke, model.soft_contact_mu = (1.0 if uniform_material else 3.0), 1.0
     pipeline = newton.CollisionPipeline(
         model,
         enable_rigid_soft_full_surface_contact=True,
