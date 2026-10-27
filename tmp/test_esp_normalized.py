@@ -323,23 +323,6 @@ class TestNormalizedEsp(unittest.TestCase):
                 )
             self.assertLess(differences[1], 0.2 * differences[0] + 1e-5)
 
-    def test_viewer_normalization_switch(self):
-        """Compare the viewer's normalized wrench, stiffness scaling and unchanged state."""
-        fixture, _baseline_experiment, baseline = make_probe()
-        experiment = NormalizedEsp(fixture, toolkit_convention=True)
-        original_np = fixture.state.particle_q.numpy().copy()
-        experiment.assemble()
-        energy_np, forces_np = experiment.result()
-        expected_wrench_np = wrench(experiment, forces_np, baseline[3]["com"])
-        for stiffness in (1.0, 3.5):
-            energy, force_np, torque_np, info = fixture.evaluate(
-                fixture.initial_transform_np, 0.03, stiffness, method=4
-            )
-            np.testing.assert_allclose(energy, stiffness * energy_np.sum(), rtol=3e-5)
-            np.testing.assert_allclose(np.concatenate((force_np, torque_np)), stiffness * expected_wrench_np, rtol=3e-5)
-            self.assertEqual(info["method"], 4)
-        np.testing.assert_array_equal(fixture.state.particle_q.numpy(), original_np)
-
 
 def subdivide(vertices_np, triangles_np):
     """Split each face into four using shared edge midpoints, preserving the surface."""

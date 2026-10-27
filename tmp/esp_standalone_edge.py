@@ -11,9 +11,9 @@ element contributes outer*(N_near/W_near + N_far/W_far); without it, outer*
 samples add to N_near and W_near only. Their position/weight derivatives come
 from the existing production functions, not a new derivative implementation.
 
-The normalized comparison matches Toolkit's raw log barrier and cubic near/far
-window; the unnormalized choice retains production's barrier/window. Both reuse
-production EE geometry, weight and position derivatives. This local example
+The normalized comparison matches Toolkit's raw log barrier; the unnormalized
+choice retains production's continued barrier. Both use the piecewise-cubic
+near/far window and reuse production EE geometry, weight and position derivatives. This local example
 scans the small target mesh; it is not a solver or a performance benchmark.
 """
 
@@ -34,6 +34,7 @@ def assemble_edge_samples(
     support: float,
     near: float,
     toolkit_convention: bool,
+    ee_only: bool,
     numerator: wp.array[float],
     weight_sum: wp.array[float],
     far: wp.array[float],
@@ -46,6 +47,8 @@ def assemble_edge_samples(
     a, b = endpoints[0], endpoints[1]
     face_count = data.rigid_tri_indices.shape[0]
     if row < 2:
+        if ee_only:
+            return
         # Fixed endpoint quadrature, with complete signed target-mesh potential.
         for face in range(face_count):
             value, near_value, full_gradients, near_gradients = triangle_terms(
@@ -56,6 +59,8 @@ def assemble_edge_samples(
             wp.atomic_add(dnumerator, 0, row, near_gradients[0])
             wp.atomic_add(dfar, 0, row, full_gradients[0] - near_gradients[0])
     elif row < 2 + face_count:
+        if ee_only:
+            return
         # Reverse fixed quadrature: each face vertex against the standalone
         # edge. A standalone edge has +1 edge term and zero endpoint terms.
         face = row - 2
@@ -178,8 +183,12 @@ class StandaloneEdgeEsp:
             self.dweight_sum = wp.zeros_like(self.dnumerator)
             self.dfar = wp.zeros_like(self.dnumerator)
 
-    def evaluate(self, endpoints_np, support, stiffness, *, method, toolkit_convention=True):
-        """Return E and -dE/d(a,b); quotient derivatives include dW."""
+    def evaluate(self, endpoints_np, support, stiffness, *, method, toolkit_convention=True, ee_only=False):
+        """Return E and -dE/d(a,b); quotient derivatives include dW.
+
+        ``ee_only`` keeps the adaptive edge-edge samples of both directions and drops the
+        fixed endpoint and target-vertex samples; it is meaningful for the unnormalized method.
+        """
         self.endpoints.assign(np.asarray(endpoints_np, dtype=np.float32))
         for array in (self.numerator, self.far, self.dnumerator, self.dweight_sum, self.dfar):
             array.zero_()
@@ -194,6 +203,7 @@ class StandaloneEdgeEsp:
                 support,
                 0.05 * support,
                 toolkit_convention and method == 4,
+                ee_only,
             ],
             outputs=[self.numerator, self.weight_sum, self.far, self.dnumerator, self.dweight_sum, self.dfar],
             device=self.device,

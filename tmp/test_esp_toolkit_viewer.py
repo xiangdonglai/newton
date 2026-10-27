@@ -13,9 +13,8 @@ from unittest.mock import patch
 
 import numpy as np
 import warp as wp
-from esp_normalized import NormalizedEsp
 from test_esp_body_viewer import rotated_pose
-from view_esp_force_field import PRESETS, BodyForceProbe, EdgeForceProbe, ForceProbe, evaluate_body_ogc
+from view_esp_force_field import MODES, PRESETS, BodyForceProbe, EdgeForceProbe, ForceProbe, evaluate_body_ogc
 
 from newton._src.solvers.vbd import esp_contact
 
@@ -87,7 +86,7 @@ class TestToolkitViewer(unittest.TestCase):
         for scene, support in ((0, 0.03), (1, 0.06)):
             body = BodyForceProbe(scene, "cpu")
             body.model.body_com.assign(np.array([[0.003, -0.002, 0.001]], np.float32))
-            initial = body.evaluate(body.initial_transform_np, support, method=5)
+            initial = body.evaluate(body.initial_transform_np, support, method=3)
             self.assertFalse(body.toolkit.mesh.is_obstacle_vertex(0))
             self.assertTrue(body.toolkit.mesh.is_obstacle_vertex(len(initial[3]["positions"])))
             reference = DirectToolkitReference(
@@ -96,7 +95,7 @@ class TestToolkitViewer(unittest.TestCase):
             for dz, tilt, scale, stiffness in ((0, 0, 1, 1), (0.0002, 0.007, 0.8, 2.3), (0.0005, -0.008, 1.2, 0.7)):
                 pose_np = rotated_pose(body.initial_transform_np, initial[3]["com"], (1, 0, 0), float(tilt))
                 pose_np[2, 3] += dz
-                actual = body.evaluate(pose_np, scale * support, stiffness, method=5)
+                actual = body.evaluate(pose_np, scale * support, stiffness, method=3)
                 E, forces_np = reference.evaluate(actual[3]["positions"], body.vertices_np, scale * support, stiffness)
                 F = forces_np[: reference.source_count]
                 torque = np.cross(actual[3]["positions"] - actual[3]["com"], F).sum(0)
@@ -113,7 +112,7 @@ class TestToolkitViewer(unittest.TestCase):
             for dz in (0, 0.0001, 0.0003):
                 endpoints_np = edge.rest_endpoints_np.copy()
                 endpoints_np[:, 2] += dz
-                actual = edge.evaluate(endpoints_np, support, 1.7, method=5)
+                actual = edge.evaluate(endpoints_np, support, 1.7, method=3)
                 E, F = reference.evaluate(endpoints_np, edge.vertices_np, support, 1.7)
                 np.testing.assert_allclose(actual[0], E, rtol=1e-10)
                 np.testing.assert_allclose(actual[1], F[:2], rtol=1e-9, atol=1e-10)
@@ -123,59 +122,8 @@ class TestToolkitViewer(unittest.TestCase):
             for stiffness in (1, 100):
                 actual = point.evaluate(x_np, support, stiffness, include_toolkit=True)
                 E, F = reference.evaluate(x_np, point.vertices_np, support, stiffness)
-                np.testing.assert_allclose(actual[0][5, 0], E, rtol=1e-10)
-                np.testing.assert_allclose(actual[1][5, 0], F[0], rtol=1e-9, atol=1e-10)
-
-    def test_matched_normalized_formulations(self):
-        """Compare actual values and full vertex gradients, not only derivatives of each energy."""
-        for scene, support in ((0, 0.03), (1, 0.06)):
-            body = BodyForceProbe(scene, "cpu")
-            matched = None
-            for dz, tilt in ((0, 0), (0.0001, 0), (0.0005, 0.01), (0.001, -0.01), (0.003, 0), (0.05, 0)):
-                pose_np = rotated_pose(
-                    body.initial_transform_np, body.initial_transform_np[:3, 3], (1, 0, 0), float(tilt)
-                )
-                pose_np[2, 3] += dz
-                body.evaluate(pose_np, support, method=0)
-                if matched is None:
-                    matched = NormalizedEsp(body, toolkit_convention=True)
-                matched.assemble()
-                E, F = matched.result()
-                toolkit = body.evaluate(pose_np, support, method=5)
-                expected_E, toolkit_forces_np = body.toolkit.evaluate(
-                    toolkit[3]["positions"], body.vertices_np, support, 1
-                )
-                rigid_count = len(toolkit[3]["positions"])
-                # Toolkit stores rigid first; our assembled buffer stores soft first.
-                expected_F = np.vstack((toolkit_forces_np[rigid_count:], toolkit_forces_np[:rigid_count]))
-                scale = max(np.max(np.abs(expected_F)), 1e-6)
-                error = np.max(np.abs(F - expected_F)) / scale
-                print(
-                    f"MATCH body scene={scene} dz={dz} tilt={tilt} E={E.sum():.9g}/{expected_E:.9g} force_error={error:.3g}",
-                    flush=True,
-                )
-                np.testing.assert_allclose(E.sum(), expected_E, rtol=5e-6, atol=1e-9)
-                np.testing.assert_allclose(F / scale, expected_F / scale, rtol=0, atol=1e-5)
-            edge = EdgeForceProbe(scene, "cpu")
-            poses = [edge.rest_endpoints_np.copy() for _ in range(5)]
-            for i, pose in enumerate(poses):
-                pose[:, 2] += 0.0001 * i
-            if scene == 0:
-                poses += [
-                    np.array([[0.035, -0.002947, 0.0006], [x, -0.002825, 0.0008]], np.float32)
-                    for x in (0.05004917, 0.05015404)
-                ]
-            for index, pose_np in enumerate(poses):
-                ours = edge.evaluate(pose_np, support, method=4)
-                expected = edge.evaluate(pose_np, support, method=5)
-                scale = max(np.max(np.abs(expected[1])), 1e-6)
-                error = np.max(np.abs(ours[1] - expected[1])) / scale
-                print(
-                    f"MATCH edge scene={scene} pose={index} E={ours[0]:.9g}/{expected[0]:.9g} force_error={error:.3g}",
-                    flush=True,
-                )
-                np.testing.assert_allclose(ours[0], expected[0], rtol=5e-6, atol=1e-9)
-                np.testing.assert_allclose(ours[1] / scale, expected[1] / scale, rtol=0, atol=1e-5)
+                np.testing.assert_allclose(actual[0][3, 0], E, rtol=1e-10)
+                np.testing.assert_allclose(actual[1][3, 0], F[0], rtol=1e-9, atol=1e-10)
 
     @unittest.skipUnless(
         esp_contact._ee_quadrature_name == "normalized", "run with NEWTON_ESP_EE_QUADRATURE=normalized"
@@ -193,7 +141,7 @@ class TestToolkitViewer(unittest.TestCase):
                     probe.initial_transform_np, probe.initial_transform_np[:3, 3], (1, 0, 0), float(tilt)
                 )
                 pose_np[2, 3] += dz
-                expected_energy, expected_force, expected_torque, info = probe.evaluate(pose_np, support, method=5)
+                expected_energy, expected_force, expected_torque, info = probe.evaluate(pose_np, support, method=3)
                 _, toolkit_forces_np = probe.toolkit.evaluate(info["positions"], probe.vertices_np, support, 1)
                 solver = probe.solver
                 solver._refresh_body_particle_contact_state(probe.contacts, refresh=True)
@@ -222,7 +170,7 @@ class TestToolkitViewer(unittest.TestCase):
                 )
 
     def test_point_matching_below_continuation(self):
-        """Matched P has the raw log barrier, unlike production's 10 um continuation.
+        """The toolkit's raw log barrier exceeds production's 10 um continuation.
 
         The near-corner position also makes reverse target-to-point samples
         nonzero unless target obstacle flags actually exclude those sources.
@@ -231,15 +179,13 @@ class TestToolkitViewer(unittest.TestCase):
         for point in ((0, 0, 2e-6), (0.049, 0.039, 0.001)):
             x_np = np.array([point], dtype=np.float32)
             energy, force, _, _ = probe.evaluate(x_np, 0.03, 1, include_toolkit=True)
-            np.testing.assert_allclose(energy[4], energy[5], rtol=1e-5, atol=1e-8)
-            # Cancellation leaves about 2 ppm of the force in nominally-zero
-            # tangential components. Use the same vector-scaled check as above.
-            scale = max(np.max(np.abs(force[5])), 1e-6)
-            np.testing.assert_allclose(force[4] / scale, force[5] / scale, rtol=0, atol=1e-5)
+            self.assertTrue(np.isfinite(energy[3]).all() and np.isfinite(force[3]).all())
             self.assertTrue(probe.toolkit.mesh.is_obstacle_vertex(1))
             self.assertFalse(probe.toolkit.mesh.is_obstacle_vertex(0))
             if point[2] < 1e-5:
-                self.assertGreater(force[5, 0, 2], 2 * force[0, 0, 2])
+                self.assertGreater(force[3, 0, 2], 2 * force[0, 0, 2])
+            else:
+                np.testing.assert_allclose(energy[0], energy[3], rtol=1e-4, atol=2e-7)
 
     def test_point_potential(self):
         """Match pointwise P away from continuation and check the C++ gradient."""
@@ -248,12 +194,8 @@ class TestToolkitViewer(unittest.TestCase):
             for point in PRESETS[scene].values():
                 x_np = np.asarray(point, dtype=np.float32)[None].astype(np.float64)
                 energy, force, _counts, _distance = probe.evaluate(x_np, support, include_toolkit=True)
-                np.testing.assert_allclose(energy[0], energy[4], rtol=1e-5, atol=1e-7)
-                np.testing.assert_allclose(force[0], force[4], rtol=1e-5, atol=1e-5)
-                np.testing.assert_allclose(energy[4], energy[5], rtol=1e-4, atol=2e-7)
-                np.testing.assert_allclose(force[4], force[5], rtol=2e-4, atol=2e-4)
-                np.testing.assert_allclose(energy[5], energy[0], rtol=1e-4, atol=2e-7)
-                np.testing.assert_allclose(force[5], force[0], rtol=2e-4, atol=2e-4)
+                np.testing.assert_allclose(energy[3], energy[0], rtol=1e-4, atol=2e-7)
+                np.testing.assert_allclose(force[3], force[0], rtol=2e-4, atol=2e-4)
                 direct_energy, direct_forces = probe.toolkit.evaluate(x_np, probe.vertices_np, support, 100)
                 finite_np = finite_force(
                     lambda x, probe=probe, support=support: probe.toolkit.evaluate(x, probe.vertices_np, support, 100)[
@@ -264,7 +206,7 @@ class TestToolkitViewer(unittest.TestCase):
                 )
                 np.testing.assert_allclose(direct_forces[:1], finite_np, rtol=2e-5, atol=1e-6)
                 np.testing.assert_allclose(direct_forces.sum(axis=0), 0, atol=1e-10)
-                self.assertAlmostEqual(direct_energy, energy[5, 0])
+                self.assertAlmostEqual(direct_energy, energy[3, 0])
 
     def test_standalone_edge_derivatives(self):
         """Check all six endpoint derivatives, both scenes and all ESP methods."""
@@ -272,7 +214,7 @@ class TestToolkitViewer(unittest.TestCase):
             probe = EdgeForceProbe(scene, "cpu")
             self.assertEqual(probe.rest_endpoints_np.shape, (2, 3))
             self.assertEqual(len(probe.target.data.soft_tri_indices), 0)
-            for method in (0, 4, 5):
+            for method in (0, 3):
                 for offset in (0.0, 0.0001):
                     positions_np = probe.rest_endpoints_np.astype(np.float64)
                     positions_np[:, 2] += offset
@@ -294,7 +236,7 @@ class TestToolkitViewer(unittest.TestCase):
                     # is 0.03% in the difficult normalized rounded-V fixture.
                     np.testing.assert_allclose(force_np / scale, finite_np / scale, rtol=0, atol=2e-3)
                     self.assertAlmostEqual(info["outer_weight"], probe.esp.rest_length / 4)
-                    if method == 5:
+                    if method == 3:
                         self.assertEqual(probe.toolkit.mesh.num_codim_edges, 1)
                         self.assertEqual(probe.toolkit.mesh.num_faces, len(probe.triangle_indices_np))
             with self.assertRaisesRegex(ValueError, "Degenerate edge"):
@@ -305,7 +247,7 @@ class TestToolkitViewer(unittest.TestCase):
         for scene, support in ((0, 0.03), (1, 0.06)):
             probe = BodyForceProbe(scene, "cpu")
             with patch.object(probe.solver, "step", side_effect=AssertionError("Viewer advanced time")):
-                energy, force_np, torque_np, info = probe.evaluate(probe.initial_transform_np, support, method=5)
+                energy, force_np, torque_np, info = probe.evaluate(probe.initial_transform_np, support, method=3)
             vertices_np = info["positions"].astype(np.float64)
             com_np = info["com"].astype(np.float64)
             toolkit = probe.toolkit
@@ -331,8 +273,9 @@ class TestToolkitViewer(unittest.TestCase):
     def test_body_methods_and_stiffness(self):
         """Keep soft positions fixed and expose each method with linear stiffness scaling."""
         probe = BodyForceProbe(0, "cpu")
+        self.addCleanup(probe.close)
         soft_positions_np = probe.state.particle_q.numpy().copy()
-        for method in range(6):
+        for method in range(len(MODES)):
             first = probe.evaluate(probe.initial_transform_np, 0.03, 1, method=method)
             second = probe.evaluate(probe.initial_transform_np, 0.03, 2, method=method)
             for i in range(3):
@@ -347,9 +290,10 @@ class TestToolkitViewer(unittest.TestCase):
     def test_no_self_contact(self):
         """Filter same-patch pairs and return zero when the body is far away."""
         probe = BodyForceProbe(0, "cpu")
+        self.addCleanup(probe.close)
         transform_np = rotated_pose(probe.initial_transform_np, probe.initial_transform_np[:3, 3], (1, 0, 0), 0.1)
         transform_np[2, 3] += 1
-        for method in range(6):
+        for method in range(len(MODES)):
             energy, force_np, torque_np, _info = probe.evaluate(transform_np, 0.03, method=method)
             self.assertEqual(energy, 0)
             np.testing.assert_array_equal(force_np, 0)
@@ -373,19 +317,119 @@ class TestToolkitViewer(unittest.TestCase):
                 0.03,
                 1.0,
             ]
-            for method in (1, 2, 3):
+            for method in (1, 2):
                 energy.zero_()
                 wrench.zero_()
                 wp.launch(evaluate_body_ogc, dim=1, inputs=[*inputs, method], outputs=[energy, wrench])
                 np.testing.assert_array_equal(energy.numpy(), 0)
                 np.testing.assert_array_equal(wrench.numpy(), 0)
 
+    def test_edge_ogc(self):
+        """OGC on the free edge: endpoint vertex rows plus edge-edge rows, with the native law.
+
+        All terms minus EE-only must equal the two-particle probe's Newton OGC result for the
+        endpoints, since both come from the same detection and filter. The hidden far triangle
+        must never contribute.
+        """
+        for scene, support in ((0, 0.03), (1, 0.06)):
+            probe = EdgeForceProbe(scene, "cpu")
+            # Find a pose with accepted edge-edge rows. The rest pose rises along +x, so above the
+            # box its separation from the top edge tilts into the top face and the cone test rejects
+            # it; a segment descending along +x separates inside the edge's normal cone.
+            candidates = [probe.rest_endpoints_np.astype(np.float64)]
+            if scene == 0:
+                candidates.append(np.array([[0.040, -0.016, 0.0030], [0.064, 0.017, -0.0015]]))
+            pose_np = None
+            for candidate_np in candidates:
+                if probe.evaluate(candidate_np, support, 1.0, method=1, ee_only=True)[2]["ee_rows"] > 0:
+                    pose_np = candidate_np
+                    break
+            self.assertIsNotNone(pose_np, "expected a pose with accepted edge-edge rows")
+            self.assertEqual(probe.ogc.model.particle_count, 5)
+            results = {}
+            for method in (1, 2):
+                full = probe.evaluate(pose_np, support, 1.0, method=method)
+                ee = probe.evaluate(pose_np, support, 1.0, method=method, ee_only=True)
+                doubled = probe.evaluate(pose_np, support, 2.0, method=method, ee_only=True)
+                np.testing.assert_array_equal(probe.ogc.forces.numpy()[2:], 0.0)
+                self.assertGreater(ee[2]["ee_rows"], 0)
+                self.assertEqual(ee[2]["vt_rows"], 0)
+                self.assertGreater(ee[0], 0.0)
+                np.testing.assert_allclose(doubled[0], 2 * ee[0], rtol=1e-6)
+                np.testing.assert_allclose(doubled[1], 2 * ee[1], rtol=1e-6, atol=1e-12)
+                # Vertex rows: the same records the two-particle probe evaluates with Newton's law.
+                energy_pp, force_pp, _counts, _distance = probe.target.evaluate(pose_np, support, 1.0)
+                np.testing.assert_allclose(full[0] - ee[0], energy_pp[method].sum(), rtol=2e-5, atol=1e-9)
+                scale = max(np.max(np.abs(force_pp[method])), 1e-9)
+                np.testing.assert_allclose((full[1] - ee[1]) / scale, force_pp[method] / scale, rtol=0, atol=2e-5)
+                # Edge-edge forces are the energy gradient wherever the accepted set is stable.
+                finite_np = finite_force(
+                    lambda x, probe=probe, support=support, method=method: probe.evaluate(
+                        x, support, 1.0, method=method, ee_only=True
+                    )[0],
+                    pose_np,
+                    2e-6,
+                )
+                scale = max(np.max(np.abs(ee[1])), 1e-9)
+                np.testing.assert_allclose(ee[1] / scale, finite_np / scale, rtol=0, atol=3e-3)
+                results[method] = ee[0]
+            self.assertNotAlmostEqual(results[1], results[2])
+            print(
+                f"EDGE OGC scene={scene}: EE rows {ee[2]['ee_rows']}, quadratic {results[1]:.6g} log {results[2]:.6g} PASS"
+            )
+
+    def test_edge_ee_only_fallback(self):
+        """The toolkit entry has no additive EE term: EE-only shows the standalone edge's unnormalized one."""
+        probe = EdgeForceProbe(1, "cpu")
+        pose_np = probe.rest_endpoints_np.astype(np.float64)
+        ours = probe.evaluate(pose_np, 0.06, 1.0, method=0, ee_only=True)
+        fallback = probe.evaluate(pose_np, 0.06, 1.0, method=3, ee_only=True)
+        self.assertTrue(np.isfinite(ours[0]) and np.isfinite(ours[1]).all())
+        np.testing.assert_array_equal(fallback[0], ours[0])
+        np.testing.assert_array_equal(fallback[1], ours[1])
+        self.assertEqual(fallback[2]["fallback"], "unnormalized EE term")
+        self.assertEqual(fallback[2]["method"], 3)
+        full = probe.evaluate(pose_np, 0.06, 1.0, method=0)
+        self.assertNotAlmostEqual(full[0], ours[0])
+
+    def test_body_ee_only(self):
+        """EE-only body evaluation: production keeps its EE energy exactly, OGC keeps accepted EE rows."""
+        probe = BodyForceProbe(0, "cpu")
+        self.addCleanup(probe.close)
+        pose_np = probe.initial_transform_np
+        full = probe.evaluate(pose_np, 0.03, method=0)
+        ee = probe.evaluate(pose_np, 0.03, method=0, ee_only=True)
+        self.assertGreater(ee[3]["ee_rows"], 0)
+        self.assertLess(ee[3]["ee_rows"], full[3]["rows"])
+        self.assertEqual(ee[3]["energy_terms"][0], 0.0)
+        np.testing.assert_allclose(ee[0], full[3]["energy_terms"][1], rtol=1e-5)
+        self.assertGreater(ee[0], 0.0)
+        ogc_full = probe.evaluate(pose_np, 0.03, method=1)
+        ogc_ee = probe.evaluate(pose_np, 0.03, method=1, ee_only=True)
+        self.assertEqual(ogc_ee[3]["ee_rows"], 4, "the box pose has four accepted native EE rows")
+        self.assertGreater(ogc_ee[0], 0.0)
+        self.assertLessEqual(ogc_ee[0], ogc_full[0])
+        for method in (3, 4):
+            fallback = probe.evaluate(pose_np, 0.03, method=method, ee_only=True)
+            self.assertEqual(fallback[3]["fallback"], "unnormalized EE term")
+            self.assertEqual(fallback[3]["method"], method)
+            np.testing.assert_array_equal(fallback[0], ee[0])
+            np.testing.assert_array_equal(fallback[1], ee[1])
+            np.testing.assert_array_equal(fallback[2], ee[2])
+        hybrid_full = probe.evaluate(pose_np, 0.03, method=5)
+        hybrid_ee = probe.evaluate(pose_np, 0.03, method=5, ee_only=True)
+        np.testing.assert_array_equal(hybrid_ee[3]["energy_terms"], 0.0)
+        np.testing.assert_allclose(
+            np.r_[hybrid_ee[1], hybrid_ee[2]], hybrid_full[3]["native_wrench"], rtol=1e-6, atol=1e-12
+        )
+        np.testing.assert_allclose(hybrid_ee[0], hybrid_full[3]["native_ee_energy"], rtol=1e-6)
+
     def test_edge_device_agreement(self):
         """Check the same local analytic endpoint kernels on CPU and CUDA."""
         if not wp.is_cuda_available():
             self.skipTest("CUDA unavailable")
         cpu, cuda = EdgeForceProbe(0, "cpu"), EdgeForceProbe(0, "cuda:0")
-        for method in (0, 4):
+        for method in (0,):
             expected = cpu.evaluate(cpu.rest_endpoints_np, 0.03, method=method)
             actual = cuda.evaluate(cuda.rest_endpoints_np, 0.03, method=method)
             np.testing.assert_allclose(actual[0], expected[0], rtol=1e-4)
