@@ -442,6 +442,72 @@ def test_coupled_mesh_filter_compact_body_mapping(test, device):
         elif shift:
             test.assertTrue(np.any(mask != initial_mask))
 
+    # Reuse this scene to separate entry membership from live particle activity.
+    flags_np = model.particle_flags.numpy().copy()
+    expected_families = {
+        int(soft_contacts_mesh._MESH_FEATURE_VT),
+        int(soft_contacts_mesh._MESH_FEATURE_TV),
+        int(soft_contacts_mesh._MESH_FEATURE_EE),
+    }
+    for excluded in ([], [0, 2]):
+        if excluded:
+            coupled = SolverCoupled(
+                model,
+                [
+                    SolverCoupled.Entry(
+                        "vbd",
+                        lambda view: SolverVBD(view, iterations=2),
+                        bodies=[1],
+                        particles=[i for i in range(model.particle_count) if i not in excluded],
+                    )
+                ],
+            )
+        entry = coupled._entries["vbd"]
+
+        def detect_and_copy(coupled=coupled):
+            pipeline.collide(state, contacts)
+            coupled._distribute_state(state, dt=0.01)
+            return coupled.entry_contacts("vbd", contacts)
+
+        copied = detect_and_copy()
+        if device.is_cuda:
+            with wp.ScopedCapture(device=device) as captured:
+                detect_and_copy()
+        for inactive in (slice(1, None, 2), slice(None), slice(0, 0)):
+            with test.subTest(excluded=excluded, inactive=inactive):
+                activity_np = flags_np.copy()
+                activity_np[inactive] = 0
+                model.particle_flags.assign(activity_np)
+                activity_np[excluded] = 0
+                entry.view.particle_flags.assign(activity_np)
+                if device.is_cuda:
+                    wp.capture_launch(captured.graph)
+                else:
+                    detect_and_copy()
+                count = int(contacts.soft_contact_count.numpy()[0])
+                corners_np = contacts.soft_contact_indices.numpy()[:count]
+                retained_np = ~np.any(np.isin(corners_np, excluded), axis=1)
+                mapping = coupled._entry_soft_contact_src_to_dst["vbd"].numpy()[:count]
+                np.testing.assert_array_equal(mapping >= 0, retained_np)
+                test.assertEqual(int(copied.soft_contact_count.numpy()[0]), int(retained_np.sum()))
+                families = contacts._soft_contact_mesh_features.numpy()[:count, 0] & int(
+                    soft_contacts_mesh._MESH_FEATURE_FAMILY_MASK
+                )
+                test.assertTrue(expected_families <= set(families[retained_np]))
+                for name in (*_RECORD_FIELDS, "soft_contact_rigid_indices", "_soft_contact_mesh_features"):
+                    np.testing.assert_array_equal(
+                        getattr(copied, name).numpy()[mapping[retained_np]],
+                        getattr(contacts, name).numpy()[:count][retained_np],
+                    )
+                mask = evaluate_soft_contact_force_mask(model, state, contacts).numpy()[:count]
+                copied_mask = evaluate_soft_contact_force_mask(entry.view, entry.state_0, copied).numpy()
+                np.testing.assert_array_equal(copied_mask[mapping[retained_np]], mask[retained_np])
+                if inactive == slice(None):
+                    test.assertFalse(np.any(copied_mask))
+                else:
+                    test.assertTrue(np.any(copied_mask))
+        model.particle_flags.assign(flags_np)
+
 
 def test_body_candidate_overflow_preserves_reactions(test, device):
     """Retain each body's reactions and feedback when candidate lists overflow."""

@@ -3686,6 +3686,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     contacts._soft_contact_mesh_features,
                     entry.view.shape_flags,
                     entry.view.particle_flags,
+                    entry.particle_dynamics_disabled_indices,
                     int(ShapeFlags.COLLIDE_PARTICLES),
                     int(ParticleFlags.ACTIVE),
                     filtered.soft_contact_count,
@@ -4656,6 +4657,7 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     src_mesh_features: wp.array[wp.vec3i],
     shape_flags: wp.array[wp.int32],
     particle_flags: wp.array[wp.int32],
+    particle_dynamics_disabled_indices: wp.array[int],
     collide_particles_mask: int,
     active_particle_mask: int,
     dst_count: wp.array[wp.int32],
@@ -4685,7 +4687,10 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     if (shape_flags[shape] & collide_particles_mask) == 0:
         return
 
-    # Keep records only when the entry owns every referenced corner.
+    mesh_contact = False
+    if src_mesh_features:
+        mesh_contact = src_mesh_features[contact_id][0] >= 0
+    # Mesh rows use entry membership here; activity gates forces in VBD.
     corners = src_indices[contact_id]
     if corners[0] < 0:
         return
@@ -4694,7 +4699,13 @@ def _filter_soft_contacts_global_shape_ids_kernel(
         if corner >= 0:
             if corner >= particle_flags.shape[0]:
                 return
-            if (particle_flags[corner] & active_particle_mask) == 0:
+            if mesh_contact:
+                # Entry construction sorts excluded global IDs and omits visible proxies.
+                index = wp.lower_bound(particle_dynamics_disabled_indices, corner)
+                if index < particle_dynamics_disabled_indices.shape[0]:
+                    if particle_dynamics_disabled_indices[index] == corner:
+                        return
+            elif (particle_flags[corner] & active_particle_mask) == 0:
                 return
 
     dst_id = wp.atomic_add(dst_count, 0, wp.int32(1))

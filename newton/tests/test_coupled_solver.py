@@ -4849,6 +4849,7 @@ def _coupled_soft_contact_filter_preserves_unified_fields(test, device):
             None,  # mesh feature records
             wp.array([int(ShapeFlags.COLLIDE_PARTICLES)], dtype=wp.int32, device=device),  # shape_flags
             wp.array([int(ParticleFlags.ACTIVE)], dtype=wp.int32, device=device),  # particle_flags
+            wp.zeros(0, dtype=int, device=device),  # particle_dynamics_disabled_indices
             int(ShapeFlags.COLLIDE_PARTICLES),
             int(ParticleFlags.ACTIVE),
             wp.zeros(1, dtype=wp.int32, device=device),  # dst_count
