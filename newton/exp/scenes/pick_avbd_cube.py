@@ -131,6 +131,8 @@ class PickAVBDCubeScene(Scene):
     ik_joint_limit_weight = 0.0  # IsaacLab disables the joint-limit objective
     ik_iters = 24
     default_sequence = "pick"
+    # Include gripper opening and the cube's fall after the pick sequence.
+    default_num_frames = 240
 
     def robot_init_q(self):
         return list(ROBOT_INIT_Q)
