@@ -13,7 +13,7 @@ _BARRIER_CONTINUATION (NEWTON_ESP_BARRIER at import: "continued" or "raw").
 
 import os
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import warp as wp
@@ -64,8 +64,10 @@ the adaptive EE samples q on its edges with weights w(q):
 A_f/9 is Toolkit's outer scaling convention, not a factor required by the paper.
 Without active EE samples, surface energy is one third of the unnormalized mode.
 Newton's small-distance Taylor continuation and per-feature friction/damping laws remain.
-Forces include denominator derivatives; the solve Hessian is exact per contact row and
-omits second-order coupling between different rows of the same face.
+Forces and VBD Hessian blocks include denominator derivatives and cross-row coupling
+through the shared face normalization.
+These are diagonal 3x3 particle and 6x6 body blocks of the conservative Hessian;
+mixed blocks between different particles/bodies are not assembled.
 """
 EE_QUADRATURE_OGC = 2
 """Edge rows go through Newton's native rigid-soft contact kernels; ESP evaluates VT/TV rows only.
@@ -179,6 +181,26 @@ class EspData:
 
 
 @wp.struct
+class FaceQuadratureGradients:
+    """Sparse sums for (face/world slot, differentiated particle or body).
+
+    keys stores face_slot * block_count + block_index; -1 denotes an empty slot.
+    Linear probing resolves hash collisions. dNdX and dWdX contain world-coordinate
+    gradients of that face's near numerator and denominator, summed across rows.
+    Particle arrays have 3 columns; body arrays have 6 (COM translation, rotation).
+    Tables are cleared for each evaluation and read only after all rows finish.
+    A full table sets ESP error bit 16; contributions are never silently dropped.
+    """
+
+    keys: wp.array[wp.int64]
+    dNdX: wp.array2d[float]
+    dWdX: wp.array2d[float]
+    face_area: wp.array[float]
+    """Rest area copied from EspData when inserting a key; shared-world slots keep the same area."""
+    block_count: int
+
+
+@wp.struct
 class FaceQuadratureSums:
     """Per-source-face near-field sums for EE_QUADRATURE_NORMALIZED; soft faces first, then rigid face slots.
 
@@ -195,6 +217,8 @@ class FaceQuadratureSums:
 
     numerator: wp.array[float]
     weight: wp.array[float]
+    particle_gradients: FaceQuadratureGradients
+    body_gradients: FaceQuadratureGradients
 
 
 @wp.struct
@@ -1209,7 +1233,7 @@ def particle_triangle(
     dt: float = 0.0,
     smoothing: float = 0.0,
 ):
-    """Accumulate one triangle's weighted force/Hessian for a particle; return its energy.
+    """Accumulate one triangle's weighted force/Hessian for a particle.
 
     With d_feature the distance from ``point`` to that triangle feature:
         E(point, a, b, c) = stiffness * [b(d_face)
@@ -1230,14 +1254,16 @@ def particle_triangle(
     Energy remains conservative-only, so those extra terms are not derivatives
     of the returned energy. ``scale`` is the fixed source area (times the fixed
     EE weight for a target-only particle). Add -scale*gradient and scale*hessian
-    to the output row ``particle_index`` and return scale*E. Nonfinite values
+    to the output row ``particle_index``. Return scale*E and the unscaled
+    conservative gradient (reused by normalized face reduction). Nonfinite values
     set ``esp_error`` without writing the force/Hessian. Buffers are not cleared.
     """
     cutoff = near if near_only else support
     box_delta = wp.max(wp.max(wp.min(wp.min(a, b), c) - point, point - wp.max(wp.max(a, b), c)), wp.vec3())
     energy, gradient, hessian = float(0.0), wp.vec3(), wp.mat33()
+    conservative_gradient_sum = wp.vec3()
     if wp.dot(box_delta, box_delta) > cutoff * cutoff:
-        return 0.0
+        return 0.0, conservative_gradient_sum
     for feature_index in range(7):
         coefficient = float(1.0)
         if feature_index > 0:
@@ -1254,6 +1280,7 @@ def particle_triangle(
         )
         energy += coefficient * stiffness * barrier_value
         gradient += coefficient * stiffness * conservative_gradient
+        conservative_gradient_sum += coefficient * stiffness * conservative_gradient
         hessian += coefficient * stiffness * conservative_hessian
         relative_displacement = sample_displacement - wp.transpose(triangle_displacements) * barycentric
         friction_damping_gradient, friction_damping_hessian = feature_friction_and_damping(
@@ -1266,12 +1293,12 @@ def particle_triangle(
         hessian += coefficient * derivative_coefficient * derivative_coefficient * friction_damping_hessian
     if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
         wp.atomic_or(esp_error, 0, 4)
-        return scale * energy
+        return scale * energy, conservative_gradient_sum
     for i in range(3):
         wp.atomic_add(esp_forces, particle_index, i, -scale * gradient[i])
         for j in range(3):
             wp.atomic_add(esp_hessians, particle_index, i, j, scale * hessian[i, j])
-    return scale * energy
+    return scale * energy, conservative_gradient_sum
 
 
 @wp.func
@@ -1300,7 +1327,7 @@ def body_triangle(
     dt: float = 0.0,
     smoothing: float = 0.0,
 ):
-    """Accumulate one triangle's weighted force/Hessian for a body; return its energy.
+    """Accumulate one triangle's weighted force/Hessian for a body.
 
     Conservative rigid-motion invariance maps the point gradient/Hessian by
     J=[-I,skew(point-com)] when the triangle moves, or [I,-skew] otherwise.
@@ -1309,7 +1336,8 @@ def body_triangle(
     Dissipative terms instead use each feature's actual rigid material point
     and J^T H J, without the conservative rotation-curvature correction.
     Add -scale*gradient and scale*hessian to output row ``body_index`` and
-    return scale*E. Coordinates are COM translation then world rotation.
+    return scale*E and the unscaled conservative gradient.
+    Coordinates are COM translation then world rotation.
     Nonfinite values set ``esp_error`` without writing the force/Hessian;
     buffers are not cleared. ``scale`` is fixed during differentiation.
     """
@@ -1317,8 +1345,9 @@ def body_triangle(
     box_delta = wp.max(wp.max(wp.min(wp.min(a, b), c) - point, point - wp.max(wp.max(a, b), c)), wp.vec3())
     energy, conservative_gradient, conservative_hessian = float(0.0), wp.vec3(), wp.mat33()
     gradient, hessian = wp.spatial_vector(), wp.spatial_matrix()
+    conservative_body_gradient = wp.spatial_vector()
     if wp.dot(box_delta, box_delta) > cutoff * cutoff:
-        return 0.0
+        return 0.0, conservative_body_gradient
     for feature_index in range(7):
         coefficient = float(1.0)
         if feature_index > 0:
@@ -1363,6 +1392,8 @@ def body_triangle(
         rotation_i = sign * wp.cross(ei, offset)
         gradient[i] += sign * conservative_gradient[i]
         gradient[i + 3] += wp.dot(rotation_i, conservative_gradient)
+        conservative_body_gradient[i] = sign * conservative_gradient[i]
+        conservative_body_gradient[i + 3] = wp.dot(rotation_i, conservative_gradient)
         for j in range(3):
             ej = wp.vec3()
             ej[j] = float(1.0)
@@ -1379,12 +1410,12 @@ def body_triangle(
             hessian[i + 3, j + 3] += wp.dot(rotation_i, conservative_hessian * rotation_j) + curvature
     if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
         wp.atomic_or(esp_error, 0, 4)
-        return scale * energy
+        return scale * energy, conservative_body_gradient
     for i in range(6):
         wp.atomic_add(esp_forces, body_index, i, -scale * gradient[i])
         for j in range(6):
             wp.atomic_add(esp_hessians, body_index, i, j, scale * hessian[i, j])
-    return scale * energy
+    return scale * energy, conservative_body_gradient
 
 
 @wp.func
@@ -1486,6 +1517,114 @@ def face_sum_index(face: int, is_rigid: bool, soft_vertex_index: int, data: EspD
 
 
 @wp.func
+def add_face_quadrature_gradients(
+    face_slot: int,
+    face_area: float,
+    block_index: int,
+    dNdX: Any,
+    dWdX: Any,
+    gradients: FaceQuadratureGradients,
+    esp_error: wp.array[int],
+) -> None:
+    """Atomically sum one contribution, using the same key for every row of a face/block."""
+    nonzero = bool(False)
+    for axis in range(gradients.dNdX.shape[1]):
+        nonzero = nonzero or dNdX[axis] != 0.0 or dWdX[axis] != 0.0
+    if not nonzero:
+        return
+    key = wp.int64(face_slot) * wp.int64(gradients.block_count) + wp.int64(block_index)
+    # Mix both IDs before masking; consecutive faces/blocks must not all probe
+    # the same small part of the power-of-two table.
+    hashed = wp.uint64(key)
+    hashed = (hashed ^ (hashed >> wp.uint64(30))) * wp.uint64(0xBF58476D1CE4E5B9)
+    hashed = (hashed ^ (hashed >> wp.uint64(27))) * wp.uint64(0x94D049BB133111EB)
+    hashed = hashed ^ (hashed >> wp.uint64(31))
+    capacity = gradients.keys.shape[0]
+    slot = int(hashed & wp.uint64(capacity - 1))
+    for _probe in range(capacity):
+        previous = wp.atomic_cas(gradients.keys, slot, wp.int64(-1), key)
+        if previous == wp.int64(-1) or previous == key:
+            if previous == wp.int64(-1):
+                gradients.face_area[slot] = face_area
+            for axis in range(gradients.dNdX.shape[1]):
+                wp.atomic_add(gradients.dNdX, slot, axis, dNdX[axis])
+                wp.atomic_add(gradients.dWdX, slot, axis, dWdX[axis])
+            return
+        slot = (slot + 1) & (capacity - 1)
+    wp.atomic_or(esp_error, 0, 16)
+
+
+@wp.func
+def add_vertex_face_gradients(
+    vertex_index: int,
+    is_rigid: bool,
+    soft_vertex_index: int,
+    block_index: int,
+    dNdX: Any,
+    data: EspData,
+    gradients: FaceQuadratureGradients,
+    esp_error: wp.array[int],
+) -> None:
+    """Add a fixed sample's near gradient to each incident face; its weight is constant."""
+    adjacent = data.rigid_adjacency.v_adj_tris if is_rigid else data.soft_adjacency.v_adj_tris
+    offsets = data.rigid_adjacency.v_adj_tris_offsets if is_rigid else data.soft_adjacency.v_adj_tris_offsets
+    tri_area = data.rigid_tri_area if is_rigid else data.soft_tri_area
+    for entry in range(offsets[vertex_index], offsets[vertex_index + 1], 2):
+        face = adjacent[entry]
+        face_slot = face_sum_index(face, is_rigid, soft_vertex_index, data)
+        add_face_quadrature_gradients(face_slot, tri_area[face], block_index, dNdX, dNdX * 0.0, gradients, esp_error)
+
+
+@wp.func
+def add_edge_face_gradients(
+    edge_index: int,
+    is_rigid: bool,
+    soft_vertex_index: int,
+    block_index: int,
+    dNdX: Any,
+    dWdX: Any,
+    data: EspData,
+    gradients: FaceQuadratureGradients,
+    esp_error: wp.array[int],
+) -> None:
+    """Add an EE sample's numerator/weight gradients to each incident face."""
+    edge_tri_indices = data.rigid_adjacency.edge_tri_indices if is_rigid else data.soft_adjacency.edge_tri_indices
+    tri_area = data.rigid_tri_area if is_rigid else data.soft_tri_area
+    for side in range(2):
+        face = edge_tri_indices[edge_index, side]
+        if face >= 0:
+            face_slot = face_sum_index(face, is_rigid, soft_vertex_index, data)
+            add_face_quadrature_gradients(face_slot, tri_area[face], block_index, dNdX, dWdX, gradients, esp_error)
+
+
+@wp.kernel
+def finish_face_quadrature_hessians(
+    gradients: FaceQuadratureGradients,
+    face_sums: FaceQuadratureSums,
+    # Outputs: the first two quotient-rule terms are already in these blocks.
+    esp_hessians: wp.array3d[float],
+    esp_error: wp.array[int],
+) -> None:
+    """Add (A_f/9) [-sym(dN dW^T)/W² + 2 N dW dW^T/W³] after summing ALL rows."""
+    slot = wp.tid()
+    key = gradients.keys[slot]
+    if key < wp.int64(0) or esp_error[0] != 0:
+        return
+    face_slot = int(key // wp.int64(gradients.block_count))
+    block_index = int(key % wp.int64(gradients.block_count))
+    N, W = face_sums.numerator[face_slot], face_sums.weight[face_slot]
+    for i in range(gradients.dNdX.shape[1]):
+        for j in range(gradients.dNdX.shape[1]):
+            ni, nj = gradients.dNdX[slot, i], gradients.dNdX[slot, j]
+            wi, wj = gradients.dWdX[slot, i], gradients.dWdX[slot, j]
+            correction = -(ni * wj + wi * nj) / (W * W) + 2.0 * N * wi * wj / (W * W * W)
+            if not wp.isfinite(correction):
+                wp.atomic_or(esp_error, 0, 4)
+            else:
+                wp.atomic_add(esp_hessians, block_index, i, j, (gradients.face_area[slot] / 9.0) * correction)
+
+
+@wp.func
 def normalized_vertex_near_weight(
     vertex_index: int,
     is_rigid: bool,
@@ -1522,23 +1661,22 @@ def normalized_edge_coefficients(
     soft_vertex_index: int,
     data: EspData,
     face_sums: FaceQuadratureSums,
-) -> wp.vec4:
-    """Return (alpha, beta, gamma, delta) for an adaptive EE sample generated on this edge.
+) -> wp.vec2:
+    """Return (alpha, beta) for the linear quotient-rule terms of an adaptive EE sample.
 
     With the edge's incident faces f, outer weights a_f = A_f/9, and current sums N_f, W_f::
 
         alpha = sum a_f / W_f       replaces the unnormalized outer weight sum a_f
         beta  = sum a_f N_f / W_f^2 multiplies -dw/dX (gradient) and -d2w/dX2 (Hessian)
-        gamma = sum a_f / W_f^2     multiplies -(dw dP^T + dP dw^T) in the Hessian
-        delta = sum a_f N_f / W_f^3 multiplies 2 dw dw^T in the Hessian
 
     P is this sample's unweighted target potential and w its weight. These are the
-    derivatives of sum_f a_f N_f / W_f with the other rows' contributions to N_f, W_f fixed.
+    first-derivative coefficients of sum_f a_f N_f / W_f. Hessian outer products
+    are assembled separately from the summed gradients of ALL rows of each face.
     ``soft_vertex_index`` selects the world slot of rigid faces; see face_sum_index.
     """
     edge_tri_indices = data.rigid_adjacency.edge_tri_indices if is_rigid else data.soft_adjacency.edge_tri_indices
     tri_area = data.rigid_tri_area if is_rigid else data.soft_tri_area
-    result = wp.vec4()
+    result = wp.vec2()
     for side in range(2):
         face = edge_tri_indices[edge_index, side]
         if face >= 0:
@@ -1546,11 +1684,9 @@ def normalized_edge_coefficients(
             slot = face_sum_index(face, is_rigid, soft_vertex_index, data)
             inverse_weight = 1.0 / face_sums.weight[slot]
             numerator = face_sums.numerator[slot]
-            result += wp.vec4(
+            result += wp.vec2(
                 area * inverse_weight,
                 area * numerator * inverse_weight * inverse_weight,
-                area * inverse_weight * inverse_weight,
-                area * numerator * inverse_weight * inverse_weight * inverse_weight,
             )
     return result
 
@@ -2582,8 +2718,9 @@ def _make_ee_block_functions(size: int):
 
         Under EE_QUADRATURE_NORMALIZED the fixed area factors A_τ become the
         per-direction coefficients alpha of normalized_edge_coefficients, and the
-        finished derivatives receive that row's quotient terms in w (beta, gamma, delta);
-        ``face_sums`` is read only in that mode.
+        finished derivatives receive the linear denominator term in w (beta).
+        Per-face gradient sums supply the remaining quotient Hessian after all
+        rows finish; ``face_sums`` is read/written only in that mode.
 
         Here ∂/∂X holds s,t fixed, whereas d/dX includes s(X),t(X).
         With column gradients s_X = ds/dX and t_X = dt/dX, the chain rule gives:
@@ -2601,8 +2738,8 @@ def _make_ee_block_functions(size: int):
         includes ds/dX, dt/dX and the mixed terms. Similar concepts apply to w & E.
         Finishing is linear in the triangle sums, so each partition can finish its
         partial sum independently and atomically add the world-coordinate result.
-        The normalized beta and delta terms depend on w alone, not on the partial
-        sums, so partition 0 applies them once.
+        The normalized beta term and denominator gradient depend on w alone, not
+        on the partial sums, so partition 0 contributes them once.
         """
         soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
         rigid_edge_vertex_indices = data.rigid_edge_vertex_indices[rigid_primitive_index]
@@ -2620,7 +2757,7 @@ def _make_ee_block_functions(size: int):
             return 0.0
         origin = pair.endpoints_world[0]
         # Source area factor per sample direction: fixed edge areas, or the
-        # normalized coefficients (alpha, beta, gamma, delta) of each generating edge.
+        # normalized coefficients (alpha, beta) of each generating edge.
         soft_area_factor = data.soft_edge_area[soft_primitive_index]
         rigid_area_factor = data.rigid_edge_area[rigid_primitive_index]
         if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
@@ -2782,9 +2919,8 @@ def _make_ee_block_functions(size: int):
             pair, P, dPdX, dPdst, d2PdX2_no_st_curvature, dissipative_gradient, dissipative_hessian
         )
         if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
-            # Derivatives of sum_f A_f N_f / W_f through this row's weight w, with the
-            # other rows' sums fixed: finish_ee_pair with P=1 differentiates w alone, and
-            # with each direction's unscaled P it gives that direction's d(wP)/dX.
+            # Keep the row-linear H(N)/W - N H(W)/W² terms here. Accumulate
+            # dN/dX and dW/dX across rows before forming the quotient outer products.
             _weight, dwdX, d2wdX2 = finish_ee_pair(pair, 1.0, vector(), wp.vec2(), matrix())
             _soft_energy, dwP_soft_dX, _soft_hessian = finish_ee_pair(
                 pair, P_soft, dPdX_soft, dPdst_soft, d2PdX2_soft_no_st_curvature
@@ -2792,15 +2928,39 @@ def _make_ee_block_functions(size: int):
             _rigid_energy, dwP_rigid_dX, _rigid_hessian = finish_ee_pair(
                 pair, P_rigid, dPdX_rigid, dPdst_rigid, d2PdX2_rigid_no_st_curvature
             )
-            # The gamma terms are linear in this partition's d(wP) and sum over partitions;
-            # the beta and delta terms depend on w alone, so only partition 0 applies them.
-            hessian -= soft_coefficients[2] * (wp.outer(dwP_soft_dX, dwdX) + wp.outer(dwdX, dwP_soft_dX))
-            hessian -= rigid_coefficients[2] * (wp.outer(dwP_rigid_dX, dwdX) + wp.outer(dwdX, dwP_rigid_dX))
+            gradients = face_sums.particle_gradients
+            if wp.static(size == 6):
+                gradients = face_sums.body_gradients
+            # Numerator gradients follow the triangle-list partitions. Count the
+            # weight gradient only once, even if a partition has no target triangles.
+            dWdX = vector()
             if partition == 0:
                 beta = soft_coefficients[1] + rigid_coefficients[1]
                 gradient -= beta * dwdX
                 hessian -= beta * d2wdX2
-                hessian += (2.0 * (soft_coefficients[3] + rigid_coefficients[3])) * wp.outer(dwdX, dwdX)
+                dWdX = dwdX
+            add_edge_face_gradients(
+                soft_primitive_index,
+                False,
+                soft_edge_vertex_indices[0],
+                block_index,
+                dwP_soft_dX,
+                dWdX,
+                data,
+                gradients,
+                esp_error,
+            )
+            add_edge_face_gradients(
+                rigid_primitive_index,
+                True,
+                soft_edge_vertex_indices[0],
+                block_index,
+                dwP_rigid_dX,
+                dWdX,
+                data,
+                gradients,
+                esp_error,
+            )
         if not wp.isfinite(energy) or not wp.isfinite(gradient) or not wp.isfinite(hessian):
             wp.atomic_or(esp_error, 0, 4)
             return energy
@@ -3411,6 +3571,7 @@ def ee_particle_targets(
     rigid_positions: wp.array[wp.vec3],
     particle_colors: wp.array[int],
     lists: EdgeTriangleListData,
+    face_sums: FaceQuadratureSums,
     particle_radius: wp.array[float],
     shape_margin: wp.array[float],
     shape_material_ke: wp.array[float],
@@ -3495,7 +3656,7 @@ def ee_particle_targets(
                 continue
             if color >= 0 and particle_colors[particle_index] != color:
                 continue
-            particle_triangle(
+            _energy, dPdX = particle_triangle(
                 q_bar,
                 particle_q[triangle_vertex_indices[0]],
                 particle_q[triangle_vertex_indices[1]],
@@ -3519,6 +3680,18 @@ def ee_particle_targets(
                 dt,
                 friction_epsilon * dt,
             )
+            if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                add_edge_face_gradients(
+                    rigid_primitive_index,
+                    True,
+                    soft_edge_vertex_indices[0],
+                    particle_index,
+                    weight * dPdX,
+                    wp.vec3(),
+                    data,
+                    face_sums.particle_gradients,
+                    esp_error,
+                )
 
 
 @wp.kernel(module="unique", enable_backward=False)
@@ -3674,7 +3847,7 @@ def accumulate_particle_contact_derivatives(
                 near_weight = normalized_vertex_near_weight(
                     particle_index, False, particle_index, data, face_sums, quadrature_weight
                 )
-                particle_triangle(
+                _energy, dPdX = particle_triangle(
                     particle_q[particle_index],
                     rigid_positions[triangle_vertex_indices[0]],
                     rigid_positions[triangle_vertex_indices[1]],
@@ -3697,6 +3870,16 @@ def accumulate_particle_contact_derivatives(
                     kd,
                     dt,
                     friction_epsilon * dt,
+                )
+                add_vertex_face_gradients(
+                    particle_index,
+                    False,
+                    particle_index,
+                    particle_index,
+                    dPdX,
+                    data,
+                    face_sums.particle_gradients,
+                    esp_error,
                 )
         elif family == 1:  # TV
             triangle_index = soft_primitive_index
@@ -3765,7 +3948,7 @@ def accumulate_particle_contact_derivatives(
                     friction_epsilon * dt,
                 )
                 if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
-                    particle_triangle(
+                    _energy, dPdX = particle_triangle(
                         rigid_positions[rigid_primitive_index],
                         particle_q[triangle_vertex_indices[0]],
                         particle_q[triangle_vertex_indices[1]],
@@ -3788,6 +3971,16 @@ def accumulate_particle_contact_derivatives(
                         kd,
                         dt,
                         friction_epsilon * dt,
+                    )
+                    add_vertex_face_gradients(
+                        rigid_primitive_index,
+                        True,
+                        triangle_vertex_indices[0],
+                        particle_index,
+                        dPdX,
+                        data,
+                        face_sums.particle_gradients,
+                        esp_error,
                     )
         else:  # EE
             soft_edge_vertex_indices = data.soft_edge_vertex_indices[soft_primitive_index]
@@ -3868,6 +4061,7 @@ def accumulate_particle_contact_derivatives(
                 rigid_positions,
                 particle_colors,
                 lists,
+                face_sums,
                 particle_radius,
                 shape_margin,
                 shape_material_ke,
@@ -4061,7 +4255,7 @@ def accumulate_body_contact_derivatives(
                 if use_friction:
                     target_mu = wp.sqrt(soft_contact_mu * shape_material_mu[target_shape_index])
                 target_kd = 0.5 * (soft_contact_kd + shape_material_kd[target_shape_index])
-                body_triangle(
+                _energy, dPdX = body_triangle(
                     q,
                     rigid_positions[triangle_vertex_indices[0]],
                     rigid_positions[triangle_vertex_indices[1]],
@@ -4086,6 +4280,18 @@ def accumulate_body_contact_derivatives(
                     dt,
                     friction_epsilon * dt,
                 )
+                if wp.static(_EE_QUADRATURE == EE_QUADRATURE_NORMALIZED):
+                    add_edge_face_gradients(
+                        soft_primitive_index,
+                        False,
+                        soft_edge_vertex_indices[0],
+                        target_body_index,
+                        weight * dPdX,
+                        wp.spatial_vector(),
+                        data,
+                        face_sums.body_gradients,
+                        esp_error,
+                    )
             if body_index >= 0 and (color < 0 or body_colors[body_index] == color):
                 com = wp.transform_point(body_q[body_index], body_com[body_index])
                 # Bodies evaluate the complete triangle lists: partition 0 of 1.
@@ -4187,7 +4393,7 @@ def accumulate_body_contact_derivatives(
                 near_weight = normalized_vertex_near_weight(
                     soft_primitive_index, False, soft_primitive_index, data, face_sums, quadrature_weight
                 )
-                body_triangle(
+                _energy, dPdX = body_triangle(
                     particle_q[soft_primitive_index],
                     rigid_positions[triangle_vertex_indices[0]],
                     rigid_positions[triangle_vertex_indices[1]],
@@ -4211,6 +4417,16 @@ def accumulate_body_contact_derivatives(
                     kd,
                     dt,
                     friction_epsilon * dt,
+                )
+                add_vertex_face_gradients(
+                    soft_primitive_index,
+                    False,
+                    soft_primitive_index,
+                    body_index,
+                    dPdX,
+                    data,
+                    face_sums.body_gradients,
+                    esp_error,
                 )
         elif family == 1:
             triangle_index = soft_primitive_index
@@ -4274,7 +4490,7 @@ def accumulate_body_contact_derivatives(
                     face_sums,
                     quadrature_weight,
                 )
-                body_triangle(
+                _energy, dPdX = body_triangle(
                     rigid_positions[rigid_primitive_index],
                     particle_q[triangle_vertex_indices[0]],
                     particle_q[triangle_vertex_indices[1]],
@@ -4298,6 +4514,16 @@ def accumulate_body_contact_derivatives(
                     kd,
                     dt,
                     friction_epsilon * dt,
+                )
+                add_vertex_face_gradients(
+                    rigid_primitive_index,
+                    True,
+                    triangle_vertex_indices[0],
+                    body_index,
+                    dPdX,
+                    data,
+                    face_sums.body_gradients,
+                    esp_error,
                 )
 
 
@@ -4439,13 +4665,34 @@ def create_esp_data(
     return data
 
 
-def create_face_quadrature_sums(data: EspData, device: wp.Device | str) -> FaceQuadratureSums:
+def _create_face_quadrature_gradients(face_count: int, block_count: int, dimensions: int) -> FaceQuadratureGradients:
+    """Allocate topology-sized sparse storage, independent of contact-buffer capacity.
+
+    Budget 16*(face_count + block_count) slots, capped by twice the number of
+    possible keys, then round up to a power of two. This is a capacity estimate,
+    not a bound on contact density;
+    a full table reports an error rather than accepting an incomplete Hessian.
+    """
+    gradients = FaceQuadratureGradients()
+    budget = min(2 * face_count * block_count, max(256, 16 * (face_count + block_count)))
+    capacity = 1 << max(0, (budget - 1).bit_length())
+    gradients.keys = wp.full(capacity, -1, dtype=wp.int64)
+    gradients.dNdX = wp.zeros((capacity, dimensions), dtype=float)
+    gradients.dWdX = wp.zeros((capacity, dimensions), dtype=float)
+    gradients.face_area = wp.empty(capacity, dtype=float)
+    gradients.block_count = block_count
+    return gradients
+
+
+def create_face_quadrature_sums(data: EspData, model: "Model") -> FaceQuadratureSums:
     """Allocate the per-face sums read by EE_QUADRATURE_NORMALIZED; see FaceQuadratureSums for the slot layout."""
     sums = FaceQuadratureSums()
     count = data.face_sum_count
-    with wp.ScopedDevice(device):
+    with wp.ScopedDevice(model.device):
         sums.numerator = wp.zeros(count, dtype=float)
         sums.weight = wp.full(count, 3.0, dtype=float)
+        sums.particle_gradients = _create_face_quadrature_gradients(count, model.particle_count, 3)
+        sums.body_gradients = _create_face_quadrature_gradients(count, model.body_count, 6)
     return sums
 
 
@@ -4542,6 +4789,11 @@ def launch_contact_blocks(
             esp_forces.zero_()
             esp_hessians.zero_()
         if _EE_QUADRATURE == EE_QUADRATURE_NORMALIZED:
+            if not energy_only:
+                gradients = face_sums.particle_gradients if block_kind == _PARTICLE_BLOCKS else face_sums.body_gradients
+                gradients.keys.fill_(-1)
+                gradients.dNdX.zero_()
+                gradients.dWdX.zero_()
             # Pass 1: per-face near-field sums at the current positions, one worker per row.
             face_sums.numerator.zero_()
             face_sums.weight.fill_(3.0)
@@ -4685,3 +4937,13 @@ def launch_contact_blocks(
             )
         else:
             raise ValueError(f"Unknown ESP output kind: {block_kind}")
+        if _EE_QUADRATURE == EE_QUADRATURE_NORMALIZED and not energy_only:
+            # Complete the quotient Hessian only after all rows have contributed
+            # to the face/block gradients. No pairwise row traversal is needed.
+            wp.launch(
+                finish_face_quadrature_hessians,
+                dim=gradients.keys.shape[0],
+                inputs=[gradients, face_sums],
+                outputs=[esp_hessians, esp_error],
+                device=model.device,
+            )

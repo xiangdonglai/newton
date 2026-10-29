@@ -311,7 +311,7 @@ def evaluate_contacts(
         tri_indices, tri_edge_indices, edge_tri_indices, vertex_term_coefficient, face
     )
     if use_direct_formulas:
-        value32 = particle_triangle(
+        value32, _conservative_gradient = particle_triangle(
             wp.vec3(particle_q64[particle]),
             wp.vec3(target_positions[triangle_vertex_indices[0]]),
             wp.vec3(target_positions[triangle_vertex_indices[1]]),

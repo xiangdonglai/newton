@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from functools import partial
 
 import numpy as np
 import warp as wp
@@ -51,8 +52,8 @@ def edge_faces_np(tri_indices_np, edge_np):
     return np.flatnonzero(np.isin(tri_indices_np, edge_np).sum(axis=1) == 2)
 
 
-def normalized_reference_energy(model, solver, row, shape, soft, rigid):
-    """Evaluate the single-row reference with Toolkit weights: sum_f (A_f/9) w P_f / (3 + w)."""
+def normalized_reference_energy(model, solver, row, shape, soft, rigid, *, sample_count=1):
+    """Evaluate identical EE samples with Toolkit weights: sum_f (A_f/9) n w P_f / (3 + n w)."""
     weight, on_rigid, on_soft = reference_ee_terms(model, solver, row, shape, soft, rigid)
     if weight == 0.0:
         return 0.0
@@ -62,7 +63,7 @@ def normalized_reference_energy(model, solver, row, shape, soft, rigid):
     rigid_faces = edge_faces_np(data.rigid_tri_indices.numpy(), data.rigid_edge_vertex_indices.numpy()[re])
     soft_area = float(data.soft_tri_area.numpy()[soft_faces].sum())
     rigid_area = float(data.rigid_tri_area.numpy()[rigid_faces].sum())
-    return weight * (soft_area * on_rigid + rigid_area * on_soft) / (9.0 * (3.0 + weight))
+    return sample_count * weight * (soft_area * on_rigid + rigid_area * on_soft) / (9.0 * (3.0 + sample_count * weight))
 
 
 def evaluate_blocks(solver, state, *, dt=0.0):
@@ -73,31 +74,62 @@ def evaluate_blocks(solver, state, *, dt=0.0):
     return tuple(getattr(solver, "_esp_" + name).numpy().copy() for name in BLOCK_NAMES)
 
 
-def toolkit_reference(model, solver, state, support, stiffness):
-    """IPC Toolkit's normalized ESP for the current positions: energy, soft forces, rigid vertex forces.
+def toolkit_reference(model, solver, state, support, stiffness, *, rest_positions_np=None):
+    """Return Toolkit's energy, soft/rigid forces and unprojected vertex-coordinate Hessian.
 
     Both patches are one CollisionMesh; make_vertex_patches_filter keeps soft-rigid pairs only.
-    Positions double as rest positions, which is exact here: the fixtures are at rest and the
-    toolkit's area weights are rest areas. Requires the ``ipctk`` bindings of the sibling checkout.
+    Pass rest_positions_np when perturbing a fixture: Toolkit's quadrature areas must stay
+    fixed like Newton's. Without it, the fixture is assumed to be at rest.
+    Requires the optional ``ipctk`` bindings; all Toolkit calculations use CPU float64.
     """
     import ipctk  # noqa: PLC0415
 
     data = solver._esp_data
-    soft = state.particle_q.numpy().astype(np.float64)
-    rigid = solver._esp_rigid_positions.numpy().astype(np.float64)
-    positions = np.vstack((soft, rigid))
-    faces = np.vstack((data.soft_tri_indices.numpy(), data.rigid_tri_indices.numpy() + len(soft))).astype(int)
-    edges = np.array(sorted({tuple(sorted((int(f[i]), int(f[(i + 1) % 3])))) for f in faces for i in range(3)}))
-    mesh = ipctk.CollisionMesh(positions, edges, faces)
-    mesh.can_collide = ipctk.make_vertex_patches_filter((np.arange(len(positions)) >= len(soft)).astype(int))
+    soft_positions_np = state.particle_q.numpy().astype(np.float64)
+    rigid_positions_np = solver._esp_rigid_positions.numpy().astype(np.float64)
+    positions_np = np.vstack((soft_positions_np, rigid_positions_np))
+    tri_indices_np = np.vstack(
+        (data.soft_tri_indices.numpy(), data.rigid_tri_indices.numpy() + model.particle_count)
+    ).astype(int)
+    edge_vertex_indices_np = np.array(
+        sorted({tuple(sorted((int(f[i]), int(f[(i + 1) % 3])))) for f in tri_indices_np for i in range(3)})
+    )
+    mesh = ipctk.CollisionMesh(
+        positions_np if rest_positions_np is None else rest_positions_np, edge_vertex_indices_np, tri_indices_np
+    )
+    mesh.can_collide = ipctk.make_vertex_patches_filter(
+        (np.arange(len(positions_np)) >= model.particle_count).astype(int)
+    )
     mesh.init_adjacencies()
     params = ipctk.ESPParameters(support, 0.05, 1, True, ipctk.ESPParameters.IntegrationType.NORMAL)
     collisions = ipctk.ESPCollisions()
-    collisions.build(mesh, positions, params)
+    collisions.build(mesh, positions_np, params)
     potential = ipctk.ESPPotential(params, True)
-    energy = stiffness * potential(collisions, mesh, positions)
-    forces = -stiffness * np.asarray(potential.gradient(collisions, mesh, positions)).reshape(-1, 3)
-    return energy, forces[: len(soft)], forces[len(soft) :]
+    energy = stiffness * potential(collisions, mesh, positions_np)
+    forces_np = -stiffness * np.asarray(potential.gradient(collisions, mesh, positions_np)).reshape(-1, 3)
+    hessian = stiffness * potential.hessian(collisions, mesh, positions_np, ipctk.PSDProjectionMethod.NONE)
+    return energy, forces_np[: model.particle_count], forces_np[model.particle_count :], hessian
+
+
+def make_toolkit_comparison_cases(device):
+    """Build separate/shared rigid bodies and a cloth grid over a closed box, with unit stiffness."""
+    cases = []
+    for shared_body in (False, True):
+        model, solver, state, _row, _shape = make_cross_target_case(
+            device, shared_body=shared_body, uniform_material=True
+        )
+        cases.append((f"cross shared_body={shared_body}", model, solver, state))
+    model, _pipeline, solver = make_case(device, dynamic=True, grid=True, gap=0.00012)
+    model.shape_material_ke.fill_(1.0)
+    model.shape_margin.fill_(0.0)
+    model.soft_contact_ke = 1.0
+    cases.append(("grid over box", model, solver, model.state()))
+    for _label, _model, solver, state in cases:
+        # The cross fixture keeps only one generating EE row. Toolkit queries every pair.
+        solver.collision_pipeline.collide(state, solver.contacts)
+        solver._refresh_body_particle_contact_state(solver.contacts, True)
+        solver._accumulate_esp_contacts(state, esp_contact._ENERGY_ONLY)
+    return cases
 
 
 def prepare_no_ee_case(device, isolated_particle):
@@ -121,6 +153,32 @@ def barrier_probe(distances: wp.array[float], near_only: bool, output: wp.array[
     i = wp.tid()
     value, first, second = esp_contact.barrier_coefficients(distances[i], 0.2, 0.05, near_only)
     output[i] = wp.vec3(value, first, second)
+
+
+@wp.kernel
+def face_gradient_reduction_probe(
+    row_count: wp.array[int], gradients: esp_contact.FaceQuadratureGradients, error: wp.array[int]
+):
+    """Send many rows to 16 face/block keys to exercise concurrent insertion and reduction."""
+    row = wp.tid()
+    if row >= row_count[0]:
+        return
+    key = row % 16
+    face, block = key // 4, key % 4
+    if gradients.dNdX.shape[1] == 3:
+        esp_contact.add_face_quadrature_gradients(
+            face, float(face + 1), block, wp.vec3(1.0, 2.0, 3.0), wp.vec3(0.0, 1.0, -1.0), gradients, error
+        )
+    else:
+        esp_contact.add_face_quadrature_gradients(
+            face,
+            float(face + 1),
+            block,
+            wp.spatial_vector(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+            wp.spatial_vector(0.0, 1.0, -1.0, 2.0, 0.0, -2.0),
+            gradients,
+            error,
+        )
 
 
 class TestEspEeQuadrature(unittest.TestCase):
@@ -219,25 +277,7 @@ class TestEspEeQuadrature(unittest.TestCase):
         except ImportError:
             self.skipTest("ipctk is not installed in this interpreter")
         with wp.ScopedDevice("cpu"):
-            cases = []
-            for shared_body in (False, True):
-                model, solver, state, _row, _shape = make_cross_target_case(
-                    "cpu", shared_body=shared_body, uniform_material=True
-                )
-                # The fixture keeps its one generating EE row; the toolkit sees every pair, so restore them.
-                solver.collision_pipeline.collide(state, solver.contacts)
-                solver._refresh_body_particle_contact_state(solver.contacts, True)
-                cases.append((f"cross shared_body={shared_body}", model, solver, state))
-            # Interior edges and vertices on both sides: a cloth grid over the closed box.
-            model, pipeline, solver = make_case("cpu", dynamic=True, grid=True, gap=0.00012)
-            model.shape_material_ke.fill_(1.0)
-            model.shape_margin.fill_(0.0)
-            model.soft_contact_ke = 1.0
-            state = model.state()
-            pipeline.collide(state, solver.contacts)
-            solver._refresh_body_particle_contact_state(solver.contacts, True)
-            cases.append(("grid over box", model, solver, state))
-            for label, model, solver, state in cases:
+            for label, model, solver, state in make_toolkit_comparison_cases("cpu"):
                 with self.subTest(case=label):
                     radii = model.particle_radius.numpy()
                     self.assertTrue(np.all(radii == radii[0]) and np.all(model.shape_margin.numpy() == 0.0))
@@ -245,7 +285,9 @@ class TestEspEeQuadrature(unittest.TestCase):
                     energy, fp, _hp, fb, _hb = evaluate_blocks(solver, state)
                     self.assertGreater(energy[0], 0.0)
                     self.assertGreater(energy[1], 0.0, "exercise active EE samples")
-                    reference_energy, soft_forces, rigid_forces = toolkit_reference(model, solver, state, support, 1.0)
+                    reference_energy, soft_forces, rigid_forces, _hessian = toolkit_reference(
+                        model, solver, state, support, 1.0
+                    )
                     np.testing.assert_allclose(energy.sum(), reference_energy, rtol=2e-5)
                     scale = np.abs(soft_forces).max()
                     np.testing.assert_allclose(fp / scale, soft_forces / scale, rtol=0, atol=3e-5)
@@ -263,6 +305,108 @@ class TestEspEeQuadrature(unittest.TestCase):
                         ]
                         scale = max(np.abs(wrench).max(), 1e-12)
                         np.testing.assert_allclose(fb[body] / scale, wrench / scale, rtol=0, atol=3e-5)
+
+    @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
+    def test_normalized_hessians_match_toolkit(self):
+        """Compare every particle/body block directly with Toolkit's unprojected full Hessian.
+
+        Use smooth configurations and fixed rest areas. Body blocks require the full
+        cross-vertex matrix, not just its vertex diagonals, plus rotation curvature.
+        Toolkit runs in CPU float64; Newton runs on every available CPU/CUDA device.
+        """
+        try:
+            import ipctk  # noqa: F401, PLC0415
+        except ImportError:
+            self.skipTest("ipctk is not installed in this interpreter")
+        for device in wp.get_devices():
+            with wp.ScopedDevice(device):
+                for label, model, solver, state in make_toolkit_comparison_cases(device):
+                    with self.subTest(device=str(device), case=label):
+                        rest_positions_np = np.vstack(
+                            (state.particle_q.numpy(), solver._esp_rigid_positions.numpy())
+                        ).astype(np.float64)
+                        # Exact closest-feature ties need not have a classical Hessian.
+                        # Use the same smooth perturbations as the independent autodiff check.
+                        jitter = 5e-5 if label.startswith("cross") else 2e-6
+                        state.particle_q.assign(
+                            state.particle_q.numpy()
+                            + np.random.default_rng(9251)
+                            .uniform(-jitter, jitter, (model.particle_count, 3))
+                            .astype(np.float32)
+                        )
+                        solver.collision_pipeline.collide(state, solver.contacts)
+                        solver._refresh_body_particle_contact_state(solver.contacts, True)
+                        energy, _fp, hp, _fb, hb = evaluate_blocks(solver, state)
+                        self.assertTrue(np.all(energy > 0), "exercise both fixed vertices and EE samples")
+                        self.assertGreater(np.max(solver._esp_face_sums.weight.numpy()), 3.0)
+                        support = float(model.particle_radius.numpy()[0])
+                        reference_energy, _soft_forces, rigid_forces, H = toolkit_reference(
+                            model, solver, state, support, 1.0, rest_positions_np=rest_positions_np
+                        )
+                        np.testing.assert_allclose(energy.sum(), reference_energy, rtol=2e-5)
+                        max_particle_error, max_body_error = 0.0, 0.0
+                        for particle in range(model.particle_count):
+                            indices = slice(3 * particle, 3 * particle + 3)
+                            reference_np = H[indices, indices].toarray()
+                            scale = max(np.abs(reference_np).max(), 1.0)
+                            error = np.abs(hp[particle] - reference_np).max() / scale
+                            max_particle_error = max(max_particle_error, error)
+                            np.testing.assert_allclose(
+                                hp[particle] / scale,
+                                reference_np / scale,
+                                rtol=0,
+                                atol=5e-4,
+                                err_msg=f"{label}: particle {particle}",
+                            )
+                        data = solver._esp_data
+                        owners_np = model.shape_body.numpy()[data.rigid_vertex_shapes.numpy()]
+                        rigid_positions_np = solver._esp_rigid_positions.numpy().astype(np.float64)
+                        for body in range(model.body_count):
+                            vertices_np = np.flatnonzero(owners_np == body)
+                            center_np = np.asarray(
+                                wp.transform_point(
+                                    wp.transform(*state.body_q.numpy()[body]), wp.vec3(*model.body_com.numpy()[body])
+                                )
+                            )
+                            offsets_np = rigid_positions_np[vertices_np] - center_np
+                            # dx/dX = [I, -[r]_cross], X = (COM translation, world rotation).
+                            J_np = np.zeros((3 * len(vertices_np), 6))
+                            curvature_np = np.zeros((3, 3))
+                            for i, (vertex, r) in enumerate(zip(vertices_np, offsets_np, strict=True)):
+                                x, y, z = r
+                                J_np[3 * i : 3 * i + 3, :3] = np.eye(3)
+                                J_np[3 * i : 3 * i + 3, 3:] = [[0, z, -y], [-z, 0, x], [y, -x, 0]]
+                                g = -rigid_forces[vertex]
+                                # For x(X)=COM+t+exp([theta]_cross)r:
+                                # sum_k g_k d²x_k/dtheta² = sym(g r^T) - (g.r) I.
+                                curvature_np += 0.5 * (np.outer(g, r) + np.outer(r, g)) - np.dot(g, r) * np.eye(3)
+                            indices_np = (3 * (vertices_np + model.particle_count)[:, None] + np.arange(3)).ravel()
+                            reference_np = J_np.T @ (H[indices_np][:, indices_np] @ J_np)
+                            reference_np[3:, 3:] += curvature_np
+                            # Translation and rotation have different units/scales.
+                            # Check each 3x3 section so a large translation block
+                            # cannot hide a missing rotation-curvature term.
+                            for row_start in (0, 3):
+                                for column_start in (0, 3):
+                                    rows = slice(row_start, row_start + 3)
+                                    columns = slice(column_start, column_start + 3)
+                                    expected_np = reference_np[rows, columns]
+                                    actual_np = hb[body, rows, columns]
+                                    scale = max(np.abs(expected_np).max(), 1.0)
+                                    error = np.abs(actual_np - expected_np).max() / scale
+                                    max_body_error = max(max_body_error, error)
+                                    np.testing.assert_allclose(
+                                        actual_np / scale,
+                                        expected_np / scale,
+                                        rtol=0,
+                                        atol=5e-4,
+                                        err_msg=f"{label}: body {body}, section ({row_start}, {column_start})",
+                                    )
+                        print(
+                            f"Toolkit Hessian {device}, {label}: max scaled particle/body errors "
+                            f"{max_particle_error:.6g}/{max_body_error:.6g}",
+                            flush=True,
+                        )
 
     @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
     def test_normalized_surface_scale_without_ee(self):
@@ -349,6 +493,179 @@ class TestEspEeQuadrature(unittest.TestCase):
                         np.testing.assert_allclose(
                             (ep - 2 * reference + em) / step**2, direction @ hb[body] @ direction, rtol=3e-3, atol=0.003
                         )
+
+    @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
+    def test_normalized_cross_row_hessian(self):
+        """Include cross-row quotient derivatives even within one particle/body block.
+
+        Two identical rows make a minimal controlled reduction test: their energy
+        is 2 w P / (3 + 2 w), not twice the single-row energy. The collision query
+        normally deduplicates these rows; real distinct-row coverage is separate.
+        """
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, solver, state, row, shape = make_cross_target_case(device)
+                for name in (
+                    "soft_contact_indices",
+                    "soft_contact_rigid_indices",
+                    "soft_contact_primitive_index",
+                    "soft_contact_rigid_primitive_index",
+                    "soft_contact_shape",
+                ):
+                    array = getattr(solver.contacts, name)
+                    values_np = array.numpy()
+                    values_np[1] = values_np[0]
+                    array.assign(values_np)
+                solver.contacts.soft_contact_count.fill_(2)
+                soft_np = state.particle_q.numpy().astype(float)
+                rigid_np = solver._esp_rigid_positions.numpy().astype(float)
+                energy, fp, hp, fb, hb = evaluate_blocks(solver, state)
+
+                reference = partial(normalized_reference_energy, model, solver, row, shape, sample_count=2)
+
+                center_energy = reference(soft_np, rigid_np)
+                np.testing.assert_allclose(energy.sum(), center_energy, rtol=2e-6)
+                # Motion normal to the two edges changes both rows' weights.
+                step = 1e-6
+                plus_np, minus_np = soft_np.copy(), soft_np.copy()
+                plus_np[0, 2] += step
+                minus_np[0, 2] -= step
+                ep, em = reference(plus_np, rigid_np), reference(minus_np, rigid_np)
+                np.testing.assert_allclose(-(ep - em) / (2 * step), fp[0, 2], rtol=2e-4)
+                np.testing.assert_allclose((ep - 2 * center_energy + em) / step**2, hp[0, 2, 2], rtol=3e-3)
+
+                body = int(model.shape_body.numpy()[shape])
+                owners_np = model.shape_body.numpy()[solver._esp_data.rigid_vertex_shapes.numpy()]
+                plus_np, minus_np = rigid_np.copy(), rigid_np.copy()
+                plus_np[owners_np == body, 2] += step
+                minus_np[owners_np == body, 2] -= step
+                ep, em = reference(soft_np, plus_np), reference(soft_np, minus_np)
+                np.testing.assert_allclose(-(ep - em) / (2 * step), fb[body, 2], rtol=2e-4)
+                np.testing.assert_allclose((ep - 2 * center_energy + em) / step**2, hb[body, 2, 2], rtol=3e-3)
+
+    @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
+    def test_normalized_detected_row_hessians(self):
+        """Differentiate the complete force with distinct detected VT/TV/EE rows sharing faces."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                model, _pipeline, solver = make_case(device, dynamic=True, grid=True, grid_extent=0.06, gap=0.002)
+                model.particle_radius.fill_(0.1)
+                state = model.state()
+                # Avoid projection ties and nearly parallel edges: lateral offsets
+                # change edge directions without closing the small normal gap.
+                state.particle_q.assign(
+                    state.particle_q.numpy()
+                    + np.random.default_rng(9251).uniform(-1, 1, size=(model.particle_count, 3)).astype(np.float32)
+                    * np.array([0.005, 0.005, 5e-5], dtype=np.float32)
+                )
+                solver.collision_pipeline.collide(state, solver.contacts)
+                solver._refresh_body_particle_contact_state(solver.contacts, True)
+                energy, _fp, hp, _fb, hb = evaluate_blocks(solver, state)
+                self.assertTrue(np.all(energy > 0), "exercise fixed vertices and EE samples")
+                self.assertGreater(np.max(solver._esp_face_sums.weight.numpy()), 4.0)
+                # On CPU .numpy() can share storage: keep the FD center immutable.
+                soft_np, body_np = state.particle_q.numpy().copy(), state.body_q.numpy().copy()
+                # Keep detected rows and neighborhoods fixed; only reevaluate energy derivatives.
+                step = 1e-6
+                for particle in range(model.particle_count):
+                    numeric_np = np.zeros((3, 3))
+                    for axis in range(3):
+                        forces_np = []
+                        positions = []
+                        for sign in (-1, 1):
+                            perturbed_np = soft_np.copy()
+                            perturbed_np[particle, axis] += sign * step
+                            positions.append(float(perturbed_np[particle, axis]))
+                            state.particle_q.assign(perturbed_np)
+                            solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
+                            forces_np.append(solver._esp_particle_forces.numpy()[particle].copy())
+                        numeric_np[:, axis] = -(forces_np[1] - forces_np[0]) / (positions[1] - positions[0])
+                    scale = max(np.abs(numeric_np).max(), 1.0)
+                    np.testing.assert_allclose(hp[particle] / scale, numeric_np / scale, rtol=0, atol=3e-3)
+                state.particle_q.assign(soft_np)
+                for body in range(model.body_count):
+                    # All six gradient components against the three COM translations;
+                    # independent autodiff additionally checks the rotation/rotation block.
+                    numeric_np = np.zeros((6, 3))
+                    for axis in range(3):
+                        forces_np = []
+                        for sign in (-1, 1):
+                            perturbed_np = body_np.copy()
+                            perturbed_np[body, axis] += sign * step
+                            state.body_q.assign(perturbed_np)
+                            solver._accumulate_esp_contacts(state, esp_contact._BODY_BLOCKS)
+                            forces_np.append(solver._esp_body_forces.numpy()[body].copy())
+                        numeric_np[:, axis] = -(forces_np[1] - forces_np[0]) / (2 * step)
+                    scale = max(np.abs(numeric_np).max(), 1.0)
+                    np.testing.assert_allclose(hb[body, :, :3] / scale, numeric_np / scale, rtol=0, atol=3e-3)
+                    state.body_q.assign(body_np)
+                solver.check_esp_contacts()
+
+    @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
+    def test_normalized_gradient_reduction(self):
+        """Preserve concurrent sums through hash collisions and changing counts under graph replay."""
+        for device in wp.get_devices():
+            for dimensions in (3, 6):
+                with self.subTest(device=str(device), dimensions=dimensions), wp.ScopedDevice(device):
+                    gradients = esp_contact.FaceQuadratureGradients()
+                    # Sixteen distinct keys fill the table, forcing linear probing.
+                    # Repeated rows must still find existing keys in a full table.
+                    gradients.keys = wp.full(16, -1, dtype=wp.int64)
+                    gradients.dNdX = wp.zeros((16, dimensions), dtype=float)
+                    gradients.dWdX = wp.zeros((16, dimensions), dtype=float)
+                    gradients.face_area = wp.empty(16, dtype=float)
+                    gradients.block_count = 4
+                    count = wp.full(1, 4096, dtype=int)
+                    error = wp.zeros(1, dtype=int)
+
+                    def evaluate(gradients=gradients, count=count, error=error):
+                        gradients.keys.fill_(-1)
+                        gradients.dNdX.zero_()
+                        gradients.dWdX.zero_()
+                        wp.launch(face_gradient_reduction_probe, dim=4096, inputs=[count], outputs=[gradients, error])
+
+                    evaluate()
+                    graph = None
+                    if device.is_cuda:
+                        with wp.ScopedCapture(device=device) as capture:
+                            evaluate()
+                        graph = capture.graph
+                    for row_count in (4096, 17, 0, 4096):
+                        count.fill_(row_count)
+                        if graph is None:
+                            evaluate()
+                        else:
+                            wp.capture_launch(graph)
+                        self.assertEqual(int(error.numpy()[0]), 0)
+                        keys_np = gradients.keys.numpy()
+                        slots_np = np.flatnonzero(keys_np >= 0)
+                        np.testing.assert_array_equal(np.sort(keys_np[slots_np]), np.arange(min(row_count, 16)))
+                        repeats_np = np.bincount(np.arange(row_count) % 16, minlength=16)[keys_np[slots_np], None]
+                        np.testing.assert_array_equal(
+                            gradients.dNdX.numpy()[slots_np], repeats_np * np.arange(1, dimensions + 1)
+                        )
+                        np.testing.assert_array_equal(
+                            gradients.dWdX.numpy()[slots_np], repeats_np * np.array([0, 1, -1, 2, 0, -2])[:dimensions]
+                        )
+                        np.testing.assert_array_equal(gradients.face_area.numpy()[slots_np], keys_np[slots_np] // 4 + 1)
+
+    @unittest.skipUnless(MODE == "normalized", "needs a process compiled for the normalized mode")
+    def test_normalized_gradient_table_overflow(self):
+        """Report a full gradient table instead of silently accepting an incomplete Hessian."""
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)), wp.ScopedDevice(device):
+                _model, solver, state, _row, _shape = make_cross_target_case(device)
+                gradients = solver._esp_face_sums.particle_gradients
+                # A single EE sample already affects several face/block combinations.
+                gradients.keys = wp.full(1, -1, dtype=wp.int64)
+                gradients.dNdX = wp.zeros((1, 3), dtype=float)
+                gradients.dWdX = wp.zeros((1, 3), dtype=float)
+                gradients.face_area = wp.empty(1, dtype=float)
+                solver._esp_face_sums.particle_gradients = gradients
+                solver._accumulate_esp_contacts(state, esp_contact._PARTICLE_BLOCKS)
+                self.assertEqual(int(solver._esp_error.numpy()[0]), 16)
+                with self.assertRaisesRegex(ValueError, "face-gradient table full"):
+                    solver.check_esp_contacts()
 
     @unittest.skipUnless(MODE == "ogc", "needs a process compiled for the OGC mode")
     def test_ogc_ee_rows_native(self):
@@ -556,7 +873,14 @@ class TestEspEeQuadrature(unittest.TestCase):
                 (
                     "normalized",
                     {"NEWTON_ESP_EE_QUADRATURE": "normalized"},
-                    ("test_normalized_energy_and_derivatives", "test_normalized_surface_scale_without_ee"),
+                    (
+                        "test_normalized_energy_and_derivatives",
+                        "test_normalized_surface_scale_without_ee",
+                        "test_normalized_cross_row_hessian",
+                        "test_normalized_detected_row_hessians",
+                        "test_normalized_gradient_reduction",
+                        "test_normalized_gradient_table_overflow",
+                    ),
                 ),
                 ("ogc", {"NEWTON_ESP_EE_QUADRATURE": "ogc"}, ("test_ogc_ee_rows_native",)),
                 (
@@ -565,6 +889,14 @@ class TestEspEeQuadrature(unittest.TestCase):
                     ("test_cubic_window_and_continuation", "test_normalized_energy_and_derivatives"),
                 ),
             ]
+            try:
+                import ipctk  # noqa: F401, PLC0415
+            except ImportError:
+                toolkit_tests = ()
+            else:
+                # Optional dependency, but when available these comparisons must
+                # actually run in both normalized children, not silently skip.
+                toolkit_tests = ("test_normalized_matches_toolkit", "test_normalized_hessians_match_toolkit")
             for mode, overrides, required in runs:
                 with self.subTest(mode=mode):
                     env = os.environ.copy()
@@ -581,7 +913,10 @@ class TestEspEeQuadrature(unittest.TestCase):
                     report = f"{mode} subprocess\nstdout:\n{result.stdout}\nstderr:\n{result.stderr[-8000:]}"
                     self.assertEqual(result.returncode, 0, msg=report)
                     # The mode-gated tests must have run there, not been skipped.
-                    for name in required:
+                    required_tests = required + (
+                        toolkit_tests if overrides["NEWTON_ESP_EE_QUADRATURE"] == "normalized" else ()
+                    )
+                    for name in required_tests:
                         self.assertEqual(verbose_status(result.stderr, name), "ok", msg=report)
 
 

@@ -2494,7 +2494,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._esp_data = esp_contact.create_esp_data(self.model, self.collision_pipeline)
             # Per-face near-field sums; rebuilt before each evaluation by the normalized mode only.
             self._esp_face_sums = (
-                esp_contact.create_face_quadrature_sums(self._esp_data, self.device)
+                esp_contact.create_face_quadrature_sums(self._esp_data, self.model)
                 if esp_contact._EE_QUADRATURE == esp_contact.EE_QUADRATURE_NORMALIZED
                 else None
             )
@@ -2651,7 +2651,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             error = int(self._esp_error.numpy()[0])
             if error:
                 raise ValueError(
-                    f"Invalid ESP contacts (flags={error}: 1=contact overflow, 2=list error, 4=nonfinite, 8=family)"
+                    f"Invalid ESP contacts (flags={error}: 1=contact overflow, 2=list error, 4=nonfinite, "
+                    "8=family, 16=face-gradient table full)"
                 )
 
     def set_rigid_history_update(self, update: bool):

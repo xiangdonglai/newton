@@ -361,6 +361,8 @@ PN = "PN"
 pnd = "pnd"
 
 [tool.typos.default.extend-identifiers]
+# Derivative of the normalized ESP numerator N with respect to X.
+dNdX = "dNdX"
 PNGs = "PNGs"
 Haa = "Haa"
 iy = "iy"

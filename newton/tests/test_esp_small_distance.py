@@ -53,7 +53,7 @@ def make_probe(scalar):
         output[i, 1] = first
         output[i, 2] = second
         output[i, 3] = kernels.barrier_energy(distance * distance, scalar(0.005), scalar(0.00025), False)
-        value = triangle(
+        value, _conservative_gradient = triangle(
             points[i],
             vec3(),
             vec3(0.01, 0.0, 0.0),
