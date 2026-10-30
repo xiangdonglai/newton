@@ -3,6 +3,8 @@
 
 """Check the checkout adapter against the actual solver and collision pipeline."""
 
+import contextlib
+import io
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +14,7 @@ import warp as wp
 
 import newton
 from experiments.collision_benchmark import comparison_runtime as runtime
-from experiments.collision_benchmark.run_solver import load_config
+from experiments.collision_benchmark.run_solver import load_config, parse_arguments
 
 
 class TestNativeSolver(unittest.TestCase):
@@ -20,12 +22,56 @@ class TestNativeSolver(unittest.TestCase):
         self.previous_config = runtime.NATIVE_CONFIG
         self.previous_mode = runtime.MODE
         self.previous_active = runtime.ACTIVE
+        self.previous_contact_policy = runtime.CONTACT_STIFFNESS_POLICY
         runtime.ACTIVE = None
+        runtime.CONTACT_STIFFNESS_POLICY = None
 
     def tearDown(self):
         runtime.NATIVE_CONFIG = self.previous_config
         runtime.MODE = self.previous_mode
         runtime.ACTIVE = self.previous_active
+        runtime.CONTACT_STIFFNESS_POLICY = self.previous_contact_policy
+
+    def test_contact_policy_arguments(self):
+        """Preserve authored defaults and accept only valid optional caps."""
+        self.assertIsNone(parse_arguments(["m3_franka_tote_2_spheres"]).contact_max_ratio)
+        args = parse_arguments(
+            ["m3_franka_tote_2_spheres", "--contact-max-ratio", "2.5", "--contact-tet-policy", "mesh"]
+        )
+        self.assertEqual(args.contact_max_ratio, 2.5)
+        self.assertEqual(args.contact_tet_policy, "mesh")
+        for value in ("nan", "inf", "0", "-1", "10.1"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_arguments(["m3_franka_tote_2_spheres", "--contact-max-ratio=" + value])
+
+    def test_contact_policy_before_native_solver_replacement(self):
+        """Apply the cap through real native solver construction and replacement."""
+        runtime.configure_native(load_config(None))
+        runtime.CONTACT_STIFFNESS_POLICY = {"max_ratio": 3.0, "tet_policy": "numeric"}
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=1800.0,
+            tri_ka=1800.0,
+        )
+        builder.add_ground_plane()
+        builder.color()
+        model = builder.finalize(device="cpu")
+        model.soft_contact_ke = 50000.0
+        model.shape_material_ke.assign(np.full(model.shape_count, 50000.0, dtype=np.float32))
+        scene = SimpleNamespace(solver=runtime.ObservedSolverVBD(model, iterations=1))
+        report = scene.solver.comparison_contact_policy
+        self.assertEqual(report["authored"]["soft_contact_ke"], 50000.0)
+        self.assertEqual(report["effective"]["soft_contact_ke"], 5400.0)
+        np.testing.assert_array_equal(model.shape_material_ke.numpy(), np.full(model.shape_count, 5400.0))
+        self.assertIs(runtime.replace_solver(scene, None).comparison_contact_policy, report)
 
     def test_reject_unsupported_explicit_setting(self):
         """Reject an unknown solver option instead of running with defaults."""

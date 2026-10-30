@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -65,12 +66,18 @@ def parse_arguments(argv=None):
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--contact-max-ratio", type=float, help="Opt-in contact stiffness cap; finite and in (0, 10]")
+    parser.add_argument("--contact-tet-policy", choices=("numeric", "mesh"), default="numeric")
     parser.add_argument(
         "--initial-reference", type=Path, help="Require the initialized model/state to match this results.json"
     )
     args = parser.parse_args(argv)
     if not args.list and args.case is None:
         parser.error("case is required unless --list is used")
+    if args.contact_max_ratio is not None and (
+        not math.isfinite(args.contact_max_ratio) or not 0 < args.contact_max_ratio <= 10
+    ):
+        parser.error("--contact-max-ratio must be finite and in (0, 10]")
     return args
 
 
@@ -138,7 +145,17 @@ def run_selected(spec):
     arguments = [spec["case"], "--mode", "native"]
     if out is not None:
         arguments.extend(["--out", str(out)])
-    for key in ("device", "duration", "hold_seconds", "video_fps", "width", "height", "viewer"):
+    for key in (
+        "device",
+        "duration",
+        "hold_seconds",
+        "video_fps",
+        "width",
+        "height",
+        "viewer",
+        "contact_max_ratio",
+        "contact_tet_policy",
+    ):
         if spec[key] is not None:
             arguments.extend(["--" + key.replace("_", "-"), str(spec[key])])
     if spec["no_video"]:

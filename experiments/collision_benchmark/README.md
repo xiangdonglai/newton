@@ -4,6 +4,25 @@ This copy reuses Anka's 44 scenes, recipes, assets, simulation loop and measurem
 The new entry point selects a Newton checkout and explicit solver settings in a
 fresh process. No core solver code is patched by the runner.
 
+The shared suite is synchronized through Anka's commit `8e904a6cc`
+(contact-stiffness caps and H1 recipe adjustments). Native solver profiles,
+interactive/video controls, and local debugging scenes are retained.
+
+The native entry point also accepts the upstream optional contact-cap flags:
+
+```bash
+uv run --no-sync python -m experiments.collision_benchmark m3_franka_tote_2_spheres \
+  --config experiments/collision_benchmark/configs/full-surface.json \
+  --contact-max-ratio 10 --contact-tet-policy numeric --duration 2
+```
+
+Omit the two contact flags to keep authored stiffness. The cap is independent
+of DAT; it is applied before preparation and solver construction and recorded
+in the results. The tetrahedral `numeric` policy compares coefficient values
+with different units; `mesh` uses the upstream dimensional proxy. See
+[Reduce contact stiffness](#reduce-contact-stiffness) for the precise scope
+and the explicitly recorded cap-10 H1 pose adjustments.
+
 Run one case with this worktree's full BVH DAT:
 
 ```bash
@@ -198,6 +217,69 @@ Manipulation runs retain the measured 60-second hold. A quick setup check can
 use `--duration 1 --no-video`. Such a short run is not a full benchmark result.
 Keep default durations and hold times for full comparisons. Every scene uses
 at most ten substeps. The saved result states the timestep and iteration count.
+
+## Reduce contact stiffness
+
+Use this explicit configuration to cap contact stiffness at ten times the
+declared elasticity reference. The default command without these flags keeps
+the original settings so the published results remain reproducible.
+
+```bash
+uv run --no-sync python -m experiments.collision_benchmark.fast_math \
+  m2_franka_pouch --mode vbd --math off \
+  --contact-max-ratio 10 --contact-tet-policy numeric \
+  --out outputs/contact-cap10/m2_franka_pouch
+```
+
+The cap only lowers values. It applies to `soft_contact_ke` and every
+`shape_material_ke` before preparation and solver construction. Rigid-soft
+contact uses their arithmetic mean, so changing only one side is insufficient.
+Zero coefficients remain zero. Elastic materials, friction, damping, time
+steps, and iteration counts stay unchanged.
+
+The tested cap10/numeric configuration includes two recorded H1 pose corrections.
+The jacket changes only the initial open right-wrist position. Its closed pinch
+and later poses stay unchanged. The H1 towel closes its thumbs slightly further;
+its open start, wrist path, timing, and release commands stay unchanged. Normal
+fresh preparation and every original geometry and joint limit check still run.
+The result identifies these changes in `initial_common_start.recipe_adjustment`.
+Other cap values and commands without a cap keep the original H1 poses.
+These two corrected scenes are not stiffness-only comparisons.
+
+Cloth uses its positive membrane coefficients. Rods use their stretch/shear
+coefficients; bending and robot actuator gains are excluded. Mixed scenes use
+the smallest declared reference because soft contact has one global coefficient.
+The original mesh, including zero-stiffness boundary triangles on tet solids,
+does not change.
+
+Tet elasticity is in Pa, whereas contact stiffness is in N/m. The `numeric`
+option compares parameter numbers and explicitly records this unit difference.
+It is not a physical stiffness ratio. The `mesh` option uses the dimensional
+proxy `min(E) * median(unique rest tet edge length)`, with
+`E = mu * (3 * lambda + 2 * mu) / (lambda + mu)`. This proxy is not an assembled
+nodal stiffness or a proof that a grip will hold.
+
+The result records the policy, reference terms, and original/effective contact
+values in `effective_contact_materials`. H1 preparation uses a separate cache
+for each policy and implementation. Original results and caches remain intact.
+Ratios must be finite, positive, and at most ten. Use a fresh process and output
+folder for each setting. A different policy must not reuse an old initial
+fingerprint as a matched pair.
+
+The cap is a configuration bound. Grip retention must be checked with the
+actual acquisition, full hold, and release. The
+[reduced-stiffness results and videos](https://kanna.ankachen.com/artifacts/newton-contact-stiffness-cap10/index.html)
+cover the nine changed cloth scenes among the 15 previously completed
+standard-VBD/math-off operations. All nine corrected recipes retain through
+the observed 60-second hold. Six solid cases already fall below the numeric
+cap and were not rerun. Prepared pinches do not establish acquisition.
+
+Hold retention is separate from the complete operation. The reduced-stiffness
+Franka dress remains caught during release. The empty tote releases, then falls
+off the table. Large local stretch and static-support overlap also remain in
+some cases. No overall fidelity pass or repeatability guarantee is assigned.
+The report preserves the rejected jacket setup and the towel's original hold
+failure beside the successful pose corrections.
 
 ## Select a scene
 

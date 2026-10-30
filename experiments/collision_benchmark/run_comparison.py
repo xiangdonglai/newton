@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import subprocess
 import time
@@ -23,6 +24,7 @@ import warp as wp
 import newton
 
 from . import comparison_runtime as runtime
+from .contact_stiffness import describe_policy
 
 ROOT = Path(newton.__file__).resolve().parents[1]
 SOLVER_PROVENANCE = None
@@ -106,7 +108,8 @@ def render_scene(scene, viewer):
         viewer.end_frame()
 
 
-def main(argv=None):
+def parse_arguments(argv=None):
+    """Validate run settings before creating outputs or initializing a device."""
     p = argparse.ArgumentParser()
     p.add_argument("case")
     p.add_argument("--mode", choices=["vbd", "alm", "native"], required=True)
@@ -119,7 +122,18 @@ def main(argv=None):
     p.add_argument("--video-fps", type=float, default=10.0)
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
+    p.add_argument("--contact-max-ratio", type=float, help="Opt-in contact stiffness cap; finite and in (0, 10]")
+    p.add_argument("--contact-tet-policy", choices=("numeric", "mesh"), default="numeric")
     args = p.parse_args(argv)
+    if args.contact_max_ratio is not None and (
+        not math.isfinite(args.contact_max_ratio) or not 0 < args.contact_max_ratio <= 10
+    ):
+        p.error("--contact-max-ratio must be finite and in (0, 10]")
+    return args
+
+
+def main(argv=None):
+    args = parse_arguments(argv)
     out = Path(args.out).resolve() if args.out is not None else None
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
@@ -131,6 +145,11 @@ def main(argv=None):
     elif args.mode != "native":
         wp.config.kernel_cache_dir = "/tmp/collision-compare-20261019"
     wp.init()
+    runtime.CONTACT_STIFFNESS_POLICY = (
+        {"max_ratio": args.contact_max_ratio, "tet_policy": args.contact_tet_policy}
+        if args.contact_max_ratio is not None
+        else None
+    )
     runtime.install_patch()
     # Preparation always uses standard elasticity. Treatment begins at the shared task start.
     runtime.MODE = None if args.mode == "native" else False
@@ -150,6 +169,7 @@ def main(argv=None):
         "viewer": args.viewer,
         "contact_options": runtime.CONTACT_OPTIONS if args.mode != "native" else None,
         "solver_provenance": SOLVER_PROVENANCE,
+        "contact_stiffness_policy": describe_policy(runtime.CONTACT_STIFFNESS_POLICY),
         "limits": "unset; no overall fidelity pass",
         "source_sha256": {
             f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in Path(__file__).parent.glob("*.py")
@@ -164,6 +184,10 @@ def main(argv=None):
     pictures = []
     try:
         scene = build_case(args.case, device=args.device, hold_seconds=args.hold_seconds)
+        contact_materials = scene.model.collision_benchmark_contact_policy
+        scene.protocol["contact_stiffness_policy"] = describe_policy(runtime.CONTACT_STIFFNESS_POLICY)
+        scene.protocol["effective_contact_materials"] = contact_materials
+        result["effective_contact_materials"] = contact_materials
         if args.mode == "native" and args.case == "r2_franka_duck":
             from .fast_math.run_fast_math import repair_duck
 
