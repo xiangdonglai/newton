@@ -80,6 +80,19 @@ class TestNativeSolver(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not_a_solver_option"):
             runtime.configure_native(config)
 
+    def test_log_barrier_profiles_preserve_base_settings(self):
+        """Enable only the log barrier while preserving each base profile."""
+        folder = Path(__file__).with_name("configs")
+        for name in ("full-surface", "full-bvh-dat"):
+            with self.subTest(profile=name):
+                expected = load_config(folder / f"{name}.json")
+                self.assertNotIn("rigid_soft_contact_use_log_barrier", expected["solver"])
+                expected["name"] = f"{name}-log-barrier"
+                expected["solver"]["rigid_soft_contact_use_log_barrier"] = True
+                actual = load_config(folder / f"{name}-log-barrier.json")
+                self.assertEqual(actual, expected)
+                runtime.configure_native(actual)
+
     def test_owned_dat_contacts_and_kinematic_body(self):
         """Generate real contacts inside DAT while preserving the prescribed body."""
         wp.init()

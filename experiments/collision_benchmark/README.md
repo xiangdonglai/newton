@@ -52,6 +52,27 @@ settings aligned with `full-bvh-dat.json`. Soft self-contact and its own DAT
 remain enabled; only rigid-soft DAT is disabled. Recording and interactive-viewer
 options work with either profile.
 
+To enable the log-barrier contact force law, select one of these profiles.
+Each retains its corresponding base settings and only enables
+`solver.rigid_soft_contact_use_log_barrier`:
+
+| Configuration | Rigid-soft DAT | Log barrier |
+| --- | --- | --- |
+| `configs/full-surface.json` | Off | Off (solver default) |
+| `configs/full-surface-log-barrier.json` | Off | On |
+| `configs/full-bvh-dat.json` | On, interval arithmetic | Off (solver default) |
+| `configs/full-bvh-dat-log-barrier.json` | On, interval arithmetic | On |
+
+For example:
+
+```bash
+uv run --no-sync python -m experiments.collision_benchmark m3_franka_tote_2_spheres \
+  --config experiments/collision_benchmark/configs/full-bvh-dat-log-barrier.json \
+  --duration 2
+```
+
+The log-barrier profiles do not enable the optional contact-stiffness cap.
+
 For an interactive window on the remote desktop:
 
 ```bash
