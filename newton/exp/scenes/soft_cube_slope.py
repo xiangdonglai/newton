@@ -305,9 +305,7 @@ class SoftCubeSlopeScene(Scene):
         if not self._reported or not self._measurements:
             return
         measurement_time, measured, _ = self._measurements[-1]
-        print(
-            f"[slope] high-friction displacement at comparison t={measurement_time:.3f} s: {measured[2]:.6f} m"
-        )
+        print(f"[slope] high-friction displacement at comparison t={measurement_time:.3f} s: {measured[2]:.6f} m")
         assert measured[0] > measured[1] > measured[2], f"unexpected friction ordering: {measured}"
         assert abs(measured[2]) < 0.02, f"high-friction cube did not remain still: {measured[2]:.6f} m"
 

@@ -199,10 +199,10 @@ def _triangles_overlap_float64_sat(
 @wp.kernel
 def _count_robust_triangle_intersections(
     triangle_bvh: wp.uint64,
-    positions: wp.array(dtype=wp.vec3),
-    triangle_indices: wp.array2d(dtype=wp.int32),
-    intersection_count: wp.array(dtype=wp.int32),
-    first_intersection_pair: wp.array(dtype=wp.int32),
+    positions: wp.array[wp.vec3],
+    triangle_indices: wp.array2d[wp.int32],
+    intersection_count: wp.array[wp.int32],
+    first_intersection_pair: wp.array[wp.int32],
 ):
     triangle = wp.tid()
     a0_index = triangle_indices[triangle, 0]
