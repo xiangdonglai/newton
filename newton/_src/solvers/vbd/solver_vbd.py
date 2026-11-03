@@ -1427,9 +1427,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
             self.body_particle_contact_buffer_pre_alloc = bp_pre_alloc
             # Large cloths need more lanes to accumulate their contacts onto each rigid body.
-            self._body_particle_contact_threads = (
-                128 if self.device.is_cuda and model.particle_count // max(model.body_count, 1) >= 4096 else 4
-            )
+            # self._body_particle_contact_threads = (
+            #     128 if self.device.is_cuda and model.particle_count // max(model.body_count, 1) >= 4096 else 4
+            # )
+            self._body_particle_contact_threads = 128 if self.device.is_cuda else 4
             self.body_particle_contact_counts = wp.zeros(model.body_count, dtype=wp.int32, device=self.device)
             self.body_particle_contact_indices = wp.zeros(
                 model.body_count * bp_pre_alloc, dtype=wp.int32, device=self.device

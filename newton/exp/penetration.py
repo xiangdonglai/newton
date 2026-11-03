@@ -400,6 +400,7 @@ class RigidSoftPenetrationTracker:
         report_interval: int = 600,
         results_path: str | None = None,
         expected_accepted_substeps: int | None = None,
+        collision_schedule: dict | None = None,
     ):
         if report_interval < 0:
             raise ValueError(f"report_interval must be non-negative, got {report_interval}")
@@ -409,6 +410,7 @@ class RigidSoftPenetrationTracker:
         self.report_interval = int(report_interval)
         self.results_path = results_path
         self.expected_accepted_substeps = expected_accepted_substeps
+        self.collision_schedule = collision_schedule
         self.sample_count = 0
         self.accepted_substep_count = 0
         self.total_contact_count = 0
@@ -864,6 +866,7 @@ class RigidSoftPenetrationTracker:
             for _, witness in sorted(self.maximum_raw_depth_by_shape_and_kind.items(), key=lambda item: item[0])
         ]
         return {
+            "collision_schedule": self.collision_schedule,
             "sample_count": self.sample_count,
             "accepted_substep_count": self.accepted_substep_count,
             "expected_accepted_substeps": self.expected_accepted_substeps,

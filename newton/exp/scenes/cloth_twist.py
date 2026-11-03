@@ -372,16 +372,6 @@ class ClothTwistScene(Scene):
     def solver_overrides(self, solver_key):
         if solver_key != "avbd":
             return {}
-        frequency = newton.solvers.SolverBase.CollisionFrequencyType
-        slot = newton.solvers.SolverBase.CollisionSlot
-        rigid_modes = {
-            "auto": frequency.AUTO,
-            "none": frequency.NONE,
-            "pre-init": frequency.PRE_INIT,
-            "pre-post-init": frequency.PRE_POST_INIT,
-            "iterations": frequency.ITERATIONS,
-        }
-        rigid_mode = rigid_modes[self.args.rigid_collision_frequency_type]
         return {
             "particle_enable_self_contact": True,
             "particle_self_contact_margin": _SELF_CONTACT_MARGIN,
@@ -389,13 +379,6 @@ class ClothTwistScene(Scene):
             "particle_topological_contact_filter_threshold": _TOPOLOGICAL_FILTER_THRESHOLD,
             "particle_vertex_contact_buffer_size": 64,
             "particle_edge_contact_buffer_size": 128,
-            # SolverVBD's AUTO self-contact schedule is PRE_POST_INIT. Preserve
-            # that behavior from the original example; rigid DAT, if requested,
-            # still requires both collision families to share one schedule.
-            "collision_frequency_type": {
-                slot.RIGID: rigid_mode,
-                slot.SOFT_SELF_CONTACT: rigid_mode if self.args.dat else frequency.PRE_POST_INIT,
-            },
         }
 
     def home_pose(self):

@@ -422,6 +422,11 @@ class Contacts:
             ``(-1, -1, -1)``. Preserve this geometry when copying contact records,
             independently of contact force eligibility.
 
+            For an inside mesh sample, the force anchor in :attr:`soft_contact_body_pos`
+            lies on the face selected by the mesh's unscaled closest-point query
+            and may not lie on this original candidate primitive. These indices
+            still identify the complete candidate for DAT.
+
             .. experimental::
 
                 Full-surface mesh primitive metadata may change without prior notice.
@@ -432,6 +437,7 @@ class Contacts:
             # Detection reports every feature pair. Force evaluation uses these
             # records and the topology reference to test the current configuration.
             self._soft_contact_mesh_features = None
+            self._soft_contact_mesh_nearest_faces = None
             self._soft_contact_mesh_params = None
             self._soft_contact_mesh_state = None
             self._soft_contact_mesh_data = None

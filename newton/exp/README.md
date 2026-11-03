@@ -16,6 +16,48 @@ For a headless run, use `--viewer null --num-frames 300 --test`.
 CUDA graphs are enabled when supported by the scene; `--no-graph-capture`
 selects eager execution.
 
+This worktree includes the local VBD drive-limit correction: a joint slightly
+outside a limit can still follow a position target strictly back inside its
+limits. The normal CLI uses it automatically; no diagnostic wrapper or extra
+flag is needed. Check it with `python -m unittest newton.exp.test_drive_limit`.
+This does not change the collision schedule or guarantee successful grasping.
+
+For `--solver avbd`, rigid collision detection (including rigid-soft) and soft
+self-contact detection now both default to `pre-post-init`, with or without
+`--dat`. This detects before and after the solver's initialization/prediction
+phase, not after every solver iteration. Newton's library defaults and the
+`proxy` strategy are unchanged.
+
+Use the same explicit setting on both sides of a DAT comparison:
+
+```bash
+# These are the defaults; append --dat only for the DAT run.
+uv run --no-sync python -m newton.exp \
+  --scene pick_avbd_cube --solver avbd --control state_machine --sequence pick \
+  --viewer gl --full-surface --robot-collision-geometry finger-box-to-mesh \
+  --rigid-soft-contact-use-log-barrier \
+  --collision-frequency-type pre-post-init
+```
+
+Use `--collision-frequency-type pre-init` to detect only before initialization,
+or `--collision-frequency-type iterations --collision-frequency 2` to also
+detect every second VBD iteration. Both flags apply to both collision families
+and take precedence over scene schedule overrides, including `cloth_twist`.
+Iteration-time re-detection automatically enables `latest` contact matching to
+carry the in-flight contact state; other modes retain matching off.
+The old `--rigid-collision-frequency-type` and `--rigid-collision-frequency`
+spellings remain aliases, but now also control soft self-contact without DAT.
+`none` requires a scene with self-contact disabled and DAT off.
+
+Explicit `auto` delegates to SolverVBD and **does not guarantee matched
+DAT/non-DAT schedules**. Startup output prints the actual resolved modes,
+iteration frequencies, and whether each collision family is enabled. The same
+information is saved under `collision_schedule` in `--penetration-results` JSON.
+Matching schedules removes a configuration difference; DAT can still change
+trajectories/contact counts, so timing differences need not be truncation alone.
+Older runs used different defaults and should not be treated as matched-schedule
+comparisons without rerunning them.
+
 Available scenes:
 
 | Scene | Solvers | Default sequence |

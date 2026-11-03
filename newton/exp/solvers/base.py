@@ -71,7 +71,7 @@ class SolverStrategy:
         raise NotImplementedError
 
     # -- simulation hooks -------------------------------------------------
-    def make_collision_pipeline(self, model, full_surface=False):
+    def make_collision_pipeline(self, model, full_surface=False, *, contact_matching="disabled"):
         """Build the collision pipeline (IsaacLab uses broad_phase='explicit').
 
         Full-surface contact uses mesh BVH queries;
@@ -81,6 +81,7 @@ class SolverStrategy:
             model,
             broad_phase="explicit",
             enable_rigid_soft_full_surface_contact=full_surface,
+            contact_matching=contact_matching,
         )
 
     def pre_substeps(self, solver, state):

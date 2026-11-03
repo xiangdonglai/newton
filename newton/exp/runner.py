@@ -82,10 +82,6 @@ class Experiment:
                 "non-default --robot-collision-geometry choices require --full-surface "
                 "because their mesh proxies use full-surface rigid-soft contacts"
             )
-        if args.solver == "avbd" and args.rigid_collision_frequency < 1:
-            raise ValueError("--rigid-collision-frequency must be at least 1")
-        if self.dat and args.rigid_collision_frequency_type == "none":
-            raise ValueError("--dat requires an active rigid collision schedule")
         self.sim_time = 0.0
         self.use_graph = bool(args.graph_capture and self.scene.supports_graph_capture)
         if args.graph_capture and not self.scene.supports_graph_capture:
@@ -190,6 +186,7 @@ class Experiment:
                 report_interval=args.penetration_report_interval,
                 results_path=args.penetration_results,
                 expected_accepted_substeps=expected_accepted_substeps,
+                collision_schedule=getattr(self.strategy, "collision_schedule", None),
             )
             self.penetration_tracker.sample(self.state_0, time=0.0, accepted_substep_count=0)
         self.capture()

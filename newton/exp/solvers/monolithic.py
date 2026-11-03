@@ -97,6 +97,14 @@ class MonolithicAvbdStrategy(SolverStrategy):
         newton.eval_fk(model, model.joint_q, model.joint_qd, model)
         self._robot_joints = handles.robot_joints
 
+    def make_collision_pipeline(self, model, full_surface=False):
+        # Iteration-time re-detection must carry the in-flight contact state.
+        return super().make_collision_pipeline(
+            model,
+            full_surface=full_surface,
+            contact_matching="latest" if self.args.collision_frequency_type == "iterations" else "disabled",
+        )
+
     def build_solver(self, model, handles, args, pipeline=None):
         # Strategy defaults are the shirt_pick values; scenes override the
         # solver-specific pieces (e.g. self-contact radii/buffers for the
@@ -109,15 +117,10 @@ class MonolithicAvbdStrategy(SolverStrategy):
             "pre-post-init": frequency.PRE_POST_INIT,
             "iterations": frequency.ITERATIONS,
         }
-        rigid_collision_frequency_type = frequency_types[args.rigid_collision_frequency_type]
-        rigid_collision_frequency = int(args.rigid_collision_frequency)
-        soft_self_collision_frequency_type = frequency.PRE_INIT
-        soft_self_collision_frequency = 1
-        if args.dat:
-            # Both DAT families write particle displacements relative to the same
-            # detection reference, so their schedules must be identical.
-            soft_self_collision_frequency_type = rigid_collision_frequency_type
-            soft_self_collision_frequency = rigid_collision_frequency
+        collision_frequency_type = frequency_types[args.collision_frequency_type]
+        collision_frequency = int(args.collision_frequency)
+        if collision_frequency < 1:
+            raise ValueError("--collision-frequency must be at least 1")
         vbd_kwargs = {
             "iterations": int(args.vbd_iterations),
             "integrate_with_external_rigid_solver": False,
@@ -129,14 +132,6 @@ class MonolithicAvbdStrategy(SolverStrategy):
             "particle_vertex_contact_buffer_size": 16,
             "particle_edge_contact_buffer_size": 20,
             "collision_pipeline": pipeline,
-            "collision_frequency": {
-                newton.solvers.SolverBase.CollisionSlot.RIGID: rigid_collision_frequency,
-                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: soft_self_collision_frequency,
-            },
-            "collision_frequency_type": {
-                newton.solvers.SolverBase.CollisionSlot.RIGID: rigid_collision_frequency_type,
-                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: soft_self_collision_frequency_type,
-            },
             "rigid_contact_k_start": 1.0e2,
             "rigid_compliant_alm": False,
             "rigid_soft_contact_use_log_barrier": bool(args.rigid_soft_contact_use_log_barrier),
@@ -162,7 +157,37 @@ class MonolithicAvbdStrategy(SolverStrategy):
             # collision pipeline's contact margin (base.py uses the 0.01 default).
             vbd_kwargs["rigid_soft_enable_dat"] = True
         vbd_kwargs.update(self.scene_solver_overrides())  # scene overrides win
+        # Schedules belong to the CLI, not scene tuning. Keep detection schedules
+        # matched across --dat toggles (and DAT's shared motion reference valid).
+        slot = newton.solvers.SolverBase.CollisionSlot
+        slots = (slot.RIGID, slot.SOFT_SELF_CONTACT)
+        vbd_kwargs["collision_frequency"] = dict.fromkeys(slots, collision_frequency)
+        vbd_kwargs["collision_frequency_type"] = dict.fromkeys(slots, collision_frequency_type)
+        if collision_frequency_type == frequency.NONE and (
+            vbd_kwargs.get("rigid_soft_enable_dat", False) or vbd_kwargs["particle_enable_self_contact"]
+        ):
+            raise ValueError("--collision-frequency-type none requires self-contact disabled and --dat off")
         self.solver = SolverVBD(model=model, **vbd_kwargs)
+        # Read the effective values from SolverVBD, including its AUTO resolver.
+        # Keep this snapshot for startup logs and penetration-result metadata.
+        self.collision_schedule = {}
+        for collision_slot in slots:
+            resolved_type = self.solver._resolved_collision_frequency_type(collision_slot)
+            enabled = pipeline is not None if collision_slot == slot.RIGID else self.solver.particle_enable_self_contact
+            self.collision_schedule[collision_slot.name.lower()] = {
+                "requested_type": self.solver.collision_frequency_type[collision_slot].name.lower().replace("_", "-"),
+                "resolved_type": resolved_type.name.lower().replace("_", "-"),
+                "frequency": self.solver.collision_frequency[collision_slot],
+                "enabled": enabled and resolved_type != frequency.NONE,
+            }
+        for name, schedule in self.collision_schedule.items():
+            print(
+                f"[collision] {name}: {schedule['requested_type']} -> {schedule['resolved_type']}, "
+                f"k={schedule['frequency']}, enabled={schedule['enabled']}",
+                flush=True,
+            )
+        if collision_frequency_type == frequency.AUTO:
+            print("[collision] AUTO uses solver defaults; DAT/non-DAT schedules may differ", flush=True)
         # NOTE: IsaacLab's NewtonVBDManager does NOT change joint constraint mode,
         # so joints stay in the default hard (augmented-Lagrangian) mode. Forcing
         # soft penalty-only constraints (set_joint_constraint_mode hard=False) is
@@ -232,17 +257,21 @@ class MonolithicAvbdStrategy(SolverStrategy):
             "--no-rigid-dat-interval-arithmetic to use sampling and bisection only.",
         )
         parser.add_argument(
+            "--collision-frequency-type",
             "--rigid-collision-frequency-type",
             choices=("auto", "none", "pre-init", "pre-post-init", "iterations"),
-            default="auto",
-            help="Unified SolverVBD rigid collision schedule, covering both rigid-rigid and rigid-soft "
-            "detection. PRE_INIT detects before initialization; PRE_POST_INIT also detects afterward; "
-            "ITERATIONS re-detects within VBD iterations.",
+            default="pre-post-init",
+            help="Shared SolverVBD schedule for rigid (rigid-rigid/rigid-soft) and soft self-contact detection, "
+            "independent of --dat. Default: pre-post-init. PRE_INIT detects before initialization; "
+            "PRE_POST_INIT also detects afterward; ITERATIONS re-detects within VBD iterations. "
+            "AUTO delegates to solver defaults and may differ with DAT. NONE requires self-contact "
+            "disabled and --dat off. The legacy --rigid-* alias now controls both collision families.",
         )
         parser.add_argument(
+            "--collision-frequency",
             "--rigid-collision-frequency",
             type=int,
             default=1,
-            help="Frequency k for an ITERATIONS rigid collision schedule (detect every k-th VBD "
-            "iteration). Ignored by the other schedule types.",
+            help="Shared frequency k for ITERATIONS (detect every k-th VBD iteration; positive, default 1). "
+            "Ignored by the other schedule types. The legacy --rigid-* alias controls both families.",
         )

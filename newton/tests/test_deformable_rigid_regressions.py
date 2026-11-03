@@ -14,6 +14,7 @@ import warp as wp
 import newton
 import newton.solvers
 from newton._src.geometry import soft_contacts_mesh
+from newton._src.geometry.flags import MeshProperties
 from newton._src.geometry.sdf_texture import SLOT_LINEAR, TextureSDFData
 from newton._src.geometry.soft_contacts_sdf import (
     _closest_edge_plane,
@@ -161,6 +162,8 @@ def test_soft_contact_workspace_storage(test, device):
     test.assertIsNotNone(pipeline._soft_mesh_contact_data)
     contacts = pipeline.contacts()
     test.assertEqual(contacts._soft_contact_mesh_features.size, contacts.soft_contact_max)
+    test.assertEqual(contacts._soft_contact_mesh_nearest_faces.size, contacts.soft_contact_max)
+    test.assertIsNone(contacts._soft_contact_mesh_nearest_faces.grad)
     test.assertFalse(hasattr(pipeline._soft_mesh_contact_data, "candidates"))
     # Exercise the counter bound without allocating billions of candidate records.
     oversized = mock.MagicMock()
@@ -992,6 +995,7 @@ def test_mesh_force_mask_preserves_detection(test, device):
         "soft_contact_body_vel",
         "soft_contact_normal",
         "_soft_contact_mesh_features",
+        "_soft_contact_mesh_nearest_faces",
         "_soft_contact_mesh_params",
     )
     count = int(contacts.soft_contact_count.numpy()[0])
@@ -1061,19 +1065,25 @@ def test_mesh_force_mask_preserves_geometry_gradients(test, device):
     pipeline = newton.CollisionPipeline(
         model, enable_rigid_soft_full_surface_contact=True, soft_contact_gap=0.02, soft_contact_max=128
     )
-    gradients = []
-    for filtered in (False, True):
-        state, contacts = model.state(), pipeline.contacts()
-        with wp.Tape() as tape:
-            pipeline.collide(state, contacts)
-        if filtered:
-            evaluate_soft_contact_force_mask(model, state, contacts)
-        # All raw geometry remains differentiable, including rows rejected for OGC forces.
-        seed = wp.ones(contacts.soft_contact_max, dtype=wp.vec3, device=device)
-        tape.backward(grads={contacts.soft_contact_body_pos: seed})
-        gradients.append(state.particle_q.grad.numpy().copy())
-    test.assertGreater(np.linalg.norm(gradients[0]), 1.0)
-    np.testing.assert_allclose(gradients[1], gradients[0], atol=1.0e-6)
+    for z in (0.055, 0.045):
+        gradients = []
+        for filtered in (False, True):
+            state, contacts = model.state(), pipeline.contacts()
+            state.particle_q.assign(np.array([(0.02, 0.01, z)], dtype=np.float32))
+            with wp.Tape() as tape:
+                pipeline.collide(state, contacts)
+            if filtered:
+                evaluate_soft_contact_force_mask(model, state, contacts)
+            # All raw geometry remains differentiable, including rejected rows.
+            seed = wp.ones(contacts.soft_contact_max, dtype=wp.vec3, device=device)
+            tape.backward(grads={contacts.soft_contact_body_pos: seed})
+            gradients.append(state.particle_q.grad.numpy().copy())
+        test.assertGreater(np.linalg.norm(gradients[0]), 1.0)
+        np.testing.assert_allclose(gradients[1], gradients[0], atol=1.0e-6)
+        if z < 0.05:
+            # Each recovery anchor is (x, y, box_top), independently of its original candidate face.
+            count = int(contacts.soft_contact_count.numpy()[0])
+            np.testing.assert_allclose(gradients[0], [[count, count, 0.0]], atol=1.0e-5)
 
 
 def test_mesh_force_mask_keeps_non_mesh_contacts(test, device):
@@ -1937,6 +1947,8 @@ def test_mesh_vertex_fallback_sign(test, device):
     penalty = wp.full(contacts.soft_contact_max, 1000.0, device=device)
     zero_material = wp.zeros(contacts.soft_contact_max, device=device)
     query_results = wp.empty(2, dtype=wp.int32, device=device)
+    query_faces = wp.empty(1, dtype=int, device=device)
+    query_anchors = wp.empty(1, dtype=wp.vec3, device=device)
     wp.launch(
         _mesh_nearest_query_results,
         dim=1,
@@ -1985,7 +1997,7 @@ def test_mesh_vertex_fallback_sign(test, device):
     if device.is_cuda:
         with wp.ScopedCapture(device=device) as capture:
             detect_and_evaluate()
-    for z, inside, expected_force in ((0.095, True, 15.0), (0.105, False, 5.0), (0.095, True, 15.0)):
+    for z, inside in ((0.095, True), (0.105, False), (0.095, True)):
         with test.subTest(z=z, inside=inside):
             state.particle_q.assign(np.array([(0.25, 0.02, z)], dtype=np.float32))
             if device.is_cuda:
@@ -2002,11 +2014,37 @@ def test_mesh_vertex_fallback_sign(test, device):
                 (features_np[ordinary] & int(soft_contacts_mesh._MESH_FEATURE_INSIDE)) != 0, inside
             )
             test.assertTrue(np.all(contacts.soft_contact_rigid_indices.numpy()[ordinary] >= 0))
-            selected = ordinary[mask.numpy()[ordinary]]
+            selected = np.flatnonzero(mask.numpy()[:count])
             test.assertEqual(len(selected), 1)
-            np.testing.assert_allclose(contacts.soft_contact_normal.numpy()[selected[0]], (0.0, 0.0, 1.0), atol=3.0e-4)
+            # Direct reuse follows Warp's sliver exclusions: the inside query
+            # selects the +x end face, not a skipped side face near this particle.
+            test.assertEqual(bool(recovery_np[selected[0]]), inside)
+            expected_normal = np.array((0.0, 0.0, 1.0))
+            expected_force = np.array((0.0, 0.0, 5.0))
+            if inside:
+                wp.launch(
+                    _mesh_query_face_reference,
+                    dim=1,
+                    inputs=[
+                        int(model.shape_source_ptr.numpy()[0]),
+                        int(model._shape_mesh_properties.numpy()[0]),
+                        wp.vec3(1.0, 1.0e6, 1.0e6),
+                        state.particle_q,
+                    ],
+                    outputs=[query_faces, query_anchors],
+                    device=device,
+                )
+                test.assertEqual(contacts._soft_contact_mesh_nearest_faces.numpy()[selected[0]], query_faces.numpy()[0])
+                anchor_np = query_anchors.numpy()[0]
+                test.assertAlmostEqual(float(anchor_np[0]), 1.0)
+                np.testing.assert_allclose(contacts.soft_contact_body_pos.numpy()[selected[0]], anchor_np, atol=1.0e-7)
+                delta_np = anchor_np - state.particle_q.numpy()[0]
+                distance = np.linalg.norm(delta_np)
+                expected_normal = delta_np / distance
+                expected_force = 1000.0 * (distance + 0.01) * expected_normal
+            np.testing.assert_allclose(contacts.soft_contact_normal.numpy()[selected[0]], expected_normal, atol=3.0e-4)
             # The observable stores the rigid reaction; negate it for the soft force.
-            np.testing.assert_allclose(-forces.numpy()[selected[0], :3], (0.0, 0.0, expected_force), atol=5.0e-3)
+            np.testing.assert_allclose(-forces.numpy()[selected[0], :3], expected_force, atol=5.0e-3)
 
 
 def test_mesh_complete_bvh_query_coverage(test, device):
@@ -2154,8 +2192,575 @@ def test_mesh_complete_bvh_query_coverage(test, device):
     np.testing.assert_array_equal(contacts._soft_contact_mesh_features.numpy()[:count], features_np)
 
 
+def test_mesh_inside_recovery_scaled_frames_and_velocity(test, device):
+    """Reuse the unscaled query face while transforming its anchor and material velocity."""
+    for x_scale in (0.01, -0.01):
+        scale = wp.vec3(x_scale, 0.04, 0.02)
+        X_wb = wp.transform(wp.vec3(0.4, -0.3, 0.2), wp.quat_from_axis_angle(wp.normalize(wp.vec3(2, 3, 5)), 0.7))
+        X_bs = wp.transform(wp.vec3(0.02, 0.03, -0.01), wp.quat_from_axis_angle(wp.vec3(0, 1, 0), 0.4))
+        X_ws = X_wb * X_bs
+        point = wp.vec3(0.008, 0.037, 0.017)
+        # Mesh coordinates are (+/-0.8, 0.925, 0.85), so the query selects +y.
+        # Physical-distance refinement would select +x; it must not run here.
+        surface = wp.vec3(0.008, 0.04, 0.017)
+        builder = newton.ModelBuilder(gravity=wp.vec3())
+        body = builder.add_body(xform=X_wb)
+        box = newton.Mesh.create_box(1.0, compute_inertia=False)
+        # Warp skips zero-area triangles with nonzero collinear edges. Its query
+        # does not reliably exclude fully coincident vertices (0/0 sliver ratio).
+        # This path intentionally inherits the query's geometry policy.
+        vertex_count = len(box.vertices)
+        degenerate_np = np.asarray(point) / np.asarray(scale) + np.array(
+            [[-0.01, 0.0, 0.0], [0.0, 0.0, 0.0], [0.01, 0.0, 0.0]], dtype=np.float32
+        )
+        mesh = newton.Mesh(
+            np.vstack((box.vertices, degenerate_np)),
+            np.concatenate((box.indices, np.arange(vertex_count, vertex_count + 3))),
+            compute_inertia=False,
+        )
+        builder.add_shape_mesh(body, xform=X_bs, mesh=mesh, scale=scale)
+        builder.add_particle(wp.transform_point(X_ws, point), wp.vec3(), mass=1.0, radius=0.005)
+        model = builder.finalize(device=device)
+        # A linear field makes the velocity check sensitive to the chosen anchor.
+        velocity_offset = wp.vec3(0.3, -0.2, 0.1)
+        mesh.mesh.velocities.assign(0.2 * np.asarray(mesh.vertices) + np.asarray(velocity_offset))
+        state = model.state()
+        pipeline = newton.CollisionPipeline(
+            model,
+            enable_rigid_soft_full_surface_contact=True,
+            soft_contact_gap=0.1,
+            soft_contact_max=32,
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        count = int(contacts.soft_contact_count.numpy()[0])
+        test.assertGreater(count, 1)
+        expected_anchor = np.asarray(wp.transform_point(X_bs, surface))
+        expected_velocity = np.asarray(wp.transform_vector(X_bs, 0.2 * surface + wp.cw_mul(scale, velocity_offset)))
+        expected_normal = np.asarray(wp.transform_vector(X_ws, wp.vec3(0, 1, 0)))
+        np.testing.assert_allclose(
+            contacts.soft_contact_body_pos.numpy()[:count], np.tile(expected_anchor, (count, 1)), atol=1.0e-7
+        )
+        np.testing.assert_allclose(
+            contacts.soft_contact_body_vel.numpy()[:count], np.tile(expected_velocity, (count, 1)), atol=1.0e-7
+        )
+        np.testing.assert_allclose(
+            # World-coordinate subtraction resolves a 3 mm gap at a 0.4 m translation.
+            contacts.soft_contact_normal.numpy()[:count],
+            np.tile(expected_normal, (count, 1)),
+            atol=5.0e-5,
+        )
+        test.assertEqual(np.count_nonzero(evaluate_soft_contact_force_mask(model, state, contacts).numpy()[:count]), 1)
+
+
+@wp.kernel(enable_backward=False)
+def _mesh_query_face_reference(
+    mesh: wp.uint64,
+    mesh_properties: int,
+    scale: wp.vec3,
+    points: wp.array[wp.vec3],
+    result: wp.array[int],
+    anchor: wp.array[wp.vec3],
+):
+    """Query Warp directly to check production face reuse and its tie/sliver policy."""
+    tid = wp.tid()
+    point = wp.cw_div(points[tid], scale)
+    if mesh_properties & MeshProperties.WATERTIGHT:
+        query = wp.mesh_query_point_sign_parity(mesh, point, 1.0e6)
+    else:
+        query = wp.mesh_query_point_sign_normal(mesh, point, 1.0e6)
+    result[tid] = wp.where(query.result, query.face, -1)
+    if query.result:
+        a = wp.cw_mul(wp.mesh_get_point(mesh, 3 * query.face), scale)
+        b = wp.cw_mul(wp.mesh_get_point(mesh, 3 * query.face + 1), scale)
+        c = wp.cw_mul(wp.mesh_get_point(mesh, 3 * query.face + 2), scale)
+        surface, _bary, _feature = soft_contacts_mesh.triangle_closest_point(a, b, c, points[tid])
+        anchor[tid] = surface
+
+
+def test_mesh_nearest_face_cache_replay(test, device):
+    """Reuse Warp's VT face selection, overwrite it on replay and filter at current poses."""
+    for half_width, mesh_properties in (
+        (1.0, int(MeshProperties.WATERTIGHT)),
+        (1.0e-7, int(MeshProperties.WATERTIGHT)),
+        (1.0, 0),
+    ):
+        builder = newton.ModelBuilder(gravity=wp.vec3())
+        mesh = newton.Mesh.create_box(1.0, half_width, half_width, compute_inertia=False)
+        builder.add_shape_mesh(-1, mesh=mesh)
+        # Three query warps span two launch blocks, including a partial block.
+        # Mixed signs below must not leak between query groups.
+        for _ in range(3):
+            builder.add_particle(wp.vec3(), wp.vec3(), mass=1.0, radius=0.01)
+        model = builder.finalize(device=device)
+        model._shape_mesh_properties.fill_(mesh_properties)
+        pipeline = newton.CollisionPipeline(
+            model, enable_rigid_soft_full_surface_contact=True, soft_contact_gap=2.1, soft_contact_max=64
+        )
+        state, contacts = model.state(), pipeline.contacts()
+        nearest = wp.empty(3, dtype=int, device=device)
+        anchor = wp.empty(3, dtype=wp.vec3, device=device)
+        pipeline.collide(state, contacts)
+        if device.is_cuda:
+            with wp.ScopedCapture(device=device) as capture:
+                pipeline.collide(state, contacts)
+        # The center is equidistant from several faces. The thin box has faces
+        # skipped by sign queries: reuse their answer rather than override it.
+        for coordinates in ((0, 0, 0), (0.25, 0.2, 0.95), (0.25, 0.2, 1.05), (0.25, 0.2, -0.95)):
+            points_np = np.array([coordinates, (-0.25, 0.2, -0.95), (0.25, 0.2, 1.05)], dtype=np.float32) * np.array(
+                [1.0, half_width, half_width], dtype=np.float32
+            )
+            state.particle_q.assign(points_np)
+            # Poison all slots, including those used by the preceding detection.
+            contacts._soft_contact_mesh_nearest_faces.fill_(-123)
+            if device.is_cuda:
+                wp.capture_launch(capture.graph)
+            else:
+                pipeline.collide(state, contacts)
+            count = int(contacts.soft_contact_count.numpy()[0])
+            test.assertGreater(count, 1)
+            features_np = contacts._soft_contact_mesh_features.numpy()[:count]
+            flags_np = features_np[:, 0]
+            particles_np = features_np[:, 1]
+            inside_np = (flags_np & int(soft_contacts_mesh._MESH_FEATURE_INSIDE)) != 0
+            nearest_faces_np = contacts._soft_contact_mesh_nearest_faces.numpy()[:count]
+            test.assertTrue(np.all(nearest_faces_np[~inside_np] == -1))
+            wp.launch(
+                _mesh_query_face_reference,
+                dim=3,
+                inputs=[mesh.mesh.id, mesh_properties, wp.vec3(1.0), state.particle_q],
+                outputs=[nearest, anchor],
+                device=device,
+            )
+            nearest_np = nearest.numpy().copy()
+            np.testing.assert_array_equal(nearest_faces_np[inside_np], nearest_np[particles_np[inside_np]])
+            np.testing.assert_allclose(
+                contacts.soft_contact_body_pos.numpy()[:count][inside_np],
+                anchor.numpy()[particles_np[inside_np]],
+                atol=1.0e-8,
+            )
+            mask_np = evaluate_soft_contact_force_mask(model, state, contacts).numpy()[:count]
+            for particle, expected_inside in enumerate((abs(coordinates[2]) < 1.0, True, False)):
+                rows_np = particles_np == particle
+                test.assertGreater(np.count_nonzero(rows_np), 1)
+                np.testing.assert_array_equal(inside_np[rows_np], expected_inside)
+                if expected_inside:
+                    test.assertEqual(np.count_nonzero(mask_np & rows_np), 1)
+                    test.assertEqual(features_np[mask_np & rows_np, 2], nearest_np[particle])
+
+        # Keep old detection rows, move particles to another nearest face, and
+        # verify ownership uses the current pose, not the cached face IDs.
+        if half_width == 1.0:
+            cached_faces_np = contacts._soft_contact_mesh_nearest_faces.numpy().copy()
+            state.particle_q.assign(np.array([(0.95, 0.2, 0.25)] * 3, dtype=np.float32))
+            wp.launch(
+                _mesh_query_face_reference,
+                dim=3,
+                inputs=[mesh.mesh.id, mesh_properties, wp.vec3(1.0), state.particle_q],
+                outputs=[nearest, anchor],
+                device=device,
+            )
+            mask_np = evaluate_soft_contact_force_mask(model, state, contacts).numpy()[:count]
+            current_nearest_np = nearest.numpy()
+            for particle in (0, 1):
+                rows_np = particles_np == particle
+                test.assertEqual(np.count_nonzero(mask_np & rows_np), 1)
+                test.assertEqual(features_np[mask_np & rows_np, 2], current_nearest_np[particle])
+                test.assertNotEqual(nearest_np[particle], current_nearest_np[particle])
+            np.testing.assert_array_equal(contacts._soft_contact_mesh_nearest_faces.numpy(), cached_faces_np)
+
+
+def test_mesh_inside_feature_depth_uses_nearest_surface(test, device):
+    """Recover inside VT/TV/EE samples without signing distant feature distances."""
+
+    # This small rotation takes the projection of the +++ rigid corner from
+    # 0.1 mm outside to 0.1 mm inside, while its vertex distance stays 10 mm.
+    # Unlike existing deep-recovery tests, all candidates are in the narrow band.
+    def triangle(slope):
+        normal_np = np.array([slope, 1.0, 0.01])
+        normal_np /= np.linalg.norm(normal_np)
+        center_np = np.full(3, 0.01) - 0.01 * normal_np
+        u_np = np.cross(normal_np, [0.0, 0.0, 1.0])
+        u_np /= np.linalg.norm(u_np)
+        v_np = np.cross(normal_np, u_np)
+        return np.array(
+            [
+                center_np + 0.004 * u_np,
+                center_np - 0.002 * u_np + 0.004 * v_np,
+                center_np - 0.002 * u_np - 0.004 * v_np,
+            ],
+            dtype=np.float32,
+        )
+
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_mesh(body=-1, mesh=newton.Mesh.create_box(0.01, compute_inertia=False))
+    builder.add_cloth_mesh(
+        pos=wp.vec3(),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(),
+        vertices=triangle(-0.01),
+        indices=[0, 1, 2],
+        density=1.0,
+        particle_radius=0.005,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 100.0
+    model.soft_contact_kd = 0.0
+    model.soft_contact_mu = 0.0
+    model.shape_material_ke.fill_(100.0)
+    model.shape_material_kd.zero_()
+    model.shape_material_mu.zero_()
+    pipeline = newton.CollisionPipeline(
+        model,
+        enable_rigid_soft_full_surface_contact=True,
+        soft_contact_gap=0.01,
+        soft_contact_max=256,
+    )
+    solver = newton.solvers.SolverVBD(
+        model,
+        collision_pipeline=pipeline,
+        rigid_soft_contact_use_log_barrier=True,
+    )
+    state, contacts = model.state(), solver.contacts
+    forces = wp.zeros(contacts.soft_contact_max, dtype=wp.spatial_vector, device=device)
+    mask = wp.empty(contacts.soft_contact_max, dtype=bool, device=device)
+
+    def detect_and_evaluate():
+        solver.particle_q_prev.assign(state.particle_q)
+        pipeline.collide(state, contacts)
+        solver._refresh_body_particle_contact_state(contacts, refresh=True)
+        solver.body_particle_contact_penalty_k.fill_(100.0)
+        solver._export_body_particle_contact_forces(state, state, contacts, 1.0 / 600.0, forces)
+        evaluate_soft_contact_force_mask(model, state, contacts, out=mask)
+
+    detect_and_evaluate()
+    if device.is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            detect_and_evaluate()
+    for slope in (-0.01, 0.01, -0.01):
+        state.particle_q.assign(triangle(slope))
+        if device.is_cuda:
+            wp.capture_launch(capture.graph)
+        else:
+            detect_and_evaluate()
+        count = int(contacts.soft_contact_count.numpy()[0])
+        features_np = contacts._soft_contact_mesh_features.numpy()[:count]
+        indices_np = contacts.soft_contact_indices.numpy()[:count]
+        rigid_indices_np = contacts.soft_contact_rigid_indices.numpy()[:count]
+        bary_np = contacts.soft_contact_barycentric.numpy()[:count]
+        points_np = np.sum(bary_np[:, :, None] * state.particle_q.numpy()[np.maximum(indices_np, 0)], axis=1)
+        anchors_np = contacts.soft_contact_body_pos.numpy()[:count]
+        normals_np = contacts.soft_contact_normal.numpy()[:count]
+        distances_np = np.sum(normals_np * (points_np - anchors_np), axis=1)
+        inside_np = (features_np[:, 0] & int(soft_contacts_mesh._MESH_FEATURE_INSIDE)) != 0
+        nearest_faces_np = contacts._soft_contact_mesh_nearest_faces.numpy()[:count]
+        test.assertTrue(np.all(nearest_faces_np[inside_np] >= 0))
+        test.assertTrue(np.all(nearest_faces_np[~inside_np] == -1))
+        families_np = features_np[:, 0] & int(soft_contacts_mesh._MESH_FEATURE_FAMILY_MASK)
+        ordinary_np = (features_np[:, 0] & int(soft_contacts_mesh._MESH_FEATURE_RECOVERY)) == 0
+        vertex_table_np = contacts._soft_contact_mesh_data.rigid_features[0].numpy()
+        edge_table_np = contacts._soft_contact_mesh_data.rigid_features[2].numpy()
+        # Original full primitives, not the recovery anchor, must remain available to DAT.
+        for family, width in ((0, 3), (1, 1), (2, 2)):
+            selected_np = ordinary_np & (families_np == family)
+            test.assertTrue(np.any(selected_np))
+            test.assertTrue(np.all(np.sum(rigid_indices_np[selected_np] >= 0, axis=1) == width))
+            feature_ids_np = features_np[selected_np, 2]
+            expected_indices_np = np.full((len(feature_ids_np), 3), -1, dtype=np.int32)
+            if family == 0:
+                expected_indices_np[:] = 3 * feature_ids_np[:, None] + np.arange(3)
+            elif family == 1:
+                expected_indices_np[:, 0] = vertex_table_np[feature_ids_np, 1]
+            else:
+                expected_indices_np[:, :2] = edge_table_np[feature_ids_np, 1:]
+            np.testing.assert_array_equal(rigid_indices_np[selected_np], expected_indices_np)
+        expected_np = np.max(np.abs(points_np[inside_np]), axis=1) - 0.01
+        np.testing.assert_allclose(distances_np[inside_np], expected_np, atol=3.0e-8)
+        np.testing.assert_allclose(
+            np.linalg.norm(points_np[inside_np] - anchors_np[inside_np], axis=1), np.abs(expected_np), atol=3.0e-8
+        )
+        # A rigid corner projecting into the face interior remains a recovery sample.
+        mesh = model.shape_source[0]
+        vertex_positions_np = np.asarray(mesh.vertices)[np.asarray(mesh.indices)[vertex_table_np[:, 1]]]
+        corner = np.flatnonzero(np.all(np.isclose(vertex_positions_np, [0.01] * 3), axis=1))
+        rows = np.flatnonzero((families_np == 1) & np.isin(features_np[:, 2], corner))
+        test.assertEqual(len(rows), 1)
+        row = rows[0]
+        test.assertTrue(mask.numpy()[row])
+        force_np = -forces.numpy()[row, :3]
+        if slope < 0.0:
+            np.testing.assert_array_equal(force_np, 0.0)
+            test.assertGreater(distances_np[row], 0.009)
+        else:
+            test.assertGreater(np.dot(force_np, normals_np[row]), 0.0)
+            test.assertLess(np.linalg.norm(force_np), 1000.0)
+            # Check the unchanged continued barrier law, not a clipped-force bound alone.
+            expected_force = 100.0 * 0.0025**2 * (2.0e-5 - distances_np[row]) / 1.0e-10
+            np.testing.assert_allclose(force_np, expected_force * normals_np[row], rtol=2.0e-5, atol=1.0e-5)
+            # +x and +z are equally near for this symmetric projection.
+            test.assertAlmostEqual(float(normals_np[row, 0] + normals_np[row, 2]), 1.0, places=5)
+            test.assertAlmostEqual(float(normals_np[row, 1]), 0.0, places=5)
+        # Many ordinary VT rows may describe one vertex; only one recovery force is needed.
+        for particle in np.unique(indices_np[(families_np == 0) & inside_np, 0]):
+            rows = (families_np == 0) & inside_np & (indices_np[:, 0] == particle)
+            test.assertEqual(np.count_nonzero(mask.numpy()[:count][rows]), 1)
+
+
+@wp.kernel(enable_backward=False)
+def _translated_mesh_query(
+    mesh: wp.uint64,
+    X_ws: wp.transform,
+    scale: wp.vec3,
+    points: wp.array[wp.vec3],
+    points_mesh: wp.array[wp.vec3],
+    signs: wp.array[int],
+):
+    tid = wp.tid()
+    point_mesh, query = soft_contacts_mesh._mesh_point_query(mesh, X_ws, scale, points[tid], 1)
+    points_mesh[tid] = point_mesh
+    signs[tid] = wp.where(query.result, wp.where(query.sign < 0.0, -1, 1), 0)
+
+
+def test_mesh_translated_query_classification(test, device):
+    """Preserve a translated concave-corner offset in point queries and VT detection."""
+    # Unlike the smooth-box force test, this captures the small coordinate
+    # itself. Previously CPU mapped the interior sample to the exact corner;
+    # CUDA retained the inside sign but doubled its distance from the corner.
+    polygon_np = 0.05 * np.array([[-1, -1], [1, -1], [1, 0], [0, 0], [0, 1], [-1, 1]])
+    vertices_np = np.array([(x, y, z) for z in (-0.05, 0.05) for x, y in polygon_np], dtype=np.float32)
+    top = [(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 5)]
+    faces = [(c, b, a) for a, b, c in top] + [(a + 6, b + 6, c + 6) for a, b, c in top]
+    for i in range(6):
+        a, b, c, d = i, (i + 1) % 6, (i + 1) % 6 + 6, i + 6
+        faces.extend(((a, b, c), (a, c, d)))
+    mesh = newton.Mesh(vertices=vertices_np, indices=np.asarray(faces, dtype=np.int32).reshape(-1))
+    test.assertTrue(mesh.is_watertight)
+    quat = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 3.0)), 0.71)
+    translation_np = np.array([10.0, -12.0, 8.0], dtype=np.float32)
+    X_ws = wp.transform(wp.vec3(*translation_np), quat)
+    points_np = np.array([[10.0, -12.000000953674316, 8.0], [10.0, -11.999999046325684, 8.0]], dtype=np.float32)
+    # Independent float64 inverse of the stored forward rotation, without
+    # normalizing away the quaternion's actual representational error.
+    x, y, z, w = np.asarray(quat, dtype=np.float64)
+    v_np = np.array([x, y, z])
+    cross_np = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    rotation_np = (2.0 * w * w - 1.0) * np.eye(3) + 2.0 * np.outer(v_np, v_np) + 2.0 * w * cross_np
+    reference_np = np.linalg.solve(rotation_np, (points_np.astype(np.float64) - translation_np).T).T
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    builder.add_shape_mesh(-1, mesh=mesh, xform=X_ws, cfg=builder.ShapeConfig(margin=0.0, gap=0.0))
+    for point in points_np:
+        builder.add_particle(wp.vec3(*point), wp.vec3(0.0), mass=1.0, radius=0.001)
+    model = builder.finalize(device=device)
+    state = model.state()
+    points_mesh = wp.empty(2, dtype=wp.vec3, device=device)
+    signs = wp.empty(2, dtype=int, device=device)
+    for scale in (wp.vec3(1.0), wp.vec3(2.0, 0.75, 1.5), wp.vec3(-2.0, 0.75, 1.5)):
+        command = wp.launch(
+            _translated_mesh_query,
+            dim=2,
+            inputs=[int(model.shape_source_ptr.numpy()[0]), X_ws, scale, state.particle_q],
+            outputs=[points_mesh, signs],
+            device=device,
+            record_cmd=True,
+        )
+        command.launch()
+        expected_np = reference_np / np.asarray(scale)
+        expected_signs_np = np.where((expected_np[:, 0] > 0.0) & (expected_np[:, 1] > 0.0), 1, -1)
+        np.testing.assert_allclose(points_mesh.numpy(), expected_np, rtol=1.0e-6, atol=2.0e-13)
+        np.testing.assert_array_equal(signs.numpy(), expected_signs_np)
+        if device.is_cuda:
+            with wp.ScopedCapture(device=device) as capture:
+                command.launch()
+            wp.capture_launch(capture.graph)
+            np.testing.assert_allclose(points_mesh.numpy(), expected_np, rtol=1.0e-6, atol=2.0e-13)
+            np.testing.assert_array_equal(signs.numpy(), expected_signs_np)
+    # Exercise VT's separate local conversion and cooperative query in the real
+    # pipeline, not only the helper called by TV/EE and deep-edge recovery.
+    pipeline = newton.CollisionPipeline(model, enable_rigid_soft_full_surface_contact=True, soft_contact_gap=0.01)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    if device.is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            pipeline.collide(state, contacts)
+        wp.capture_launch(capture.graph)
+    count = int(contacts.soft_contact_count.numpy()[0])
+    features_np = contacts._soft_contact_mesh_features.numpy()[:count]
+    for particle, expected in enumerate((-1, 1)):
+        rows_np = features_np[(features_np[:, 0] & 7 == 0) & (features_np[:, 1] == particle)]
+        test.assertGreater(len(rows_np), 0)
+        test.assertTrue(np.all((rows_np[:, 0] & 32) == 0))
+        np.testing.assert_array_equal(np.where(rows_np[:, 0] & 8, -1, 1), expected)
+
+
+def test_mesh_near_surface_keeps_solid_sign(test, device):
+    """Keep TV/EE query signs and outward recovery forces through a smooth mesh boundary."""
+
+    # The candidate corner/edge is 4 cm from the soft sample, but the actual
+    # solid boundary is only micrometres away. Candidate cones cannot sign the
+    # recovered nearest-face distance. A translated pose also exercises normal
+    # cancellation between detection, barycentric reconstruction and projection.
+    def points(offset, rotation_np, translation_np):
+        center_np = np.array([0.05 + offset, 0.01, 0.045])
+        normal_np = np.array([0.05, 0.05, 0.05]) - center_np
+        normal_np /= np.linalg.norm(normal_np)
+        u_np = np.cross(normal_np, [1.0, 0.0, 0.0])
+        u_np /= np.linalg.norm(u_np)
+        v_np = np.cross(normal_np, u_np)
+        face_np = [
+            center_np + 0.01 * u_np,
+            center_np - 0.005 * u_np + 0.01 * v_np,
+            center_np - 0.005 * u_np - 0.01 * v_np,
+        ]
+        center_np = np.array([0.05 + offset, 0.01, 0.0])
+        edge_np = np.cross([0.0, 0.0, 1.0], center_np - [0.05, 0.05, 0.0])
+        edge_np /= np.linalg.norm(edge_np)
+        points_np = np.array(
+            [*face_np, center_np - 0.01 * edge_np, center_np + 0.01 * edge_np, center_np + np.array([0.0, 0.0, 0.01])]
+        )
+        return (points_np @ rotation_np.T + translation_np).astype(np.float32)
+
+    for translated in (False, True):
+        quat = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 3.0)), 0.71) if translated else wp.quat_identity()
+        rotation_np = np.asarray(wp.quat_to_matrix(quat)).reshape(3, 3).astype(np.float64)
+        translation_np = np.array([10.0, -12.0, 8.0]) if translated else np.zeros(3)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        mesh = newton.Mesh.create_box(0.05, compute_inertia=False)
+        builder.add_shape_mesh(
+            -1,
+            mesh=mesh,
+            xform=wp.transform(wp.vec3(*translation_np), quat),
+            cfg=builder.ShapeConfig(margin=0.0, gap=0.0),
+        )
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=points(0.0, rotation_np, translation_np),
+            indices=[0, 1, 2, 3, 4, 5],
+            density=1.0,
+            particle_radius=0.005,
+        )
+        model = builder.finalize(device=device)
+        state = model.state()
+        pipeline = newton.CollisionPipeline(
+            model, enable_rigid_soft_full_surface_contact=True, soft_contact_gap=0.06, soft_contact_max=512
+        )
+        contacts = pipeline.contacts()
+        mask = wp.empty(contacts.soft_contact_max, dtype=bool, device=device)
+        forces = [wp.empty(contacts.soft_contact_max, dtype=wp.spatial_vector, device=device) for _ in range(2)]
+        penalty = wp.full(contacts.soft_contact_max, 100.0, device=device)
+        zero_material = wp.zeros(contacts.soft_contact_max, device=device)
+
+        def detect_and_evaluate(
+            pipeline=pipeline,
+            model=model,
+            state=state,
+            contacts=contacts,
+            mask=mask,
+            forces=forces,
+            penalty=penalty,
+            zero_material=zero_material,
+        ):
+            pipeline.collide(state, contacts)
+            evaluate_soft_contact_force_mask(model, state, contacts, out=mask)
+            for barrier, output in enumerate(forces):
+                wp.launch(
+                    compute_body_particle_contact_forces,
+                    contacts.soft_contact_max,
+                    inputs=[
+                        1.0 / 60.0,
+                        state.particle_q,
+                        state.particle_q,
+                        model.particle_radius,
+                        model.shape_body,
+                        state.body_q,
+                        state.body_q,
+                        state.body_qd,
+                        model.body_com,
+                        0.01,
+                        bool(barrier),
+                        penalty,
+                        zero_material,
+                        zero_material,
+                        contacts.soft_contact_count,
+                        soft_contacts_mesh._make_soft_contact_filter_data(
+                            model, contacts, state.particle_q, state.body_q
+                        ),
+                        contacts.soft_contact_indices,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_body_vel,
+                        contacts.soft_contact_normal,
+                        contacts.soft_contact_barycentric,
+                        model.shape_margin,
+                    ],
+                    outputs=[output],
+                    device=device,
+                )
+
+        detect_and_evaluate()
+        if device.is_cuda:
+            with wp.ScopedCapture(device=device) as capture:
+                detect_and_evaluate()
+        data = contacts._soft_contact_mesh_data
+        vertex_table_np, edge_table_np = data.rigid_features[0].numpy(), data.rigid_features[2].numpy()
+        rigid_points_np = np.asarray(mesh.vertices)[np.asarray(mesh.indices)]
+        vertices = np.flatnonzero(np.linalg.norm(rigid_points_np[vertex_table_np[:, 1]] - 0.05, axis=1) < 1e-7)
+        edge_points_np = rigid_points_np[edge_table_np[:, 1:]]
+        edges = np.flatnonzero(
+            np.all(np.linalg.norm(edge_points_np[:, :, :2] - 0.05, axis=2) < 1e-7, axis=1)
+            & (np.abs(edge_points_np[:, 0, 2] - edge_points_np[:, 1, 2]) > 0.05)
+        )
+        soft_edges = np.flatnonzero(np.all(np.sort(model.edge_indices.numpy()[:, 2:], axis=1) == [3, 4], axis=1))
+        test.assertEqual((len(vertices), len(edges), len(soft_edges)), (1, 1, 1))
+        targets = ((1, 0, vertices[0]), (2, soft_edges[0], edges[0]))
+        for offset in (-0.0002, -2e-6, -0.75e-6, 0.0, 0.75e-6, 1.25e-6, 2e-6, 0.0002):
+            with test.subTest(translated=translated, offset=offset):
+                state.particle_q.assign(points(offset, rotation_np, translation_np))
+                if device.is_cuda:
+                    wp.capture_launch(capture.graph)
+                else:
+                    detect_and_evaluate()
+                count = int(contacts.soft_contact_count.numpy()[0])
+                test.assertLessEqual(count, contacts.soft_contact_max)
+                test.assertEqual(contacts._soft_contact_source_overflow.numpy()[0], 0)
+                features_np = contacts._soft_contact_mesh_features.numpy()[:count]
+                rigid_indices_np = contacts.soft_contact_rigid_indices.numpy()
+                for family, soft, rigid in targets:
+                    rows = np.flatnonzero(
+                        ((features_np[:, 0] & 7) == family) & (features_np[:, 1] == soft) & (features_np[:, 2] == rigid)
+                    )
+                    test.assertEqual(len(rows), 1)
+                    row = rows[0]
+                    test.assertTrue(mask.numpy()[row])
+                    expected_indices = (
+                        [vertex_table_np[rigid, 1], -1, -1] if family == 1 else [*edge_table_np[rigid, 1:], -1]
+                    )
+                    np.testing.assert_array_equal(rigid_indices_np[row], expected_indices)
+                    inside = bool(features_np[row, 0] & int(soft_contacts_mesh._MESH_FEATURE_INSIDE))
+                    if offset != 0.0 and (not translated or abs(offset) >= 0.0002):
+                        test.assertEqual(inside, offset < 0.0)
+                    for output in forces:
+                        force_np = -output.numpy()[row, :3]
+                        test.assertTrue(np.isfinite(force_np).all())
+                        outward_force = float(np.dot(force_np, rotation_np[:, 0]))
+                        test.assertGreaterEqual(outward_force, -1e-3)
+                        if offset == -0.0002:
+                            test.assertGreater(outward_force, 0.01)
+                        if offset == 0.0002:
+                            np.testing.assert_array_equal(force_np, 0.0)
+
+
 for device in get_test_devices():
     for fn in (
+        test_mesh_nearest_face_cache_replay,
+        test_mesh_inside_recovery_scaled_frames_and_velocity,
+        test_mesh_inside_feature_depth_uses_nearest_surface,
+        test_mesh_near_surface_keeps_solid_sign,
+        test_mesh_translated_query_classification,
         test_mesh_vertex_fallback_sign,
         test_mesh_complete_rigid_indices_and_reuse,
         test_mesh_complete_bvh_query_coverage,

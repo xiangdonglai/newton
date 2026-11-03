@@ -2422,8 +2422,8 @@ def resolve_drive_limit_mode(
 ):
     """Resolve drive/limit priority and compute position error [m or rad].
 
-    Limits take precedence: if q is outside [lower, upper], the active limit
-    wins. Otherwise the drive engages with target clamped to the limit range.
+    Outside the limits, retain a drive whose clamped target points strictly
+    inward. Otherwise the violated limit wins. Inside, use the clamped drive.
 
     Returns:
         (mode, err_pos) -- active mode constant and signed position error.
@@ -2434,11 +2434,19 @@ def resolve_drive_limit_mode(
     if has_limits:
         drive_target = wp.clamp(target_pos, lim_lower, lim_upper)
         if q < lim_lower:
-            mode = _DRIVE_LIMIT_MODE_LIMIT_LOWER
-            err_pos = q - lim_lower
+            if has_drive and drive_target > lim_lower:
+                mode = _DRIVE_LIMIT_MODE_DRIVE
+                err_pos = q - drive_target
+            else:
+                mode = _DRIVE_LIMIT_MODE_LIMIT_LOWER
+                err_pos = q - lim_lower
         elif q > lim_upper:
-            mode = _DRIVE_LIMIT_MODE_LIMIT_UPPER
-            err_pos = q - lim_upper
+            if has_drive and drive_target < lim_upper:
+                mode = _DRIVE_LIMIT_MODE_DRIVE
+                err_pos = q - drive_target
+            else:
+                mode = _DRIVE_LIMIT_MODE_LIMIT_UPPER
+                err_pos = q - lim_upper
     if mode == _DRIVE_LIMIT_MODE_NONE and has_drive:
         mode = _DRIVE_LIMIT_MODE_DRIVE
         err_pos = q - drive_target
