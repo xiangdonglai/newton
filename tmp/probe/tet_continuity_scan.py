@@ -4,9 +4,10 @@ Runs every case of ``CONTINUITY_CASES`` with the default TV rows (extremum-sum);
 TV cases (5, 17 to 24) with the OGC block test as a further curve and checks the TV rows analytically.
 
 The cases are ``CONTINUITY_CASES`` in tet_point_force.py (also loadable in the viewer). Each sweep moves a soft probe
-by small steps through a transition and records |F| for c7, the proposal (excess-depth chord rows), the proposal with
-c7's two-crossing chord rows, the proposal with the nearest-face inside normal instead of the blended one, and the
-proposal without the pair weight.
+by small steps through a transition and records |F| for c7, the proposal (excess-depth chord rows, OGC EE endpoint
+rule), the proposal with extremum-sum EE endpoint groups (Section 17.8), the proposal with c7's two-crossing chord
+rows, the proposal with the nearest-face inside normal instead of the blended one, and the proposal without the pair
+weight.
 A step is 'big' if it exceeds 5% of k r = 0.025 N.
 """
 
@@ -23,26 +24,28 @@ from tet_point_force import CONTINUITY_CASES, Probe  # noqa: E402
 FAMS = {"VT", "TV", "EE", "EEdepth"}
 
 
-def run(kind, positions_per_step, label, steps, table_every=None, params=None, transition=None, window=0.3):
+def run(kind, positions_per_step, label, steps, table_every=None, params=None, transition=None, window=0.3, spokes=6):
     """positions_per_step: (steps, per_copy, 3). Returns dict of |F| curves and sample counts.
 
     With ``table_every`` the sweep also prints every n-th step with the per-family proposal force and the
     carrier families, and splits the largest step into the part before any EE-depth row exists (outside)
     and the step at which the first EE-depth row appears (entry).
     """
-    probe = Probe(kind, steps)
+    probe = Probe(kind, steps, fan_spokes=spokes)
     pos = np.asarray(positions_per_step, dtype=np.float32).reshape(-1, 3)
     per = probe.per_copy
     curves, counts = {}, {}
-    for name, act, chord_mode, blend in (
-        ("proposal", True, "excess", 0.25),
-        ("proposal, c7 chords", True, "c7", 0.25),
-        ("proposal, nearest normal", True, "excess", 0.0),
-        ("proposal, no activation", False, "excess", 0.25),
+    for name, act, chord_mode, blend, ee_mode in (
+        ("proposal", True, "excess", 0.25, "ogc"),
+        ("proposal, extremum EE", True, "excess", 0.25, "extremum"),
+        ("proposal, c7 chords", True, "c7", 0.25, "ogc"),
+        ("proposal, nearest normal", True, "excess", 0.0, "ogc"),
+        ("proposal, no activation", False, "excess", 0.25, "ogc"),
     ):
         probe.proposal.use_activation = act
         probe.proposal.chord_mode = chord_mode
         probe.proposal.inside_blend = blend
+        probe.proposal.ee_mode = ee_mode
         res = probe.evaluate(pos)
         if name == "proposal":
             pf = Probe.particle_forces(res, "c7", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
@@ -107,4 +110,5 @@ for case in CONTINUITY_CASES:
         table_every=20 if case.table else None,
         params=case.parameters(),
         transition=case.transition,
+        spokes=case.spokes,
     )

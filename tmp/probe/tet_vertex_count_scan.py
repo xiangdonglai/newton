@@ -3,7 +3,8 @@
 The fan lies in the plane x = 23 mm, parallel to the rigid edge (20, u, u) and 3 mm outside it along the wedge
 bisector. Sweeping the fan along _W_HAT moves the rigid edge's projection across the chosen vertex. Each step is a
 fresh detection. The fan is rotated by 15 degrees so that no spoke is parallel or perpendicular to the rigid edge.
-Reports |F| for c7 and the proposal, the number of proposal samples with force, and the largest step.
+Reports |F| for c7, the proposal (OGC EE endpoint rule) and the proposal with extremum-sum EE endpoint groups
+(Section 17.8), the number of proposal samples with force, and the largest step.
 """
 
 import sys
@@ -31,11 +32,16 @@ def sweep(spokes, vertex, label, half=0.0003, steps=61):
     pos = [fan_vertices(BASE + (shift + o) * _W_HAT, E1, E2, spokes=spokes) for o in sig]
     probe = Probe("fan", steps, fan_spokes=spokes)
     per = probe.per_copy
+    probe.proposal.ee_mode = "extremum"
+    res_x = probe.evaluate(np.asarray(pos, dtype=np.float32).reshape(-1, 3))
+    probe.proposal.ee_mode = "ogc"
     res = probe.evaluate(np.asarray(pos, dtype=np.float32).reshape(-1, 3))
     curves = {}
     for key, name in (("c7", "c7"), ("prop", "proposal")):
         pf = Probe.particle_forces(res, key, FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
         curves[name] = np.linalg.norm(pf, axis=1)
+    pf = Probe.particle_forces(res_x, "prop", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
+    curves["proposal, extremum EE"] = np.linalg.norm(pf, axis=1)
     n_ee = np.zeros(steps, dtype=int)
     f_ee = np.zeros(steps)
     f_vt = np.zeros(steps)
@@ -57,16 +63,17 @@ def sweep(spokes, vertex, label, half=0.0003, steps=61):
     print(
         f"\n== {label}: valence {len(neighbors)}, incident edges toward -W: {sum(c < 0 for c in comps)}, toward +W: {sum(c > 0 for c in comps)}"
     )
-    print(f"  {'offset mm':>9} {'c7':>8} {'proposal':>9} {'VT':>7} {'EE':>7} {'EE samples':>10}")
+    print(f"  {'offset mm':>9} {'c7':>8} {'proposal':>9} {'extremum':>9} {'VT':>7} {'EE':>7} {'EE samples':>10}")
     for i in [*range(0, steps, 10), steps // 2]:
         print(
-            f"  {1e3 * sig[i]:9.3f} {curves['c7'][i]:8.4f} {curves['proposal'][i]:9.4f} {f_vt[i]:7.4f} {f_ee[i]:7.4f} {n_ee[i]:10d}"
+            f"  {1e3 * sig[i]:9.3f} {curves['c7'][i]:8.4f} {curves['proposal'][i]:9.4f} {curves['proposal, extremum EE'][i]:9.4f}"
+            f" {f_vt[i]:7.4f} {f_ee[i]:7.4f} {n_ee[i]:10d}"
         )
     for name, values in curves.items():
         jumps = np.abs(np.diff(values))
         i = int(jumps.argmax())
         print(
-            f"  {name:9s} largest step {jumps.max():.4f} N at offset {1e3 * sig[i]:.3f} mm (step {1e3 * (sig[1] - sig[0]):.3f} mm)"
+            f"  {name:22s} largest step {jumps.max():.4f} N at offset {1e3 * sig[i]:.3f} mm (step {1e3 * (sig[1] - sig[0]):.3f} mm)"
         )
     print(
         f"  proposal EE samples with force: {n_ee.min()} to {n_ee.max()}; EE at the vertex {f_ee[steps // 2]:.4f} N from {n_ee[steps // 2]} sample(s)"

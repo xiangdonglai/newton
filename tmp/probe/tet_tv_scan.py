@@ -1,12 +1,14 @@
 """TV battery: a rigid vertex (the tetrahedron apex) against a soft patch through the patch's feature crossings.
 
-Cases 5 and 17 to 24 of ``CONTINUITY_CASES`` (tet_point_force.py). For every case the sweep records |F| of
+Cases 5 and 17 to 25 of ``CONTINUITY_CASES`` (tet_point_force.py). For every case the sweep records |F| of
 c7, of the proposal with the extremum-sum TV rows (default), of the proposal with the OGC block test
 (production _soft_face_valid) and of the proposal without the pair weight, and prints the largest step overall
 and within 0.3 mm of the transition. For the extremum-sum rows it also checks, at the 'after' configuration, that
 every row's force equals net * a_s * k (r - phi) n with phi, n from the independent numpy signed distance, and
 that the group bookkeeping counts every point of the patch once (the signed sum of the rows at one closest point
-is the Morse sign of that critical point).
+is the Morse sign of that critical point). Steps are reported both as the change of |F| and as the norm of the
+change of the force vector (total and worst particle); the TV family's smallest component along the apex axis
+shows the attractive regime of Section 17.6 (negative = pulling the patch toward the apex).
 """
 
 import sys
@@ -21,6 +23,7 @@ from tet_edge_scan import K, R, sdf  # noqa: E402
 from tet_point_force import CONTINUITY_CASES, Probe  # noqa: E402
 
 FAMS = {"VT", "TV", "EE", "EEdepth"}
+APEX_AXIS = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)  # outward direction at the apex; negative F.axis = pull toward it
 TV_CASES = [4, *range(16, len(CONTINUITY_CASES))]  # zero-based indices: case 5 and 17..
 
 
@@ -31,6 +34,7 @@ def run(case, window=0.3, table_every=None):
     pos = np.asarray([case.positions(float(v)) for v in params], dtype=np.float32).reshape(-1, 3)
     per = probe.per_copy
     curves, tv_curves, counts = {}, {}, {}
+    vec, vec_particle, tv_axis = {}, {}, {}  # vector totals, per-particle vectors, TV total along the apex axis
     for name, act, tv_mode in (
         ("proposal", True, "extremum"),
         ("proposal, OGC TV blocks", True, "ogc"),
@@ -44,10 +48,14 @@ def run(case, window=0.3, table_every=None):
             curves["c7"] = np.linalg.norm(pf, axis=1)
             pf = Probe.particle_forces(res, "c7", {"TV"}, probe.active).reshape(steps, per, 3).sum(axis=1)
             tv_curves["c7"] = np.linalg.norm(pf, axis=1)
-        pf = Probe.particle_forces(res, "prop", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
+        pp = Probe.particle_forces(res, "prop", FAMS, probe.active).reshape(steps, per, 3)
+        pf = pp.sum(axis=1)
         curves[name] = np.linalg.norm(pf, axis=1)
+        vec[name] = pf
+        vec_particle[name] = pp
         pf = Probe.particle_forces(res, "prop", {"TV"}, probe.active).reshape(steps, per, 3).sum(axis=1)
         tv_curves[name] = np.linalg.norm(pf, axis=1)
+        tv_axis[name] = pf @ APEX_AXIS
         n = np.zeros(steps, dtype=int)
         neg = np.zeros(steps, dtype=int)
         for r in res["rows"]:
@@ -60,16 +68,25 @@ def run(case, window=0.3, table_every=None):
     near = np.flatnonzero(np.abs(params - case.transition) <= window)
     lo, hi = (int(near.min()), int(near.max())) if near.size > 1 else (0, steps - 1)
     print(
-        f"  {'curve':28s} {'max |F|':>8} {'largest step':>13} {'at s':>8} {'near transition':>16}   (TV family alone: step, near)"
+        f"  {'curve':28s} {'max |F|':>8} {'|d|F||':>7} {'at s':>7} {'near':>7} | {'||dF||':>7} {'per-particle':>12} {'near':>7}"
+        "   (TV: |d|F||, near; min F_TV.axis)"
     )
     for name, values in curves.items():
         jumps = np.abs(np.diff(values))
         i = int(jumps.argmax())
         tj = np.abs(np.diff(tv_curves[name]))
         flag = "  <-- big" if jumps.max() > 0.025 else ""
+        if name in vec:
+            vj = np.linalg.norm(np.diff(vec[name], axis=0), axis=1)
+            pj = np.linalg.norm(np.diff(vec_particle[name], axis=0), axis=2).max(axis=1)
+            vec_txt = f"{vj.max():7.4f} {pj.max():12.4f} {vj[lo:hi].max() if hi > lo else 0.0:7.4f}"
+            axis_txt = f"; min F_TV.axis {tv_axis[name].min():+.4f} N"
+        else:
+            vec_txt = f"{'-':>7} {'-':>12} {'-':>7}"
+            axis_txt = ""
         print(
-            f"  {name:28s} {values.max():8.4f} {jumps.max():13.4f} {params[i]:8.3f} {np.abs(np.diff(values[lo : hi + 1])).max():16.4f}"
-            f"   ({tj.max():.4f}, {np.abs(np.diff(tv_curves[name][lo : hi + 1])).max():.4f}){flag}"
+            f"  {name:28s} {values.max():8.4f} {jumps.max():7.4f} {params[i]:7.3f} {np.abs(np.diff(values[lo : hi + 1])).max():7.4f} | {vec_txt}"
+            f"   ({tj.max():.4f}, {np.abs(np.diff(tv_curves[name][lo : hi + 1])).max():.4f}{axis_txt}){flag}"
         )
     n, neg = counts["proposal"]
     n_ogc, _ = counts["proposal, OGC TV blocks"]
