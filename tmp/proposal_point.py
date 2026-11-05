@@ -20,13 +20,21 @@ instead of switching. Switching between families is what produces force jumps.
             INSIDE at detection whose soft edge has an EE-depth row against the same shape hands over to it.
   EE-depth  redefined (chord rows, one thread per soft edge): the inside portions of the edge, bounded by surface
             crossings or by endpoints that are themselves inside; sample = midpoint of a portion (frozen t).
-            Weight w = clamp((depth at the sample - deepest endpoint) / (r/4), 0, 1): the row carries only the
-            penetration of the edge interior beyond what its endpoints' VT rows already carry. A chord that
-            starts at an entering endpoint is born with w = 0; a chord that forms at a rigid edge or vertex
-            (endpoints far outside) is born with w = 1 and takes over from the EE pair; a chord that keeps
-            existing while an endpoint enters keeps its weight. An EE row inside at detection carries
-            a (1 - w) of its force, the chord row w: the hand-over is continuous.
+            Weight w = min(clamp(excess / (r/4)), clamp(depth / (r/4))) with excess = depth at the sample minus
+            the deeper endpoint's depth: the row fades in over the first quarter radius of its own depth and
+            carries only the penetration of the edge interior beyond what its endpoints' VT rows already
+            carry. A chord that starts at an entering endpoint has no excess and carries nothing; a chord that
+            keeps existing while an endpoint enters keeps its weight.
+  EE inside An EE row whose sample is inside at detection fades with its own depth: weight a (1 - clamp(depth /
+            (r/4))). At a rigid-edge entry the chord is born at the EE sample, and its depth ramp is the exact
+            complement of the EE fade, so the hand-over is continuous; elsewhere the two weights are independent
+            and each is continuous in the configuration. No table is shared between detectors.
             chord_mode = "c7" keeps the production two-crossing chords and the hard hand-over for comparison.
+  normal    Outside: radial from the closest point. Inside or on the surface: the normalized sum of the normals of
+            the faces within INSIDE_BLEND * r of the nearest, weighted by 1 - (d_i - d_min) / (INSIDE_BLEND r)
+            (open choice 5; inside_blend = 0 restores the nearest face). Two rows that sample the same point then
+            agree on the direction, and the direction turns continuously at convex edges and medial planes. The
+            magnitude is k (r - phi) with the sharp signed distance phi.
 
 Pair weight a_s = clamp((r - d) / (r/4), 0, 1) on EE/TV samples, with d the detection-time distance between the
 sample and the rigid feature that placed it, frozen per pass. It is the analogue of OGC's pair energy being zero
@@ -67,7 +75,7 @@ STATE_SOFT_FACE_INVALID = 1024  # TV: soft sub-feature not owned by this triangl
 STATE_CHORD = 2048  # proposal chord row (EE-depth redefined, per soft edge)
 STATE_CHORD_NO_EXCESS = 4096  # chord row no deeper than its endpoints: weight 0
 STATE_REPLACED = 8192  # c7 EE-depth row, replaced by the proposal's chord rows
-STATE_CHORD_SHARE = 16384  # EE inside at detection: shares the edge with a chord row, weight a (1 - w)
+STATE_CHORD_SHARE = 16384  # EE inside at detection: fading with its own depth, weight a (1 - depth / (r/4))
 HOST_REJECT = (
     STATE_NOT_OWNER
     | STATE_SOFT_NEIGHBOR
@@ -79,6 +87,9 @@ HOST_REJECT = (
 )
 CHORD_MAX = 4  # inside portions kept per soft edge (a convex solid has at most one)
 CHORD_BAND = 0.25  # the chord weight saturates once the excess depth reaches CHORD_BAND * r
+INSIDE_BLEND = (
+    0.25  # inside normal: blend of the normals of the faces within INSIDE_BLEND * r of the nearest; 0 = nearest face
+)
 WEIGHT_EPS = 1.0e-6
 NO_SHAPE = 2147483647
 
@@ -86,7 +97,7 @@ REASON = {
     STATE_NOT_OWNER: "not owner",
     STATE_SOFT_NEIGHBOR: "soft vertex: neighbor edge's block",
     STATE_SOFT_VERTEX_DUP: "soft vertex: carried by another incident edge",
-    STATE_DEFER_DEPTH: "inside at detection: EE-depth carries",
+    STATE_DEFER_DEPTH: "inside at detection: faded out (depth >= r/4); the chord rows carry",
     STATE_RIGID_NEIGHBOR: "rigid vertex: neighbor edge's block",
     STATE_RIGID_VERTEX_DUP: "rigid vertex: carried by another incident edge",
     STATE_SOFT_FACE_INVALID: "soft sub-feature not owned / off cone",
@@ -94,7 +105,7 @@ REASON = {
     STATE_CHORD: "chord row",
     STATE_CHORD_NO_EXCESS: "chord no deeper than its endpoints (w = 0)",
     STATE_REPLACED: "c7 chord row, replaced by the per-edge chord rows",
-    STATE_CHORD_SHARE: "inside at detection: shares the edge with a chord row, weight a (1 - w)",
+    STATE_CHORD_SHARE: "inside at detection: fading with depth, weight a (1 - depth / (r/4))",
 }
 
 
@@ -125,19 +136,25 @@ def _scaled_face(mesh: wp.uint64, face: int, scale: wp.vec3):
 
 
 @wp.func
-def _penalty_force(
-    x: wp.vec3, c_world: wp.vec3, n_world: wp.vec3, collision_radius: float, k: float, log_barrier: bool
-):
-    distance = wp.dot(n_world, x - c_world)
-    if collision_radius - distance <= 0.0:
+def _penalty_force(phi: float, n_world: wp.vec3, collision_radius: float, k: float, log_barrier: bool):
+    """F = -psi'(phi) n: the magnitude from the signed distance itself, the direction from n (which may be the
+    blended inside normal, so the distance is not re-derived by projecting onto n)."""
+    if collision_radius - phi <= 0.0:
         return wp.vec3(0.0)
-    dE_dD, _d2 = _evaluate_rigid_soft_contact_force_norm(distance, collision_radius, k, log_barrier)
+    dE_dD, _d2 = _evaluate_rigid_soft_contact_force_norm(phi, collision_radius, k, log_barrier)
     return n_world * (-dE_dD)
 
 
 @wp.func
-def _signed_distance(mesh: wp.uint64, X_ws: wp.transform, scale: wp.vec3, sign_method: int, x: wp.vec3):
-    """One query: (ok, phi, c_world, n_world) of the signed distance from world point x to the solid."""
+def _signed_distance(mesh: wp.uint64, X_ws: wp.transform, scale: wp.vec3, sign_method: int, x: wp.vec3, blend_h: float):
+    """One query: (ok, phi, c_world, n_world) of the signed distance from world point x to the solid.
+
+    Outside, n is the radial direction from the closest point. Inside, n is the nearest face normal, or, with
+    ``blend_h > 0``, the normalized sum of the normals of all faces whose distance is within ``blend_h`` of the
+    nearest one, each weighted by 1 - (d_i - d_min) / blend_h (open choice 5). The blend makes the inside
+    direction continuous across medial planes, so two rows sampling the same point agree on it, and it turns
+    the direction kink at a convex edge into a turn over blend_h.
+    """
     x_local = _shape_local_point(X_ws, x)
     query = mesh_query_point_sign(mesh, wp.cw_div(x_local, scale), 1.0e6, sign_method)
     if not query.result:
@@ -150,6 +167,24 @@ def _signed_distance(mesh: wp.uint64, X_ws: wp.transform, scale: wp.vec3, sign_m
     phi = d
     if query.sign < 0.0:
         phi = -d
+    if query.sign < 0.0 or d <= 1.0e-6:
+        # inside, or on the surface (where the radial direction is undefined): nearest face normal, or the blend
+        if blend_h > 0.0:
+            reach = wp.cw_div(wp.vec3(d + blend_h), scale)
+            center = wp.cw_div(x_local, scale)
+            n_sum = wp.vec3(0.0)
+            aabb = wp.mesh_query_aabb(mesh, center - reach, center + reach)
+            face = int(0)
+            while wp.mesh_query_aabb_next(aabb, face):
+                fa, fb, fc = _scaled_face(mesh, face, scale)
+                fcp, _fb, _ff = triangle_closest_point(fa, fb, fc, x_local)
+                w = 1.0 - (wp.length(x_local - fcp) - d) / blend_h
+                if w > 0.0:
+                    n_sum += wp.min(w, 1.0) * transform_normal_with_scale(
+                        wp.transform_identity(), scale, wp.mesh_eval_face_normal(mesh, face)
+                    )
+            if wp.length(n_sum) > 1.0e-12:
+                n_local = wp.normalize(n_sum)
     elif d > 1.0e-6:
         # radial direction; below a micrometre the face normal is used, since diff / d is roundoff there
         n_local = diff / d
@@ -166,6 +201,7 @@ def proposal_rows(
     shape_margin: wp.array[float],
     stiffness: float,
     use_log_barrier: bool,
+    inside_blend: float,
     row_force: wp.array[wp.vec3],
     row_sample: wp.array[wp.vec3],
     row_anchor: wp.array[wp.vec3],
@@ -208,8 +244,14 @@ def proposal_rows(
     _X_bs, X_ws, _X_sw = _shape_frames(data.shape_body, data.body_q, data.shape_transform, shape)
     mesh = data.shape_source_ptr[shape]
     scale = data.shape_scale[shape]
+    margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
     ok, phi, c_world, n_world = _signed_distance(
-        mesh, X_ws, scale, resolve_mesh_sign_method(data.shape_mesh_properties[shape]), x
+        mesh,
+        X_ws,
+        scale,
+        resolve_mesh_sign_method(data.shape_mesh_properties[shape]),
+        x,
+        inside_blend * (radius + margin),
     )
     if not ok:
         row_state[tid] = STATE_QUERY_FAILED
@@ -244,8 +286,7 @@ def proposal_rows(
     row_phi[tid] = phi
     row_state[tid] = state
     if (state & STATE_ENABLED) != 0:
-        margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
-        row_force[tid] = weight[tid] * _penalty_force(x, c_world, n_world, radius + margin, stiffness, use_log_barrier)
+        row_force[tid] = weight[tid] * _penalty_force(phi, n_world, radius + margin, stiffness, use_log_barrier)
 
 
 @wp.kernel(enable_backward=False)
@@ -262,26 +303,28 @@ def proposal_point_reference(
     shape_margin: wp.array[float],
     stiffness: float,
     use_log_barrier: bool,
+    inside_blend: float,
     force: wp.array[wp.vec3],
     phi_out: wp.array[float],
 ):
     """Closed form for a lone point, independent of any detected row: F = k (r - phi) n."""
     p = wp.tid()
     _X_bs, X_ws, _X_sw = _shape_frames(shape_body, body_q, shape_transform, shape)
+    margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
     ok, phi, c_world, n_world = _signed_distance(
         shape_source_ptr[shape],
         X_ws,
         shape_scale[shape],
         resolve_mesh_sign_method(shape_mesh_properties[shape]),
         particle_q[p],
+        inside_blend * (particle_radius[p] + margin),
     )
     force[p] = wp.vec3(0.0)
     phi_out[p] = 1.0e9
     if not ok:
         return
-    margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
     phi_out[p] = phi
-    force[p] = _penalty_force(particle_q[p], c_world, n_world, particle_radius[p] + margin, stiffness, use_log_barrier)
+    force[p] = _penalty_force(phi, n_world, particle_radius[p] + margin, stiffness, use_log_barrier)
 
 
 @wp.func
@@ -301,11 +344,13 @@ def _chord_portion(
 ):
     """Chord row for the inside portion [t_a, t_b] of the edge: (ok, t_c, phi_c, excess, w)."""
     t_c = 0.5 * (t_a + t_b)
-    ok, phi_c, _c, _n = _signed_distance(mesh, X_ws, scale, sign_method, q0 + t_c * (q1 - q0))
+    ok, phi_c, _c, _n = _signed_distance(mesh, X_ws, scale, sign_method, q0 + t_c * (q1 - q0), 0.0)
     if not ok or phi_c >= 0.0:
         return False, t_c, phi_c, 0.0, 0.0
     excess = -phi_c - wp.max(-phi0, -phi1)
-    w = wp.clamp(excess / wp.max(band * radius, 1.0e-9), 0.0, 1.0)
+    ramp = wp.max(band * radius, 1.0e-9)
+    # fades in over the first band * r of its own depth, and only for the excess over the deeper endpoint
+    w = wp.min(wp.clamp(excess / ramp, 0.0, 1.0), wp.clamp(-phi_c / ramp, 0.0, 1.0))
     return True, t_c, phi_c, excess, w
 
 
@@ -355,8 +400,8 @@ def detect_chords(
     mesh = shape_source_ptr[shape]
     scale = shape_scale[shape]
     method = resolve_mesh_sign_method(shape_mesh_properties[shape])
-    ok0, phi0, _c0, _n0 = _signed_distance(mesh, X_ws, scale, method, q0)
-    ok1, phi1, _c1, _n1 = _signed_distance(mesh, X_ws, scale, method, q1)
+    ok0, phi0, _c0, _n0 = _signed_distance(mesh, X_ws, scale, method, q0, 0.0)
+    ok1, phi1, _c1, _n1 = _signed_distance(mesh, X_ws, scale, method, q1, 0.0)
     if not ok0 or not ok1:
         return
     p = wp.cw_div(_shape_local_point(X_ws, q0), scale)
@@ -423,6 +468,7 @@ def chord_rows(
     shape_margin: wp.array[float],
     stiffness: float,
     use_log_barrier: bool,
+    inside_blend: float,
     row_force: wp.array[wp.vec3],
     row_sample: wp.array[wp.vec3],
     row_anchor: wp.array[wp.vec3],
@@ -452,7 +498,7 @@ def chord_rows(
     mesh = shape_source_ptr[shape]
     scale = shape_scale[shape]
     ok, phi, c_world, n_world = _signed_distance(
-        mesh, X_ws, scale, resolve_mesh_sign_method(shape_mesh_properties[shape]), x
+        mesh, X_ws, scale, resolve_mesh_sign_method(shape_mesh_properties[shape]), x, inside_blend * radius
     )
     row_sample[tid] = x
     if not ok:
@@ -464,7 +510,7 @@ def chord_rows(
     w = chord_weight[e, k]
     if w > 0.0:
         state |= STATE_ENABLED
-        row_force[tid] = w * _penalty_force(x, c_world, n_world, radius, stiffness, use_log_barrier)
+        row_force[tid] = w * _penalty_force(phi, n_world, radius, stiffness, use_log_barrier)
     else:
         state |= STATE_CHORD_NO_EXCESS
     row_anchor[tid] = c_world
@@ -488,6 +534,7 @@ class ProposalEvaluator:
         self.use_activation = True
         self.chord_mode = "excess"  # "excess": per-edge chord rows (redefined EE-depth); "c7": production chords
         self.chord_band = CHORD_BAND
+        self.inside_blend = INSIDE_BLEND  # fraction of r over which inside normals blend; 0 = nearest face
         edge_count = int(model.edge_count) if getattr(model, "edge_count", 0) else 0
         self.edge_count = edge_count
         if edge_count:
@@ -546,12 +593,12 @@ class ProposalEvaluator:
             self._soft_topology = (edges, incident)
         return self._soft_topology
 
-    def place(self, model, state, contacts, chord_w_max=None):
+    def place(self, model, state, contacts, row_phi=None):
         """Detection-time placement decisions and onset weights (host side; production: in the detectors).
 
-        ``chord_w_max``: per soft edge, the largest weight of its chord rows (excess mode); None in c7 mode.
+        ``row_phi``: signed distance of every c7 row's sample at detection (the detector's own sign query);
+        used for the depth fade of inside EE rows. None in c7 mode.
         """
-        chord_w_max = chord_w_max or {}
         count = int(contacts.soft_contact_count.numpy()[0])
         feat = contacts._soft_contact_mesh_features.numpy()[:count]
         idx = contacts.soft_contact_indices.numpy()[:count]
@@ -633,13 +680,14 @@ class ProposalEvaluator:
                     if self.chord_mode == "c7":
                         if depth_shapes.get(soft_edge, NO_SHAPE) == sh:
                             host[i] |= STATE_DEFER_DEPTH
-                    elif soft_edge in chord_w_max:
-                        w = chord_w_max[soft_edge]
-                        if w >= 1.0 - 1.0e-6:
+                    else:
+                        depth = max(-float(row_phi[i]), 0.0) if row_phi is not None else 0.0
+                        fade = min(depth / max(self.chord_band * r_force, 1e-9), 1.0)
+                        if fade >= 1.0:
                             host[i] |= STATE_DEFER_DEPTH
-                        else:
+                        elif fade > 0.0:
                             host[i] |= STATE_CHORD_SHARE
-                            a *= 1.0 - w
+                        a *= 1.0 - fade
                 weight[i] = a
                 info[i] = (d, u, a)
             else:  # c7 EE-depth (two-crossing chord): used only in c7 mode
@@ -683,17 +731,9 @@ class ProposalEvaluator:
             outputs=[self.chord_t, self.chord_bounds, self.chord_weight, self.chord_excess, self.chord_phi],
             device=self.device,
         )
-        t = self.chord_t.numpy()
-        w = self.chord_weight.numpy()
-        w_max = {}
-        for e in np.flatnonzero((t >= 0.0).any(axis=1)):
-            w_max[int(e)] = float(w[e][t[e] >= 0.0].max())
-        return w_max
+        return int((self.chord_t.numpy() >= 0.0).sum())
 
-    def evaluate(self, model, state, contacts, *, stiffness, use_log_barrier, shape=0, reference=True):
-        use_chords = self.chord_mode != "c7" and self.edge_count > 0
-        chord_w_max = self.detect(model, state, shape) if use_chords else None
-        count, _feat, idx, bary, info = self.place(model, state, contacts, chord_w_max)
+    def _launch_rows(self, model, state, contacts, stiffness, use_log_barrier):
         wp.launch(
             proposal_rows,
             dim=contacts.soft_contact_max,
@@ -706,10 +746,26 @@ class ProposalEvaluator:
                 model.shape_margin,
                 stiffness,
                 use_log_barrier,
+                self.inside_blend,
             ],
             outputs=[self.row_force, self.row_sample, self.row_anchor, self.row_normal, self.row_phi, self.row_state],
             device=self.device,
         )
+
+    def evaluate(self, model, state, contacts, *, stiffness, use_log_barrier, shape=0, reference=True):
+        use_chords = self.chord_mode != "c7" and self.edge_count > 0
+        if use_chords:
+            self.detect(model, state, shape)
+        row_phi = None
+        if self.chord_mode != "c7":
+            # the detector's own sign query of every row's sample: run the row kernel once with neutral
+            # placement to read it (production stores it when the row is appended)
+            self.host_state.zero_()
+            self.weight.fill_(1.0)
+            self._launch_rows(model, state, contacts, stiffness, use_log_barrier)
+            row_phi = self.row_phi.numpy().copy()
+        count, _feat, idx, bary, info = self.place(model, state, contacts, row_phi)
+        self._launch_rows(model, state, contacts, stiffness, use_log_barrier)
         state_np = self.row_state.numpy()[:count]
         force = self.row_force.numpy()[:count]
         enabled = (state_np & STATE_ENABLED) != 0
@@ -740,6 +796,7 @@ class ProposalEvaluator:
                     model.shape_margin,
                     stiffness,
                     use_log_barrier,
+                    self.inside_blend,
                 ],
                 outputs=[
                     self.chord_force,
@@ -837,6 +894,7 @@ class ProposalEvaluator:
                     model.shape_margin,
                     stiffness,
                     use_log_barrier,
+                    self.inside_blend,
                 ],
                 outputs=[self.ref_force, self.ref_phi],
                 device=self.device,

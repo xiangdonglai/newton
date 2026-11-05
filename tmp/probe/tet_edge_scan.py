@@ -17,6 +17,7 @@ from proposal_point import STATE_INSIDE, reason_text  # noqa: E402
 from tet_point_force import EDGE_PRESETS, Probe, regular_tetrahedron  # noqa: E402
 
 K, R = 100.0, 0.005
+BLEND = 0.25 * R  # inside-normal blend band of the local evaluator
 VERTS, FACES = regular_tetrahedron()
 VERTS = VERTS.astype(np.float64)
 NORMALS = []
@@ -62,6 +63,13 @@ def sdf(x, ties=False):
     plane = np.array([(x - VERTS[f[0]]) @ n for f, n in zip(FACES, NORMALS, strict=True)])
     if np.all(plane <= 0.0):
         i = int(np.argmax(plane))
+        if BLEND > 0.0:
+            # inside: blend of the normals of the faces within BLEND of the nearest (the local evaluator's rule)
+            dist = np.array([np.linalg.norm(x - closest_on_triangle(x, *VERTS[f])) for f in FACES])
+            w = np.clip(1.0 - (dist - dist.min()) / BLEND, 0.0, 1.0)
+            n = NORMALS.T @ w
+            n /= np.linalg.norm(n)
+            return plane[i], x - plane[i] * NORMALS[i], [n] if ties else n
         normals = [NORMALS[j] for j in range(len(FACES)) if plane[j] > plane[i] - 1e-7] if ties else NORMALS[i]
         return plane[i], x - plane[i] * NORMALS[i], normals
     best = None

@@ -2,7 +2,8 @@
 
 The cases are ``CONTINUITY_CASES`` in tet_point_force.py (also loadable in the viewer). Each sweep moves a soft probe
 by small steps through a transition and records |F| for c7, the proposal (excess-depth chord rows), the proposal with
-c7's two-crossing chord rows, and the proposal without the pair weight.
+c7's two-crossing chord rows, the proposal with the nearest-face inside normal instead of the blended one, and the
+proposal without the pair weight.
 A step is 'big' if it exceeds 5% of k r = 0.025 N.
 """
 
@@ -19,7 +20,7 @@ from tet_point_force import CONTINUITY_CASES, Probe  # noqa: E402
 FAMS = {"VT", "TV", "EE", "EEdepth"}
 
 
-def run(kind, positions_per_step, label, steps, table_every=None):
+def run(kind, positions_per_step, label, steps, table_every=None, params=None, transition=None, window=0.3):
     """positions_per_step: (steps, per_copy, 3). Returns dict of |F| curves and sample counts.
 
     With ``table_every`` the sweep also prints every n-th step with the per-family proposal force and the
@@ -30,13 +31,15 @@ def run(kind, positions_per_step, label, steps, table_every=None):
     pos = np.asarray(positions_per_step, dtype=np.float32).reshape(-1, 3)
     per = probe.per_copy
     curves, counts = {}, {}
-    for name, act, chord_mode in (
-        ("proposal", True, "excess"),
-        ("proposal, c7 chords", True, "c7"),
-        ("proposal, no activation", False, "excess"),
+    for name, act, chord_mode, blend in (
+        ("proposal", True, "excess", 0.25),
+        ("proposal, c7 chords", True, "c7", 0.25),
+        ("proposal, nearest normal", True, "excess", 0.0),
+        ("proposal, no activation", False, "excess", 0.25),
     ):
         probe.proposal.use_activation = act
         probe.proposal.chord_mode = chord_mode
+        probe.proposal.inside_blend = blend
         res = probe.evaluate(pos)
         if name == "proposal":
             pf = Probe.particle_forces(res, "c7", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
@@ -61,6 +64,15 @@ def run(kind, positions_per_step, label, steps, table_every=None):
         print(f"  {name:24s} max |F| {values.max():.4f} N, largest step {jumps.max():.4f} N at index {i}{flag}")
     n = counts["proposal"]
     print(f"  proposal samples with force: min {n.min()} max {n.max()}")
+    if params is not None and transition is not None:
+        near = np.flatnonzero(np.abs(np.asarray(params) - transition) <= window)
+        if near.size > 1:
+            lo, hi = int(near.min()), int(near.max())
+            parts = []
+            for name, values in curves.items():
+                j = np.abs(np.diff(values[lo : hi + 1]))
+                parts.append(f"{name} {j.max():.4f} N")
+            print(f"  largest step within {window} mm of the transition (s = {transition:g}): " + ", ".join(parts))
     if table_every:
         print(
             f"  {'step':>5} {'c7':>8} {'proposal':>9} {'c7 chords':>9} {'VT':>7} {'TV':>7} {'EE':>7} {'EEdepth':>8}  depth row"
@@ -90,4 +102,6 @@ for case in CONTINUITY_CASES:
         case.label,
         case.steps,
         table_every=20 if case.table else None,
+        params=case.parameters(),
+        transition=case.transition,
     )

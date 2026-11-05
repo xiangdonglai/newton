@@ -354,7 +354,53 @@ CONTINUITY_CASES += [
         table=True,
     ),
 ]
+# chord events next to a rigid edge: a needle through the wedge, a vertex entering beside the rigid edge with an EE
+# endpoint pair, and an inside edge whose EE pair fades as it moves away from the rigid edge
+_W1 = np.array([-2.0, -1.0, 1.0]) / np.sqrt(6.0)  # in face 1, perpendicular to the rigid edge (20, u, u), into the face
+_C14_P = np.array([0.02, 0.0, 0.0]) + 0.002 * _W0  # on face 0, 2 mm from the rigid edge
+_C15_V1 = _C14_P + 0.006 * _E_HAT + 0.004 * _N0 + 0.001 * _W0
+_C16_V0 = np.array([0.02, 0.0, 0.0]) + 0.002 * _W0 - 0.001 * _N0  # 1 mm inside face 0, 2 mm from the rigid edge
+_C16_V1 = np.array([0.02, 0.0, 0.0]) + 0.0026 * _W1 - 0.001 * _N1  # 1 mm inside face 1, 2.6 mm from the rigid edge
+CONTINUITY_CASES += [
+    ContinuityCase(
+        "14. needle through the wedge: tip enters face 0 two mm from the rigid edge and leaves through face 1 (one crossing -> two); s = height of the tip over face 0 [mm]",
+        "edge",
+        lambda s: np.array([_C14_P + s * 1e-3 * _N0, _C14_P + 0.010 * _N0]),
+        2.0,
+        -8.0,
+        201,
+        -5.657,
+        -5.55,
+        -5.75,
+        table=True,
+    ),
+    ContinuityCase(
+        "15. vertex 0 enters face 0 two mm from the rigid edge while its edge carries an EE endpoint pair (VT and EE at the vertex); s = height of vertex 0 over face 0 [mm]",
+        "edge",
+        lambda s: np.array([_C14_P + s * 1e-3 * _N0, _C15_V1]),
+        3.0,
+        -3.0,
+        121,
+        0.0,
+        0.1,
+        -0.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "16. edge inside the wedge, both ends 1 mm inside, middle slightly deeper, moved deeper along the bisector (EE pair distance passes r); s = x shift [mm]",
+        "edge",
+        lambda s: np.array([_C16_V0 + np.array([s * 1e-3, 0, 0]), _C16_V1 + np.array([s * 1e-3, 0, 0])]),
+        0.0,
+        -4.0,
+        161,
+        -1.54,
+        -1.4,
+        -2.9,
+        table=True,
+    ),
+]
 CHORD_MODES = ("excess-depth chord rows per soft edge (redefined EE-depth)", "c7 two-crossing chord rows")
+INSIDE_NORMALS = ("blend of the faces within r/4 of the nearest (open choice 5)", "nearest face")
 CHORD_MODE_KEYS = ("excess", "c7")
 
 
@@ -592,6 +638,7 @@ class Viewer:
         self.detail = 1  # index into DISPLAY_MODES
         self.activation = True
         self.chord_mode = 0  # index into CHORD_MODES
+        self.inside_normal = 0  # index into INSIDE_NORMALS
         self.case = None
         self.sweep_note = None
         self.sweep_axis = 2
@@ -700,12 +747,14 @@ class Viewer:
             self.activation,
             self.detail,
             self.chord_mode,
+            self.inside_normal,
         )
         if not force and key == self.last_key:
             return
         self.last_key = key
         self.probe.proposal.use_activation = self.activation
         self.probe.proposal.chord_mode = CHORD_MODE_KEYS[self.chord_mode]
+        self.probe.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
         self.probe.radius = self.radius
         self.probe.stiffness = self.stiffness
         self.probe.use_log_barrier = self.log_barrier
@@ -978,6 +1027,7 @@ class Viewer:
         curves = {}
         mode = CHORD_MODE_KEYS[self.chord_mode]
         other = CHORD_MODE_KEYS[1 - self.chord_mode]
+        probe.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
         for label, use_activation, chord_mode in (
             ("proposal", True, mode),
             (f"proposal, {other} chords", True, other),
@@ -1024,8 +1074,8 @@ class Viewer:
             "(proposal blue, c7 red) and the same force distributed to the endpoints as w_i F "
             "(proposal purple, c7 gold). Arrows acting on one particle are drawn head to tail, VT first, so the "
             "chain ends at the particle's total. EE-depth rows of the proposal are the per-edge chord rows "
-            "(inside portions of a soft edge, weight = excess depth over the endpoints / (r/4)); switch to the c7 "
-            "two-crossing chords below to compare."
+            "(inside pieces of a soft edge, weight = min(excess depth over the endpoints, own depth) / (r/4)); "
+            "inside EE rows fade with their own depth over r/4. Switch to the c7 two-crossing chords below to compare."
         )
         changed, self.kind = ui.Combo("probe", self.kind, list(PROBES))
         if changed:
@@ -1034,6 +1084,7 @@ class Viewer:
         _, self.contribution = ui.Combo("contributions", self.contribution, list(CONTRIBUTIONS))
         _, self.detail = ui.Combo("force display", self.detail, list(DISPLAY_MODES))
         _, self.chord_mode = ui.Combo("EE-depth rows", self.chord_mode, list(CHORD_MODES))
+        _, self.inside_normal = ui.Combo("inside normal", self.inside_normal, list(INSIDE_NORMALS))
         _, self.activation = ui.Checkbox(
             "pair weight a = clamp((r-d)/(r/4), 0, 1) on TV/EE samples (zero when the pair distance exceeds r), frozen per pass",
             self.activation,
