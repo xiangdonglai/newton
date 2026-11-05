@@ -18,7 +18,15 @@ instead of switching. Switching between families is what produces force jumps.
             rigid sub-feature holding x_r (OGC Eq. 14 for interiors, Eq. 15 wireframe vertex blocks for
             endpoints). An endpoint sample is carried by one row only (lowest incident edge id). A sample
             INSIDE at detection whose soft edge has an EE-depth row against the same shape hands over to it.
-  EE-depth  sample = chord midpoint (frozen t). Always carried.
+  EE-depth  redefined (chord rows, one thread per soft edge): the inside portions of the edge, bounded by surface
+            crossings or by endpoints that are themselves inside; sample = midpoint of a portion (frozen t).
+            Weight w = clamp((depth at the sample - deepest endpoint) / (r/4), 0, 1): the row carries only the
+            penetration of the edge interior beyond what its endpoints' VT rows already carry. A chord that
+            starts at an entering endpoint is born with w = 0; a chord that forms at a rigid edge or vertex
+            (endpoints far outside) is born with w = 1 and takes over from the EE pair; a chord that keeps
+            existing while an endpoint enters keeps its weight. An EE row inside at detection carries
+            a (1 - w) of its force, the chord row w: the hand-over is continuous.
+            chord_mode = "c7" keeps the production two-crossing chords and the hard hand-over for comparison.
 
 Pair weight a_s = clamp((r - d) / (r/4), 0, 1) on EE/TV samples, with d the detection-time distance between the
 sample and the rigid feature that placed it, frozen per pass. It is the analogue of OGC's pair energy being zero
@@ -56,6 +64,10 @@ STATE_DEFER_DEPTH = 128  # EE inside at detection: the chord's EE-depth row carr
 STATE_RIGID_NEIGHBOR = 256  # EE at a rigid vertex: the soft point lies in a neighboring rigid edge's block
 STATE_RIGID_VERTEX_DUP = 512  # EE at a rigid vertex: another incident rigid edge's row carries it
 STATE_SOFT_FACE_INVALID = 1024  # TV: soft sub-feature not owned by this triangle or rigid vertex off its cone
+STATE_CHORD = 2048  # proposal chord row (EE-depth redefined, per soft edge)
+STATE_CHORD_NO_EXCESS = 4096  # chord row no deeper than its endpoints: weight 0
+STATE_REPLACED = 8192  # c7 EE-depth row, replaced by the proposal's chord rows
+STATE_CHORD_SHARE = 16384  # EE inside at detection: shares the edge with a chord row, weight a (1 - w)
 HOST_REJECT = (
     STATE_NOT_OWNER
     | STATE_SOFT_NEIGHBOR
@@ -63,7 +75,10 @@ HOST_REJECT = (
     | STATE_DEFER_DEPTH
     | STATE_RIGID_NEIGHBOR
     | STATE_RIGID_VERTEX_DUP
+    | STATE_REPLACED
 )
+CHORD_MAX = 4  # inside portions kept per soft edge (a convex solid has at most one)
+CHORD_BAND = 0.25  # the chord weight saturates once the excess depth reaches CHORD_BAND * r
 WEIGHT_EPS = 1.0e-6
 NO_SHAPE = 2147483647
 
@@ -76,6 +91,10 @@ REASON = {
     STATE_RIGID_VERTEX_DUP: "rigid vertex: carried by another incident edge",
     STATE_SOFT_FACE_INVALID: "soft sub-feature not owned / off cone",
     STATE_QUERY_FAILED: "query failed",
+    STATE_CHORD: "chord row",
+    STATE_CHORD_NO_EXCESS: "chord no deeper than its endpoints (w = 0)",
+    STATE_REPLACED: "c7 chord row, replaced by the per-edge chord rows",
+    STATE_CHORD_SHARE: "inside at detection: shares the edge with a chord row, weight a (1 - w)",
 }
 
 
@@ -131,7 +150,8 @@ def _signed_distance(mesh: wp.uint64, X_ws: wp.transform, scale: wp.vec3, sign_m
     phi = d
     if query.sign < 0.0:
         phi = -d
-    elif d > 1.0e-9:
+    elif d > 1.0e-6:
+        # radial direction; below a micrometre the face normal is used, since diff / d is roundoff there
         n_local = diff / d
     return True, phi, wp.transform_point(X_ws, cp), wp.transform_vector(X_ws, n_local)
 
@@ -264,6 +284,195 @@ def proposal_point_reference(
     force[p] = _penalty_force(particle_q[p], c_world, n_world, particle_radius[p] + margin, stiffness, use_log_barrier)
 
 
+@wp.func
+def _chord_portion(
+    mesh: wp.uint64,
+    X_ws: wp.transform,
+    scale: wp.vec3,
+    sign_method: int,
+    q0: wp.vec3,
+    q1: wp.vec3,
+    t_a: float,
+    t_b: float,
+    phi0: float,
+    phi1: float,
+    radius: float,
+    band: float,
+):
+    """Chord row for the inside portion [t_a, t_b] of the edge: (ok, t_c, phi_c, excess, w)."""
+    t_c = 0.5 * (t_a + t_b)
+    ok, phi_c, _c, _n = _signed_distance(mesh, X_ws, scale, sign_method, q0 + t_c * (q1 - q0))
+    if not ok or phi_c >= 0.0:
+        return False, t_c, phi_c, 0.0, 0.0
+    excess = -phi_c - wp.max(-phi0, -phi1)
+    w = wp.clamp(excess / wp.max(band * radius, 1.0e-9), 0.0, 1.0)
+    return True, t_c, phi_c, excess, w
+
+
+@wp.kernel(enable_backward=False)
+def detect_chords(
+    particle_q: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    edge_indices: wp.array2d[int],
+    shape: int,
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[int],
+    shape_margin: wp.array[float],
+    band: float,
+    chord_t: wp.array2d[float],
+    chord_bounds: wp.array2d[wp.vec2],
+    chord_weight: wp.array2d[float],
+    chord_excess: wp.array2d[float],
+    chord_phi: wp.array2d[wp.vec3],
+):
+    """One thread per soft edge: the edge's inside portions against one shape, as chord rows.
+
+    The segment is cast against the rigid mesh and split at the hits; each piece whose midpoint is inside is
+    a chord, bounded by two crossings or by an endpoint that is inside. The piece's midpoint is the row's
+    sample (frozen for the pass); its weight is the excess of the sample's depth over the deeper endpoint,
+    ramped over CHORD_BAND * r. Fixed-size output (CHORD_MAX rows per edge), no atomics.
+    """
+    e = wp.tid()
+    for k in range(CHORD_MAX):
+        chord_t[e, k] = -1.0
+        chord_bounds[e, k] = wp.vec2(0.0)
+        chord_weight[e, k] = 0.0
+        chord_excess[e, k] = 0.0
+        chord_phi[e, k] = wp.vec3(0.0)
+    v0 = edge_indices[e, 2]
+    v1 = edge_indices[e, 3]
+    if v0 < 0 or v1 < 0:
+        return
+    q0 = particle_q[v0]
+    q1 = particle_q[v1]
+    margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
+    radius = wp.max(particle_radius[v0], particle_radius[v1]) + margin
+    _X_bs, X_ws, _X_sw = _shape_frames(shape_body, body_q, shape_transform, shape)
+    mesh = shape_source_ptr[shape]
+    scale = shape_scale[shape]
+    method = resolve_mesh_sign_method(shape_mesh_properties[shape])
+    ok0, phi0, _c0, _n0 = _signed_distance(mesh, X_ws, scale, method, q0)
+    ok1, phi1, _c1, _n1 = _signed_distance(mesh, X_ws, scale, method, q1)
+    if not ok0 or not ok1:
+        return
+    p = wp.cw_div(_shape_local_point(X_ws, q0), scale)
+    q = wp.cw_div(_shape_local_point(X_ws, q1), scale)
+    seg = q - p
+    length = wp.length(seg)
+    if length <= 0.0:
+        return
+    direction = seg / length
+    # Split the edge at its surface crossings; every piece whose midpoint is inside is a chord. The inside
+    # test is a sign query at the piece's midpoint rather than hit parity, so grazing or repeated hits at a
+    # crossing cannot flip the classification. The walk restarts a little past each hit; pieces shorter than
+    # that are skipped.
+    eps = wp.max(1.0e-4 * length, 1.0e-6)
+    t_start = float(0.0)
+    t_cursor = float(0.0)
+    count = int(0)
+    for _hit in range(2 * CHORD_MAX + 2):
+        if t_cursor >= 1.0 or count >= CHORD_MAX:
+            break
+        hit = wp.mesh_query_ray(mesh, p + seg * t_cursor, direction, length * (1.0 - t_cursor))
+        if not hit.result:
+            break
+        t_hit = wp.min(t_cursor + hit.t / length, 1.0)
+        if t_hit - t_start > eps:
+            ok, t_c, phi_c, excess, w = _chord_portion(
+                mesh, X_ws, scale, method, q0, q1, t_start, t_hit, phi0, phi1, radius, band
+            )
+            if ok:
+                chord_t[e, count] = t_c
+                chord_bounds[e, count] = wp.vec2(t_start, t_hit)
+                chord_weight[e, count] = w
+                chord_excess[e, count] = excess
+                chord_phi[e, count] = wp.vec3(phi0, phi1, phi_c)
+                count += 1
+        t_start = t_hit
+        t_cursor = t_hit + eps
+    if count < CHORD_MAX and 1.0 - t_start > eps:
+        ok, t_c, phi_c, excess, w = _chord_portion(
+            mesh, X_ws, scale, method, q0, q1, t_start, 1.0, phi0, phi1, radius, band
+        )
+        if ok:
+            chord_t[e, count] = t_c
+            chord_bounds[e, count] = wp.vec2(t_start, 1.0)
+            chord_weight[e, count] = w
+            chord_excess[e, count] = excess
+            chord_phi[e, count] = wp.vec3(phi0, phi1, phi_c)
+
+
+@wp.kernel(enable_backward=False)
+def chord_rows(
+    particle_q: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    edge_indices: wp.array2d[int],
+    chord_t: wp.array2d[float],
+    chord_weight: wp.array2d[float],
+    shape: int,
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[int],
+    shape_margin: wp.array[float],
+    stiffness: float,
+    use_log_barrier: bool,
+    row_force: wp.array[wp.vec3],
+    row_sample: wp.array[wp.vec3],
+    row_anchor: wp.array[wp.vec3],
+    row_normal: wp.array[wp.vec3],
+    row_phi: wp.array[float],
+    row_state: wp.array[int],
+):
+    """Force of the chord rows at the current state: the same single-query rule as every other sample."""
+    tid = wp.tid()
+    e = tid // CHORD_MAX
+    k = tid - e * CHORD_MAX
+    row_force[tid] = wp.vec3(0.0)
+    row_sample[tid] = wp.vec3(0.0)
+    row_anchor[tid] = wp.vec3(0.0)
+    row_normal[tid] = wp.vec3(0.0)
+    row_phi[tid] = 0.0
+    row_state[tid] = 0
+    t = chord_t[e, k]
+    if t < 0.0:
+        return
+    v0 = edge_indices[e, 2]
+    v1 = edge_indices[e, 3]
+    x = (1.0 - t) * particle_q[v0] + t * particle_q[v1]
+    margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
+    radius = wp.max(particle_radius[v0], particle_radius[v1]) + margin
+    _X_bs, X_ws, _X_sw = _shape_frames(shape_body, body_q, shape_transform, shape)
+    mesh = shape_source_ptr[shape]
+    scale = shape_scale[shape]
+    ok, phi, c_world, n_world = _signed_distance(
+        mesh, X_ws, scale, resolve_mesh_sign_method(shape_mesh_properties[shape]), x
+    )
+    row_sample[tid] = x
+    if not ok:
+        row_state[tid] = STATE_QUERY_FAILED | STATE_CHORD
+        return
+    state = STATE_CHORD
+    if phi < 0.0:
+        state |= STATE_INSIDE
+    w = chord_weight[e, k]
+    if w > 0.0:
+        state |= STATE_ENABLED
+        row_force[tid] = w * _penalty_force(x, c_world, n_world, radius, stiffness, use_log_barrier)
+    else:
+        state |= STATE_CHORD_NO_EXCESS
+    row_anchor[tid] = c_world
+    row_normal[tid] = n_world
+    row_phi[tid] = phi
+    row_state[tid] = state
+
+
 class ProposalEvaluator:
     """Evaluate the proposal on an already-collided probe (model, state, contacts).
 
@@ -277,6 +486,24 @@ class ProposalEvaluator:
         self.gap = float(gap)
         self.rigid_points = np.asarray(rigid_corner_points, dtype=np.float64)
         self.use_activation = True
+        self.chord_mode = "excess"  # "excess": per-edge chord rows (redefined EE-depth); "c7": production chords
+        self.chord_band = CHORD_BAND
+        edge_count = int(model.edge_count) if getattr(model, "edge_count", 0) else 0
+        self.edge_count = edge_count
+        if edge_count:
+            shape2d = (edge_count, CHORD_MAX)
+            self.chord_t = wp.zeros(shape2d, dtype=float, device=device)
+            self.chord_bounds = wp.zeros(shape2d, dtype=wp.vec2, device=device)
+            self.chord_weight = wp.zeros(shape2d, dtype=float, device=device)
+            self.chord_excess = wp.zeros(shape2d, dtype=float, device=device)
+            self.chord_phi = wp.zeros(shape2d, dtype=wp.vec3, device=device)
+            m = edge_count * CHORD_MAX
+            self.chord_force = wp.empty(m, dtype=wp.vec3, device=device)
+            self.chord_sample = wp.empty(m, dtype=wp.vec3, device=device)
+            self.chord_anchor = wp.empty(m, dtype=wp.vec3, device=device)
+            self.chord_normal = wp.empty(m, dtype=wp.vec3, device=device)
+            self.chord_row_phi = wp.empty(m, dtype=float, device=device)
+            self.chord_state = wp.empty(m, dtype=int, device=device)
         self.host_state = wp.zeros(n, dtype=int, device=device)
         self.weight = wp.ones(n, dtype=float, device=device)
         self.row_force = wp.empty(n, dtype=wp.vec3, device=device)
@@ -319,8 +546,12 @@ class ProposalEvaluator:
             self._soft_topology = (edges, incident)
         return self._soft_topology
 
-    def place(self, model, state, contacts):
-        """Detection-time placement decisions and onset weights (host side; production: in the detectors)."""
+    def place(self, model, state, contacts, chord_w_max=None):
+        """Detection-time placement decisions and onset weights (host side; production: in the detectors).
+
+        ``chord_w_max``: per soft edge, the largest weight of its chord rows (excess mode); None in c7 mode.
+        """
+        chord_w_max = chord_w_max or {}
         count = int(contacts.soft_contact_count.numpy()[0])
         feat = contacts._soft_contact_mesh_features.numpy()[:count]
         idx = contacts.soft_contact_indices.numpy()[:count]
@@ -397,12 +628,23 @@ class ProposalEvaluator:
                         rigid_vertex_candidates.setdefault((soft_edge, v_r, sh), []).append((rigid_edge, i))
                     else:
                         host[i] |= STATE_RIGID_NEIGHBOR
-                if (int(feat[i, 0]) & 8) and depth_shapes.get(soft_edge, NO_SHAPE) == sh:
-                    host[i] |= STATE_DEFER_DEPTH
                 a = activation(d, r_force, T) if self.use_activation else 1.0
+                if int(feat[i, 0]) & 8:  # sample inside at detection
+                    if self.chord_mode == "c7":
+                        if depth_shapes.get(soft_edge, NO_SHAPE) == sh:
+                            host[i] |= STATE_DEFER_DEPTH
+                    elif soft_edge in chord_w_max:
+                        w = chord_w_max[soft_edge]
+                        if w >= 1.0 - 1.0e-6:
+                            host[i] |= STATE_DEFER_DEPTH
+                        else:
+                            host[i] |= STATE_CHORD_SHARE
+                            a *= 1.0 - w
                 weight[i] = a
                 info[i] = (d, u, a)
-            else:  # EE-depth
+            else:  # c7 EE-depth (two-crossing chord): used only in c7 mode
+                if self.chord_mode != "c7":
+                    host[i] |= STATE_REPLACED
                 info[i] = (np.nan, np.nan, 1.0)
         # within-family dedup of endpoint samples: the lowest incident edge id carries
         for cands in soft_vertex_candidates.values():
@@ -419,8 +661,39 @@ class ProposalEvaluator:
         self.weight.assign(weight)
         return count, feat, idx, bary, info
 
+    def detect(self, model, state, shape):
+        """Per-edge chord rows against ``shape`` (prototype of the redefined EE-depth detector)."""
+        wp.launch(
+            detect_chords,
+            dim=self.edge_count,
+            inputs=[
+                state.particle_q,
+                model.particle_radius,
+                model.edge_indices,
+                shape,
+                state.body_q,
+                model.shape_transform,
+                model.shape_body,
+                model.shape_scale,
+                model.shape_source_ptr,
+                model._shape_mesh_properties,
+                model.shape_margin,
+                self.chord_band,
+            ],
+            outputs=[self.chord_t, self.chord_bounds, self.chord_weight, self.chord_excess, self.chord_phi],
+            device=self.device,
+        )
+        t = self.chord_t.numpy()
+        w = self.chord_weight.numpy()
+        w_max = {}
+        for e in np.flatnonzero((t >= 0.0).any(axis=1)):
+            w_max[int(e)] = float(w[e][t[e] >= 0.0].max())
+        return w_max
+
     def evaluate(self, model, state, contacts, *, stiffness, use_log_barrier, shape=0, reference=True):
-        count, _feat, idx, bary, info = self.place(model, state, contacts)
+        use_chords = self.chord_mode != "c7" and self.edge_count > 0
+        chord_w_max = self.detect(model, state, shape) if use_chords else None
+        count, _feat, idx, bary, info = self.place(model, state, contacts, chord_w_max)
         wp.launch(
             proposal_rows,
             dim=contacts.soft_contact_max,
@@ -446,7 +719,78 @@ class ProposalEvaluator:
             for k in range(3):
                 if idx[i, k] >= 0:
                     particle_force[idx[i, k]] += bary[i, k] * force[i]
+        rows_extra = []
+        if use_chords:
+            wp.launch(
+                chord_rows,
+                dim=self.edge_count * CHORD_MAX,
+                inputs=[
+                    state.particle_q,
+                    model.particle_radius,
+                    model.edge_indices,
+                    self.chord_t,
+                    self.chord_weight,
+                    shape,
+                    state.body_q,
+                    model.shape_transform,
+                    model.shape_body,
+                    model.shape_scale,
+                    model.shape_source_ptr,
+                    model._shape_mesh_properties,
+                    model.shape_margin,
+                    stiffness,
+                    use_log_barrier,
+                ],
+                outputs=[
+                    self.chord_force,
+                    self.chord_sample,
+                    self.chord_anchor,
+                    self.chord_normal,
+                    self.chord_row_phi,
+                    self.chord_state,
+                ],
+                device=self.device,
+            )
+            edges = model.edge_indices.numpy()
+            c_t = self.chord_t.numpy()
+            c_b = self.chord_bounds.numpy()
+            c_w = self.chord_weight.numpy()
+            c_x = self.chord_excess.numpy()
+            c_phi = self.chord_phi.numpy()
+            c_state = self.chord_state.numpy()
+            c_force = self.chord_force.numpy()
+            c_sample = self.chord_sample.numpy()
+            c_anchor = self.chord_anchor.numpy()
+            c_normal = self.chord_normal.numpy()
+            c_rphi = self.chord_row_phi.numpy()
+            for e, k in zip(*np.nonzero(c_t >= 0.0), strict=True):
+                j = int(e) * CHORD_MAX + int(k)
+                t = float(c_t[e, k])
+                v0, v1 = int(edges[e, 2]), int(edges[e, 3])
+                if c_state[j] & STATE_ENABLED:
+                    particle_force[v0] += (1.0 - t) * c_force[j]
+                    particle_force[v1] += t * c_force[j]
+                rows_extra.append(
+                    {
+                        "family": "EEdepth",
+                        "edge": int(e),
+                        "corners": [v0, v1, -1],
+                        "bary": np.array([1.0 - t, t, 0.0]),
+                        "sample": c_sample[j].astype(np.float64),
+                        "prop_enabled": bool(c_state[j] & STATE_ENABLED),
+                        "prop_state": int(c_state[j]),
+                        "prop_force": c_force[j],
+                        "prop_anchor": c_anchor[j],
+                        "prop_normal": c_normal[j],
+                        "prop_phi": float(c_rphi[j]),
+                        "weight": float(c_w[e, k]),
+                        "chord_bounds": (float(c_b[e, k][0]), float(c_b[e, k][1])),
+                        "chord_excess": float(c_x[e, k]),
+                        "chord_phi": tuple(float(v) for v in c_phi[e, k]),
+                    }
+                )
         out = {
+            "rows_extra": rows_extra,
             "particle_force": particle_force,
             "row_enabled": enabled,
             "row_state": state_np,

@@ -274,6 +274,89 @@ CONTINUITY_CASES = [
     ),
 ]
 
+# chord (EE-depth) events: endpoint entry with and without an existing chord, endpoint exit through the far
+# face, the second endpoint entering, and a flat patch pushed through a face
+_C9_V0 = np.array([10.869, 3.396, -6.284]) * 1e-3
+_C9_V1 = np.array([5.471, -8.444, 7.621]) * 1e-3
+_C9_DIR = np.array([9.848, 3.213, -6.283]) * 1e-3 - _C9_V0
+_C9_DIR /= np.linalg.norm(_C9_DIR)
+_N0 = np.array([1.0, 1.0, -1.0]) / np.sqrt(3.0)  # face 0 outward normal
+_N1 = np.array([1.0, -1.0, 1.0]) / np.sqrt(3.0)  # face 1 outward normal
+_C0 = np.array([20.0, 20.0, -20.0]) / 3.0 * 1e-3  # face 0 centroid
+_C1 = np.array([20.0, -20.0, 20.0]) / 3.0 * 1e-3  # face 1 centroid
+_T0 = np.array([1.0, -1.0, 0.0]) / np.sqrt(2.0)  # in face 0
+_T1 = np.cross(_N0, _T0)
+_C10_V1 = _C0 + 0.012 * _N0 + 0.004 * _T0
+_C11_V1 = _C1 + 0.003 * _N1 + 0.005 * np.array([0.0, 1.0, 1.0]) / np.sqrt(2.0)  # off the face-0/face-1 medial plane
+_C11_SHIFT = 0.004 * _T0  # vertex 0 path, also off the medial plane
+_C12_M = np.array([0.016, 0.0, 0.0])  # 4 mm inside the rigid edge (20, u, u) along the wedge bisector
+_C12_V0 = _C12_M - 0.0025 * _W_HAT
+_C12_T_FACE = (11.547 * 1e-3 * np.sqrt(3.0) - 0.016) / np.sqrt(2.0)  # W-shift at which m + s W reaches face 0
+CONTINUITY_CASES += [
+    ContinuityCase(
+        "9. vertex 0 enters face 0 while the edge already has a deep chord (7.png -> 8.png); s = displacement of vertex 0 [mm]",
+        "edge",
+        lambda s: np.array([_C9_V0 + s * 1e-3 * _C9_DIR, _C9_V1]),
+        -1.5,
+        2.5,
+        161,
+        0.473,
+        0.4,
+        0.55,
+        table=True,
+    ),
+    ContinuityCase(
+        "10. vertex 0 enters face 0 with the edge pointing outward (fresh entry, no chord before); s = height of vertex 0 over face 0 [mm]",
+        "edge",
+        lambda s: np.array([_C0 + s * 1e-3 * _N0, _C10_V1]),
+        3.0,
+        -3.0,
+        121,
+        0.0,
+        0.1,
+        -0.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "11. vertex 0 deep inside leaves through face 0 while vertex 1 is outside face 1 (one crossing -> two); s = height of vertex 0 over face 0 [mm]",
+        "edge",
+        lambda s: np.array([_C0 + _C11_SHIFT + s * 1e-3 * _N0, _C11_V1]),
+        -8.0,
+        2.0,
+        201,
+        0.0,
+        -0.1,
+        0.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "12. edge across the wedge interior, middle deeper than both ends; vertex 1 leaves through face 0 (fully inside -> one crossing); s = overshoot of vertex 1 past face 0 [mm]",
+        "edge",
+        lambda s: np.array([_C12_V0, _C12_M + (_C12_T_FACE + s * 1e-3) * _W_HAT]),
+        -0.6,
+        2.0,
+        131,
+        0.0,
+        -0.1,
+        0.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "13. flat fan pushed through face 0 (every edge's chord is no deeper than its endpoints); s = height of the fan over face 0 [mm]",
+        "fan",
+        lambda s: fan_vertices(_C0 + s * 1e-3 * _N0, _T0, _T1),
+        2.0,
+        -4.0,
+        121,
+        0.0,
+        0.5,
+        -0.5,
+        table=True,
+    ),
+]
+CHORD_MODES = ("excess-depth chord rows per soft edge (redefined EE-depth)", "c7 two-crossing chord rows")
+CHORD_MODE_KEYS = ("excess", "c7")
+
 
 def regular_tetrahedron(scale=0.02):
     """Regular tetrahedron, edge length scale * 2 sqrt(2), faces oriented outward."""
@@ -462,6 +545,22 @@ class Probe:
                     "weight": float(prop["row_weight"][i]),
                 }
             )
+        for extra in prop["rows_extra"]:
+            row = {
+                "index": -1,
+                "copy": extra["corners"][0] // self.per_copy,
+                "inside": True,
+                "recovery": True,
+                "rigid": -1,
+                "c7_enabled": False,
+                "c7_force": np.zeros(3),
+                "c7_anchor": extra["sample"],
+                "c7_normal": np.zeros(3),
+                "pair_distance": float("nan"),
+                "rigid_param": float("nan"),
+            }
+            row.update(extra)
+            rows.append(row)
         return {"rows": rows, "proposal": prop, "particle_count": self.active}
 
     @staticmethod
@@ -492,6 +591,7 @@ class Viewer:
         self.contribution = 0
         self.detail = 1  # index into DISPLAY_MODES
         self.activation = True
+        self.chord_mode = 0  # index into CHORD_MODES
         self.case = None
         self.sweep_note = None
         self.sweep_axis = 2
@@ -599,11 +699,13 @@ class Viewer:
             self.contribution,
             self.activation,
             self.detail,
+            self.chord_mode,
         )
         if not force and key == self.last_key:
             return
         self.last_key = key
         self.probe.proposal.use_activation = self.activation
+        self.probe.proposal.chord_mode = CHORD_MODE_KEYS[self.chord_mode]
         self.probe.radius = self.radius
         self.probe.stiffness = self.stiffness
         self.probe.use_log_barrier = self.log_barrier
@@ -874,8 +976,15 @@ class Viewer:
         fam = self.families()
         per = probe.per_copy
         curves = {}
-        for label, use_activation in (("proposal", True), ("proposal, no activation", False)):
+        mode = CHORD_MODE_KEYS[self.chord_mode]
+        other = CHORD_MODE_KEYS[1 - self.chord_mode]
+        for label, use_activation, chord_mode in (
+            ("proposal", True, mode),
+            (f"proposal, {other} chords", True, other),
+            ("proposal, no activation", False, mode),
+        ):
             probe.proposal.use_activation = use_activation
+            probe.proposal.chord_mode = chord_mode
             res = probe.evaluate(positions)
             if label == "proposal":
                 pf = Probe.particle_forces(res, "c7", fam, probe.active).reshape(steps, per, 3).sum(axis=1)
@@ -883,6 +992,7 @@ class Viewer:
             pf = Probe.particle_forces(res, "prop", fam, probe.active).reshape(steps, per, 3).sum(axis=1)
             curves[label] = np.linalg.norm(pf, axis=1)
         probe.proposal.use_activation = self.activation
+        probe.proposal.chord_mode = mode
         return curves
 
     def compute_case_sweep(self, index):
@@ -913,7 +1023,9 @@ class Viewer:
             "VT force at the vertex (proposal green, c7 olive); TV / EE / EE-depth force at the closest point x_s "
             "(proposal blue, c7 red) and the same force distributed to the endpoints as w_i F "
             "(proposal purple, c7 gold). Arrows acting on one particle are drawn head to tail, VT first, so the "
-            "chain ends at the particle's total."
+            "chain ends at the particle's total. EE-depth rows of the proposal are the per-edge chord rows "
+            "(inside portions of a soft edge, weight = excess depth over the endpoints / (r/4)); switch to the c7 "
+            "two-crossing chords below to compare."
         )
         changed, self.kind = ui.Combo("probe", self.kind, list(PROBES))
         if changed:
@@ -921,6 +1033,7 @@ class Viewer:
         _, self.show_model = ui.Combo("arrows", self.show_model, ["c7 only", "proposal only", "both"])
         _, self.contribution = ui.Combo("contributions", self.contribution, list(CONTRIBUTIONS))
         _, self.detail = ui.Combo("force display", self.detail, list(DISPLAY_MODES))
+        _, self.chord_mode = ui.Combo("EE-depth rows", self.chord_mode, list(CHORD_MODES))
         _, self.activation = ui.Checkbox(
             "pair weight a = clamp((r-d)/(r/4), 0, 1) on TV/EE samples (zero when the pair distance exceeds r), frozen per pass",
             self.activation,
@@ -1010,6 +1123,11 @@ class Viewer:
                     f"{'ON ' if r['c7_enabled'] else 'off'} {np.linalg.norm(r['c7_force']):.4f} | "
                     f"{'ON ' if r['prop_enabled'] else 'off'} {np.linalg.norm(r['prop_force']):.4f} {r['weight']:.2f} {d_txt} {u_txt} "
                     f"{'in ' if st & STATE_INSIDE else 'out'} {reason_text(st)}"
+                    + (
+                        f" portion [{r['chord_bounds'][0]:.3f}, {r['chord_bounds'][1]:.3f}], excess {1e3 * r['chord_excess']:+.2f} mm"
+                        if "chord_bounds" in r
+                        else ""
+                    )
                 )
         ui.EndChild()
         ui.Separator()

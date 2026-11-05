@@ -1,7 +1,8 @@
 """Continuity battery for the edge and triangle families: largest force step between consecutive configurations.
 
 The cases are ``CONTINUITY_CASES`` in tet_point_force.py (also loadable in the viewer). Each sweep moves a soft probe
-by small steps through a transition and records |F| for c7, the proposal and the proposal without the pair weight.
+by small steps through a transition and records |F| for c7, the proposal (excess-depth chord rows), the proposal with
+c7's two-crossing chord rows, and the proposal without the pair weight.
 A step is 'big' if it exceeds 5% of k r = 0.025 N.
 """
 
@@ -29,10 +30,15 @@ def run(kind, positions_per_step, label, steps, table_every=None):
     pos = np.asarray(positions_per_step, dtype=np.float32).reshape(-1, 3)
     per = probe.per_copy
     curves, counts = {}, {}
-    for act in (True, False):
+    for name, act, chord_mode in (
+        ("proposal", True, "excess"),
+        ("proposal, c7 chords", True, "c7"),
+        ("proposal, no activation", False, "excess"),
+    ):
         probe.proposal.use_activation = act
+        probe.proposal.chord_mode = chord_mode
         res = probe.evaluate(pos)
-        if act:
+        if name == "proposal":
             pf = Probe.particle_forces(res, "c7", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
             curves["c7"] = np.linalg.norm(pf, axis=1)
             n = np.zeros(steps, dtype=int)
@@ -46,7 +52,7 @@ def run(kind, positions_per_step, label, steps, table_every=None):
                     fam_force[r["family"]][r["copy"]] += r["prop_force"]
             counts["proposal"] = n
         pf = Probe.particle_forces(res, "prop", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
-        curves["proposal" if act else "proposal, no activation"] = np.linalg.norm(pf, axis=1)
+        curves[name] = np.linalg.norm(pf, axis=1)
     print(f"\n== {label}")
     for name, values in curves.items():
         jumps = np.abs(np.diff(values))
@@ -56,10 +62,12 @@ def run(kind, positions_per_step, label, steps, table_every=None):
     n = counts["proposal"]
     print(f"  proposal samples with force: min {n.min()} max {n.max()}")
     if table_every:
-        print(f"  {'step':>5} {'c7':>8} {'proposal':>9} {'VT':>7} {'TV':>7} {'EE':>7} {'EEdepth':>8}  depth row")
+        print(
+            f"  {'step':>5} {'c7':>8} {'proposal':>9} {'c7 chords':>9} {'VT':>7} {'TV':>7} {'EE':>7} {'EEdepth':>8}  depth row"
+        )
         for i in range(0, steps, table_every):
             print(
-                f"  {i:5d} {curves['c7'][i]:8.4f} {curves['proposal'][i]:9.4f} "
+                f"  {i:5d} {curves['c7'][i]:8.4f} {curves['proposal'][i]:9.4f} {curves['proposal, c7 chords'][i]:9.4f} "
                 + " ".join(f"{np.linalg.norm(fam_force[f][i]):7.4f}" for f in ("VT", "TV", "EE"))
                 + f" {np.linalg.norm(fam_force['EEdepth'][i]):8.4f}  {'yes' if depth[i] else 'no'}"
             )
