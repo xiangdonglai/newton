@@ -1,4 +1,4 @@
-"""Drag a soft point, edge, triangle pair or fan around a rigid tetrahedron and watch the contact forces.
+"""Drag a soft point, edge, single triangle, triangle pair or fan around a rigid tetrahedron and watch the contact forces.
 
 Every drag runs the real CollisionPipeline (full-surface mesh contact) and then two force evaluations on
 the same detection output: the production VBD exporter ``compute_body_particle_contact_forces`` of the
@@ -8,7 +8,7 @@ damping. The field slice evaluates a grid of independent copies of the probe (tr
 orientation) in one collide call.
 
     DISPLAY=:1 uv run --no-sync --with polyscope==2.6.1 python \
-        tmp/tet_point_force.py [--probe point|edge|triangles|fan] [--case N --at before|after|transition]
+        tmp/tet_point_force.py [--probe point|edge|triangle|triangles|fan] [--case N --at before|after|transition]
     uv run --no-sync --with polyscope==2.6.1 python \
         tmp/tet_point_force.py --headless --screenshot out.png
 """
@@ -31,7 +31,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import compute_body_particle_cont
 from newton.tests.utils.soft_contacts import evaluate_soft_contact_force_mask
 
 FAMILY = {0: "VT", 1: "TV", 2: "EE", 3: "EEdepth"}
-PROBES = ("point", "edge", "triangles", "fan")
+PROBES = ("point", "edge", "triangle", "triangles", "fan")
 # Fan: a cloth vertex with a full ring of six triangles (7 particles), 6 mm ring radius, in the plane x = const.
 FAN_RING = 0.006
 
@@ -161,6 +161,47 @@ TRIANGLE_PRESETS = {
     ),
     "quad folded 60 degrees concave, apex 1 mm into the overlap of the two face blocks": _folded_quad(
         _APEX + 0.003 * _N + 0.001 * _V, -60.0
+    ),
+}
+
+
+def _single_triangle(center, u=_U, v=_V, circumradius=0.008):
+    """One soft triangle in the plane spanned by u, v: vertex 0 at +R v (the top), vertices 1 and 2 on the base
+    edge at v = -R/2 (side 13.9 mm for R = 8 mm). The minimal TV patch: one face (+1), three boundary edges and
+    three boundary vertices (weight 0), so the extremum sum is OGC's one row everywhere, and the simplest EE
+    patch: three soft edges against one rigid edge."""
+    pts = []
+    for deg in (90.0, 210.0, 330.0):
+        a = np.deg2rad(deg)
+        pts.append(np.asarray(center, dtype=np.float64) + circumradius * (np.cos(a) * u + np.sin(a) * v))
+    return np.array(pts)
+
+
+SINGLE_TRIANGLE_PRESETS = {
+    # (vertices, sweep direction); the apex (20, 20, 20) mm is 3 mm below the triangle plane along its normal
+    "apex under the triangle interior (one TV face row; sweep along V toward the base edge)": (
+        _single_triangle(_APEX + 0.003 * _N),
+        _V,
+    ),
+    "apex under the base edge (TV edge group +1 and the apex's EE pair with that edge: two samples)": (
+        _single_triangle(_APEX + 0.003 * _N + 0.004 * _V),
+        _V,
+    ),
+    "apex under the top vertex (TV vertex group +1 and the vertex's VT row: two samples)": (
+        _single_triangle(_APEX + 0.003 * _N - 0.008 * _V),
+        _V,
+    ),
+    "apex 3.5 mm beyond the base edge (TV edge group outside the patch, fading with the pair weight)": (
+        _single_triangle(_APEX + 0.003 * _N + 0.0075 * _V),
+        _V,
+    ),
+    "triangle pierced by the apex, TV sample 1.5 mm inside (inside branch; sweep along N)": (
+        _single_triangle(_APEX - 0.0015 * _N),
+        _N,
+    ),
+    "triangle 3 mm outside the rigid edge (20, u, u), normal to its wedge bisector (EE pairs; sweep across)": (
+        _single_triangle(np.array([0.023, 0.0, 0.0]), _E_HAT, _W_HAT),
+        _W_HAT,
     ),
 }
 # (vertex 0, vertex 1, sweep direction). Onset preset, constructed analytically: a 15 mm soft "needle" nearly
@@ -596,6 +637,30 @@ CONTINUITY_CASES += [
         1.1,
         table=True,
     ),
+    ContinuityCase(
+        "27. single triangle 3 mm over the apex, slid along V: the apex's closest point moves from the face interior onto the base edge (s = 4; the boundary edge group keeps the count at +1) and the row fades with the pair weight beyond the patch (s = 6.25 to 8); s = shift along V [mm]",
+        "triangle",
+        lambda s: _single_triangle(_APEX + 0.003 * _N + s * 1e-3 * _V),
+        -2.0,
+        10.0,
+        241,
+        4.0,
+        3.9,
+        4.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "28. single triangle pressed onto the apex under its interior: the TV sample passes through the surface at s = 0 (signed depth s/3 along the apex axis) and its pair distance passes r at s = -5; s = height over the apex [mm]",
+        "triangle",
+        lambda s: _single_triangle(_APEX + s * 1e-3 * _N),
+        3.0,
+        -6.0,
+        181,
+        0.0,
+        0.1,
+        -0.1,
+        table=True,
+    ),
 ]
 CHORD_MODES = ("excess-depth chord rows per soft edge (redefined EE-depth)", "c7 two-crossing chord rows")
 INSIDE_NORMALS = ("blend of the faces within r/4 of the nearest (open choice 5)", "nearest face")
@@ -634,7 +699,7 @@ class Probe:
         self.kind = kind
         self.count = count
         self.fan_spokes = fan_spokes
-        self.per_copy = {"point": 1, "edge": 2, "triangles": 4, "fan": 1 + fan_spokes}[kind]
+        self.per_copy = {"point": 1, "edge": 2, "triangle": 3, "triangles": 4, "fan": 1 + fan_spokes}[kind]
         self.radius = radius
         self.stiffness = stiffness
         self.use_log_barrier = False
@@ -643,6 +708,18 @@ class Probe:
         builder = newton.ModelBuilder(gravity=(0, 0, 0))
         builder.add_shape_mesh(-1, mesh=self.mesh, cfg=builder.ShapeConfig(margin=0.0, gap=0.0))
         for i in range(count):
+            if kind == "triangle":
+                builder.add_cloth_mesh(
+                    pos=wp.vec3(0.0, 0.0, 1.0 + 0.1 * i),
+                    rot=wp.quat_identity(),
+                    scale=1.0,
+                    vel=wp.vec3(),
+                    vertices=[[0, 0.008, 0], [-0.0069, -0.004, 0], [0.0069, -0.004, 0]],
+                    indices=[0, 1, 2],
+                    density=1.0,
+                    particle_radius=radius,
+                )
+                continue
             if kind == "triangles":
                 builder.add_cloth_mesh(
                     pos=wp.vec3(0.0, 0.0, 1.0 + 0.1 * i),
@@ -915,6 +992,12 @@ class Viewer:
             self.gizmos[0].set_position(EDGE_CENTER - EDGE_HALF)
             self.gizmos[1].set_position(EDGE_CENTER + EDGE_HALF)
             self.sweep_dir = None
+        elif kind == "triangle":
+            pts, direction = next(iter(SINGLE_TRIANGLE_PRESETS.values()))
+            for g, pos in zip(self.gizmos, pts, strict=False):
+                g.set_position(pos)
+            self.sweep_dir = direction
+            self.sweep_axis = 3
         elif kind == "triangles":
             for g, pos in zip(self.gizmos, next(iter(TRIANGLE_PRESETS.values())), strict=False):
                 g.set_position(pos)
@@ -994,6 +1077,11 @@ class Viewer:
         if self.probe.kind == "edge":
             edge = ps.register_curve_network("soft edge", x, np.array([[0, 1]]), color=(1.0, 0.45, 0.04))
             edge.set_radius(0.0006, relative=False)
+        elif self.probe.kind == "triangle":
+            tri = ps.register_surface_mesh(
+                "soft triangles", x, np.array([[0, 1, 2]]), color=(1.0, 0.8, 0.35), edge_width=1.0
+            )
+            tri.set_back_face_policy("identical")
         elif self.probe.kind == "triangles":
             tri = ps.register_surface_mesh(
                 "soft triangles", x, np.array([[0, 1, 2], [1, 0, 3]]), color=(1.0, 0.8, 0.35), edge_width=1.0
@@ -1374,7 +1462,7 @@ class Viewer:
             )
             if changed:
                 self.gizmos[i].set_position(np.asarray(position) / 1000.0)
-        if self.probe.per_copy == 2:
+        if self.probe.kind == "edge":
             ui.Text("edge presets:")
             for label, (p0, p1, direction) in EDGE_PRESETS.items():
                 if ui.Button(label):
@@ -1383,7 +1471,15 @@ class Viewer:
                     self.sweep_dir = direction
                     if direction is not None:
                         self.sweep_axis = 3
-        if self.probe.per_copy == 4:
+        if self.probe.kind == "triangle":
+            ui.Text("single triangle presets:")
+            for label, (pts, direction) in SINGLE_TRIANGLE_PRESETS.items():
+                if ui.Button(label):
+                    for g, pos in zip(self.gizmos, pts, strict=False):
+                        g.set_position(pos)
+                    self.sweep_dir = direction
+                    self.sweep_axis = 3
+        if self.probe.kind == "triangles":
             ui.Text("triangle presets:")
             for label, quad in TRIANGLE_PRESETS.items():
                 if ui.Button(label):

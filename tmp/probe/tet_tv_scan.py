@@ -1,6 +1,6 @@
 """TV battery: a rigid vertex (the tetrahedron apex) against a soft patch through the patch's feature crossings.
 
-Cases 5 and 17 to 25 of ``CONTINUITY_CASES`` (tet_point_force.py). For every case the sweep records |F| of
+Cases 5 and 17 onward of ``CONTINUITY_CASES`` (tet_point_force.py). For every case the sweep records |F| of
 c7, of the proposal with the extremum-sum TV rows (default), of the proposal with the OGC block test
 (production _soft_face_valid) and of the proposal without the pair weight, and prints the largest step overall
 and within 0.3 mm of the transition. For the extremum-sum rows it also checks, at the 'after' configuration, that
