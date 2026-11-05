@@ -76,6 +76,8 @@ STATE_CHORD = 2048  # proposal chord row (EE-depth redefined, per soft edge)
 STATE_CHORD_NO_EXCESS = 4096  # chord row no deeper than its endpoints: weight 0
 STATE_REPLACED = 8192  # c7 EE-depth row, replaced by the proposal's chord rows
 STATE_CHORD_SHARE = 16384  # EE inside at detection: fading with its own depth, weight a (1 - depth / (r/4))
+STATE_TV_SUM = 32768  # proposal TV row: extremum-sum sample of a rigid vertex against the soft patch
+STATE_TV_NEGATIVE = 65536  # extremum-sum row with a negative group weight (a saddle of the distance to the patch)
 HOST_REJECT = (
     STATE_NOT_OWNER
     | STATE_SOFT_NEIGHBOR
@@ -86,6 +88,7 @@ HOST_REJECT = (
     | STATE_REPLACED
 )
 CHORD_MAX = 4  # inside portions kept per soft edge (a convex solid has at most one)
+TV_MAX_PER_VERTEX = 64  # extremum-sum rows kept per rigid vertex (faces, edge groups and vertex groups in range)
 CHORD_BAND = 0.25  # the chord weight saturates once the excess depth reaches CHORD_BAND * r
 INSIDE_BLEND = (
     0.25  # inside normal: blend of the normals of the faces within INSIDE_BLEND * r of the nearest; 0 = nearest face
@@ -104,8 +107,10 @@ REASON = {
     STATE_QUERY_FAILED: "query failed",
     STATE_CHORD: "chord row",
     STATE_CHORD_NO_EXCESS: "chord no deeper than its endpoints (w = 0)",
-    STATE_REPLACED: "c7 chord row, replaced by the per-edge chord rows",
+    STATE_REPLACED: "c7 row, replaced (chord rows / extremum-sum TV rows)",
     STATE_CHORD_SHARE: "inside at detection: fading with depth, weight a (1 - depth / (r/4))",
+    STATE_TV_SUM: "extremum-sum TV row",
+    STATE_TV_NEGATIVE: "negative group weight (saddle)",
 }
 
 
@@ -311,7 +316,7 @@ def proposal_point_reference(
     p = wp.tid()
     _X_bs, X_ws, _X_sw = _shape_frames(shape_body, body_q, shape_transform, shape)
     margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
-    ok, phi, c_world, n_world = _signed_distance(
+    ok, phi, _c_world, n_world = _signed_distance(
         shape_source_ptr[shape],
         X_ws,
         shape_scale[shape],
@@ -519,6 +524,84 @@ def chord_rows(
     row_state[tid] = state
 
 
+@wp.kernel(enable_backward=False)
+def sample_rows(
+    particle_q: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    corners: wp.array[wp.vec3i],
+    bary: wp.array[wp.vec3],
+    weight: wp.array[float],
+    count: int,
+    shape: int,
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[int],
+    shape_margin: wp.array[float],
+    stiffness: float,
+    use_log_barrier: bool,
+    inside_blend: float,
+    base_state: int,
+    row_force: wp.array[wp.vec3],
+    row_sample: wp.array[wp.vec3],
+    row_anchor: wp.array[wp.vec3],
+    row_normal: wp.array[wp.vec3],
+    row_phi: wp.array[float],
+    row_state: wp.array[int],
+):
+    """Force of a generic frozen sample (corners, barycentric weights, signed weight): the single-query rule.
+
+    Used for the extremum-sum TV rows. ``weight`` is the product of the group weight (+1, -1, -(k-1)) and
+    the pair weight a_s; a negative weight reverses the force (a saddle of the distance to the soft patch).
+    """
+    tid = wp.tid()
+    row_force[tid] = wp.vec3(0.0)
+    row_sample[tid] = wp.vec3(0.0)
+    row_anchor[tid] = wp.vec3(0.0)
+    row_normal[tid] = wp.vec3(0.0)
+    row_phi[tid] = 0.0
+    row_state[tid] = 0
+    if tid >= count:
+        return
+    c = corners[tid]
+    b = bary[tid]
+    if c[0] < 0:
+        return
+    x = b[0] * particle_q[c[0]]
+    radius = particle_radius[c[0]]
+    for k in range(1, 3):
+        if c[k] >= 0:
+            x += b[k] * particle_q[c[k]]
+            radius = wp.max(radius, particle_radius[c[k]])
+    margin = shape_margin[shape] if shape_margin.shape[0] > 0 else 0.0
+    radius += margin
+    _X_bs, X_ws, _X_sw = _shape_frames(shape_body, body_q, shape_transform, shape)
+    mesh = shape_source_ptr[shape]
+    scale = shape_scale[shape]
+    ok, phi, c_world, n_world = _signed_distance(
+        mesh, X_ws, scale, resolve_mesh_sign_method(shape_mesh_properties[shape]), x, inside_blend * radius
+    )
+    row_sample[tid] = x
+    if not ok:
+        row_state[tid] = STATE_QUERY_FAILED | base_state
+        return
+    state = base_state
+    if phi < 0.0:
+        state |= STATE_INSIDE
+    w = weight[tid]
+    if w < 0.0:
+        state |= STATE_TV_NEGATIVE
+    if wp.abs(w) > 0.0:
+        state |= STATE_ENABLED
+        row_force[tid] = w * _penalty_force(phi, n_world, radius, stiffness, use_log_barrier)
+    row_anchor[tid] = c_world
+    row_normal[tid] = n_world
+    row_phi[tid] = phi
+    row_state[tid] = state
+
+
 class ProposalEvaluator:
     """Evaluate the proposal on an already-collided probe (model, state, contacts).
 
@@ -535,6 +618,12 @@ class ProposalEvaluator:
         self.chord_mode = "excess"  # "excess": per-edge chord rows (redefined EE-depth); "c7": production chords
         self.chord_band = CHORD_BAND
         self.inside_blend = INSIDE_BLEND  # fraction of r over which inside normals blend; 0 = nearest face
+        # "extremum": TV rows are the extremum-sum of the rigid vertex's distance to the soft patch (faces +1,
+        # interior edges -1, interior vertices +1, grouped by closest point); "ogc": production TV rows with the
+        # soft-side block test (_soft_face_valid) and the owner triangle
+        self.tv_mode = "extremum"
+        self._tv_capacity = 0
+        self._tv_topology = None
         edge_count = int(model.edge_count) if getattr(model, "edge_count", 0) else 0
         self.edge_count = edge_count
         if edge_count:
@@ -593,6 +682,164 @@ class ProposalEvaluator:
             self._soft_topology = (edges, incident)
         return self._soft_topology
 
+    def tv_topology(self, model):
+        """Static soft-patch tables for the extremum-sum TV rows: face edges, edge/vertex interior flags."""
+        if self._tv_topology is None:
+            tris = model.tri_indices.numpy().astype(np.int64) if model.tri_count else np.zeros((0, 3), dtype=np.int64)
+            edges = (
+                model.edge_indices.numpy().astype(np.int64) if model.edge_count else np.zeros((0, 4), dtype=np.int64)
+            )
+            edge_of = {}
+            for e, row in enumerate(edges):
+                edge_of[(min(int(row[2]), int(row[3])), max(int(row[2]), int(row[3])))] = e
+            face_edges = np.full((len(tris), 3), -1, dtype=np.int64)
+            for f, (a, b, c) in enumerate(tris):
+                for k, (u, v) in enumerate(((a, b), (b, c), (c, a))):
+                    face_edges[f, k] = edge_of.get((min(int(u), int(v)), max(int(u), int(v))), -1)
+            edge_interior = (edges[:, 0] >= 0) & (edges[:, 1] >= 0) if len(edges) else np.zeros(0, dtype=bool)
+            n = int(model.particle_count)
+            on_boundary = np.zeros(n, dtype=bool)
+            has_face = np.zeros(n, dtype=bool)
+            for e, row in enumerate(edges):
+                if not edge_interior[e]:
+                    on_boundary[int(row[2])] = on_boundary[int(row[3])] = True
+            for a, b, c in tris:
+                has_face[int(a)] = has_face[int(b)] = has_face[int(c)] = True
+            # inclusion-exclusion weights (ESP supplement S4): every point of the patch counted once
+            w_edge = np.where(edge_interior, -1, 0).astype(np.int64)
+            w_vertex = np.where(has_face & ~on_boundary, 1, 0).astype(np.int64)
+            self._tv_topology = (tris, edges, face_edges, w_edge, w_vertex)
+        return self._tv_topology
+
+    def detect_tv(self, model, state, contacts):
+        """Extremum-sum TV rows of every rigid vertex against the soft patch (host prototype of the detector).
+
+        For one rigid vertex p the TV family is sum_sigma w_sigma F(cp_sigma(p)) over the closed simplices of the
+        soft patch, w = +1 (face), -1 (interior edge), 0 (boundary edge), +1 (interior vertex), 0 (boundary
+        vertex), each sampled at its closest point to p. Simplices sharing a closest point are grouped: a face
+        with an interior closest point is its own group (+1); an edge whose own closest point is interior
+        carries w_e plus the number of incident faces whose closest point lies on it (-1 saddle, 0 not extremal,
+        +1 minimum); a vertex carries w_v plus the weights of the incident edges and faces whose closest point is
+        the vertex (+1 minimum or maximum, 0 not extremal, -(k-1) saddle). Every member of a group has the same
+        pair distance, so the pair weight a_s(d) and the detection range apply to the group as a whole.
+        """
+        tris, edges, face_edges, w_edge, w_vertex = self.tv_topology(model)
+        canon, _incident, _neighbors = self.rigid_topology(contacts)
+        q = state.particle_q.numpy().astype(np.float64)
+        radius = model.particle_radius.numpy().astype(np.float64)
+        margin = model.shape_margin.numpy() if model.shape_margin is not None and model.shape_margin.shape[0] else None
+        m = float(margin[0]) if margin is not None else 0.0
+        eps = WEIGHT_EPS
+        rows = []  # (corners, bary, net, a_s, d, kind, rigid)
+        unique = {}
+        for i, cid in canon.items():
+            unique.setdefault(cid, self.rigid_points[i])
+        n_e = len(edges)
+        n_v = len(q)
+        for cid, p in sorted(unique.items()):
+            # vertices
+            dv = np.linalg.norm(q - p, axis=1)
+            # edges: closest point and its class (interior, or the endpoint it sits on)
+            if n_e:
+                e0 = q[edges[:, 2]]
+                e1 = q[edges[:, 3]]
+                seg = e1 - e0
+                l2 = np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-30)
+                t = np.clip(np.einsum("ij,ij->i", p - e0, seg) / l2, 0.0, 1.0)
+                cp_e = e0 + t[:, None] * seg
+                de = np.linalg.norm(p - cp_e, axis=1)
+                cls_e = np.where(t <= 0.5, edges[:, 2], edges[:, 3])
+                cls_e = np.where((t > eps) & (t < 1.0 - eps), -1, cls_e)
+            else:
+                t = de = np.zeros(0)
+                cls_e = np.zeros(0, dtype=np.int64)
+            edge_faces = np.zeros(n_e, dtype=np.int64)  # faces whose closest point lies on this edge's interior
+            vertex_faces = np.zeros(n_v, dtype=np.int64)  # faces whose closest point is this vertex
+            for f, tri in enumerate(tris):
+                a, b, c = q[tri[0]], q[tri[1]], q[tri[2]]
+                nrm = np.cross(b - a, c - a)
+                nn = float(nrm @ nrm)
+                if nn <= 0.0:
+                    continue
+                proj = p - ((p - a) @ nrm) / nn * nrm
+                lam = (
+                    np.array(
+                        [
+                            np.cross(b - proj, c - proj) @ nrm,
+                            np.cross(c - proj, a - proj) @ nrm,
+                            np.cross(a - proj, b - proj) @ nrm,
+                        ]
+                    )
+                    / nn
+                )
+                if np.all(lam > 0.0):
+                    d = float(np.linalg.norm(p - proj))
+                    r_force = float(radius[tri].max()) + m
+                    if d < r_force + self.gap:
+                        a_s = activation(d, r_force) if self.use_activation else 1.0
+                        rows.append(([int(v) for v in tri], lam / lam.sum(), 1, a_s, d, "face", cid))
+                    continue
+                # boundary closest point: the nearest of the face's edges, classified like the edge itself
+                cand = [e for e in face_edges[f] if e >= 0]
+                if not cand:
+                    continue
+                e_best = min(cand, key=lambda e: (de[e], e))
+                if cls_e[e_best] < 0:
+                    edge_faces[e_best] += 1
+                else:
+                    vertex_faces[cls_e[e_best]] += 1
+            # edge groups
+            for e in range(n_e):
+                if cls_e[e] >= 0:
+                    continue
+                net = int(w_edge[e] + edge_faces[e])
+                if net == 0:
+                    continue
+                v0, v1 = int(edges[e, 2]), int(edges[e, 3])
+                r_force = float(max(radius[v0], radius[v1])) + m
+                if de[e] < r_force + self.gap:
+                    a_s = activation(float(de[e]), r_force) if self.use_activation else 1.0
+                    rows.append(([v0, v1, -1], np.array([1.0 - t[e], t[e], 0.0]), net, a_s, float(de[e]), "edge", cid))
+            # vertex groups
+            edge_w_at_vertex = np.zeros(n_v, dtype=np.int64)
+            for e in range(n_e):
+                if cls_e[e] >= 0:
+                    edge_w_at_vertex[cls_e[e]] += w_edge[e]
+            for v in range(n_v):
+                net = int(w_vertex[v] + edge_w_at_vertex[v] + vertex_faces[v])
+                if net == 0:
+                    continue
+                r_force = float(radius[v]) + m
+                if dv[v] < r_force + self.gap:
+                    a_s = activation(float(dv[v]), r_force) if self.use_activation else 1.0
+                    rows.append(([v, -1, -1], np.array([1.0, 0.0, 0.0]), net, a_s, float(dv[v]), "vertex", cid))
+        count = len(rows)
+        if count > self._tv_capacity:
+            cap = max(TV_MAX_PER_VERTEX, 2 * count)
+            self._tv_capacity = cap
+            self.tv_corners = wp.zeros(cap, dtype=wp.vec3i, device=self.device)
+            self.tv_bary = wp.zeros(cap, dtype=wp.vec3, device=self.device)
+            self.tv_weight = wp.zeros(cap, dtype=float, device=self.device)
+            self.tv_force = wp.empty(cap, dtype=wp.vec3, device=self.device)
+            self.tv_sample = wp.empty(cap, dtype=wp.vec3, device=self.device)
+            self.tv_anchor = wp.empty(cap, dtype=wp.vec3, device=self.device)
+            self.tv_normal = wp.empty(cap, dtype=wp.vec3, device=self.device)
+            self.tv_row_phi = wp.empty(cap, dtype=float, device=self.device)
+            self.tv_state = wp.empty(cap, dtype=int, device=self.device)
+        self.tv_meta = rows
+        if count:
+            corners = np.full((self._tv_capacity, 3), -1, dtype=np.int32)
+            bary = np.zeros((self._tv_capacity, 3), dtype=np.float32)
+            weight = np.zeros(self._tv_capacity, dtype=np.float32)
+            for i, (c, b, net, a_s, _d, _kind, _cid) in enumerate(rows):
+                corners[i] = c
+                bary[i] = b
+                weight[i] = net * a_s
+            self.tv_corners.assign(corners)
+            self.tv_bary.assign(bary)
+            self.tv_weight.assign(weight)
+        return count
+
     def place(self, model, state, contacts, row_phi=None):
         """Detection-time placement decisions and onset weights (host side; production: in the detectors).
 
@@ -644,6 +891,8 @@ class ProposalEvaluator:
                 v_r = self.rigid_points[int(rv_table[int(feat[i, 2])][1])]
                 d = float(np.linalg.norm(x - v_r))
                 a = activation(d, r_force, T) if self.use_activation else 1.0
+                if self.tv_mode != "ogc":
+                    host[i] |= STATE_REPLACED  # the extremum-sum rows of detect_tv carry the TV family
                 weight[i] = a
                 info[i] = (d, np.nan, a)
             elif fam == 2:  # EE
@@ -846,6 +1095,73 @@ class ProposalEvaluator:
                         "chord_phi": tuple(float(v) for v in c_phi[e, k]),
                     }
                 )
+        if self.tv_mode != "ogc":
+            n_tv = self.detect_tv(model, state, contacts)
+            if n_tv:
+                wp.launch(
+                    sample_rows,
+                    dim=n_tv,
+                    inputs=[
+                        state.particle_q,
+                        model.particle_radius,
+                        self.tv_corners,
+                        self.tv_bary,
+                        self.tv_weight,
+                        n_tv,
+                        shape,
+                        state.body_q,
+                        model.shape_transform,
+                        model.shape_body,
+                        model.shape_scale,
+                        model.shape_source_ptr,
+                        model._shape_mesh_properties,
+                        model.shape_margin,
+                        stiffness,
+                        use_log_barrier,
+                        self.inside_blend,
+                        STATE_TV_SUM,
+                    ],
+                    outputs=[
+                        self.tv_force,
+                        self.tv_sample,
+                        self.tv_anchor,
+                        self.tv_normal,
+                        self.tv_row_phi,
+                        self.tv_state,
+                    ],
+                    device=self.device,
+                )
+                t_state = self.tv_state.numpy()[:n_tv]
+                t_force = self.tv_force.numpy()[:n_tv]
+                t_sample = self.tv_sample.numpy()[:n_tv]
+                t_anchor = self.tv_anchor.numpy()[:n_tv]
+                t_normal = self.tv_normal.numpy()[:n_tv]
+                t_phi = self.tv_row_phi.numpy()[:n_tv]
+                for j, (c, b, net, a_s, d, kind, cid) in enumerate(self.tv_meta):
+                    if t_state[j] & STATE_ENABLED:
+                        for k in range(3):
+                            if c[k] >= 0:
+                                particle_force[c[k]] += b[k] * t_force[j]
+                    rows_extra.append(
+                        {
+                            "family": "TV",
+                            "corners": list(c),
+                            "bary": np.asarray(b, dtype=np.float64),
+                            "sample": t_sample[j].astype(np.float64),
+                            "prop_enabled": bool(t_state[j] & STATE_ENABLED),
+                            "prop_state": int(t_state[j]),
+                            "prop_force": t_force[j],
+                            "prop_anchor": t_anchor[j],
+                            "prop_normal": t_normal[j],
+                            "prop_phi": float(t_phi[j]),
+                            "weight": float(a_s),
+                            "tv_net": int(net),
+                            "tv_kind": kind,
+                            "rigid": int(cid),
+                            "pair_distance": float(d),
+                            "inside": bool(t_phi[j] < 0.0),
+                        }
+                    )
         out = {
             "rows_extra": rows_extra,
             "particle_force": particle_force,

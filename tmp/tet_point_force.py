@@ -1,4 +1,4 @@
-"""Drag a soft point or a soft edge around a rigid tetrahedron and watch the contact forces.
+"""Drag a soft point, edge, triangle pair or fan around a rigid tetrahedron and watch the contact forces.
 
 Every drag runs the real CollisionPipeline (full-surface mesh contact) and then two force evaluations on
 the same detection output: the production VBD exporter ``compute_body_particle_contact_forces`` of the
@@ -8,7 +8,7 @@ damping. The field slice evaluates a grid of independent copies of the probe (tr
 orientation) in one collide call.
 
     DISPLAY=:1 uv run --no-sync --with polyscope==2.6.1 python \
-        tmp/tet_point_force.py [--probe point|edge]
+        tmp/tet_point_force.py [--probe point|edge|triangles|fan] [--case N --at before|after|transition]
     uv run --no-sync --with polyscope==2.6.1 python \
         tmp/tet_point_force.py --headless --screenshot out.png
 """
@@ -64,8 +64,18 @@ DISPLAY_MODES = (
     "separated: VT at the vertex; TV/EE/EE-depth at the closest point and as shares at the endpoints",
 )
 # separated display: VT force at the vertex / force at the closest point / its shares w_i F at the endpoints
-PROPOSAL_FAMILY_COLORS = {"VT": (0.1, 0.65, 0.2), "sample": (0.15, 0.35, 0.95), "share": (0.6, 0.2, 0.9)}
-C7_FAMILY_COLORS = {"VT": (0.4, 0.5, 0.1), "sample": (0.9, 0.1, 0.1), "share": (0.95, 0.75, 0.05)}
+PROPOSAL_FAMILY_COLORS = {
+    "VT": (0.1, 0.65, 0.2),
+    "sample": (0.15, 0.35, 0.95),
+    "share": (0.6, 0.2, 0.9),
+    "negative": (0.9, 0.3, 0.0),
+}
+C7_FAMILY_COLORS = {
+    "VT": (0.4, 0.5, 0.1),
+    "sample": (0.9, 0.1, 0.1),
+    "share": (0.95, 0.75, 0.05),
+    "negative": (0.5, 0.0, 0.0),
+}
 EDGE_HALF = np.array([0.015, 0.0, 0.0])
 EDGE_CENTER = np.array([0.0, 0.002, 0.010])  # y offset keeps the chord midpoint off the medial plane
 # Two soft triangles sharing an edge, placed 3 mm above the tetrahedron apex (20, 20, 20) mm.
@@ -80,20 +90,69 @@ def _quad(center, u=_U, v=_V, half_edge=0.008, height=0.006):
     return np.array([center - half_edge * u, center + half_edge * u, center + height * v, center - height * v])
 
 
+def _folded_quad(center, angle_deg, u=_U, v=_V, n=_N, half_edge=0.008, height=0.006):
+    """The quad of _quad with its two wings rotated about the shared edge by angle/2 each. Positive angles lift
+    the wings along n, away from the solid below (a convex fold as seen from the rigid vertex); negative angles
+    dip them toward the solid (a concave fold, whose face blocks overlap and have open boundaries)."""
+    a = np.deg2rad(angle_deg) / 2.0
+    wing = height * (np.cos(a) * v + np.sin(a) * n)
+    wing_m = height * (-np.cos(a) * v + np.sin(a) * n)
+    return np.array([center - half_edge * u, center + half_edge * u, center + wing, center + wing_m])
+
+
+def _fan_lifted(center, e1, e2, n, lift, spokes, ring=FAN_RING):
+    """A fan whose center vertex is displaced by ``lift`` along n: a pocket (lift away from the solid) or a tent."""
+    pts = fan_vertices(center, e1, e2, ring=ring, spokes=spokes)
+    pts[0] = pts[0] + lift * n
+    return pts
+
+
 _E_HAT = np.array([0.0, 1.0, 1.0]) / np.sqrt(2.0)  # rigid edge (20, u, u) direction
 _W_HAT = np.array([0.0, 1.0, -1.0]) / np.sqrt(2.0)  # in the plane x = const, perpendicular to the rigid edge
 FAN_PRESETS = {
+    # (vertices, sweep direction, spokes)
     # the rigid edge's line passes 3 mm below the fan plane; sweeping along _W_HAT moves its projection across
     # the center vertex (offset 0) and then across ring vertices and edges
     "fan 3 mm over the rigid edge, sweep across the center vertex": (
         fan_vertices(np.array([0.023, 0.0, 0.0]) + 0.0025 * _W_HAT, _W_HAT, _E_HAT),
         _W_HAT,
+        6,
+    ),
+    # TV: a three-face pocket over the apex (center lifted away from the solid, faces at 30 degrees), and a
+    # four-face tent (center pushed toward the solid)
+    "3-face pocket over the apex (TV, concave vertex; sweep across the pocket)": (
+        _fan_lifted(_APEX + 0.0005 * _N, _U, _V, _N, FAN_RING * np.tan(np.deg2rad(30.0)), 3),
+        _U,
+        3,
+    ),
+    "4-face tent over the apex (TV, convex vertex; sweep across the tent)": (
+        _fan_lifted(_APEX + 0.005 * _N, _U, _V, _N, -0.0025, 4),
+        _U,
+        4,
+    ),
+    "planar 6-spoke fan 3 mm over the apex, rotated 15 degrees (TV, regular vertex)": (
+        fan_vertices(
+            _APEX + 0.003 * _N,
+            np.cos(np.deg2rad(15.0)) * _U + np.sin(np.deg2rad(15.0)) * _V,
+            -np.sin(np.deg2rad(15.0)) * _U + np.cos(np.deg2rad(15.0)) * _V,
+        ),
+        _U,
+        6,
     ),
 }
 TRIANGLE_PRESETS = {
     "rigid vertex over the shared soft edge (TV owner)": _quad(_APEX + 0.003 * _N),
     "rigid vertex over a triangle interior (TV)": _quad(_APEX + 0.003 * _N + 0.0025 * _V),
     "rigid vertex over a soft vertex (VT)": _quad(_APEX + 0.003 * _N - 0.008 * _U),
+    "quad folded 30 degrees convex (wings away from the solid), apex 0.5 mm into wing 2's side": _folded_quad(
+        _APEX + 0.003 * _N + 0.0005 * _V, 30.0
+    ),
+    "quad folded 5 degrees concave (wings toward the solid), apex under the fold": _folded_quad(
+        _APEX + 0.003 * _N, -5.0
+    ),
+    "quad folded 60 degrees concave, apex 1 mm into the overlap of the two face blocks": _folded_quad(
+        _APEX + 0.003 * _N + 0.001 * _V, -60.0
+    ),
 }
 # (vertex 0, vertex 1, sweep direction). Onset preset, constructed analytically: a 15 mm soft "needle" nearly
 # perpendicular to face 0 (normal n0), its tip 0.04 mm above the face and 6.1 mm in-plane from the rigid edge
@@ -141,10 +200,11 @@ class ContinuityCase:
     """One sweep of the continuity battery (Section 14.4): ``positions(s)`` for a parameter s in mm, the parameter
     at which the transition happens, and a before/after pair one step on either side of it."""
 
-    def __init__(self, label, kind, positions, lo, hi, steps, transition, before, after, table=False):
+    def __init__(self, label, kind, positions, lo, hi, steps, transition, before, after, table=False, spokes=6):
         self.label, self.kind, self.positions = label, kind, positions
         self.lo, self.hi, self.steps = lo, hi, steps
         self.transition, self.before, self.after, self.table = transition, before, after, table
+        self.spokes = spokes  # fan probes only
 
     def parameters(self):
         return np.linspace(self.lo, self.hi, self.steps)
@@ -168,7 +228,7 @@ _CASE4_QUAD = np.array(
         np.array([0.023, 0, 0]) - 0.006 * _E_HAT + 0.002 * _W_HAT,
     ]
 )
-_CASE3_PTS, _CASE3_DIR = next(iter(FAN_PRESETS.values()))
+_CASE3_PTS, _CASE3_DIR, _ = next(iter(FAN_PRESETS.values()))
 _CASE6_P0, _CASE6_P1, _CASE6_DIR = EDGE_PRESETS[
     "needle on face 0, rigid edge entering range (EE onset; sweep along preset direction)"
 ]
@@ -399,9 +459,119 @@ CONTINUITY_CASES += [
         table=True,
     ),
 ]
+# TV: a rigid vertex (the apex) against a soft patch through the feature crossings of the patch: planar edge
+# (case 5), convex fold, slightly and strongly concave folds (open block boundaries), a concave pocket vertex, a
+# convex tent vertex, a regular planar vertex, the sample passing through the surface, and onset / exit at the
+# patch boundary
+_ROT15 = np.deg2rad(15.0)
+_U15 = np.cos(_ROT15) * _U + np.sin(_ROT15) * _V
+_V15 = -np.sin(_ROT15) * _U + np.cos(_ROT15) * _V
+_N0_FACE = np.array([1.0, 1.0, -1.0]) / np.sqrt(3.0)  # face 0 outward normal (apex (20,20,20) is a corner of face 0)
+_F0_IN = np.array([-1.0, -1.0, -2.0]) / np.sqrt(6.0)  # in face 0, from the apex toward the face centroid
+_F0_T = np.cross(_N0_FACE, _F0_IN)
+CONTINUITY_CASES += [
+    ContinuityCase(
+        "17. quad folded 30 degrees convex (wings away from the solid): the apex crosses the fold, face block -> edge wedge -> face block; s = shift along V [mm]",
+        "triangles",
+        lambda s: _folded_quad(_APEX + 0.003 * _N + s * 1e-3 * _V, 30.0),
+        -3.0,
+        3.0,
+        241,
+        0.804,
+        0.7,
+        0.9,
+    ),
+    ContinuityCase(
+        "18. quad folded 5 degrees concave (wings toward the solid): the apex crosses the fold through the 0.26 mm overlap of the two face blocks; s = shift along V [mm]",
+        "triangles",
+        lambda s: _folded_quad(_APEX + 0.003 * _N + s * 1e-3 * _V, -5.0),
+        -1.5,
+        1.5,
+        241,
+        0.131,
+        0.0,
+        0.25,
+    ),
+    ContinuityCase(
+        "19. quad folded 60 degrees concave: the apex leaves wing 3's face block through its open boundary while inside wing 2's; s = shift along V [mm]",
+        "triangles",
+        lambda s: _folded_quad(_APEX + 0.003 * _N + s * 1e-3 * _V, -60.0),
+        -3.5,
+        3.5,
+        281,
+        1.732,
+        1.6,
+        1.85,
+        table=True,
+    ),
+    ContinuityCase(
+        "20. 3-face pocket (faces at 30 degrees, center lifted away from the solid): the apex moves across the pocket from under one face to under another; s = shift along U [mm]",
+        "fan",
+        lambda s: _fan_lifted(_APEX + 0.0005 * _N + s * 1e-3 * _U, _U, _V, _N, FAN_RING * np.tan(np.deg2rad(30.0)), 3),
+        -4.0,
+        4.0,
+        321,
+        0.0,
+        -0.1,
+        0.1,
+        table=True,
+        spokes=3,
+    ),
+    ContinuityCase(
+        "21. 4-face tent (center pushed 2.5 mm toward the solid): the apex crosses the tent vertex, vertex block -> edge wedge -> face; s = shift along U [mm]",
+        "fan",
+        lambda s: _fan_lifted(_APEX + 0.005 * _N + s * 1e-3 * _U, _U, _V, _N, -0.0025, 4),
+        -3.0,
+        3.0,
+        241,
+        0.0,
+        -0.1,
+        0.1,
+        spokes=4,
+    ),
+    ContinuityCase(
+        "22. planar 6-spoke fan 3 mm over the apex, rotated 15 degrees: the apex crosses the center vertex (s = 0), a ring edge (s = 5.8) and leaves the patch; s = shift along U [mm]",
+        "fan",
+        lambda s: fan_vertices(_APEX + 0.003 * _N + s * 1e-3 * _U, _U15, _V15),
+        -2.025,  # grid offset by half a step: s = 0 exactly is the tie where the apex sits on the vertex normal
+        8.975,
+        221,
+        0.0,
+        -0.125,
+        0.125,
+    ),
+    ContinuityCase(
+        "23. quad pressed onto the apex, apex under a triangle interior: the TV sample passes through the surface at s = 0 and its pair distance passes r at s = -5; s = height over the apex [mm]",
+        "triangles",
+        lambda s: _quad(_APEX + s * 1e-3 * _N + 0.0025 * _V),
+        3.0,
+        -6.0,
+        181,
+        0.0,
+        0.1,
+        -0.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "24. quad parallel to face 0, 4 mm above it, slid from the apex into the face: the apex's closest point moves from the interior to the trailing boundary edge (s = 8) and the pair distance passes r (s = 11); s = shift into the face [mm]",
+        "triangles",
+        lambda s: _quad(_APEX + 0.004 * _N0_FACE + s * 1e-3 * _F0_IN, _F0_T, _F0_IN),
+        -2.0,
+        14.0,
+        321,
+        8.0,
+        7.9,
+        8.1,
+    ),
+]
 CHORD_MODES = ("excess-depth chord rows per soft edge (redefined EE-depth)", "c7 two-crossing chord rows")
 INSIDE_NORMALS = ("blend of the faces within r/4 of the nearest (open choice 5)", "nearest face")
 CHORD_MODE_KEYS = ("excess", "c7")
+TV_MODES = (
+    "extremum-sum rows per rigid vertex (faces +1, interior edges -1, interior vertices +1 at their closest points)",
+    "OGC block test (production _soft_face_valid: interior always, edge / vertex samples by cone and owner triangle)",
+)
+TV_MODE_KEYS = ("extremum", "ogc")
 
 
 def regular_tetrahedron(scale=0.02):
@@ -639,6 +809,8 @@ class Viewer:
         self.activation = True
         self.chord_mode = 0  # index into CHORD_MODES
         self.inside_normal = 0  # index into INSIDE_NORMALS
+        self.tv_mode = 0  # index into TV_MODES
+        self.spokes = 6  # fan probe spokes
         self.case = None
         self.sweep_note = None
         self.sweep_axis = 2
@@ -691,7 +863,7 @@ class Viewer:
             "rigid tetrahedron", verts, faces, color=(0.55, 0.60, 0.67), edge_width=1.5
         )
         rigid.set_transparency(0.45)
-        self.probe = Probe(kind, 1, radius=self.radius, device=self.args.device)
+        self.probe = Probe(kind, 1, radius=self.radius, device=self.args.device, fan_spokes=self.spokes)
         self.field = None
         self.field_key = None
         self.trace = np.zeros((0, 4), dtype=np.float32)
@@ -705,7 +877,10 @@ class Viewer:
             for g, pos in zip(self.gizmos, next(iter(TRIANGLE_PRESETS.values())), strict=False):
                 g.set_position(pos)
         else:
-            pts, direction = next(iter(FAN_PRESETS.values()))
+            pts, direction, _spokes = next(
+                (v for v in FAN_PRESETS.values() if v[2] == self.spokes),
+                (fan_vertices(_APEX + 0.003 * _N, _U15, _V15, spokes=self.spokes), _U, self.spokes),
+            )
             for g, pos in zip(self.gizmos, pts, strict=False):
                 g.set_position(pos)
             self.sweep_dir = direction
@@ -718,8 +893,10 @@ class Viewer:
     def load_case(self, index, which):
         """Load continuity case ``index`` at its 'before' or 'after' parameter (or a float s in mm)."""
         case = CONTINUITY_CASES[index]
-        if PROBES[self.kind] != case.kind:
+        if PROBES[self.kind] != case.kind or (case.kind == "fan" and self.spokes != case.spokes):
             self.kind = PROBES.index(case.kind)
+            if case.kind == "fan":
+                self.spokes = case.spokes
             self.load_probe()
         s = {"before": case.before, "after": case.after, "transition": case.transition}.get(which, which)
         for g, pos in zip(self.gizmos, case.positions(float(s)), strict=False):
@@ -748,12 +925,14 @@ class Viewer:
             self.detail,
             self.chord_mode,
             self.inside_normal,
+            self.tv_mode,
         )
         if not force and key == self.last_key:
             return
         self.last_key = key
         self.probe.proposal.use_activation = self.activation
         self.probe.proposal.chord_mode = CHORD_MODE_KEYS[self.chord_mode]
+        self.probe.proposal.tv_mode = TV_MODE_KEYS[self.tv_mode]
         self.probe.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
         self.probe.radius = self.radius
         self.probe.stiffness = self.stiffness
@@ -776,9 +955,9 @@ class Viewer:
                 "soft triangles", x, np.array([[0, 1, 2], [1, 0, 3]]), color=(1.0, 0.8, 0.35), edge_width=1.0
             )
             tri.set_back_face_policy("identical")
-        elif n == 7:
+        elif self.probe.kind == "fan":
             tri = ps.register_surface_mesh(
-                "soft triangles", x, np.array(FAN_TRIANGLES), color=(1.0, 0.8, 0.35), edge_width=1.0
+                "soft triangles", x, np.array(fan_triangles(self.spokes)), color=(1.0, 0.8, 0.35), edge_width=1.0
             )
             tri.set_back_face_policy("identical")
         fam = self.families()
@@ -794,7 +973,9 @@ class Viewer:
                 f"{name} | particle force",
                 f"{name} | VT force at the vertex",
                 f"{name} | force at the closest point",
+                f"{name} | negative-weight force at the closest point",
                 f"{name} | shares at the endpoints",
+                f"{name} | negative shares at the endpoints",
                 f"{name} | anchors",
             ):
                 if ps.has_point_cloud(structure):
@@ -834,18 +1015,26 @@ class Viewer:
                     )
                     vt.add_scalar_quantity("|F| N", np.linalg.norm(rf, axis=1))
                 # TV, EE, EE-depth: the force acts at the closest point x_s and the solver applies w_i F to the corners
-                sample_rows = [r for r in all_rows if r["family"] != "VT"]
-                if sample_rows:
+                # negative-weight rows (extremum-sum TV saddles) are drawn in their own color
+                for sign, tag, sample_color, share_color in (
+                    (1, "", palette["sample"], palette["share"]),
+                    (-1, "negative-weight ", palette["negative"], palette["negative"]),
+                ):
+                    sample_rows = [
+                        r for r in all_rows if r["family"] != "VT" and (1 if r.get("tv_net", 1) > 0 else -1) == sign
+                    ]
+                    if not sample_rows:
+                        continue
                     pts = np.array([r["sample"] for r in sample_rows])
                     rf = np.array([r[f"{key_}_force"] for r in sample_rows])
-                    at = ps.register_point_cloud(f"{name} | force at the closest point", pts, color=palette["sample"])
+                    at = ps.register_point_cloud(f"{name} | {tag}force at the closest point", pts, color=sample_color)
                     at.set_radius(0.0006, relative=False)
                     at.add_vector_quantity(
                         "F at x_s",
                         rf * self.arrow_scale,
                         vectortype="ambient",
                         enabled=True,
-                        color=palette["sample"],
+                        color=sample_color,
                         radius=0.014,
                     )
                     at.add_scalar_quantity("|F| N", np.linalg.norm(rf, axis=1))
@@ -859,7 +1048,9 @@ class Viewer:
                                 tip[i] += r["bary"][k] * f * self.arrow_scale
                     if ends:
                         sh = ps.register_point_cloud(
-                            f"{name} | shares at the endpoints", np.array(ends), color=palette["share"]
+                            f"{name} | {'negative ' if sign < 0 else ''}shares at the endpoints",
+                            np.array(ends),
+                            color=share_color,
                         )
                         sh.set_radius(0.0004, relative=False)
                         sh.add_vector_quantity(
@@ -867,7 +1058,7 @@ class Viewer:
                             np.array(shares) * self.arrow_scale,
                             vectortype="ambient",
                             enabled=True,
-                            color=palette["share"],
+                            color=share_color,
                             radius=0.014,
                         )
                         sh.add_scalar_quantity("|w_i F| N", np.linalg.norm(np.array(shares), axis=1))
@@ -896,7 +1087,9 @@ class Viewer:
                 f"{name} | particle force",
                 f"{name} | VT force at the vertex",
                 f"{name} | force at the closest point",
+                f"{name} | negative-weight force at the closest point",
                 f"{name} | shares at the endpoints",
+                f"{name} | negative shares at the endpoints",
                 f"{name} | anchors",
             ):
                 if ps.has_point_cloud(structure):
@@ -922,6 +1115,7 @@ class Viewer:
         local = x - x.mean(axis=0)
         key = (
             self.kind,
+            self.spokes,
             self.field_axis,
             round(self.field_offset, 6),
             self.field_n,
@@ -935,8 +1129,10 @@ class Viewer:
         if key == self.field_key:
             return
         self.field_key = key
-        if self.field is None or self.field.count != self.field_n**2:
-            self.field = Probe(PROBES[self.kind], self.field_n**2, radius=self.radius, device=self.args.device)
+        if self.field is None or self.field.count != self.field_n**2 or self.field.fan_spokes != self.spokes:
+            self.field = Probe(
+                PROBES[self.kind], self.field_n**2, radius=self.radius, device=self.args.device, fan_spokes=self.spokes
+            )
         self.field.radius, self.field.stiffness, self.field.use_log_barrier = (
             self.radius,
             self.stiffness,
@@ -1015,8 +1211,13 @@ class Viewer:
         self.sweep_note = "Sweep: total force of the selected contributions versus translation along the sweep axis."
 
     def _sweep_probe(self, kind, steps):
-        if self.sweep_probe is None or self.sweep_probe.count != steps or self.sweep_probe.kind != kind:
-            self.sweep_probe = Probe(kind, steps, radius=self.radius, device=self.args.device)
+        if (
+            self.sweep_probe is None
+            or self.sweep_probe.count != steps
+            or self.sweep_probe.kind != kind
+            or self.sweep_probe.fan_spokes != self.spokes
+        ):
+            self.sweep_probe = Probe(kind, steps, radius=self.radius, device=self.args.device, fan_spokes=self.spokes)
         probe = self.sweep_probe
         probe.radius, probe.stiffness, probe.use_log_barrier = self.radius, self.stiffness, self.log_barrier
         return probe
@@ -1027,14 +1228,18 @@ class Viewer:
         curves = {}
         mode = CHORD_MODE_KEYS[self.chord_mode]
         other = CHORD_MODE_KEYS[1 - self.chord_mode]
+        tv = TV_MODE_KEYS[self.tv_mode]
+        tv_other = TV_MODE_KEYS[1 - self.tv_mode]
         probe.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
-        for label, use_activation, chord_mode in (
-            ("proposal", True, mode),
-            (f"proposal, {other} chords", True, other),
-            ("proposal, no activation", False, mode),
+        for label, use_activation, chord_mode, tv_mode in (
+            ("proposal", True, mode, tv),
+            (f"proposal, {tv_other} TV rows", True, mode, tv_other),
+            (f"proposal, {other} chords", True, other, tv),
+            ("proposal, no activation", False, mode, tv),
         ):
             probe.proposal.use_activation = use_activation
             probe.proposal.chord_mode = chord_mode
+            probe.proposal.tv_mode = tv_mode
             res = probe.evaluate(positions)
             if label == "proposal":
                 pf = Probe.particle_forces(res, "c7", fam, probe.active).reshape(steps, per, 3).sum(axis=1)
@@ -1043,12 +1248,15 @@ class Viewer:
             curves[label] = np.linalg.norm(pf, axis=1)
         probe.proposal.use_activation = self.activation
         probe.proposal.chord_mode = mode
+        probe.proposal.tv_mode = tv
         return curves
 
     def compute_case_sweep(self, index):
         """Sweep continuity case ``index`` along its own parametrization (the battery of Section 14.4)."""
         case = CONTINUITY_CASES[index]
         params = case.parameters()
+        if case.kind == "fan":
+            self.spokes = case.spokes
         probe = self._sweep_probe(case.kind, case.steps)
         positions = np.asarray([case.positions(float(s)) for s in params], dtype=np.float32).reshape(-1, 3)
         curves = self._run_sweep(probe, positions, case.steps)
@@ -1075,7 +1283,11 @@ class Viewer:
             "(proposal purple, c7 gold). Arrows acting on one particle are drawn head to tail, VT first, so the "
             "chain ends at the particle's total. EE-depth rows of the proposal are the per-edge chord rows "
             "(inside pieces of a soft edge, weight = min(excess depth over the endpoints, own depth) / (r/4)); "
-            "inside EE rows fade with their own depth over r/4. Switch to the c7 two-crossing chords below to compare."
+            "inside EE rows fade with their own depth over r/4. Switch to the c7 two-crossing chords below to compare. "
+            "TV rows of the proposal are the extremum-sum of the rigid vertex's distance to the soft patch: faces +1, "
+            "interior edges -1, interior vertices +1, each at its closest point, grouped by closest point; rows with a "
+            "negative group weight (saddles of the distance, in concave folds) are drawn orange. Switch to the OGC "
+            "block test below to compare."
         )
         changed, self.kind = ui.Combo("probe", self.kind, list(PROBES))
         if changed:
@@ -1085,6 +1297,12 @@ class Viewer:
         _, self.detail = ui.Combo("force display", self.detail, list(DISPLAY_MODES))
         _, self.chord_mode = ui.Combo("EE-depth rows", self.chord_mode, list(CHORD_MODES))
         _, self.inside_normal = ui.Combo("inside normal", self.inside_normal, list(INSIDE_NORMALS))
+        _, self.tv_mode = ui.Combo("TV rows", self.tv_mode, list(TV_MODES))
+        if PROBES[self.kind] == "fan":
+            changed, spokes = ui.SliderInt("fan spokes", self.spokes, 3, 6)
+            if changed and spokes != self.spokes:
+                self.spokes = spokes
+                self.load_probe()
         _, self.activation = ui.Checkbox(
             "pair weight a = clamp((r-d)/(r/4), 0, 1) on TV/EE samples (zero when the pair distance exceeds r), frozen per pass",
             self.activation,
@@ -1111,10 +1329,13 @@ class Viewer:
                 if ui.Button(label):
                     for g, pos in zip(self.gizmos, quad, strict=False):
                         g.set_position(pos)
-        if self.probe.per_copy == 7:
+        if PROBES[self.kind] == "fan":
             ui.Text("fan presets:")
-            for label, (pts, direction) in FAN_PRESETS.items():
+            for label, (pts, direction, spokes) in FAN_PRESETS.items():
                 if ui.Button(label):
+                    if spokes != self.spokes:
+                        self.spokes = spokes
+                        self.load_probe()
                     for g, pos in zip(self.gizmos, pts, strict=False):
                         g.set_position(pos)
                     self.sweep_dir = direction
@@ -1163,6 +1384,7 @@ class Viewer:
         rows = [r for r in self.result["rows"] if r["family"] in fam]
         ui.Text(f"candidate rows ({len(rows)} of {len(self.result['rows'])} in the selected contributions):")
         ui.Text("  family rigid weights          tag   | c7  |F|     | prop |F|     a    d mm  u    in/out (reason)")
+        ui.Text("  extremum-sum TV rows: kind (face / edge / vertex group) and signed group weight w after the reason")
         if ui.BeginChild("rows", (0.0, 190.0), True):
             for r in rows:
                 st = r["prop_state"]
@@ -1179,6 +1401,7 @@ class Viewer:
                         if "chord_bounds" in r
                         else ""
                     )
+                    + (f" {r['tv_kind']} group w={r['tv_net']:+d}" if "tv_net" in r else "")
                 )
         ui.EndChild()
         ui.Separator()

@@ -1,4 +1,8 @@
-"""Two soft triangles sharing an edge against the tetrahedron apex: sample assignment by rigid feature type."""
+"""Two soft triangles sharing an edge against the tetrahedron apex: sample assignment by rigid feature type.
+
+The TV rows are the extremum-sum rows (faces +1, interior edges -1, interior vertices +1, grouped by closest
+point); the expectation per enabled (family, point) sample is the signed group weight times a_s k (r - phi) n.
+"""
 
 import sys
 from pathlib import Path
@@ -28,6 +32,7 @@ for name, quad in TRIANGLE_PRESETS.items():
             f"{'ON' if r['c7_enabled'] else '-':4}{np.linalg.norm(r['c7_force']):<9.4f}{'ON' if r['prop_enabled'] else '-':5}"
             f"{np.linalg.norm(r['prop_force']):<9.4f}{1e3 * r['prop_phi']:<+9.3f}"
             f"{np.array2string(1e3 * r['sample'], precision=2, suppress_small=True):30} {'in' if st & STATE_INSIDE else 'out'} {reason_text(st)}"
+            + (f" {r['tv_kind']} w={r['tv_net']:+d}" if "tv_net" in r else "")
         )
     # expectation: each distinct enabled material sample once, a k (r - phi) n from the exact distance
     samples = {}
@@ -39,7 +44,8 @@ for name, quad in TRIANGLE_PRESETS.items():
     worst = 0.0
     for key, rs in samples.items():
         phi, c, n = sdf(np.array(key[1]))
-        fe = rs[0]["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
+        # extremum-sum TV rows carry a signed group weight (tv_net); all other rows +1
+        fe = rs[0].get("tv_net", 1) * rs[0]["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
         got = sum(r["prop_force"] for r in rs)
         worst = max(worst, np.linalg.norm(got - fe))
         print(

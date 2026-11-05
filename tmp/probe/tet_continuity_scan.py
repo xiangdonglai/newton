@@ -1,4 +1,7 @@
-"""Continuity battery for the edge and triangle families: largest force step between consecutive configurations.
+"""Continuity battery for the edge, chord and triangle families: largest force step between consecutive configurations.
+
+Runs every case of ``CONTINUITY_CASES`` with the default TV rows (extremum-sum); ``probe/tet_tv_scan.py`` runs the
+TV cases (5, 17 to 24) with the OGC block test as a further curve and checks the TV rows analytically.
 
 The cases are ``CONTINUITY_CASES`` in tet_point_force.py (also loadable in the viewer). Each sweep moves a soft probe
 by small steps through a transition and records |F| for c7, the proposal (excess-depth chord rows), the proposal with
