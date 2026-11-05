@@ -19,11 +19,12 @@ import numpy as np
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[2]))
 sys.path.insert(0, str(HERE.parents[1]))
-from tet_edge_scan import K, R, sdf  # noqa: E402
+from tet_edge_scan import K, R, closest_on_triangle, sdf  # noqa: E402
 from tet_point_force import CONTINUITY_CASES, Probe  # noqa: E402
 
 FAMS = {"VT", "TV", "EE", "EEdepth"}
 APEX_AXIS = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)  # outward direction at the apex; negative F.axis = pull toward it
+APEX = np.array([0.02, 0.02, 0.02])
 TV_CASES = [4, *range(16, len(CONTINUITY_CASES))]  # zero-based indices: case 5 and 17..
 
 
@@ -34,7 +35,12 @@ def run(case, window=0.3, table_every=None):
     pos = np.asarray([case.positions(float(v)) for v in params], dtype=np.float32).reshape(-1, 3)
     per = probe.per_copy
     curves, tv_curves, counts = {}, {}, {}
-    vec, vec_particle, tv_axis = {}, {}, {}  # vector totals, per-particle vectors, TV total along the apex axis
+    vec, vec_particle, tv_axis, tv_vec = (
+        {},
+        {},
+        {},
+        {},
+    )  # vector totals, per-particle vectors, TV axial, TV vector steps
     for name, act, tv_mode in (
         ("proposal", True, "extremum"),
         ("proposal, OGC TV blocks", True, "ogc"),
@@ -53,9 +59,14 @@ def run(case, window=0.3, table_every=None):
         curves[name] = np.linalg.norm(pf, axis=1)
         vec[name] = pf
         vec_particle[name] = pp
-        pf = Probe.particle_forces(res, "prop", {"TV"}, probe.active).reshape(steps, per, 3).sum(axis=1)
+        pt = Probe.particle_forces(res, "prop", {"TV"}, probe.active).reshape(steps, per, 3)
+        pf = pt.sum(axis=1)
         tv_curves[name] = np.linalg.norm(pf, axis=1)
         tv_axis[name] = pf @ APEX_AXIS
+        tv_vec[name] = (
+            np.linalg.norm(np.diff(pf, axis=0), axis=1),
+            np.linalg.norm(np.diff(pt, axis=0), axis=2).max(axis=1),
+        )
         n = np.zeros(steps, dtype=int)
         neg = np.zeros(steps, dtype=int)
         for r in res["rows"]:
@@ -80,7 +91,11 @@ def run(case, window=0.3, table_every=None):
             vj = np.linalg.norm(np.diff(vec[name], axis=0), axis=1)
             pj = np.linalg.norm(np.diff(vec_particle[name], axis=0), axis=2).max(axis=1)
             vec_txt = f"{vj.max():7.4f} {pj.max():12.4f} {vj[lo:hi].max() if hi > lo else 0.0:7.4f}"
-            axis_txt = f"; min F_TV.axis {tv_axis[name].min():+.4f} N"
+            tvv, tvp = tv_vec[name]
+            axis_txt = (
+                f"; TV ||dF|| {tvv.max():.4f} / per-particle {tvp.max():.4f}, near {tvv[lo:hi].max() if hi > lo else 0.0:.4f}"
+                f"; min F_TV.axis {tv_axis[name].min():+.4f} N"
+            )
         else:
             vec_txt = f"{'-':>7} {'-':>12} {'-':>7}"
             axis_txt = ""
@@ -103,11 +118,55 @@ def run(case, window=0.3, table_every=None):
     return curves
 
 
+def closest_on_segment(p, a, b):
+    ab = b - a
+    t = float(np.clip(((p - a) @ ab) / max(ab @ ab, 1e-30), 0.0, 1.0))
+    return a + t * ab
+
+
+def ungrouped_tv(positions, tris, p, gap=0.001):
+    """Independent oracle: the extremum sum written as the plain inclusion-exclusion over ALL closed simplices of
+    the patch (faces +1, edges 1 - faces, vertices 1 - faces - sum of edge weights), each at its own closest point
+    to the rigid vertex p, with the pair weight and the numpy signed distance. No grouping, no classification."""
+    q = np.asarray(positions, dtype=np.float64)
+    edges = {}
+    for tri in tris:
+        for u, v in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            edges[(min(u, v), max(u, v))] = edges.get((min(u, v), max(u, v)), 0) + 1
+    faces_at = np.zeros(len(q), dtype=int)
+    for tri in tris:
+        for v in tri:
+            faces_at[v] += 1
+    edge_w_at = np.zeros(len(q), dtype=int)
+    for (u, v), nf in edges.items():
+        edge_w_at[u] += 1 - nf
+        edge_w_at[v] += 1 - nf
+
+    def term(w, c):
+        d = float(np.linalg.norm(p - c))
+        if w == 0 or d >= R + gap:
+            return np.zeros(3)
+        a = float(np.clip((R - d) / (0.25 * R), 0.0, 1.0))
+        phi, _cp, n = sdf(c)
+        return w * a * K * (R - phi) * n if phi < R else np.zeros(3)
+
+    total = np.zeros(3)
+    for tri in tris:
+        total += term(1, closest_on_triangle(p, *q[list(tri)]))
+    for (u, v), nf in edges.items():
+        total += term(1 - nf, closest_on_segment(p, q[u], q[v]))
+    for v in range(len(q)):
+        if faces_at[v]:
+            total += term(1 - faces_at[v] - edge_w_at[v], q[v])
+    return total
+
+
 def check_rows(case, s_value):
-    """Per-row analytic check and group bookkeeping at one configuration of the case."""
+    """Per-row analytic check, the independent ungrouped oracle, and the group bookkeeping at one configuration."""
     probe = Probe(case.kind, 1, fan_spokes=case.spokes)
     probe.proposal.tv_mode = "extremum"
-    res = probe.evaluate(np.asarray(case.positions(float(s_value)), dtype=np.float32))
+    pos = np.asarray(case.positions(float(s_value)), dtype=np.float32)
+    res = probe.evaluate(pos)
     rows = [r for r in res["rows"] if r["family"] == "TV" and "tv_net" in r]
     worst = 0.0
     groups = {}
@@ -116,7 +175,15 @@ def check_rows(case, s_value):
         fe = r["tv_net"] * r["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
         worst = max(worst, float(np.linalg.norm(r["prop_force"] - fe)))
         groups.setdefault(tuple(np.round(r["sample"], 7)), []).append(r)
-    print(f"  rows at s = {s_value:g}: {len(rows)} extremum-sum TV rows, max |row - net a k (r - phi) n| {worst:.2e} N")
+    tris = probe.model.tri_indices.numpy().tolist()
+    oracle = ungrouped_tv(pos, tris, APEX)
+    got = sum((r["prop_force"] for r in rows), np.zeros(3))
+    oracle_err = float(np.linalg.norm(got - oracle))
+    print(
+        f"  rows at s = {s_value:g}: {len(rows)} extremum-sum TV rows, max |row - net a k (r - phi) n| {worst:.2e} N, "
+        f"|grouped total - ungrouped oracle| {oracle_err:.2e} N"
+    )
+    worst = max(worst, oracle_err)
     for pt, rs in groups.items():
         net = sum(r["tv_net"] for r in rs)
         kinds = "+".join(f"{r['tv_kind']}({r['tv_net']:+d})" for r in rs)
@@ -132,5 +199,10 @@ if __name__ == "__main__":
     for i in TV_CASES:
         case = CONTINUITY_CASES[i]
         run(case, table_every=20 if case.table else None)
-        worst = max(worst, check_rows(case, case.after))
-    print(f"\nmax |row - analytic| over the checked configurations: {worst:.2e} N")
+        for s_check in (case.before, case.after):
+            worst = max(worst, check_rows(case, s_check))
+    verdict = "PASS" if worst < 1.0e-4 else "FAIL"
+    print(
+        f"\n{verdict}: max |row - analytic| and |grouped - ungrouped oracle| over the checked configurations: {worst:.2e} N"
+    )
+    sys.exit(0 if verdict == "PASS" else 1)
