@@ -179,7 +179,7 @@ SINGLE_TRIANGLE_PRESETS = {
         _single_triangle(_APEX + 0.003 * _N - 0.008 * _V),
         _V,
     ),
-    "apex 3.5 mm beyond the base edge (TV edge group outside the patch, fading with the pair weight)": (
+    "apex 3.5 mm beyond the base edge (TV edge group outside the patch, pair force k(r-d) fading with the distance)": (
         _single_triangle(_APEX + 0.003 * _N + 0.0075 * _V),
         _V,
     ),
@@ -591,18 +591,19 @@ CONTINUITY_CASES += [
         table=True,
     ),
     ContinuityCase(
-        "24. quad parallel to face 0, 4 mm above it, slid from the apex into the face along its 6 mm wing: the apex's closest point moves from the interior to the trailing wing vertex (s = 6) and the pair distance passes r (s = 9); s = shift into the face [mm]",
-        "triangles",
-        lambda s: _quad(_APEX + 0.004 * _N0_FACE + s * 1e-3 * _F0_IN, _F0_T, _F0_IN),
+        "24. single triangle parallel to face 0, 4 mm above it, slid from the apex into the face: the apex's closest point moves from the interior onto the trailing edge (s = 4), the pair distance passes r (s = 7, where OGC's pair force k(r-d) reaches zero) and leaves detection range (s = 8.5); s = shift into the face [mm]",
+        "triangle",
+        lambda s: _single_triangle(_APEX + 0.004 * _N0_FACE + s * 1e-3 * _F0_IN, _F0_T, _F0_IN),
         -2.0,
         14.0,
         321,
-        6.0,
-        5.9,
-        6.1,
+        7.0,
+        4.1,
+        8.45,
+        table=True,
     ),
     ContinuityCase(
-        "25. single triangle 3 mm over the apex, slid along V: the apex's closest point moves from the face interior onto the base edge (s = 4; the boundary edge group keeps the count at +1) and the row fades with the pair weight beyond the patch (s = 6.25 to 8); s = shift along V [mm]",
+        "25. single triangle 3 mm over the apex, slid along V: the apex's closest point moves from the face interior onto the base edge (s = 4; the boundary edge group keeps the count at +1) and the row's pair force k(r-d) fades to zero beyond the patch as the pair distance reaches r (s = 8); s = shift along V [mm]",
         "triangle",
         lambda s: _single_triangle(_APEX + 0.003 * _N + s * 1e-3 * _V),
         -2.0,
@@ -1349,6 +1350,8 @@ class Viewer:
             "(inside pieces of a soft edge, weight = min(excess depth over the endpoints, own depth) / (r/4)); "
             "inside EE rows fade with their own depth over r/4. Switch to the c7 two-crossing chords below to compare. "
             "TV rows keep OGC's soft-side block test (owner triangle and cone test, production _soft_face_valid); "
+            "outside the body their force is OGC's pair force k(r-d) from the rigid vertex toward the sample (c7's TV "
+            "rule, no pair weight); inside, the whole-body query times the pair weight; "
             "at a concave soft fold the block test switches a whole sample's force on and off, an accepted limitation "
             "(cases 18 to 20)."
         )
@@ -1366,7 +1369,7 @@ class Viewer:
                 self.spokes = spokes
                 self.load_probe()
         _, self.activation = ui.Checkbox(
-            "pair weight a = clamp((r-d)/(r/4), 0, 1) on TV/EE samples (zero when the pair distance exceeds r), frozen per pass",
+            "pair weight a = clamp((r-d)/(r/4), 0, 1) on EE samples and inside TV samples (zero when the pair distance exceeds r), frozen per pass",
             self.activation,
         )
         self.apply_model_visibility()

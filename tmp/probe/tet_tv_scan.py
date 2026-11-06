@@ -99,12 +99,23 @@ def check_rows(case, s_value):
     pos = np.asarray(case.positions(float(s_value)), dtype=np.float32)
     res = probe.evaluate(pos)
     rows = [r for r in res["rows"] if r["family"] == "TV" and r["prop_enabled"]]
+    rv_table = probe.proposal.rigid_vertex_table
     worst = 0.0
     for r in rows:
-        phi, _c, n = sdf(np.asarray(r["sample"], dtype=np.float64))
-        fe = r["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
+        x = np.asarray(r["sample"], dtype=np.float64)
+        phi, _c, n = sdf(x)
+        if phi >= 0.0:
+            # outside: OGC's pair force from the rigid vertex, no pair weight
+            v = probe.proposal.rigid_points[int(rv_table[int(r["rigid"])][1])]
+            d = float(np.linalg.norm(x - v))
+            fe = K * (R - d) * (x - v) / d if d < R else np.zeros(3)
+        else:
+            fe = r["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
         worst = max(worst, float(np.linalg.norm(r["prop_force"] - fe)))
-    print(f"  rows at s = {s_value:g}: {len(rows)} enabled TV rows, max |row - a k (r - phi) n| {worst:.2e} N")
+    print(
+        f"  rows at s = {s_value:g}: {len(rows)} enabled TV rows, max |row - expected| {worst:.2e} N "
+        "(outside: k (r - d) from the rigid vertex; inside: a k (r - phi) n)"
+    )
     for r in rows:
         print(
             f"    sample {np.round(1e3 * np.asarray(r['sample']), 3)} mm: d {1e3 * r['pair_distance']:.3f} mm, "

@@ -2,7 +2,7 @@
 
 For every preset the proposal's enabled rows are listed and checked against the analytic expectation: each
 distinct enabled (family, point) sample carries a_s k (r - phi) n, with phi and n from the independent numpy
-signed distance. Single triangle: one face, no fold. Quad: the owner / interior / vertex presets and the folded
+signed distance; an outside TV sample carries OGC's pair force k (r - d) from the rigid vertex instead. Single triangle: one face, no fold. Quad: the owner / interior / vertex presets and the folded
 presets; at the concave folds the TV row is OGC's block-test row, whose switching across the fold is the accepted
 limitation measured by probe/tet_tv_scan.py. Exits non-zero if any sample deviates by more than 1e-4 N.
 """
@@ -48,9 +48,17 @@ def run(kind, presets, n_particles):
         dup = [k for k, v in samples.items() if len(v) > 1]
         print(f"  distinct enabled (family, point) samples: {len(samples)}; samples carried more than once: {len(dup)}")
         worst = 0.0
+        rv_table = probe.proposal.rigid_vertex_table
         for key, rs in samples.items():
-            phi, _c, n = sdf(np.array(key[1]))
-            fe = rs[0]["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
+            x = np.array(key[1])
+            phi, _c, n = sdf(x)
+            if key[0] == "TV" and phi >= 0.0:
+                # outside TV: OGC's pair force from the rigid vertex, no pair weight
+                v = probe.proposal.rigid_points[int(rv_table[int(rs[0]["rigid"])][1])]
+                d = float(np.linalg.norm(x - v))
+                fe = K * (R - d) * (x - v) / d if d < R else np.zeros(3)
+            else:
+                fe = rs[0]["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
             got = sum(r["prop_force"] for r in rs)
             worst = max(worst, np.linalg.norm(got - fe))
             print(
