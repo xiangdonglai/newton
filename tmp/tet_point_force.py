@@ -8,7 +8,7 @@ damping. The field slice evaluates a grid of independent copies of the probe (tr
 orientation) in one collide call.
 
     DISPLAY=:1 uv run --no-sync --with polyscope==2.6.1 python \
-        tmp/tet_point_force.py [--probe point|edge|triangle|triangles|fan] [--case N --at before|after|transition|<s in mm>]
+        tmp/tet_point_force.py [--probe point|edge|triangle|triangles|fan] [--case N --at before|after|transition|<s in mm>] [--ee-outside whole|pair] [--zoom <mm> [--zoom-view current|edge]]
     uv run --no-sync --with polyscope==2.6.1 python \
         tmp/tet_point_force.py --headless --screenshot out.png
 """
@@ -461,7 +461,7 @@ _C16_V0 = np.array([0.02, 0.0, 0.0]) + 0.002 * _W0 - 0.001 * _N0  # 1 mm inside 
 _C16_V1 = np.array([0.02, 0.0, 0.0]) + 0.0026 * _W1 - 0.001 * _N1  # 1 mm inside face 1, 2.6 mm from the rigid edge
 CONTINUITY_CASES += [
     ContinuityCase(
-        "14. needle through a rigid edge's block: tip enters face 0 two mm from the rigid edge and leaves through face 1 (one crossing -> two); s = height of the tip over face 0 [mm]",
+        "14. needle through a rigid edge's block: tip enters face 0 two mm from the rigid edge and leaves through face 1 (one crossing -> two); compare 'EE rows outside the body' (open choice 6); s = height of the tip over face 0 [mm]",
         "edge",
         lambda s: np.array([_C14_P + s * 1e-3 * _N0, _C14_P + 0.010 * _N0]),
         2.0,
@@ -473,7 +473,7 @@ CONTINUITY_CASES += [
         table=True,
     ),
     ContinuityCase(
-        "15. vertex 0 enters face 0 two mm from the rigid edge while its edge carries an EE endpoint pair (VT and EE at the vertex); s = height of vertex 0 over face 0 [mm]",
+        "15. vertex 0 enters face 0 two mm from the rigid edge while its edge carries an EE endpoint pair (VT and EE at the vertex); compare 'EE rows outside the body' (open choice 6); s = height of vertex 0 over face 0 [mm]",
         "edge",
         lambda s: np.array([_C14_P + s * 1e-3 * _N0, _C15_V1]),
         3.0,
@@ -642,6 +642,14 @@ CONTINUITY_CASES += [
 CHORD_MODES = ("excess-depth chord rows per soft edge (redefined EE-depth)", "c7 two-crossing chord rows")
 INSIDE_NORMALS = ("blend of the faces within r/4 of the nearest (open choice 5)", "nearest face")
 CHORD_MODE_KEYS = ("excess", "c7")
+EE_OUTSIDE = (
+    "whole-mesh distance, with the pair weight a (proposal)",
+    "OGC pair force k(r-d) from the rigid edge, no pair weight (c7; open choice 6)",
+)
+EE_OUTSIDE_KEYS = ("whole", "pair")
+EE_OUTSIDE_SHORT = ("whole-mesh", "pair force")
+ZOOM_VIEWS = ("keep the current view direction", "look along the rigid edge of the sample's EE row (edge seen end-on)")
+ZOOM_VIEW_KEYS = ("current", "edge")
 
 
 def regular_tetrahedron(scale=0.02):
@@ -885,12 +893,17 @@ class Viewer:
         self.stiffness = 100.0
         self.log_barrier = False
         self.arrow_scale = 0.02
+        self.thickness = 1.0  # multiplier on every drawn radius (edge capsule, markers, arrows, gizmos)
+        self.show_spheres = True  # the transparent spheres of radius r around the soft particles
+        self.zoom_mm = 1.0  # camera distance of "zoom to the sample"
+        self.zoom_view = ZOOM_VIEW_KEYS.index(getattr(args, "zoom_view", "current"))  # index into ZOOM_VIEWS
         self.show_model = 2  # 0 = c7 only, 1 = proposal only, 2 = both
         self.contribution = 0
         self.detail = 1  # index into DISPLAY_MODES
         self.activation = True
         self.chord_mode = 0  # index into CHORD_MODES
         self.inside_normal = 0  # index into INSIDE_NORMALS
+        self.ee_outside = EE_OUTSIDE_KEYS.index(getattr(args, "ee_outside", "whole"))  # index into EE_OUTSIDE
         self.spokes = 6  # fan probe spokes
         self.case = None
         self.sweep_note = None
@@ -1007,11 +1020,14 @@ class Viewer:
             self.stiffness,
             self.log_barrier,
             self.arrow_scale,
+            self.thickness,
+            self.show_spheres,
             self.contribution,
             self.activation,
             self.detail,
             self.chord_mode,
             self.inside_normal,
+            self.ee_outside,
         )
         if not force and key == self.last_key:
             return
@@ -1019,22 +1035,26 @@ class Viewer:
         self.probe.proposal.use_activation = self.activation
         self.probe.proposal.chord_mode = CHORD_MODE_KEYS[self.chord_mode]
         self.probe.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
+        self.probe.proposal.ee_outside = EE_OUTSIDE_KEYS[self.ee_outside]
         self.probe.radius = self.radius
         self.probe.stiffness = self.stiffness
         self.probe.use_log_barrier = self.log_barrier
         self.result = self.probe.evaluate(x)
         n = self.probe.per_copy
         ps = self.ps
+        t = self.thickness
         soft = ps.register_point_cloud("soft particles", x, color=(1.0, 0.45, 0.04))
-        soft.set_radius(self.radius, relative=False)
-        soft.set_transparency(0.35)
+        soft.set_radius(self.radius if self.show_spheres else 0.0005 * t, relative=False)
+        soft.set_transparency(0.35 if self.show_spheres else 1.0)
+        for g in self.gizmos:
+            g.set_gizmo_scale(0.6 * t)
         if ps.has_curve_network("soft edge"):
             ps.remove_curve_network("soft edge")
         if ps.has_surface_mesh("soft triangles"):
             ps.remove_surface_mesh("soft triangles")
         if self.probe.kind == "edge":
             edge = ps.register_curve_network("soft edge", x, np.array([[0, 1]]), color=(1.0, 0.45, 0.04))
-            edge.set_radius(0.0006, relative=False)
+            edge.set_radius(0.0006 * t, relative=False)
         elif self.probe.kind == "triangle":
             tri = ps.register_surface_mesh(
                 "soft triangles", x, np.array([[0, 1, 2]]), color=(1.0, 0.8, 0.35), edge_width=1.0
@@ -1072,9 +1092,9 @@ class Viewer:
                 ps.remove_curve_network(f"{name} | sample -> anchor")
             if simplified:
                 center = ps.register_point_cloud(f"{name} | particle force", x, color=color)
-                center.set_radius(0.0008, relative=False)
+                center.set_radius(0.0008 * t, relative=False)
                 center.add_vector_quantity(
-                    "force", pf * self.arrow_scale, vectortype="ambient", enabled=True, color=color, radius=0.02
+                    "force", pf * self.arrow_scale, vectortype="ambient", enabled=True, color=color, radius=0.02 * t
                 )
             all_rows = [r for r in self.result["rows"] if r[f"{key_}_enabled"] and r["family"] in fam]
             if not simplified and all_rows:
@@ -1092,14 +1112,14 @@ class Viewer:
                         tip[i] += f * self.arrow_scale
                     pts = np.array(pts)
                     vt = ps.register_point_cloud(f"{name} | VT force at the vertex", pts, color=palette["VT"])
-                    vt.set_radius(0.0006, relative=False)
+                    vt.set_radius(0.0006 * t, relative=False)
                     vt.add_vector_quantity(
                         "F",
                         rf * self.arrow_scale,
                         vectortype="ambient",
                         enabled=True,
                         color=palette["VT"],
-                        radius=0.014,
+                        radius=0.014 * t,
                     )
                     vt.add_scalar_quantity("|F| N", np.linalg.norm(rf, axis=1))
                 # TV, EE, EE-depth: the force acts at the closest point x_s and the solver applies w_i F to the corners
@@ -1108,14 +1128,14 @@ class Viewer:
                     pts = np.array([r["sample"] for r in sample_rows])
                     rf = np.array([r[f"{key_}_force"] for r in sample_rows])
                     at = ps.register_point_cloud(f"{name} | force at the closest point", pts, color=palette["sample"])
-                    at.set_radius(0.0006, relative=False)
+                    at.set_radius(0.0006 * t, relative=False)
                     at.add_vector_quantity(
                         "F at x_s",
                         rf * self.arrow_scale,
                         vectortype="ambient",
                         enabled=True,
                         color=palette["sample"],
-                        radius=0.014,
+                        radius=0.014 * t,
                     )
                     at.add_scalar_quantity("|F| N", np.linalg.norm(rf, axis=1))
                     ends, shares = [], []
@@ -1130,21 +1150,21 @@ class Viewer:
                         sh = ps.register_point_cloud(
                             f"{name} | shares at the endpoints", np.array(ends), color=palette["share"]
                         )
-                        sh.set_radius(0.0004, relative=False)
+                        sh.set_radius(0.0004 * t, relative=False)
                         sh.add_vector_quantity(
                             "w_i F",
                             np.array(shares) * self.arrow_scale,
                             vectortype="ambient",
                             enabled=True,
                             color=palette["share"],
-                            radius=0.014,
+                            radius=0.014 * t,
                         )
                         sh.add_scalar_quantity("|w_i F| N", np.linalg.norm(np.array(shares), axis=1))
             if all_rows:
                 samples = np.array([r["sample"] for r in all_rows])
                 anchors = np.array([r[f"{key_}_anchor"] for r in all_rows])
                 anc = ps.register_point_cloud(f"{name} | anchors", anchors, color=anchor_color)
-                anc.set_radius(0.0005, relative=False)
+                anc.set_radius(0.0005 * t, relative=False)
                 anc.set_point_render_mode("quad" if key_ == "prop" else "sphere")
                 m = len(all_rows)
                 lines = ps.register_curve_network(
@@ -1153,10 +1173,59 @@ class Viewer:
                     np.column_stack([np.arange(m), np.arange(m) + m]),
                     color=line_color,
                 )
-                lines.set_radius(0.00015, relative=False)
+                lines.set_radius(0.00015 * t, relative=False)
         self.apply_model_visibility()
         f = self.forces["proposal" if self.show_model == 1 else "c7"].sum(axis=0)
         self.trace = np.vstack((self.trace[-399:], np.r_[np.linalg.norm(f), f].astype(np.float32)))
+
+    def zoom_target(self):
+        """The point to zoom to and its row: the first carrying proposal sample row of the shown families (EE first),
+        else soft vertex 0 and None."""
+        fam = self.families()
+        rows = [r for r in self.result["rows"] if r["prop_enabled"] and r["family"] in fam]
+        rows.sort(key=lambda r: {"EE": 0, "TV": 1, "EEdepth": 2}.get(r["family"], 3))
+        if rows:
+            return np.asarray(rows[0]["sample"], dtype=np.float64), rows[0]
+        return self.positions()[0].astype(np.float64), None
+
+    def rigid_edge_direction(self, row):
+        """Unit direction of the rigid edge of an EE row, or None."""
+        if row is None or row["family"] != "EE" or row["rigid"] < 0:
+            return None
+        table = getattr(self.probe.proposal, "rigid_edge_table", None)
+        if table is None:
+            return None
+        _shape, i0, i1 = (int(v) for v in table[row["rigid"]])
+        e = self.probe.proposal.rigid_points[i1] - self.probe.proposal.rigid_points[i0]
+        return e / max(np.linalg.norm(e), 1e-12)
+
+    def zoom_to_sample(self):
+        """Camera at zoom_mm from the sample, along the current view direction; every drawn radius and the arrow
+        scale shrink by zoom_mm / 60 mm so the picture keeps its proportions; the r spheres are hidden."""
+        target, row = self.zoom_target()
+        factor = self.zoom_mm / 60.0
+        self.thickness = factor
+        self.arrow_scale = 0.02 * factor
+        self.show_spheres = False
+        try:
+            cam = self.ps.get_view_camera_parameters()
+            look = np.asarray(cam.get_look_dir(), dtype=np.float64)
+        except Exception:  # older polyscope without camera parameters: fixed direction
+            look = np.array([-0.09, 0.11, -0.07])
+        look = look / max(np.linalg.norm(look), 1e-12)
+        if ZOOM_VIEW_KEYS[self.zoom_view] == "edge":
+            e = self.rigid_edge_direction(row)
+            if e is not None:
+                look = e if np.dot(e, look) >= 0.0 else -e  # the end of the edge nearer to the current camera
+        self.ps.look_at(target - look * self.zoom_mm * 1e-3, target)
+        self.refresh(force=True)
+
+    def reset_view(self):
+        self.thickness = 1.0
+        self.arrow_scale = 0.02
+        self.show_spheres = True
+        self.ps.look_at((0.09, -0.11, 0.07), (0.0, 0.0, 0.0))
+        self.refresh(force=True)
 
     def apply_model_visibility(self):
         ps = self.ps
@@ -1203,6 +1272,7 @@ class Viewer:
             self.activation,
             self.chord_mode,
             self.inside_normal,
+            self.ee_outside,
             local.tobytes(),
         )
         if key == self.field_key:
@@ -1220,6 +1290,7 @@ class Viewer:
         self.field.proposal.use_activation = self.activation
         self.field.proposal.chord_mode = CHORD_MODE_KEYS[self.chord_mode]
         self.field.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
+        self.field.proposal.ee_outside = EE_OUTSIDE_KEYS[self.ee_outside]
         centers = self.field_centers()
         positions = (centers[:, None, :] + local[None, :, :]).reshape(-1, 3)
         t0 = time.perf_counter()
@@ -1310,14 +1381,18 @@ class Viewer:
         curves = {}
         mode = CHORD_MODE_KEYS[self.chord_mode]
         other = CHORD_MODE_KEYS[1 - self.chord_mode]
+        ee = EE_OUTSIDE_KEYS[self.ee_outside]
+        other_ee = 1 - self.ee_outside
         probe.proposal.inside_blend = 0.25 if self.inside_normal == 0 else 0.0
-        for label, use_activation, chord_mode in (
-            ("proposal", True, mode),
-            (f"proposal, {other} chords", True, other),
-            ("proposal, no activation", False, mode),
+        for label, use_activation, chord_mode, ee_outside in (
+            ("proposal", True, mode, ee),
+            (f"proposal, {other} chords", True, other, ee),
+            ("proposal, no activation", False, mode, ee),
+            (f"proposal, EE outside: {EE_OUTSIDE_SHORT[other_ee]}", True, mode, EE_OUTSIDE_KEYS[other_ee]),
         ):
             probe.proposal.use_activation = use_activation
             probe.proposal.chord_mode = chord_mode
+            probe.proposal.ee_outside = ee_outside
             res = probe.evaluate(positions)
             if label == "proposal":
                 pf = Probe.particle_forces(res, "c7", fam, probe.active).reshape(steps, per, 3).sum(axis=1)
@@ -1326,6 +1401,7 @@ class Viewer:
             curves[label] = np.linalg.norm(pf, axis=1)
         probe.proposal.use_activation = self.activation
         probe.proposal.chord_mode = mode
+        probe.proposal.ee_outside = ee
         return curves
 
     def compute_case_sweep(self, index):
@@ -1366,7 +1442,10 @@ class Viewer:
             "rule, no pair weight); inside, the whole-body query, also without pair weight, until the detector deletes the row "
             "at pair distance T (an accepted step, case 27); "
             "at a concave soft fold the block test switches a whole sample's force on and off, an accepted limitation "
-            "(cases 18 to 20)."
+            "(cases 18 to 20). EE rows outside the body: the combo 'EE rows outside the body' switches between the "
+            "whole-mesh distance (proposal) and OGC's pair force from the rigid edge (c7, open choice 6); the two differ "
+            "where the sample enters a face next to the rigid edge (cases 14 and 15), and the case sweep plots the other "
+            "mode as 'proposal, EE outside: ...' for comparison."
         )
         changed, self.kind = ui.Combo("probe", self.kind, list(PROBES))
         if changed:
@@ -1376,13 +1455,15 @@ class Viewer:
         _, self.detail = ui.Combo("force display", self.detail, list(DISPLAY_MODES))
         _, self.chord_mode = ui.Combo("EE-depth rows", self.chord_mode, list(CHORD_MODES))
         _, self.inside_normal = ui.Combo("inside normal", self.inside_normal, list(INSIDE_NORMALS))
+        _, self.ee_outside = ui.Combo("EE rows outside the body", self.ee_outside, list(EE_OUTSIDE))
         if PROBES[self.kind] == "fan":
             changed, spokes = ui.SliderInt("fan spokes", self.spokes, 3, 6)
             if changed and spokes != self.spokes:
                 self.spokes = spokes
                 self.load_probe()
         _, self.activation = ui.Checkbox(
-            "pair weight a = clamp((r-d)/(r/4), 0, 1) on EE samples (zero when the pair distance exceeds r), frozen per pass",
+            "pair weight a = clamp((r-d)/(r/4), 0, 1) on EE samples (zero when the pair distance exceeds r), frozen per pass; "
+            "in the pair-force mode only EE rows inside at detection keep it",
             self.activation,
         )
         self.apply_model_visibility()
@@ -1450,7 +1531,24 @@ class Viewer:
         _, self.radius = ui.SliderFloat("contact radius r [m]", self.radius, 0.001, 0.015, format="%.4f")
         _, self.stiffness = ui.SliderFloat("stiffness k [N/m]", self.stiffness, 10.0, 1000.0, format="%.0f")
         _, self.log_barrier = ui.Checkbox("continued log barrier", self.log_barrier)
-        _, self.arrow_scale = ui.SliderFloat("arrow scale [m/N]", self.arrow_scale, 1e-4, 0.1, format="%.4f")
+        _, self.arrow_scale = ui.SliderFloat("arrow scale [m/N]", self.arrow_scale, 1e-5, 0.1, format="%.5f")
+        changed, lg = ui.SliderFloat(
+            "display thickness, log10 (0 = default; -2 = edge capsule, markers, arrows, gizmos 100x thinner)",
+            float(np.log10(self.thickness)),
+            -3.5,
+            0.0,
+            format="%.2f",
+        )
+        if changed:
+            self.thickness = float(10.0**lg)
+        _, self.show_spheres = ui.Checkbox("show the spheres of radius r around the soft particles", self.show_spheres)
+        _, self.zoom_mm = ui.SliderFloat("zoom distance [mm]", self.zoom_mm, 0.05, 60.0, format="%.2f")
+        _, self.zoom_view = ui.Combo("zoom view", self.zoom_view, list(ZOOM_VIEWS))
+        if ui.Button("zoom to the sample x_s: camera at the zoom distance, thickness and arrow scale shrink to match"):
+            self.zoom_to_sample()
+        ui.SameLine()
+        if ui.Button("reset view"):
+            self.reset_view()
         self.refresh()
         fam = self.families()
         ui.Separator()
@@ -1545,6 +1643,21 @@ def main():
         default="after",
         help="load the case at before | after | transition, or at a position s in mm (e.g. --at -5.5)",
     )
+    parser.add_argument("--zoom", type=float, help="after loading, zoom to the sample with this camera distance in mm")
+    parser.add_argument(
+        "--zoom-view",
+        choices=ZOOM_VIEW_KEYS,
+        default="current",
+        help="view direction of --zoom: current = keep the start-up direction, edge = along the rigid edge of the "
+        "sample's EE row (edge seen end-on)",
+    )
+    parser.add_argument(
+        "--ee-outside",
+        choices=EE_OUTSIDE_KEYS,
+        default="whole",
+        help="force of the EE rows outside the body: whole = whole-mesh distance (proposal), pair = OGC's pair force "
+        "from the rigid edge (c7; open choice 6); also a combo in the panel",
+    )
     args = parser.parse_args()
     if args.at not in ("before", "after", "transition"):
         try:
@@ -1554,6 +1667,9 @@ def main():
     if args.headless and args.screenshot is None:
         parser.error("--headless requires --screenshot")
     viewer = Viewer(args)
+    if args.zoom:
+        viewer.zoom_mm = args.zoom
+        viewer.zoom_to_sample()
     if args.screenshot:
         for _ in range(3):
             viewer.ps.frame_tick()

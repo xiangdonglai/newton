@@ -24,6 +24,10 @@ instead of switching. Switching between families is what produces force steps.
             lies in the block of the rigid feature holding x_r (OGC Eq. 14 edge blocks for interiors, Eq. 15
             vertex blocks for endpoints). An endpoint sample is carried by one row only (lowest incident edge id). A sample
             INSIDE at detection whose soft edge has an EE-depth row against the same shape hands over to it.
+            Outside: the whole-mesh nearest point with the pair weight a_s (default, ee_outside = "whole"), or OGC's
+            pair force k (r - d) from the rigid edge's closest point toward the sample with no pair weight
+            (ee_outside = "pair", c7's EE rule; open choice 6, a viewer switch). The two differ where the sample is
+            nearer to a face than to the rigid edge, at the entry through a face next to the edge (cases 14, 15).
   EE-depth  redefined (chord rows, one thread per soft edge against one shape; the prototype handles one shape, production
             needs one thread per (soft edge, shape) pair in range): the inside portions of the edge, bounded by surface
             crossings or by endpoints that are themselves inside; sample = midpoint of a portion (frozen t).
@@ -49,7 +53,7 @@ at pair distance r: a pair-placed sample whose own feature is farther than r car
 is near some other face (otherwise far features duplicate the near one's sample), and a sample fades in over
 the last quarter radius instead of appearing at a finite force. VT, TV and EE-depth have a_s = 1: outside,
 their force is the pair's own k (r - d), zero at d = r by itself; an inside TV row is deleted at d = T while
-pushing (accepted, see above).
+pushing (accepted, see above). With ee_outside = "pair" the EE rows outside at detection have a_s = 1 too.
 """
 
 import numpy as np
@@ -222,6 +226,7 @@ def proposal_rows(
     stiffness: float,
     use_log_barrier: bool,
     inside_blend: float,
+    ee_outside_pair: bool,
     row_force: wp.array[wp.vec3],
     row_sample: wp.array[wp.vec3],
     row_anchor: wp.array[wp.vec3],
@@ -344,6 +349,23 @@ def proposal_rows(
                 n_world = diff / d
             phi = d
             c_world = x_rigid
+    if family == _MESH_FEATURE_EE and ee_outside_pair and phi >= 0.0:
+        # EE outside, pair mode (open choice 6, viewer switch): OGC's pair force, c7's EE rule. The distance is from
+        # the sample to the closest point of the rigid edge at the current positions and the direction points from
+        # that point to the sample. Default (ee_outside_pair false): the whole-mesh distance of the query above, which
+        # keeps the entry through a face next to a rigid edge continuous (cases 14 and 15).
+        edge_entry = data.rigid_edge_table[feature[2]]
+        r0 = wp.transform_point(X_ws, wp.cw_mul(wp.mesh_get_point(mesh, edge_entry[1]), scale))
+        r1 = wp.transform_point(X_ws, wp.cw_mul(wp.mesh_get_point(mesh, edge_entry[2]), scale))
+        e = r1 - r0
+        u = wp.clamp(wp.dot(x - r0, e) / wp.max(wp.dot(e, e), 1.0e-30), 0.0, 1.0)
+        x_rigid = r0 + u * e
+        diff = x - x_rigid
+        d = wp.length(diff)
+        if d > CONTACT_NORMAL_DEGENERATE_EPS:
+            n_world = diff / d
+        phi = d
+        c_world = x_rigid
     if family == _MESH_FEATURE_TV and (state & HOST_REJECT) == 0:
         sign = wp.where(phi < 0.0, -1.0, 1.0)
         if not _soft_face_valid(
@@ -614,6 +636,9 @@ class ProposalEvaluator:
         self.chord_mode = "excess"  # "excess": per-edge chord rows (redefined EE-depth); "c7": production chords
         self.chord_band = CHORD_BAND
         self.inside_blend = INSIDE_BLEND  # fraction of r over which inside normals blend; 0 = nearest face
+        # EE rows outside the body: "whole" = the whole-mesh distance with the pair weight a_s (default); "pair" =
+        # OGC's pair force k (r - d) from the rigid edge, no pair weight, c7's EE rule (open choice 6)
+        self.ee_outside = "whole"
         edge_count = int(model.edge_count) if getattr(model, "edge_count", 0) else 0
         self.edge_count = edge_count
         if edge_count:
@@ -689,6 +714,9 @@ class ProposalEvaluator:
         rv_table = contacts._soft_contact_mesh_data.rigid_features[0].numpy()
         self.rigid_vertex_table = rv_table  # (shape, mesh point index) per rigid vertex feature; read by the scans
         re_table = contacts._soft_contact_mesh_data.rigid_features[2].numpy()
+        self.rigid_edge_table = (
+            re_table  # (shape, mesh point i0, mesh point i1) per rigid edge feature; read by the viewer
+        )
         canon, _rigid_incident, rigid_neighbors = self.rigid_topology(contacts)
         soft_edges, soft_incident = self.soft_topology(model)
         host = np.zeros(contacts.soft_contact_max, dtype=np.int32)
@@ -772,6 +800,9 @@ class ProposalEvaluator:
                         elif fade > 0.0:
                             host[i] |= STATE_CHORD_SHARE
                         a *= 1.0 - fade
+                elif self.ee_outside == "pair":
+                    # OGC's pair force k (r - d) is zero at d = r by itself: no pair weight, as for the TV rows
+                    a = 1.0
                 weight[i] = a
                 info[i, :3] = (d, u, a)
             else:  # c7 EE-depth (two-crossing chord): used only in c7 mode
@@ -831,6 +862,7 @@ class ProposalEvaluator:
                 stiffness,
                 use_log_barrier,
                 self.inside_blend,
+                self.ee_outside == "pair",
             ],
             outputs=[self.row_force, self.row_sample, self.row_anchor, self.row_normal, self.row_phi, self.row_state],
             device=self.device,

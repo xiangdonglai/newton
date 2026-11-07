@@ -5,8 +5,9 @@ family separated and checks the TV rows analytically.
 
 The cases are ``CONTINUITY_CASES`` in tet_point_force.py (also loadable in the viewer). Each sweep moves a soft probe
 by small steps through a transition and records |F| for c7, the proposal (excess-depth chord rows, OGC EE endpoint
-rule), the proposal with c7's two-crossing chord rows, the proposal with the nearest-face inside normal instead of the blended one, and the proposal without the pair
-weight.
+rule), the proposal with c7's two-crossing chord rows, the proposal with the nearest-face inside normal instead of the blended one, the proposal without the pair
+weight, and the proposal with OGC's pair force from the rigid edge for the EE rows outside the body (c7's EE rule,
+open choice 6; it differs from the whole-mesh distance only where a sample enters a face next to a rigid edge, cases 14 and 15).
 A step is 'big' if it exceeds 5% of k r = 0.025 N.
 """
 
@@ -34,15 +35,17 @@ def run(kind, positions_per_step, label, steps, table_every=None, params=None, t
     pos = np.asarray(positions_per_step, dtype=np.float32).reshape(-1, 3)
     per = probe.per_copy
     curves, counts = {}, {}
-    for name, act, chord_mode, blend in (
-        ("proposal", True, "excess", 0.25),
-        ("proposal, c7 chords", True, "c7", 0.25),
-        ("proposal, nearest normal", True, "excess", 0.0),
-        ("proposal, no activation", False, "excess", 0.25),
+    for name, act, chord_mode, blend, ee_outside in (
+        ("proposal", True, "excess", 0.25, "whole"),
+        ("proposal, c7 chords", True, "c7", 0.25, "whole"),
+        ("proposal, nearest normal", True, "excess", 0.0, "whole"),
+        ("proposal, no activation", False, "excess", 0.25, "whole"),
+        ("proposal, EE pair force", True, "excess", 0.25, "pair"),
     ):
         probe.proposal.use_activation = act
         probe.proposal.chord_mode = chord_mode
         probe.proposal.inside_blend = blend
+        probe.proposal.ee_outside = ee_outside
         res = probe.evaluate(pos)
         if name == "proposal":
             pf = Probe.particle_forces(res, "c7", FAMS, probe.active).reshape(steps, per, 3).sum(axis=1)
