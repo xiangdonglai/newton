@@ -1,6 +1,6 @@
 """EE pair count when a rigid edge's projection crosses a cloth vertex (fans of 4, 5 and 6 spokes, and a ring vertex).
 
-The fan lies in the plane x = 23 mm, parallel to the rigid edge (20, u, u) and 3 mm outside it along the wedge
+The fan lies in the plane x = 23 mm, parallel to the rigid edge (20, u, u) and 3 mm outside it along the edge's
 bisector. Sweeping the fan along _W_HAT moves the rigid edge's projection across the chosen vertex. Each step is a
 fresh detection. The fan is rotated by 15 degrees so that no spoke is parallel or perpendicular to the rigid edge.
 Reports |F| for c7 and the proposal (OGC EE endpoint rule), the number of proposal samples with force, and the
@@ -21,7 +21,7 @@ FAMS = {"VT", "TV", "EE", "EEdepth"}
 ROT = np.deg2rad(15.0)
 E1 = np.cos(ROT) * _W_HAT + np.sin(ROT) * _E_HAT
 E2 = -np.sin(ROT) * _W_HAT + np.cos(ROT) * _E_HAT
-BASE = np.array([0.023, 0.0, 0.0])  # 3 mm outside the rigid edge along its wedge bisector
+BASE = np.array([0.023, 0.0, 0.0])  # 3 mm outside the rigid edge along its bisector
 
 
 def sweep(spokes, vertex, label, half=0.0003, steps=61):

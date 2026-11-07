@@ -1,9 +1,10 @@
 """Soft triangle patches against the tetrahedron apex: one triangle, and two triangles sharing an edge.
 
 For every preset the proposal's enabled rows are listed and checked against the analytic expectation: each
-distinct enabled (family, point) sample carries a_s k (r - phi) n, with phi and n from the independent numpy
-signed distance; an outside TV sample carries OGC's pair force k (r - d) from the rigid vertex instead. Single triangle: one face, no fold. Quad: the owner / interior / vertex presets and the folded
-presets; at the concave folds the TV row is OGC's block-test row, whose switching across the fold is the accepted
+distinct enabled (family, point) sample carries w k (r - phi) n, with phi and n from the independent numpy
+signed distance and w the row weight (1 for VT and TV rows, the pair weight a_s for EE rows); an outside TV
+sample carries OGC's pair force k (r - d) from the rigid vertex instead. Single triangle: one face, no fold. Quad: the owner / interior / vertex presets and the folded
+presets; at the concave folds the TV row is the one that passes the block test, whose switching across the fold is the accepted
 limitation measured by probe/tet_tv_scan.py. Exits non-zero if any sample deviates by more than 1e-4 N.
 """
 

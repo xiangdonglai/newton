@@ -8,7 +8,7 @@ damping. The field slice evaluates a grid of independent copies of the probe (tr
 orientation) in one collide call.
 
     DISPLAY=:1 uv run --no-sync --with polyscope==2.6.1 python \
-        tmp/tet_point_force.py [--probe point|edge|triangle|triangles|fan] [--case N --at before|after|transition]
+        tmp/tet_point_force.py [--probe point|edge|triangle|triangles|fan] [--case N --at before|after|transition|<s in mm>]
     uv run --no-sync --with polyscope==2.6.1 python \
         tmp/tet_point_force.py --headless --screenshot out.png
 """
@@ -187,7 +187,7 @@ SINGLE_TRIANGLE_PRESETS = {
         _single_triangle(_APEX - 0.0015 * _N),
         _N,
     ),
-    "triangle 3 mm outside the rigid edge (20, u, u), normal to its wedge bisector (EE pairs; sweep across)": (
+    "triangle 3 mm outside the rigid edge (20, u, u) along the edge's bisector, normal to it (EE pairs; sweep across)": (
         _single_triangle(np.array([0.023, 0.0, 0.0]), _E_HAT, _W_HAT),
         _W_HAT,
     ),
@@ -206,7 +206,7 @@ _ONSET_P1 = _ONSET_SAMPLE + 0.00016 * _ONSET_D  # tip, 0.04 mm above the face
 _ONSET_DIR = -_W0
 EDGE_PRESETS = {
     "across the tetrahedron (VT + EE-depth)": (EDGE_CENTER - EDGE_HALF, EDGE_CENTER + EDGE_HALF, None),
-    "beside a rigid edge, in its wedge (EE)": (
+    "beside a rigid edge, in its edge block (EE)": (
         np.array([0.022, 0.010, -0.010]),
         np.array([0.022, -0.010, 0.010]),
         None,
@@ -255,7 +255,7 @@ _CASE1_A = np.array([21.206, 3.506, 5.204]) * 1e-3
 _CASE1_B = np.array([19.517, 2.872, 5.366]) * 1e-3
 _CASE1_U = (_CASE1_B - _CASE1_A) / np.linalg.norm(_CASE1_B - _CASE1_A)
 _CASE1_LEN = 1e3 * float(np.linalg.norm(_CASE1_B - _CASE1_A))
-# 2. soft edge perpendicular to the rigid edge (20, u, u), 3 mm outside along the wedge bisector, slid along it
+# 2. soft edge perpendicular to the rigid edge (20, u, u), 3 mm outside along the edge's bisector, slid along it
 _CASE2_BIS = np.array([1.0, 0.0, 0.0])
 # 4. quad whose boundary vertex leaves the rigid edge's projection
 _CASE4_QUAD = np.array(
@@ -270,7 +270,7 @@ _CASE3_PTS, _CASE3_DIR, _ = next(iter(FAN_PRESETS.values()))
 _CASE6_P0, _CASE6_P1, _CASE6_DIR = EDGE_PRESETS[
     "needle on face 0, rigid edge entering range (EE onset; sweep along preset direction)"
 ]
-_CASE7_W0, _CASE7_W1, _ = EDGE_PRESETS["beside a rigid edge, in its wedge (EE)"]
+_CASE7_W0, _CASE7_W1, _ = EDGE_PRESETS["beside a rigid edge, in its edge block (EE)"]
 _CASE8_W1 = _CASE7_W1 + np.array([-0.0015, 0.0, 0.0])
 
 
@@ -347,7 +347,7 @@ CONTINUITY_CASES = [
         0.25,
     ),
     ContinuityCase(
-        "7. soft edge entering the solid through the wedge, perpendicular (EE -> EE-depth); s = x shift [mm], touch at -2",
+        "7. soft edge entering the solid through a rigid edge's block, perpendicular (EE -> EE-depth); s = x shift [mm], touch at -2",
         "edge",
         lambda s: np.array([_CASE7_W0 + np.array([s * 1e-3, 0, 0]), _CASE7_W1 + np.array([s * 1e-3, 0, 0])]),
         1.0,
@@ -387,7 +387,7 @@ _T1 = np.cross(_N0, _T0)
 _C10_V1 = _C0 + 0.012 * _N0 + 0.004 * _T0
 _C11_V1 = _C1 + 0.003 * _N1 + 0.005 * np.array([0.0, 1.0, 1.0]) / np.sqrt(2.0)  # off the face-0/face-1 medial plane
 _C11_SHIFT = 0.004 * _T0  # vertex 0 path, also off the medial plane
-_C12_M = np.array([0.016, 0.0, 0.0])  # 4 mm inside the rigid edge (20, u, u) along the wedge bisector
+_C12_M = np.array([0.016, 0.0, 0.0])  # 4 mm inside the rigid edge (20, u, u) along the edge's bisector
 _C12_V0 = _C12_M - 0.0025 * _W_HAT
 _C12_T_FACE = (11.547 * 1e-3 * np.sqrt(3.0) - 0.016) / np.sqrt(2.0)  # W-shift at which m + s W reaches face 0
 CONTINUITY_CASES += [
@@ -428,7 +428,7 @@ CONTINUITY_CASES += [
         table=True,
     ),
     ContinuityCase(
-        "12. edge across the wedge interior, middle deeper than both ends; vertex 1 leaves through face 0 (fully inside -> one crossing); s = overshoot of vertex 1 past face 0 [mm]",
+        "12. edge across a rigid edge's block, middle deeper than both ends; vertex 1 leaves through face 0 (fully inside -> one crossing); s = overshoot of vertex 1 past face 0 [mm]",
         "edge",
         lambda s: np.array([_C12_V0, _C12_M + (_C12_T_FACE + s * 1e-3) * _W_HAT]),
         -0.6,
@@ -452,7 +452,7 @@ CONTINUITY_CASES += [
         table=True,
     ),
 ]
-# chord events next to a rigid edge: a needle through the wedge, a vertex entering beside the rigid edge with an EE
+# chord events next to a rigid edge: a needle through the edge's block, a vertex entering beside the rigid edge with an EE
 # endpoint pair, and an inside edge whose EE pair fades as it moves away from the rigid edge
 _W1 = np.array([-2.0, -1.0, 1.0]) / np.sqrt(6.0)  # in face 1, perpendicular to the rigid edge (20, u, u), into the face
 _C14_P = np.array([0.02, 0.0, 0.0]) + 0.002 * _W0  # on face 0, 2 mm from the rigid edge
@@ -461,7 +461,7 @@ _C16_V0 = np.array([0.02, 0.0, 0.0]) + 0.002 * _W0 - 0.001 * _N0  # 1 mm inside 
 _C16_V1 = np.array([0.02, 0.0, 0.0]) + 0.0026 * _W1 - 0.001 * _N1  # 1 mm inside face 1, 2.6 mm from the rigid edge
 CONTINUITY_CASES += [
     ContinuityCase(
-        "14. needle through the wedge: tip enters face 0 two mm from the rigid edge and leaves through face 1 (one crossing -> two); s = height of the tip over face 0 [mm]",
+        "14. needle through a rigid edge's block: tip enters face 0 two mm from the rigid edge and leaves through face 1 (one crossing -> two); s = height of the tip over face 0 [mm]",
         "edge",
         lambda s: np.array([_C14_P + s * 1e-3 * _N0, _C14_P + 0.010 * _N0]),
         2.0,
@@ -485,7 +485,7 @@ CONTINUITY_CASES += [
         table=True,
     ),
     ContinuityCase(
-        "16. edge inside the wedge, both ends 1 mm inside, middle slightly deeper, moved deeper along the bisector (EE pair distance passes r); s = x shift [mm]",
+        "16. edge inside a rigid edge's block, both ends 1 mm inside, middle slightly deeper, moved deeper along the bisector (EE pair distance passes r); s = x shift [mm]",
         "edge",
         lambda s: np.array([_C16_V0 + np.array([s * 1e-3, 0, 0]), _C16_V1 + np.array([s * 1e-3, 0, 0])]),
         0.0,
@@ -509,7 +509,7 @@ _F0_IN = np.array([-1.0, -1.0, -2.0]) / np.sqrt(6.0)  # in face 0, from the apex
 _F0_T = np.cross(_N0_FACE, _F0_IN)
 CONTINUITY_CASES += [
     ContinuityCase(
-        "17. quad folded 30 degrees convex (wings away from the solid): the apex crosses the fold, face block -> edge wedge -> face block; s = shift along V [mm]",
+        "17. quad folded 30 degrees convex (wings away from the solid): the apex crosses the fold, face block -> edge block -> face block; s = shift along V [mm]",
         "triangles",
         lambda s: _folded_quad(_APEX + 0.003 * _N + s * 1e-3 * _V, 30.0),
         -3.0,
@@ -556,7 +556,7 @@ CONTINUITY_CASES += [
         spokes=3,
     ),
     ContinuityCase(
-        "21. 4-face tent (center pushed 2.5 mm toward the solid): the apex crosses the tent vertex, vertex block -> edge wedge -> face; s = shift along U [mm]",
+        "21. 4-face tent (center pushed 2.5 mm toward the solid): the apex crosses the tent vertex, vertex block -> edge block -> face block; s = shift along U [mm]",
         "fan",
         lambda s: _fan_lifted(_APEX + 0.005 * _N + s * 1e-3 * _U, _U, _V, _N, -0.0025, 4),
         -3.0,
@@ -579,7 +579,7 @@ CONTINUITY_CASES += [
         0.125,
     ),
     ContinuityCase(
-        "23. quad pressed onto the apex, apex under a triangle interior: the TV sample passes through the surface at s = 0 (signed depth = s/3 along the apex axis) and its pair distance passes r at s = -5; s = height over the apex [mm]",
+        "23. quad pressed onto the apex, apex under a triangle interior: the TV sample passes through the surface at s = 0 (signed depth = s/3 along the apex axis); s = height over the apex [mm]",
         "triangles",
         lambda s: _quad(_APEX + s * 1e-3 * _N + 0.0025 * _V),
         3.0,
@@ -615,7 +615,7 @@ CONTINUITY_CASES += [
         table=True,
     ),
     ContinuityCase(
-        "26. single triangle pressed onto the apex under its interior: the TV sample passes through the surface at s = 0 (signed depth s/3 along the apex axis) and its pair distance passes r at s = -5; s = height over the apex [mm]",
+        "26. single triangle pressed onto the apex under its interior: the TV sample passes through the surface at s = 0 (signed depth s/3 along the apex axis); s = height over the apex [mm]",
         "triangle",
         lambda s: _single_triangle(_APEX + s * 1e-3 * _N),
         3.0,
@@ -624,6 +624,18 @@ CONTINUITY_CASES += [
         0.0,
         0.1,
         -0.1,
+        table=True,
+    ),
+    ContinuityCase(
+        "27. single triangle pressed 6 mm past the apex: the inside TV row leaves detection range when its pair distance passes T = r + g = 6 mm (s = -6) while its sample is 2 mm inside the body; the row is deleted while pushing 0.70 N, an accepted step that c7 has too (decided 2026-11-06); s = height over the apex [mm]",
+        "triangle",
+        lambda s: _single_triangle(_APEX + s * 1e-3 * _N),
+        -4.0,
+        -8.0,
+        161,
+        -6.0,
+        -5.9,
+        -6.1,
         table=True,
     ),
 ]
@@ -893,7 +905,7 @@ class Viewer:
         self.field_offset = 0.0
         self.field_n = 41
         self.field_live = False
-        self.show_field = True
+        self.show_field = False
         self.last_key = None
         self.field_key = None
         self.field = None
@@ -1349,9 +1361,10 @@ class Viewer:
             "chain ends at the particle's total. EE-depth rows of the proposal are the per-edge chord rows "
             "(inside pieces of a soft edge, weight = min(excess depth over the endpoints, own depth) / (r/4)); "
             "inside EE rows fade with their own depth over r/4. Switch to the c7 two-crossing chords below to compare. "
-            "TV rows keep OGC's soft-side block test (owner triangle and cone test, production _soft_face_valid); "
+            "TV rows carry when they pass the soft block test (production _soft_face_valid, with the owner triangle for shared edges and vertices); "
             "outside the body their force is OGC's pair force k(r-d) from the rigid vertex toward the sample (c7's TV "
-            "rule, no pair weight); inside, the whole-body query times the pair weight; "
+            "rule, no pair weight); inside, the whole-body query, also without pair weight, until the detector deletes the row "
+            "at pair distance T (an accepted step, case 27); "
             "at a concave soft fold the block test switches a whole sample's force on and off, an accepted limitation "
             "(cases 18 to 20)."
         )
@@ -1369,7 +1382,7 @@ class Viewer:
                 self.spokes = spokes
                 self.load_probe()
         _, self.activation = ui.Checkbox(
-            "pair weight a = clamp((r-d)/(r/4), 0, 1) on EE samples and inside TV samples (zero when the pair distance exceeds r), frozen per pass",
+            "pair weight a = clamp((r-d)/(r/4), 0, 1) on EE samples (zero when the pair distance exceeds r), frozen per pass",
             self.activation,
         )
         self.apply_model_visibility()
@@ -1429,6 +1442,11 @@ class Viewer:
             ui.TextWrapped(f"{case.label} (before s = {case.before:g}, after s = {case.after:g})")
         if self.case is not None:
             ui.Text(f"loaded: case {self.case[0] + 1} at s = {self.case[1]:g} mm")
+            case = CONTINUITY_CASES[self.case[0]]
+            lo, hi = sorted((case.lo, case.hi))
+            changed, s = ui.SliderFloat("case position s [mm]", self.case[1], lo, hi, format="%.2f")
+            if changed:
+                self.load_case(self.case[0], float(s))
         _, self.radius = ui.SliderFloat("contact radius r [m]", self.radius, 0.001, 0.015, format="%.4f")
         _, self.stiffness = ui.SliderFloat("stiffness k [N/m]", self.stiffness, 10.0, 1000.0, format="%.0f")
         _, self.log_barrier = ui.Checkbox("continued log barrier", self.log_barrier)
@@ -1522,8 +1540,17 @@ def main():
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--screenshot", type=Path)
     parser.add_argument("--case", type=int, choices=range(1, len(CONTINUITY_CASES) + 1), help="load a continuity case")
-    parser.add_argument("--at", default="after", choices=("before", "after", "transition"))
+    parser.add_argument(
+        "--at",
+        default="after",
+        help="load the case at before | after | transition, or at a position s in mm (e.g. --at -5.5)",
+    )
     args = parser.parse_args()
+    if args.at not in ("before", "after", "transition"):
+        try:
+            args.at = float(args.at)
+        except ValueError:
+            parser.error("--at takes before, after, transition or a number (s in mm)")
     if args.headless and args.screenshot is None:
         parser.error("--headless requires --screenshot")
     viewer = Viewer(args)

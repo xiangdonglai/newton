@@ -7,22 +7,25 @@ Placement decisions use detection-time data and are frozen for the pass.
 Families are independent, exactly as OGC's vertex-facet and edge-edge energies are: each family is continuous
 on its own through hand-over at block boundaries, duplicates are removed only WITHIN a family, and overlaps
 between families (a soft vertex covered by its VT sample and by an EE sample at the same point) persist
-instead of switching. Switching between families is what produces force jumps.
+instead of switching. Switching between families is what produces force steps.
 
   VT        sample = the soft vertex. Outside: OGC's vertex-face rule (c7's _face_valid on the record's stored
-            face plus Eq. 7's outward half-prism side, force radial from that face's closest point). Inside: one
+            face plus Eq. 7's outward side of the face block, force radial from that face's closest point). Inside: one
             owner row per (vertex, shape), the lowest stored slot, with the whole-mesh nearest point.
-  TV        sample = closest point on the soft triangle to the rigid vertex (frozen weights); carried when the
-            rigid vertex lies in the block of the soft sub-feature holding the sample (production
-            _soft_face_valid: interior always, soft edge / vertex via owner triangle + normal cone). Outside:
-            OGC's pair force, k (r - d) from the rigid vertex toward the sample, c7's TV rule, no pair weight.
-            Inside: the whole-mesh nearest point, times the pair weight.
-  EE        sample = closest point on the soft edge to the rigid edge (frozen t). Carried when the rigid closest
-            point x_r lies in the block of the soft sub-feature holding x_s AND x_s lies in the block of the
-            rigid sub-feature holding x_r (OGC Eq. 14 for interiors, Eq. 15 wireframe vertex blocks for
-            endpoints). An endpoint sample is carried by one row only (lowest incident edge id). A sample
+  TV        sample = closest point on the soft triangle to the rigid vertex (frozen weights); carried when it
+            passes the soft block test: the rigid vertex lies in the block of the soft feature holding the sample
+            (production _soft_face_valid: an interior sample always, an edge or vertex sample via its owner
+            triangle's edge or vertex block). Outside:
+            OGC's pair force, k (r - d) from the rigid vertex toward the sample, c7's TV rule. Inside: the
+            whole-mesh nearest point. No pair weight either way: an inside row keeps pushing until the detector
+            deletes it at pair distance T, an accepted step (case 27; decided 2026-11-06).
+  EE        sample = closest point on the soft edge to the rigid edge (frozen t). Carried when it passes both
+            block tests: the rigid closest point x_r lies in the block of the soft feature holding x_s AND x_s
+            lies in the block of the rigid feature holding x_r (OGC Eq. 14 edge blocks for interiors, Eq. 15
+            vertex blocks for endpoints). An endpoint sample is carried by one row only (lowest incident edge id). A sample
             INSIDE at detection whose soft edge has an EE-depth row against the same shape hands over to it.
-  EE-depth  redefined (chord rows, one thread per soft edge): the inside portions of the edge, bounded by surface
+  EE-depth  redefined (chord rows, one thread per soft edge against one shape; the prototype handles one shape, production
+            needs one thread per (soft edge, shape) pair in range): the inside portions of the edge, bounded by surface
             crossings or by endpoints that are themselves inside; sample = midpoint of a portion (frozen t).
             Weight w = min(clamp(excess / (r/4)), clamp(depth / (r/4))) with excess = depth at the sample minus
             the deeper endpoint's depth: the row fades in over the first quarter radius of its own depth and
@@ -40,12 +43,13 @@ instead of switching. Switching between families is what produces force jumps.
             agree on the direction, and the direction turns continuously at convex edges and medial planes. The
             magnitude is k (r - phi) with the sharp signed distance phi.
 
-Pair weight a_s = clamp((r - d) / (r/4), 0, 1) on EE samples and on TV samples inside the body, with d the
-detection-time distance between the sample and the rigid feature that placed it, frozen per pass. It is the analogue of OGC's pair energy being zero
+Pair weight a_s = clamp((r - d) / (r/4), 0, 1) on EE samples, with d the detection-time distance between the
+sample and the rigid edge that placed it, frozen per pass. It is the analogue of OGC's pair energy being zero
 at pair distance r: a pair-placed sample whose own feature is farther than r carries nothing even if the sample
 is near some other face (otherwise far features duplicate the near one's sample), and a sample fades in over
-the last quarter radius instead of appearing at a finite force. VT, outside TV and EE-depth have a_s = 1:
-their force is the pair's own k (r - d), zero at d = r by itself.
+the last quarter radius instead of appearing at a finite force. VT, TV and EE-depth have a_s = 1: outside,
+their force is the pair's own k (r - d), zero at d = r by itself; an inside TV row is deleted at d = T while
+pushing (accepted, see above).
 """
 
 import numpy as np
@@ -78,13 +82,17 @@ STATE_SOFT_VERTEX_DUP = 64  # EE at a soft vertex: another incident soft edge's 
 STATE_DEFER_DEPTH = 128  # EE inside at detection: the chord's EE-depth row carries the recovery
 STATE_RIGID_NEIGHBOR = 256  # EE at a rigid vertex: the soft point lies in a neighboring rigid edge's block
 STATE_RIGID_VERTEX_DUP = 512  # EE at a rigid vertex: another incident rigid edge's row carries it
-STATE_SOFT_FACE_INVALID = 1024  # TV: soft sub-feature not owned by this triangle or rigid vertex off its cone
+STATE_SOFT_FACE_INVALID = (
+    1024  # TV: fails the soft block test (not the owner triangle, or the rigid vertex outside the block)
+)
 STATE_CHORD = 2048  # proposal chord row (EE-depth redefined, per soft edge)
 STATE_CHORD_NO_EXCESS = 4096  # chord row no deeper than its endpoints: weight 0
 STATE_REPLACED = 8192  # c7 EE-depth row, replaced by the proposal's chord rows
 STATE_CHORD_SHARE = 16384  # EE inside at detection: fading with its own depth, weight a (1 - depth / (r/4))
 STATE_FACE_INVALID = 32768  # VT outside: the record's stored face fails OGC's block test (_face_valid)
-STATE_FACE_BACKSIDE = 65536  # VT outside: behind the stored face's plane; OGC's face block is the outward half-prism
+STATE_FACE_BACKSIDE = (
+    65536  # VT outside: behind the stored face's plane; the face block is only the outward half of the prism
+)
 _CLEAR_NOT_OWNER = ~STATE_NOT_OWNER
 HOST_REJECT = (
     STATE_NOT_OWNER
@@ -110,9 +118,9 @@ REASON = {
     STATE_DEFER_DEPTH: "inside at detection: faded out (depth >= r/4); the chord rows carry",
     STATE_RIGID_NEIGHBOR: "rigid vertex: neighbor edge's block",
     STATE_RIGID_VERTEX_DUP: "rigid vertex: carried by another incident edge",
-    STATE_SOFT_FACE_INVALID: "soft sub-feature not owned / off cone",
-    STATE_FACE_INVALID: "outside VT: rigid sub-feature not owned / off cone (_face_valid)",
-    STATE_FACE_BACKSIDE: "outside VT: behind the face plane (OGC Eq. 7 block is the outward half-prism; c7 accepts it)",
+    STATE_SOFT_FACE_INVALID: "TV: fails the soft block test (not the owner triangle, or outside the block)",
+    STATE_FACE_INVALID: "outside VT: fails the face's block test (not the owner face, or outside the block; _face_valid)",
+    STATE_FACE_BACKSIDE: "outside VT: behind the face plane (OGC Eq. 7: the face block is only the outward half of the prism; c7 accepts it)",
     STATE_QUERY_FAILED: "query failed",
     STATE_CHORD: "chord row",
     STATE_CHORD_NO_EXCESS: "chord no deeper than its endpoints (w = 0)",
@@ -135,7 +143,7 @@ def activation(d, radius, detection_range=None):
 
 
 def in_vertex_block(x, v, neighbors):
-    """OGC Eq. (15): x lies beyond vertex v with respect to every incident wireframe edge."""
+    """OGC Eq. (15), the vertex block of the edge-only rule: x lies beyond vertex v with respect to every incident edge."""
     return all(np.dot(x - v, v - n) >= -1e-12 for n in neighbors)
 
 
@@ -272,9 +280,9 @@ def proposal_rows(
     if phi < 0.0:
         state |= STATE_INSIDE
 
-    # VT outside: OGC's vertex-face rule. The record's stored face decides with c7's _face_valid (interior always;
-    # a face edge or vertex only for its owner face, within the wedge or cone), plus OGC Eq. 7's side: the face
-    # block is the outward half-prism, so an interior projection from behind the face plane does not count (c7
+    # VT outside: the block test of the record's stored face, c7's _face_valid (a face interior always passes; a
+    # face edge or vertex only for its owner face, within its edge or vertex block), plus OGC Eq. 7's side: the
+    # face block is only the outward half of the prism, so an interior projection from behind the face plane fails (c7
     # accepts it: the backside slivers of spec-history 13.4). The force is the pair's: from the face's closest
     # point, radial when resolvable, the face normal when degenerate, exactly c7's final stored normal. Two
     # faces push in a concave rigid corner, as in OGC. The lowest-slot owner rule applies inside only.
@@ -308,7 +316,7 @@ def proposal_rows(
             and wp.dot(diff, tri_n) < 0.0
         ):
             # interior projection from behind the face plane; edge and vertex closest points are already
-            # confined to the exterior wedge or cone by _face_valid's cone test
+            # confined to the outside edge and vertex blocks by _face_valid
             state |= STATE_FACE_BACKSIDE
         n_local = tri_n
         if d > CONTACT_NORMAL_DEGENERATE_EPS:
@@ -317,9 +325,9 @@ def proposal_rows(
         c_world = wp.transform_point(X_ws, cp)
         n_world = wp.transform_vector(X_ws, n_local)
 
-    # TV: the rigid vertex must lie in the block of the soft sub-feature holding the sample (OGC Eq. 8-10 on
-    # the soft side); production _soft_face_valid implements it, including the owner triangle for shared
-    # edges and vertices. Interior samples pass unconditionally.
+    # TV block test: the rigid vertex must lie in the block of the soft feature holding the sample (OGC Eq. 7 to 9
+    # on the soft triangle); production _soft_face_valid implements it, including the owner triangle for shared
+    # edges and vertices. Interior samples always pass.
     w = weight[tid]
     if family == _MESH_FEATURE_TV:
         index = data.rigid_vertex_table[feature[2]][1]
@@ -328,15 +336,14 @@ def proposal_rows(
             # TV outside: OGC's pair force (c7's TV rule). The pair is the rigid vertex and the soft triangle:
             # the distance is from the rigid vertex to the sample and the direction points from the vertex to
             # the sample; the whole-body normal stays only when the two coincide. k (r - d) is already zero at
-            # d = r, so the pair weight does not apply (it stays on inside rows, where the force is the
-            # whole-body one). Decided 2026-11-05 (spec Section 3.2).
+            # d = r. Decided 2026-11-05 (spec Section 3.2). TV rows carry no pair weight (place() stores 1):
+            # inside, the whole-body force is kept until the detector deletes the row (decided 2026-11-06).
             diff = x - x_rigid
             d = wp.length(diff)
             if d > CONTACT_NORMAL_DEGENERATE_EPS:
                 n_world = diff / d
             phi = d
             c_world = x_rigid
-            w = 1.0
     if family == _MESH_FEATURE_TV and (state & HOST_REJECT) == 0:
         sign = wp.where(phi < 0.0, -1.0, 1.0)
         if not _soft_face_valid(
@@ -713,15 +720,14 @@ class ProposalEvaluator:
                     host[i] |= STATE_NOT_OWNER
                 owner_seen.add(key)
                 info[i, :3] = (np.nan, np.nan, 1.0)
-            elif fam == 1:  # TV: soft-side block test happens in the kernel (production _soft_face_valid)
+            elif fam == 1:  # TV: the soft block test happens in the kernel (production _soft_face_valid)
                 v_r = self.rigid_points[int(rv_table[int(feat[i, 2])][1])]
                 d = float(np.linalg.norm(x - v_r))
-                # outside: OGC's pair force k (r - d), no pair weight (the kernel sets it to 1 as well);
-                # inside: the whole-body force times the pair weight
-                outside = row_phi is not None and row_phi[i] >= 0.0
-                a = activation(d, r_force, T) if (self.use_activation and not outside) else 1.0
-                weight[i] = a
-                info[i, :3] = (d, np.nan, a)
+                # no pair weight: outside the force is OGC's pair force k (r - d), zero at d = r by itself; inside
+                # it is the whole-body force until the detector deletes the row at d = T (accepted step, case 27,
+                # decided 2026-11-06)
+                weight[i] = 1.0
+                info[i, :3] = (d, np.nan, 1.0)
             elif fam == 2:  # EE
                 t = float(bary[i, 1])
                 soft_edge = int(feat[i, 1])
@@ -737,7 +743,7 @@ class ProposalEvaluator:
                 v_s = (corners[0] if t <= 0.5 else corners[1]) if soft_end else -1
                 corner = (i0 if u <= 0.5 else i1) if rigid_end else -1
                 v_r = canon[corner] if rigid_end else -1
-                # soft side: x_r must lie in the block of the soft sub-feature holding x_s
+                # soft block test: x_r must lie in the block of the soft feature holding x_s
                 if soft_end:
                     neighbors = [
                         q[int(soft_edges[k, 3]) if int(soft_edges[k, 2]) == v_s else int(soft_edges[k, 2])]
@@ -747,7 +753,7 @@ class ProposalEvaluator:
                         soft_vertex_candidates.setdefault((v_s, rigid_edge, sh), []).append((soft_edge, i))
                     else:
                         host[i] |= STATE_SOFT_NEIGHBOR
-                # rigid side: x_s must lie in the block of the rigid sub-feature holding x_r
+                # rigid block test: x_s must lie in the block of the rigid feature holding x_r
                 if rigid_end:
                     if in_vertex_block(x, self.rigid_points[corner], rigid_neighbors[v_r]):
                         rigid_vertex_candidates.setdefault((soft_edge, v_r, sh), []).append((rigid_edge, i))

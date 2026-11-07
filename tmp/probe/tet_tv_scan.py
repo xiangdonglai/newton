@@ -4,10 +4,11 @@ Cases 5 and 17 onward of ``CONTINUITY_CASES`` (tet_point_force.py). For every ca
 of the proposal and of the proposal without the pair weight, the TV family alone, the number of TV rows with
 force, and the largest step overall and within 0.3 mm of the transition, as the change of |F| and as the norm of
 the change of the force vector (total and worst particle). At the 'before' and 'after' configurations every
-enabled TV row is checked against a_s k (r - phi) n with phi, n from the independent numpy signed distance.
+enabled TV row is checked against k (r - phi) n inside (phi, n from the independent numpy signed distance) and
+against OGC's pair force k (r - d) from the rigid vertex outside; TV rows carry no pair weight.
 
-The TV rows are OGC's: one row per rigid vertex at the closest point of the owner triangle, soft-side block test
-(production _soft_face_valid). At a concave soft fold the block test switches a whole sample's force on and off
+The TV rows are OGC's: one row per rigid vertex at the closest point of the owner triangle, carried when it passes the soft
+block test (production _soft_face_valid). At a concave soft fold the block test switches a whole sample's force on and off
 (cases 18 to 20); that step is an accepted limitation, and this scan is where it is measured.
 """
 
@@ -110,11 +111,11 @@ def check_rows(case, s_value):
             d = float(np.linalg.norm(x - v))
             fe = K * (R - d) * (x - v) / d if d < R else np.zeros(3)
         else:
-            fe = r["weight"] * K * (R - phi) * n if phi < R else np.zeros(3)
+            fe = K * (R - phi) * n if phi < R else np.zeros(3)
         worst = max(worst, float(np.linalg.norm(r["prop_force"] - fe)))
     print(
         f"  rows at s = {s_value:g}: {len(rows)} enabled TV rows, max |row - expected| {worst:.2e} N "
-        "(outside: k (r - d) from the rigid vertex; inside: a k (r - phi) n)"
+        "(outside: k (r - d) from the rigid vertex; inside: k (r - phi) n)"
     )
     for r in rows:
         print(

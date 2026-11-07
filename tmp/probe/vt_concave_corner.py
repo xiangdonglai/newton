@@ -1,4 +1,4 @@
-"""VT outside at an inward (reflex) rigid corner: one soft vertex against an L-shaped rigid block.
+"""VT outside at an inward (reflex) rigid corner: one soft vertex against an L-shaped rigid body.
 
 The tetrahedron is convex, so it cannot show the one place where OGC's vertex-face rule keeps two rows: in a
 concave rigid corner the blocks of the two walls overlap and both faces push (OGC Section 3.2, Fig. 4c). The L is
