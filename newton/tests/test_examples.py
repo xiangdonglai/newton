@@ -896,6 +896,14 @@ add_example_test(
     use_viewer=True,
     test_suffix="finger_mesh",
 )
+add_example_test(
+    TestClothExamples,
+    name="vbd.example_vbd_gripper_soft_grid",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 360, "finger-mesh": True, "mesh-backend": "sdf"},
+    use_viewer=True,
+    test_suffix="finger_mesh_sdf",
+)
 
 
 class TestRobotExamples(unittest.TestCase):

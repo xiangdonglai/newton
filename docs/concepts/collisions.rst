@@ -1717,6 +1717,7 @@ carries a volume SDF reports one contact per deformable vertex, edge, and face
 from that SDF, as analytic shapes do; these contacts carry no rigid feature and
 :class:`~solvers.SolverVBD` applies all of them. A mesh without a volume SDF
 keeps the default ``"bvh"`` contacts, which the rest of this section describes.
+See :ref:`full-surface-mesh-backends` for the comparison of the two back-ends.
 
 With the ``"bvh"`` mesh back-end, detection retains
 the returned feature pairs, including endpoint contacts. :class:`~solvers.SolverVBD`
@@ -1768,6 +1769,108 @@ feature pairs queried. Lowering capacity can save memory but produces incomplete
 contacts if it is too small; it is not a way to reduce query work while preserving
 the same contacts. The edge and vertex queries and the processing of their
 records remain a runtime cost even when the buffer is sized appropriately.
+
+.. _full-surface-mesh-backends:
+
+Full-surface mesh back-ends
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With full-surface contact enabled, ``rigid_soft_full_surface_mesh_backend`` selects
+how :class:`CollisionPipeline` queries rigid mesh and convex-mesh shapes. Analytic
+shapes, planes, and heightfields are unaffected.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 14 43 43
+
+   * -
+     - ``"bvh"`` (default)
+     - ``"sdf"``
+   * - Contacts
+     - Every vertex-face, face-vertex, and edge-edge feature pair within the contact
+       band, as described above.
+     - One contact per deformable vertex, edge, and face: the volume SDF is sampled
+       at vertices and minimized over edges and faces, as for analytic shapes.
+   * - Surface
+     - The triangle surface.
+     - The SDF zero level set. Sharp edges and thin parts are rounded at the voxel
+       size.
+   * - Inside the mesh
+     - Depth and direction come from the paired rigid feature, which exists only
+       near the surface.
+     - Depth and direction come from the signed distance field at any depth.
+   * - Requirements
+     - None.
+     - A volume SDF per mesh, which needs a CUDA device.
+
+Use ``"sdf"`` when the solver or its settings do not keep deformables free of
+penetration, for example when rigid-soft Divide-and-Truncate is disabled and a
+gripper closes firmly on a deformable object. A vertex, edge, or face that ends up
+deep inside a mesh is then pushed toward the nearest surface along the SDF
+gradient. Use ``"bvh"`` when contact near sharp rigid features must be exact, or
+when rigid-soft Divide-and-Truncate should see every feature pair: its complete
+feature-pair coverage holds only for meshes on ``"bvh"`` contacts.
+
+Provision the volume SDF before :meth:`ModelBuilder.finalize`, either on the
+shape configuration or on the mesh:
+
+.. code-block:: python
+
+    cfg = newton.ModelBuilder.ShapeConfig()
+    cfg.configure_sdf(force_sdf=True)
+    builder.add_shape_mesh(body, mesh=mesh, cfg=cfg)
+
+    pipeline = newton.CollisionPipeline(
+        model,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_full_surface_mesh_backend="sdf",
+    )
+
+Every mesh with a volume SDF uses ``"sdf"`` contacts, and
+:attr:`~newton.ShapeFlags.COLLIDE_PARTICLES` is honored at each collision. Such a
+mesh therefore adds candidate pairs, replay storage, and default contact capacity
+for every deformable edge and face even while that flag is clear; set
+``soft_contact_max`` to bound the contact storage in scenes with many such meshes.
+A mesh
+without a volume SDF that collides with particles at construction keeps ``"bvh"``
+contacts, and the pipeline warns once at construction with the names of such
+meshes. A scene can therefore mix both kinds of mesh contacts. On a CPU device no
+volume SDF can be built, so every mesh keeps ``"bvh"`` contacts.
+
+``"sdf"`` mesh contacts follow the rules of analytic-shape contacts rather than
+those of ``"bvh"`` mesh contacts: :class:`~solvers.SolverVBD` applies every
+reported contact without the current-position selection described above, and
+edge and face contacts are reported for inactive particles as well. Vertex
+contacts skip inactive particles.
+
+The contact surface is as accurate as the SDF voxel size. With ``force_sdf=True`` the
+SDF spans the mesh bounds, padded by the shape's contact gap
+(:attr:`ModelBuilder.ShapeConfig.gap`, 0.1 m by default), with 64 voxels along its
+longest axis, so the voxel size is about ``(longest extent + 2 * gap) / 64``. A
+small part with the default gap therefore gets voxels of several millimeters; give
+such shapes a smaller gap, or build the SDF with :meth:`Mesh.build_sdf` and a
+smaller ``margin``, a larger ``max_resolution``, or a ``target_voxel_size``.
+Flat faces are reproduced exactly; sharp edges and corners are rounded at the
+voxel size. Inside the mesh, the contact direction blends between exit directions
+within about one voxel of the surfaces where the nearest face changes, such as the
+diagonal planes through a box edge. The deepest point of a deformable edge or face
+often lies on such a surface. On a line where three or more faces are equally near,
+such as the axis through a corner, the interpolated direction is unreliable and can
+point into the mesh. The edge and face minimization is a local search and can stop
+at a local minimum on strongly nonconvex meshes. Gradients through ``"sdf"`` mesh
+contacts are not validated.
+
+A deformable vertex, each of its edges, and each of its faces report separate
+contacts, as for analytic shapes. When a vertex is the closest point of its edges
+and faces, all of them push at that vertex, so the contact stiffness it feels grows
+with the number of its incident edges and faces.
+
+An SDF built without a baked scale is sampled in the unscaled mesh frame. Under a
+nonuniform shape scale the reported distance is exact for planar faces near the
+surface, but deep inside the mesh the contact keeps the nearest feature of the
+unscaled mesh, which can be a farther exit than the scaled mesh's nearest
+surface. Bake a nonuniform scale with ``mesh.build_sdf(scale=...)`` when deep
+penetration matters.
 
 .. _collision-frequency-in-the-simulation-loop:
 

@@ -22,6 +22,8 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples vbd_gripper_soft_grid`
+- `python -m newton.examples vbd_gripper_soft_grid --finger-mesh --mesh-backend sdf`
+  (mesh finger pads whose contacts sample the pads' volume SDF)
 """
 
 from __future__ import annotations
@@ -71,9 +73,11 @@ PARAMS = {
     "enable_water_tight": True,
     # cube finger pads (equal half-extents -> a cube)
     "finger_half": 0.03,
-    # finger shape: False = analytic box SDF; True = a triangulated cube MESH, which
-    # exercises the texture (volume) SDF path instead of the closed-form box SDF.
+    # finger shape: False = analytic box SDF; True = a triangulated cube MESH.
     "finger_mesh": False,
+    # contact query for mesh finger pads: "bvh" = exact mesh feature pairs; "sdf" = the
+    # pads' volume SDF, as for the analytic box. Only used with finger_mesh.
+    "mesh_backend": "bvh",
     "finger_density": 1000.0,
     "finger_color_left": (0.8, 0.3, 0.3),
     "finger_color_right": (0.3, 0.3, 0.8),
@@ -125,7 +129,11 @@ PARAMS = {
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
-        self.params = {**PARAMS, "finger_mesh": getattr(args, "finger_mesh", PARAMS["finger_mesh"])}
+        self.params = {
+            **PARAMS,
+            "finger_mesh": getattr(args, "finger_mesh", PARAMS["finger_mesh"]),
+            "mesh_backend": getattr(args, "mesh_backend", PARAMS["mesh_backend"]),
+        }
         self.sim_time = 0.0
         self.fps = self.params["fps"]
         self.frame_dt = 1.0 / self.fps
@@ -160,6 +168,7 @@ class Example:
             broad_phase=self.params["collision_broad_phase"],
             soft_contact_gap=self.params["soft_contact_gap"],
             enable_rigid_soft_full_surface_contact=self.params["enable_water_tight"],
+            rigid_soft_full_surface_mesh_backend=self.params["mesh_backend"],
         )
 
         self.state_0 = self.model.state()
@@ -214,8 +223,8 @@ class Example:
 
         finger_cfg = newton.ModelBuilder.ShapeConfig(density=p["finger_density"], mu=p["soft_contact_mu"])
         if p["enable_water_tight"]:
-            # Provision the rigid finger mesh's SDF for full-surface rigid-soft contact (analytic box
-            # fingers ignore this -- finalize only builds mesh/convex SDFs).
+            # Provision the rigid finger mesh's volume SDF, which the "sdf" mesh back-end samples
+            # (analytic box fingers ignore this -- finalize only builds mesh/convex SDFs).
             finger_cfg.configure_sdf(force_sdf=True)
         if p["finger_mesh"]:
             cube = _box_mesh(h)  # one mesh shared by both jaws -> a single deduplicated SDF
@@ -378,6 +387,12 @@ class Example:
             action=argparse.BooleanOptionalAction,
             default=PARAMS["finger_mesh"],
             help="Use triangulated cube finger pads instead of analytic boxes.",
+        )
+        parser.add_argument(
+            "--mesh-backend",
+            choices=("bvh", "sdf"),
+            default=PARAMS["mesh_backend"],
+            help="Contact query for mesh finger pads: exact mesh feature pairs or the pads' volume SDF.",
         )
         return parser
 
