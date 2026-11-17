@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ALM-DAT: a real first-impact substep</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: light-dark(#fafbf9, #151c1c);
+    --ink: light-dark(#203330, #e0eae5);
+    --muted: light-dark(#52665f, #a6bcb2);
+    --line: light-dark(#d7e0d9, #364a40);
+    --surface: light-dark(#e9eeea, #24352c);
+    --reference: light-dark(#576c99, #afc2ed);
+    --anchor: light-dark(#047b68, #70d6ba);
+    --trial: light-dark(#bd591b, #ffb77b);
+    --below: light-dark(#f3e9e0, #342a22);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.55 system-ui, sans-serif; }
+  main { max-width: 1260px; margin: auto; padding: 38px 36px; }
+  h1, h2, h3, p, figure { margin: 0; }
+  h1 { font-size: clamp(29px, 4vw, 44px); font-weight: 500; line-height: 1.18; letter-spacing: -.025em; }
+  h2 { font-size: 23px; font-weight: 500; line-height: 1.35; }
+  h3 { font-size: 17px; font-weight: 500; }
+  strong { font-weight: 600; }
+  .eyebrow { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-bottom: 9px; }
+  .intro { max-width: 860px; margin-top: 16px; }
+  .small { font-size: 13px; color: var(--muted); }
+  .legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; padding: 21px 0; margin: 10px 0 0; }
+  .legend dt { display: flex; align-items: center; gap: 9px; font-weight: 500; }
+  .legend dd { margin: 5px 0 0 22px; color: var(--muted); font-size: 14px; }
+  .symbol { display: inline-block; width: 12px; height: 12px; flex-shrink: 0; }
+  .symbol.reference { border: 2px solid var(--reference); }
+  .symbol.anchor { border: 3px solid var(--anchor); border-radius: 50%; width: 14px; height: 14px; }
+  .symbol.trial { background: var(--trial); transform: rotate(45deg); width: 10px; height: 10px; }
+  .walkthrough { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 24px 0; }
+  .walkthrough-header { display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between; align-items: baseline; }
+  .stage-controls { display: flex; gap: 10px; margin: 16px 0 24px; }
+  .stage-controls button { min-height: 44px; padding: 8px 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; cursor: pointer; }
+  .stage-controls button:disabled { opacity: .45; cursor: default; }
+  .scene-layout { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(290px, 1fr); gap: 32px; }
+  .plots { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; min-width: 0; }
+  figure { min-width: 0; }
+  figure h3 { font-size: 16px; }
+  .plot { width: 100%; height: 430px; display: block; }
+  .plot text { fill: var(--ink); font: 13px system-ui, sans-serif; }
+  .plot .tick { fill: var(--muted); font-size: 12px; }
+  .plot .grid { stroke: var(--line); stroke-width: 1; }
+  .plot .ref-mark { stroke: var(--reference); stroke-width: 2; fill: var(--paper); }
+  .plot .anchor-mark { stroke: var(--anchor); stroke-width: 3; fill: var(--paper); }
+  .plot .trial-mark { fill: var(--trial); }
+  figcaption { font-size: 12px; color: var(--muted); }
+  .stage-index { color: var(--muted); font-size: 13px; margin-bottom: 9px; }
+  .detail h3 { font-size: 26px; line-height: 1.25; margin-bottom: 14px; }
+  .formula { font: 25px/1.6 Georgia, serif; margin-bottom: 14px; }
+  #stage-description { min-height: 125px; }
+  .state-values { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 18px 0 12px; }
+  .state-values div { border-top: 2px solid var(--line); padding-top: 8px; min-width: 0; }
+  .state-values div[data-changed="true"] { border-top-color: var(--ink); }
+  .state-values dt { font-size: 13px; color: var(--muted); }
+  .state-values dd { margin: 3px 0; font-size: 19px; font-variant-numeric: tabular-nums; }
+  .multiplier { font-variant-numeric: tabular-nums; }
+  #detail-values { min-height: 48px; margin-top: 12px; }
+  .timeline { display: flex; gap: 4px; height: 5px; margin-top: 24px; }
+  .timeline span { flex: 1; background: var(--line); }
+  .timeline .past { background: var(--muted); opacity: .55; }
+  .timeline .current { background: var(--anchor); }
+  .phase-labels { display: grid; grid-template-columns: 3fr 3fr 3fr 3fr; font-size: 12px; color: var(--muted); margin: 7px 0 14px; gap: 6px; }
+  section { margin-top: 32px; }
+  section > p { margin-top: 12px; max-width: 940px; }
+  .table-wrap { overflow-x: auto; margin-top: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 11px 12px; text-align: right; border-bottom: 1px solid var(--line); }
+  th { font-weight: 500; font-size: 13px; color: var(--muted); }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; }
+  tr.current { background: var(--surface); }
+  .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 18px; }
+  .facts p + p { margin-top: 12px; }
+  a { color: inherit; text-underline-offset: 3px; }
+  code { font-size: .92em; overflow-wrap: anywhere; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface); padding: 18px; margin: 16px 0; font-size: 14px; }
+  footer { margin-top: 32px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  @media (max-width: 950px) {
+    .scene-layout { grid-template-columns: 1fr; }
+    .detail { max-width: 680px; }
+    #stage-description { min-height: 75px; }
+    .state-values dd { font-size: 22px; }
+  }
+  @media (max-width: 600px) {
+    main { padding: 26px 18px; }
+    .legend { gap: 12px; }
+    .legend dt { font-size: 13px; }
+    .legend dd { margin-left: 0; font-size: 12px; }
+    .state-values dd { font-size: 17px; }
+    .plots, .facts { grid-template-columns: 1fr; }
+    .plot { height: 365px; }
+    .plots { gap: 24px; }
+    .phase-labels { font-size: 11px; }
+    .table-wrap { margin-right: -4px; }
+    th, td { padding: 9px 7px; }
+  }
+  @media print {
+    :root { color-scheme: light; }
+    main { padding: 0; }
+    .stage-controls, .timeline, .phase-labels { display: none; }
+    section { break-inside: avoid; }
+    .scene-layout { display: block; }
+  }
+</style>
+</head>
+<body>
+<main id="alm-dat-illustration">
+  <header>
+    <p class="eyebrow">ALM-DAT · recorded Newton solver states</p>
+    <h1>One impact. Two iterations.<br>Two more anchor advances.</h1>
+    <p class="intro">A free particle falls under gravity onto a triangle whose three vertices are fixed. Follow the <strong>first substep, from 0 to 120 ms</strong>: the force solver leaves its trial below the triangle, while DAT keeps a separate anchor above it. The simulation outputs the anchor.</p>
+    <p class="small" style="margin-top: 10px">A deliberately coarse timestep and only two VBD iterations make the sequence visible. These are real calculations, not prescribed particle motion.</p>
+    <dl class="legend">
+      <div><dt><span class="symbol reference"></span>Reference r</dt><dd>Saved at detection. Fixed for this PRE_INIT substep.</dd></div>
+      <div><dt><span class="symbol anchor"></span>Anchor a</dt><dd>Advanced by DAT at each checkpoint. Accepted as output.</dd></div>
+      <div><dt><span class="symbol trial"></span>Trial y</dt><dd>Updated by the force solver. Unchanged by DAT.</dd></div>
+    </dl>
+  </header>
+
+  <section class="walkthrough" aria-label="Recorded first-substep walkthrough">
+    <div class="walkthrough-header">
+      <h2>First impact, in solver order</h2>
+      <p class="small" id="playback-status">Plays once · Previous or Next pauses playback</p>
+    </div>
+    <div class="stage-controls" role="group" aria-label="Stage navigation">
+      <button type="button" id="previous-stage" aria-controls="scene stage-announcement" disabled>← Previous</button>
+      <button type="button" id="next-stage" aria-controls="scene stage-announcement">Next →</button>
+    </div>
+    <div class="scene-layout" id="scene">
+      <div class="plots">
+        <figure>
+          <h3>Whole movement · millimeters</h3>
+          <svg class="plot" id="overview" role="img" aria-label="Height of reference, anchor, and trial relative to the fixed triangle"></svg>
+          <figcaption>Same particle, three columns for readability. Solid line: triangle at z = 0. Dashed horizontal: lower isotropic bound. Dashed vertical: requested anchor-to-trial movement.</figcaption>
+        </figure>
+        <figure>
+          <h3>Near the triangle · micrometers</h3>
+          <svg class="plot" id="detail-plot" role="img" aria-label="Magnified anchor movement near the triangle; the reference and trial are not shown in this inset"></svg>
+          <figcaption>Anchor only; fixed magnification. Solid line: triangle. Dashed line: allowed point boundary, approximately 2 µm above it. Markers show point centers, not particle size.</figcaption>
+        </figure>
+      </div>
+      <div class="detail">
+        <div id="stage-announcement" aria-live="polite" aria-atomic="true">
+          <p class="stage-index" id="stage-index"></p>
+          <h3 id="stage-title"></h3>
+          <p class="formula" id="stage-formula"></p>
+          <p id="stage-description"></p>
+        </div>
+        <dl class="state-values">
+          <div id="value-r"><dt>r · mm</dt><dd></dd></div>
+          <div id="value-a"><dt>a · mm</dt><dd></dd></div>
+          <div id="value-y"><dt>y · mm</dt><dd></dd></div>
+        </dl>
+        <p class="multiplier">Normal multiplier λ = <span id="value-lambda"></span> N</p>
+        <p class="small" id="detail-values"></p>
+      </div>
+    </div>
+    <div class="timeline" id="timeline" aria-hidden="true"></div>
+    <div class="phase-labels" aria-hidden="true"><span>Initialize</span><span>Iteration 1</span><span>Iteration 2</span><span>Finalize</span></div>
+    <p class="small">Animation interpolates between recorded positions only to make changes visible. Its pacing is not physical time. Readouts show the exact stage endpoints; no intermediate force-solver states are invented.</p>
+  </section>
+
+  <section aria-labelledby="record-heading">
+    <h2 id="record-heading">What each real DAT call did</h2>
+    <p>The reference stays at <strong>40 mm</strong>. Each row is one recorded truncation call. It changes the anchor and leaves the trial untouched. In the final two rows, the force solve and multiplier update have already finished.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">Checkpoint</th><th scope="col">Anchor before<br>mm</th><th scope="col">Trial<br>mm</th><th scope="col">Anchor after<br>mm</th><th scope="col">λ<br>N</th></tr></thead>
+        <tbody id="records"></tbody>
+      </table>
+    </div>
+    <p id="final-summary"></p>
+  </section>
+
+  <section aria-labelledby="selection-heading">
+    <h2 id="selection-heading">Why this particular substep?</h2>
+    <div class="facts">
+      <div>
+        <p><strong>It separates all three roles.</strong> Gravity predicts a deeply penetrating trial. The two force iterations change that trial; DAT advances the anchor independently at initialization and after each iteration. Two additional final rounds advance the anchor toward the same trial before committing it.</p>
+        <p><strong>The final rounds need magnification.</strong> The anchor is already very close to the triangle after iteration 2. Their small but real advances are visible in the micrometer view.</p>
+      </div>
+      <div>
+        <p id="control-summary"></p>
+        <p><strong>This is a schedule demonstration.</strong> The intentionally low iteration count is not a convergence recommendation. The triangle’s normal is constant, so this example does not show how changing plane normals can influence later contact forces.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="reproduce-heading">
+    <h2 id="reproduce-heading">Reproduce the recorded calculation</h2>
+    <p>Run from the <code>newton-collision</code> checkout on <code>donglaix/rigid-soft-alm-dat-design</code>, commit <code id="commit"></code>. The script uses the real CPU SolverVBD implementation and records its checkpoints. The fixed triangle is a soft triangle with three zero-mass vertices; this is the branch’s soft self-contact ALM-DAT path.</p>
+    <pre><code>uv run --script tmp/alm-dat/run_example.py \
+  --dt 0.12 --height 0.04 --iterations 2 --contact-gap 0.2 --steps 120 \
+  --output tmp/alm-dat/illustrative-real.json</code></pre>
+    <p class="small">For the Newton viewer, append <code>--viewer gl --speed 0.1 --paused</code> (and use <code>DISPLAY=:1</code> when needed). It renders accepted substep states; the website shows the recorded internal checkpoints. The viewer has Reset, pause, and single-step controls.</p>
+    <p id="parameters"></p>
+    <p>The larger detection gap makes the isotropic motion bound nonbinding for these anchor advances. The actual DAT plane limits all five. Its plane offset plus reserved margin put the allowed point boundary about 2 µm above the physical triangle.</p>
+    <p id="validation-summary"></p>
+    <p><a href="alm-dat-selected-trace.json" download>Selected substep JSON</a> · <a href="illustrative-real.json" download>Full 120-substep trace</a> · <a href="illustrative-ten-iterations.json" download>Ten-iteration comparison</a> · <a href="run_example.py" download>Recorded-example script</a></p>
+    <p class="small">Place the downloaded script at the path shown in the command so that it imports this checkout. The selected JSON also records the solver commit and SHA-256 hashes of the script and full trace.</p>
+  </section>
+  <footer>Recorded on November 17, 2026 · <a href="comparison.md">Mathematical schedule comparison</a> · <a href="alm-dat-truncation-schematic.html">Archived schematic with invented positions</a></footer>
+</main>
+<script type="application/json" id="recorded-trace">__RECORDED_TRACE__</script>
+<script>
+(() => {
+  'use strict';
+  const root = document.getElementById('alm-dat-illustration');
+  const get = id => root.querySelector(`#${id}`);
+  const trace = JSON.parse(document.getElementById('recorded-trace').textContent);
+  const records = trace.checkpoints;
+  const summary = trace.summary;
+  const mm = value => (value * 1000).toFixed(6).replace('-', '−');
+  const um = value => (value * 1e6).toFixed(3).replace('-', '−');
+  const compact = value => (value * 1000).toFixed(3).replace('-', '−');
+  const reference = records[0].reference[2];
+  const boundary = records[0].vt_point_before[0][2] + records[0].vt_margin_before[0];
+  const stages = [];
+  let state = {r: reference, a: reference, y: reference, lambda: records[0].normal_multipliers[0]};
+  const add = (kind, phase, title, formula, description, changes = {}, record = -1) => {
+    state = {...state, ...changes};
+    stages.push({...state, kind, phase, title, formula, description, record});
+  };
+  const truncate = 'a ← T<sub>r</sub>(a, y)';
+  add('hold', 'Start · collision detection', 'Save the reference', 'r = a = y',
+    'The free particle starts at rest, 40 mm above the fixed triangle. PRE_INIT detects before prediction. This reference stays fixed throughout the substep.');
+  add('trial', 'Initialization · gravity prediction', 'Let the trial cross', 'y ← gravity prediction',
+    'Gravity over this deliberately large 120 ms step predicts y below the triangle. Prediction changes the trial; the reference and anchor have not moved.', {y: records[0].trial[2]});
+  add('dat', 'Initialization · first DAT call', 'Advance only the anchor', truncate,
+    'DAT advances from a toward the predicted y, stopping above the triangle. It does not replace y. The first force iteration still starts from the penetrating trial.', {a: records[0].anchor_after[2]}, 0);
+  for (let i = 1; i <= 2; i++) {
+    const record = records[i];
+    add('trial', `Iteration ${i} · force solve`, i === 1 ? 'Update the trial from forces' : 'Continue from the previous trial', 'y ← VBD update',
+      'This is the recorded endpoint after all color groups in the iteration. Contact and inertial forces change y. The anchor and reference stay fixed during this solve.', {y: record.trial[2]});
+    add('multipliers', `Iteration ${i} · after all colors`, 'Update the multiplier', 'λ ← update from y',
+      'The multiplier update reads the untruncated trial. It changes the contact multiplier, not any of the three positions. The updated multiplier is available to subsequent force evaluations.', {lambda: record.normal_multipliers[0]});
+    add('dat', `Iteration ${i} · checkpoint`, 'Advance the anchor', truncate,
+      i === 1 ? 'The anchor advances toward the current trial, then the solver rebuilds its stored planes. This is not another collision detection: r stays fixed and the next iteration resumes from y.' : 'The last iteration has its usual checkpoint. The trial remains below the triangle. The anchor is now close enough to appear in the magnified view.', {a: record.anchor_after[2]}, i);
+  }
+  for (let i = 3; i < records.length; i++) {
+    add('dat', `Finalization · round ${i - 2} of 2`, 'Advance toward the same trial', truncate,
+      'There is no new force solve or multiplier update. Run DAT again from the latest anchor toward the unchanged trial. Only the anchor advances; the reference and its motion budget stay fixed.', {a: records[i].anchor_after[2]}, i);
+  }
+  add('output', 'End of first substep · t = 120 ms', 'Accept the anchor', 'x<sup>out</sup> ← a',
+    'The actual output is the final anchor above the triangle. The penetrating orange trial is shown for comparison; it is not the position committed to the simulation.');
+
+  const names = ['Initialization', 'Iteration 1', 'Iteration 2', 'Final round 1', 'Final round 2'];
+  get('records').innerHTML = records.map((r, i) => `<tr data-record="${i}"><th scope="row">${names[i]}</th><td>${mm(r.anchor_before[2])}</td><td>${mm(r.trial[2])}</td><td>${mm(r.anchor_after[2])}</td><td>${r.normal_multipliers[0].toFixed(6)}</td></tr>`).join('');
+  get('final-summary').innerHTML = `During finalization, <strong>a: ${um(records[2].anchor_after[2])} → ${um(records[3].anchor_after[2])} → ${um(records[4].anchor_after[2])} µm</strong>, while <strong>y stays at ${compact(records[4].trial[2])} mm</strong>.`;
+  get('control-summary').innerHTML = `<strong>Final rounds need not move anything.</strong> With the same setup and ten VBD iterations, y and a finish at ${compact(trace.control.frame.position[2])} mm above the triangle. Both final rounds then leave the anchor unchanged.`;
+  get('commit').textContent = summary.commit.slice(0, 9);
+  get('parameters').textContent = `Settings: mass 0.1 kg; gravity 9.81 m/s²; contact stiffness 1,000 N/m; no damping or friction; contact margin ${summary.contact_margin_m * 1000} mm; detection gap ${summary.contact_gap_m * 1000} mm; DAT relaxation ${summary.dat_relaxation}; isotropic motion budget ${summary.motion_budget_m * 1000} mm about r. Plane updates occur after every iteration, followed by two final truncation rounds.`;
+  get('validation-summary').textContent = `The full ${summary.steps}-substep CPU run remained finite, kept the triangle fixed, and had no accepted crossing. It settled at ${compact(summary.final_output_height_m)} mm with λ = ${summary.final_normal_multipliers_N[0].toFixed(3)} N, matching the 0.981 N weight. Every recorded DAT call left the trial bitwise unchanged.`;
+  const timeline = get('timeline');
+  stages.forEach(() => timeline.appendChild(document.createElement('span')));
+
+  function mark(kind, x, y, opacity = 1) {
+    if (kind === 'r') return `<rect class="ref-mark" opacity="${opacity}" x="${x - 5}" y="${y - 5}" width="10" height="10"/>`;
+    if (kind === 'a') return `<circle class="anchor-mark" opacity="${opacity}" cx="${x}" cy="${y}" r="8"/>`;
+    return `<path class="trial-mark" opacity="${opacity}" d="M ${x} ${y - 6} l 6 6 l -6 6 l -6 -6 Z"/>`;
+  }
+  function drawPlots(stage, previous, values) {
+    const svg = get('overview');
+    const width = svg.clientWidth, height = svg.clientHeight;
+    const left = 52, right = width - 12, top = 45, bottom = height - 34;
+    const z = value => top + (0.05 - value) / 0.16 * (bottom - top);
+    const x = {r: left + (right - left) * .18, a: left + (right - left) * .52, y: left + (right - left) * .86};
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    let content = `<rect x="${left}" y="${z(0)}" width="${right - left}" height="${bottom - z(0)}" fill="var(--below)"/>`;
+    for (const tick of [.04, 0, -.04, -.08]) {
+      content += `<line class="grid" x1="${left}" x2="${right}" y1="${z(tick)}" y2="${z(tick)}"/><text class="tick" x="${left - 10}" y="${z(tick) + 4}" text-anchor="end">${Math.round(tick * 1000)}</text>`;
+    }
+    const lower = reference - summary.motion_budget_m;
+    content += `<line x1="${left}" x2="${right}" y1="${z(lower)}" y2="${z(lower)}" stroke="var(--muted)" stroke-dasharray="4 5"/><line x1="${left}" x2="${right}" y1="${z(0)}" y2="${z(0)}" stroke="var(--ink)" stroke-width="2"/>`;
+    if (stage.kind === 'dat') {
+      content += `<line x1="${x.a}" x2="${x.a}" y1="${z(previous.a)}" y2="${z(stage.y)}" stroke="var(--anchor)" stroke-dasharray="4 4"/><line x1="${x.a}" x2="${x.a}" y1="${z(previous.a)}" y2="${z(values.a)}" stroke="var(--anchor)" stroke-width="3"/>`;
+    }
+    if (stage.kind === 'trial') content += `<line x1="${x.y}" x2="${x.y}" y1="${z(previous.y)}" y2="${z(values.y)}" stroke="var(--trial)" stroke-width="2"/>`;
+    for (const key of ['r', 'a', 'y']) content += `<text x="${x[key]}" y="21" text-anchor="middle">${key}</text>` + mark(key, x[key], z(values[key]), stage.kind === 'output' && key === 'y' ? .45 : 1);
+    content += `<text class="tick" x="${left}" y="${height - 6}">Lower bound: ${compact(lower)} mm</text>`;
+    svg.innerHTML = content;
+
+    const inset = get('detail-plot');
+    const w = inset.clientWidth, h = inset.clientHeight;
+    const l = 48, r = w - 12, t = 45, b = h - 34, center = (l + r) / 2;
+    const detailZ = value => t + (160e-6 - value) / 172e-6 * (b - t);
+    inset.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    let detail = '';
+    for (const tick of [160, 120, 80, 40, 0]) {
+      detail += `<line class="grid" x1="${l}" x2="${r}" y1="${detailZ(tick * 1e-6)}" y2="${detailZ(tick * 1e-6)}"/><text class="tick" x="${l - 10}" y="${detailZ(tick * 1e-6) + 4}" text-anchor="end">${tick}</text>`;
+    }
+    detail += `<line x1="${l}" x2="${r}" y1="${detailZ(0)}" y2="${detailZ(0)}" stroke="var(--ink)" stroke-width="2"/><line x1="${l}" x2="${r}" y1="${detailZ(boundary)}" y2="${detailZ(boundary)}" stroke="var(--anchor)" stroke-width="1.5" stroke-dasharray="4 4"/>`;
+    if (values.a > 160e-6) {
+      detail += `<text x="${center}" y="21" text-anchor="middle">a is above this view ↑</text>`;
+    } else {
+      detail += `<text x="${center}" y="21" text-anchor="middle">a = ${um(stage.a)} µm</text>`;
+      if (stage.kind === 'dat') {
+        const start = Math.min(160e-6, previous.a);
+        detail += `<line x1="${center}" x2="${center}" y1="${detailZ(start)}" y2="${detailZ(values.a)}" stroke="var(--anchor)" stroke-width="2"/>`;
+        if (previous.a <= 160e-6) detail += mark('a', center, detailZ(previous.a), .3);
+      }
+      detail += mark('a', center, detailZ(values.a));
+    }
+    detail += `<text class="tick" x="${l}" y="${h - 6}">Boundary: ${um(boundary)} µm</text>`;
+    inset.innerHTML = detail;
+  }
+
+  let activeIndex = -1;
+  let lastValues;
+  function displayStage(index, progress) {
+    const stage = stages[index], previous = stages[Math.max(0, index - 1)];
+    const ease = progress * progress * (3 - 2 * progress);
+    const values = Object.fromEntries(['r', 'a', 'y'].map(key => [key, previous[key] + (stage[key] - previous[key]) * ease]));
+    lastValues = values;
+    drawPlots(stage, previous, values);
+    if (index === activeIndex) return;
+    activeIndex = index;
+    root.dataset.stage = String(index);
+    get('stage-index').textContent = `${index + 1} / ${stages.length} · ${stage.phase}`;
+    get('stage-title').textContent = stage.title;
+    get('stage-formula').innerHTML = stage.formula;
+    get('stage-description').textContent = stage.description;
+    for (const key of ['r', 'a', 'y']) {
+      const field = get(`value-${key}`);
+      field.querySelector('dd').textContent = compact(stage[key]);
+      field.dataset.changed = String(stage[key] !== previous[key]);
+      field.dataset.meters = String(stage[key]);
+    }
+    get('value-lambda').textContent = stage.lambda.toFixed(6);
+    get('detail-values').textContent = stage.kind === 'dat'
+      ? `Anchor: ${um(previous.a)} → ${um(stage.a)} µm. Plane-limited fraction of the requested movement: ${(records[stage.record].truncation_t * 100).toFixed(3)}%. Trial unchanged.`
+      : stage.kind === 'output' ? `Accepted height: ${um(stage.a)} µm. Final trial: ${compact(stage.y)} mm.` : 'Readouts show the recorded endpoint of this stage.';
+    get('previous-stage').disabled = index === 0;
+    get('next-stage').disabled = index === stages.length - 1;
+    [...timeline.children].forEach((element, i) => { element.className = i < index ? 'past' : i === index ? 'current' : ''; });
+    [...get('records').children].forEach((element, i) => element.classList.toggle('current', i === stage.record));
+  }
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  let stopped = reducedMotion.matches;
+  let elapsed = 0, previousTime;
+  const lastIndex = stages.length - 1;
+  const stepStage = direction => {
+    stopped = true;
+    displayStage(Math.max(0, Math.min(lastIndex, activeIndex + direction)), 1);
+    get('playback-status').textContent = 'Playback paused · use Previous and Next to step';
+  };
+  get('previous-stage').addEventListener('click', () => stepStage(-1));
+  get('next-stage').addEventListener('click', () => stepStage(1));
+  if (stopped) {
+    displayStage(lastIndex, 1);
+    get('playback-status').textContent = 'Reduced-motion view · final state shown';
+  } else {
+    displayStage(0, 1);
+    const animate = time => {
+      if (stopped) return;
+      if (previousTime !== undefined && !document.hidden) elapsed += Math.min(time - previousTime, 100);
+      previousTime = time;
+      const index = Math.min(lastIndex, Math.floor(elapsed / 4800));
+      displayStage(index, Math.min(1, (elapsed - index * 4800) / 1000));
+      if (index === lastIndex) get('playback-status').textContent = 'Walkthrough complete · final anchor accepted';
+      else window.requestAnimationFrame(animate);
+    };
+    window.requestAnimationFrame(animate);
+  }
+  reducedMotion.addEventListener('change', event => {
+    if (event.matches) {
+      stopped = true;
+      displayStage(lastIndex, 1);
+      get('playback-status').textContent = 'Reduced-motion view · final state shown';
+    }
+  });
+  new ResizeObserver(() => {
+    if (activeIndex >= 0) drawPlots(stages[activeIndex], stages[Math.max(0, activeIndex - 1)], lastValues);
+  }).observe(get('scene'));
+})();
+</script>
+</body>
+</html>

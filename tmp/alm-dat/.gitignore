@@ -1,0 +1,7 @@
+# Local runs and verification outputs; recorded website inputs stay tracked.
+/result*.json
+/*-verification.json
+/website-*.png
+/viewer-*.png
+/*.log
+/*.pid
