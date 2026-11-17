@@ -17,7 +17,7 @@ Defaults match the website's recorded first-impact case: dt=0.12 s,
 two VBD iterations, initial height=0.04 m, and contact gap=0.2 m.
 
 Runs (from newton-collision):
-    uv run --script tmp/alm-dat/run_example.py --viewer gl --speed 0.1 --paused
+    uv run --script tmp/alm-dat/run_particle_triangle.py --viewer gl --speed 0.1 --paused
 
 Success criteria: the triangle stays fixed, the free particle lands above it,
 all positions remain finite, and DAT calls leave the trial unchanged.
