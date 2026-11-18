@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "warp-lang==1.19.0",
+#   "warp-lang==1.17.0",
 #   "numpy",
 #   "pyglet>=2.1.6,<3",
 #   "imgui_bundle>=1.92.0",
@@ -12,6 +12,7 @@
 """Drop one free particle onto one fixed triangle using the real ALM-DAT solver.
 
 Run with uv run --script to use an isolated, compatible viewer environment.
+Uses cuda:0 by default; pass --device cpu to run on the CPU.
 Writes actual solver checkpoints and a summary beside this script.
 Defaults match the website's recorded first-impact case: dt=0.12 s,
 two VBD iterations, initial height=0.04 m, and contact gap=0.2 m.
@@ -146,6 +147,7 @@ class Example:
     def gui(self, imgui):
         """Show the scene's physical scale and progress in the Newton panel."""
         imgui.text("One free particle / one fixed triangle")
+        imgui.text(f"Physics device: {self.model.device}")
         imgui.text("Orange: accepted particle position")
         imgui.text(f"Step {len(self.frames)} / {self.args.steps}; time {self.sim_time:.3f} s")
         height = self.frames[-1]["position"][2] if self.frames else self.args.height
@@ -163,6 +165,7 @@ class Example:
 def main():
     """Build the four-particle model, simulate, and save measured state changes."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--device", default="cuda:0", help="Warp simulation device, e.g. cuda:0 or cpu.")
     parser.add_argument("--steps", type=int, default=120, help="Number of physical timesteps.")
     parser.add_argument("--iterations", type=int, default=2, help="VBD iterations per physical timestep.")
     parser.add_argument("--dt", type=float, default=0.12, help="Physical timestep [s].")
@@ -187,7 +190,7 @@ def main():
     if args.headless and args.paused:
         parser.error("headless rendering cannot start paused")
     wp.init()
-    wp.set_device("cpu")
+    wp.set_device(args.device)
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
     for position in [(-0.2, -0.2, 0.0), (0.2, -0.2, 0.0), (0.0, 0.2, 0.0)]:
         builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(0.0), mass=0.0, radius=0.005)
@@ -196,7 +199,7 @@ def main():
         pos=wp.vec3(0.0, 0.0, args.height), vel=wp.vec3(0.0, 0.0, -args.initial_speed), mass=0.1, radius=0.005
     )
     builder.color()
-    model = builder.finalize(device="cpu")
+    model = builder.finalize(device=args.device)
     model.soft_contact_ke = 1000.0
     model.soft_contact_kd = 0.0
     model.soft_contact_mu = 0.0
@@ -261,7 +264,7 @@ def main():
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "newton_source": newton.__file__,
         "warp_version": wp.__version__,
-        "device": "cpu",
+        "device": str(model.device),
         "particle_count": model.particle_count,
         "triangle_count": model.tri_count,
         "rigid_shape_count": model.shape_count,

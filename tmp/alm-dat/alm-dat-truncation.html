@@ -196,7 +196,7 @@
 
   <section aria-labelledby="reproduce-heading">
     <h2 id="reproduce-heading">Reproduce the recorded calculation</h2>
-    <p>Run from the <code>newton-collision</code> checkout on <code>donglaix/rigid-soft-alm-dat-design</code>, commit <code id="commit"></code>. The script uses the real CPU SolverVBD implementation and records its checkpoints. The fixed triangle is a soft triangle with three zero-mass vertices; this is the branch’s soft self-contact ALM-DAT path.</p>
+    <p>The recording below used the real SolverVBD implementation at commit <code id="commit"></code> on CPU with Warp 1.19.0. The current script defaults to CUDA with stable Warp 1.17.0; use <code>--device cpu</code> to select CPU. Run from the <code>newton-collision</code> checkout on <code>donglaix/rigid-soft-alm-dat-design</code>. The fixed triangle is a soft triangle with three zero-mass vertices; this is the branch’s soft self-contact ALM-DAT path.</p>
     <pre><code>uv run --script tmp/alm-dat/run_particle_triangle.py \
   --dt 0.12 --height 0.04 --iterations 2 --contact-gap 0.2 --steps 120 \
   --output tmp/alm-dat/illustrative-real.json</code></pre>
