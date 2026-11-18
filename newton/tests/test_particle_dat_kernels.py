@@ -17,7 +17,8 @@ from newton._src.solvers.vbd.particle_dat_kernels import (
     dat_plane_offset,
     truncate_against_contact_planes,
 )
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton._src.solvers.vbd.rigid_vbd_kernels import planar_truncation_t
+from newton.tests.unittest_utils import NewtonTestCase, add_function_test, get_test_devices
 
 
 @wp.kernel
@@ -29,7 +30,6 @@ def _plane_offset_kernel(
     positive_pos: wp.array[wp.vec3],
     positive_disp: wp.array[wp.vec3],
     positive_count: int,
-    margin: float,
     eps: float,
     out: wp.array[float],
 ):
@@ -43,15 +43,20 @@ def _plane_offset_kernel(
     for j in range(positive_count):
         pos[j] = positive_pos[j]
         pos_d[j] = positive_disp[j]
-    plane_point, room, margin_eff = dat_plane_offset(
-        n, neg, neg_d, negative_count, pos, pos_d, positive_count, margin, eps
-    )
+    plane_point, room, margin_eff = dat_plane_offset(n, neg, neg_d, negative_count, pos, pos_d, positive_count, eps)
     out[0] = wp.dot(n, plane_point)
     out[1] = room
     out[2] = margin_eff
+    if out.shape[0] > 3:
+        for i in range(negative_count):
+            out[3 + i] = wp.dot(-n, neg[i] - plane_point) - margin_eff
+            out[9 + i] = planar_truncation_t(neg[i], neg_d[i], -n, plane_point, 0.85, margin_eff)
+        for j in range(positive_count):
+            out[6 + j] = wp.dot(n, pos[j] - plane_point) - margin_eff
+            out[12 + j] = planar_truncation_t(pos[j], pos_d[j], n, plane_point, 0.85, margin_eff)
 
 
-def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, margin=0.25, eps=1.0e-6):
+def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, eps=1.0e-6):
     out = wp.zeros(3, dtype=float, device=device)
     wp.launch(
         _plane_offset_kernel,
@@ -64,7 +69,6 @@ def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, 
             wp.array(positive, dtype=wp.vec3, device=device),
             wp.array(positive_disp, dtype=wp.vec3, device=device),
             len(positive),
-            margin,
             eps,
         ],
         outputs=[out],
@@ -76,17 +80,19 @@ def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, 
 def test_plane_offset_balances_slowest_vertices(test, device):
     """Place the plane where the slowest approaching vertex on each side gets the same fraction."""
     # Worked example from the design notes: triangle heights 0, -1, -2 moving up by 2, 5
-    # and down by 1; vertex at height 3 moving down by 3; margin 0.25 per side.
+    # and down by 1; vertex at height 3 moving down by 3.
     triangle = [(0.0, 0.0, 0.0), (1.0, 0.0, -1.0), (0.0, 1.0, -2.0)]
     triangle_disp = [(0.0, 0.0, 2.0), (0.0, 0.0, 5.0), (0.0, 0.0, -1.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
     offset, room, margin_eff = _run_plane_offset(device, triangle, triangle_disp, vertex, vertex_disp)
     # the fast triangle vertex (rate 5) binds against the vertex (rate 3):
-    # b = (3 * (-1 + 0.25) + 5 * (3 - 0.25)) / 8
-    test.assertAlmostEqual(float(offset), 1.4375, places=5)
-    test.assertAlmostEqual(float(room), 0.4375, places=5)
-    test.assertAlmostEqual(float(margin_eff), 0.25, places=6)
+    # offset = (3 * (-1 + eps) + 5 * (3 - eps)) / 8.
+    # Both limiting endpoints get (4 - 2*eps)/8 of their proposed motion.
+    eps = 1.0e-6
+    test.assertAlmostEqual(float(offset), 1.5 - 0.25 * eps, places=6)
+    test.assertAlmostEqual(float(room), 0.5 - 0.25 * eps, places=6)
+    test.assertAlmostEqual(float(margin_eff), eps, places=10)
 
 
 def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
@@ -96,13 +102,83 @@ def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
     offset, room, margin_eff = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
-    # plane sits just above the highest triangle vertex; the vertex can take (3 - 0.25 - 0.25)/3
-    test.assertAlmostEqual(float(offset), 0.25, places=5)
-    test.assertAlmostEqual(float(room), 2.5 / 3.0, places=5)
-    # thin pair: margin shrinks to half the gap
+    # The plane is eps above the highest triangle vertex. Truncation retains
+    # eps, giving the approaching vertex (3 - eps - eps)/3 of its motion.
+    eps = 1.0e-6
+    test.assertAlmostEqual(float(offset), eps, places=10)
+    test.assertAlmostEqual(float(room), 1 - 2 * eps / 3, places=6)
+    # Use a larger epsilon to exercise a gap narrower than the construction
+    # band: construction takes half the gap. The stored-plane fallback reduces
+    # the truncation clearance to half of the measured clearance (gap/4).
     thin_vertex = [(0.3, 0.3, 0.1)]
-    _offset, _room, margin_eff = _run_plane_offset(device, triangle, receding, thin_vertex, vertex_disp)
-    test.assertAlmostEqual(float(margin_eff), 0.05, places=5)
+    _offset, _room, margin_eff = _run_plane_offset(device, triangle, receding, thin_vertex, vertex_disp, eps=0.125)
+    test.assertAlmostEqual(float(margin_eff), 0.025, places=6)
+
+
+def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, device):
+    """Admit safe near-tangential motions without invalidating the stored separation band."""
+    # Frozen EE records from the five-sheet free-fall scene: one ignored small
+    # approach and one balanced candidate that rounds onto the opposite boundary.
+    # Coordinates are cm; shifts also exercise float32 world-point storage.
+    cases = (
+        (
+            (-0.7535979748, -0.6573342681, -0.00128194608),
+            (
+                (-0.5342752934, -0.1955957711, -62.449874878),
+                (-1.5322945118, -0.1223239973, -62.449012756),
+                (1.6179898977, 1.6527905464, -62.451862335),
+                (0.6856902242, 2.7209086418, -62.086380005),
+            ),
+            (
+                (-0.5342752934, -0.1955957711, -62.449874878),
+                (-1.5313527584, -0.1224250123, -62.448871613),
+                (1.6179898977, 1.6527905464, -62.451862335),
+                (0.6861742735, 2.7210466862, -62.446521759),
+            ),
+        ),
+        (
+            (-0.9820537567, -0.0705535561, -0.1749072373),
+            (
+                (-5.2487082481, -0.0373020172, -0.0942333341),
+                (-5.1770501137, -1.0347313881, -0.0942333341),
+                (-3.3100192547, -0.9904513359, 0.1557666659),
+                (-3.4050002098, 0.0050277710, 0.2875041962),
+            ),
+            (
+                (-5.2487082481, -0.0373020098, -0.0942333341),
+                (-5.1770501137, -1.0347313881, -0.0942333341),
+                (-3.3100192547, -0.9904513359, 0.1557666659),
+                (-3.4050357342, 0.0051305690, 0.1555224210),
+            ),
+        ),
+    )
+    for case, (normal, anchor, trial) in enumerate(cases):
+        anchor_np = np.asarray(anchor, dtype=np.float32)
+        displacement_np = np.asarray(trial, dtype=np.float32) - anchor_np
+        for shift in (0.0, -10.0, 10.0, 1000.0):
+            with test.subTest(case=case, shift=shift):
+                shifted_np = (anchor_np.astype(np.float64) + shift).astype(np.float32)
+                eps = max(1e-6, 4 * np.finfo(np.float32).eps * max(1.0, float(np.abs(shifted_np).max())))
+                out = wp.zeros(15, dtype=float, device=device)
+                wp.launch(
+                    _plane_offset_kernel,
+                    1,
+                    inputs=[
+                        wp.vec3(*normal),
+                        wp.array(shifted_np[2:], dtype=wp.vec3, device=device),
+                        wp.array(displacement_np[2:], dtype=wp.vec3, device=device),
+                        2,
+                        wp.array(shifted_np[:2], dtype=wp.vec3, device=device),
+                        wp.array(displacement_np[:2], dtype=wp.vec3, device=device),
+                        2,
+                        eps,
+                    ],
+                    outputs=[out],
+                    device=device,
+                )
+                values_np = out.numpy()
+                test.assertGreaterEqual(float(values_np[[3, 4, 6, 7]].min()), 0.0)
+                np.testing.assert_array_equal(values_np[[9, 10, 12, 13]], np.ones(4))
 
 
 def _two_layer_model(device, layer_gap=0.012):
@@ -184,15 +260,45 @@ def test_build_contact_planes_certifies_every_stored_pair(test, device):
     planes = create_particle_contact_dat_planes(info, device)
     anchor = wp.clone(model.particle_q)
     trial = wp.clone(model.particle_q)
-    build_contact_planes(model, anchor, trial, info, planes, margin=0.0, refresh_normals=True)
+    build_contact_planes(model, anchor, trial, info, planes, refresh_normals=True)
     worst, checked = _plane_sides(model, info, planes, anchor)
     test.assertGreater(checked, 0)
     test.assertLessEqual(worst, 0.0)
+    test.assertTrue(bool(planes.coverage.numpy()[0]))
     rows = info.edge_colliding_edges.numpy()
     valid = planes.ee_valid.numpy()
     for slot in range(int(info.edge_colliding_edges_offsets.numpy()[-1])):
         if int(rows[2 * slot]) > int(rows[2 * slot + 1]):
             test.assertEqual(int(valid[slot]), 0)
+    # Deliberately collapse the geometry to exercise both failure paths. A
+    # failed replacement must warn and preserve the complete previous plane.
+    fields = ("vt_normal", "vt_point", "vt_margin", "vt_valid", "ee_normal", "ee_point", "ee_margin", "ee_valid")
+    stored_np = {name: getattr(planes, name).numpy().copy() for name in fields}
+    anchor.zero_()
+    trial.zero_()
+    for refresh_normals in (True, False):
+        failure = "separating normal" if refresh_normals else "valid stored plane"
+        for family in ("EE", "VT"):
+            test.expectOutputRegex(
+                rf"Warning: ALM-DAT found no {failure} for {family} row \d+: [^\n]+retaining_previous_plane=1",
+                stream="stdout",
+            )
+        build_contact_planes(model, anchor, trial, info, planes, refresh_normals=refresh_normals)
+        for name in fields:
+            np.testing.assert_array_equal(getattr(planes, name).numpy(), stored_np[name])
+        test.assertTrue(bool(planes.coverage.numpy()[0]))
+
+    # With no previous plane there is no certificate to retain: warn and clear
+    # coverage. Mirrored EE records are skipped, rather than reported as failures.
+    planes.vt_valid.zero_()
+    planes.ee_valid.zero_()
+    for family in ("EE", "VT"):
+        test.expectOutputRegex(
+            rf"Warning: ALM-DAT found no separating normal for {family} row \d+: [^\n]+retaining_previous_plane=0",
+            stream="stdout",
+        )
+    build_contact_planes(model, anchor, trial, info, planes, refresh_normals=True)
+    test.assertFalse(bool(planes.coverage.numpy()[0]))
 
 
 def test_truncate_against_planes_keeps_every_vertex_on_its_side(test, device):
@@ -204,7 +310,7 @@ def test_truncate_against_planes_keeps_every_vertex_on_its_side(test, device):
     rng = np.random.default_rng(3)
     trial_np = model.particle_q.numpy() + rng.uniform(-0.03, 0.03, size=(model.particle_count, 3)).astype(np.float32)
     trial = wp.array(trial_np, dtype=wp.vec3, device=device)
-    build_contact_planes(model, anchor, trial, info, planes, margin=0.0, refresh_normals=True)
+    build_contact_planes(model, anchor, trial, info, planes, refresh_normals=True)
     # negative control: the untruncated trial pose does cross stored planes
     worst_trial, _checked = _plane_sides(model, info, planes, trial)
     test.assertGreater(worst_trial, 0.0)
@@ -243,8 +349,9 @@ def test_commit_budget_sphere(test, device):
 devices = get_test_devices()
 
 
-class TestParticleDatKernels(unittest.TestCase):
-    pass
+class TestParticleDatKernels(NewtonTestCase):
+    def setUp(self):
+        self.allowOutputRegex(r"^Module .* load on device .*\n?", stream="stdout")
 
 
 add_function_test(
@@ -265,6 +372,12 @@ add_function_test(
     TestParticleDatKernels,
     "test_plane_offset_gives_all_room_to_the_only_approaching_side",
     test_plane_offset_gives_all_room_to_the_only_approaching_side,
+    devices=devices,
+)
+add_function_test(
+    TestParticleDatKernels,
+    "test_plane_offset_preserves_small_approaches_and_stored_clearance",
+    test_plane_offset_preserves_small_approaches_and_stored_clearance,
     devices=devices,
 )
 add_function_test(

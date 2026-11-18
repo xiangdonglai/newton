@@ -1243,8 +1243,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "particle_dat_truncation_iterations must be at least 1 with alm_dat: the committed state is the "
                 "truncated iterate, so the final truncation cannot be skipped"
             )
-        # thickness reserved on each side of a stored plane; the certificate is "no crossing"
-        self._dat_margin = 0.0
         self._dat_planes = None
         self._dat_alm_state = None
         self._dat_anchor = None
@@ -1535,7 +1533,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if self._alm_dat:
             # plane and multiplier storage is indexed by row slot, so it follows the
             # row capacity; a capacity change drops the matching history once
-            self._dat_planes = create_particle_contact_dat_planes(info, self.device)
+            self._dat_planes = create_particle_contact_dat_planes(info, self.device, coverage=self._dat_coverage)
             self._dat_alm_state = create_particle_contact_alm_state(self.model, info, self.device)
         self._self_contact_info_source = info
         self._self_contact_storage_generation = generation
@@ -4119,7 +4117,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             trial,
             self.trimesh_collision_info,
             self._dat_planes,
-            margin=self._dat_margin,
             refresh_normals=refresh_normals,
             launch_size=launch_size,
         )
@@ -4152,7 +4149,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             state_in.particle_q,
             self.trimesh_collision_info,
             self._dat_planes,
-            margin=self._dat_margin,
             refresh_normals=True,
             launch_size=self.particle_self_contact_evaluation_kernel_launch_size,
         )
@@ -4196,18 +4192,19 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             state_in.particle_q,
             self.trimesh_collision_info,
             self._dat_planes,
-            margin=self._dat_margin,
             refresh_normals=True,
             launch_size=self.particle_self_contact_evaluation_kernel_launch_size,
         )
         match_contact_history(self._self_contact_info_source, self._dat_alm_state, self.device)
 
     def particle_dat_coverage_ok(self) -> bool:
-        """Return whether the last ``alm_dat`` step's detection stored every found pair.
+        """Return whether the last ``alm_dat`` step retained a certified plane for every found pair.
 
-        ``False`` means the shared self-contact buffer overflowed, some pairs have
-        no stored plane, and the penetration-free certificate does not cover
-        them; call :meth:`check_and_grow_self_contact_buffers` between steps.
+        ``False`` means detection overflowed or a pair could not be separated by a
+        certified stored plane. The penetration-free certificate does not cover
+        that step. For overflow, call :meth:`check_and_grow_self_contact_buffers`
+        between steps; already intersecting or numerically unresolved geometry
+        requires correcting the input state or increasing geometric resolution.
         Reads one device integer back (synchronizes); graph users can read the
         same flag from ``self._dat_coverage``. Always ``True`` on the
         ``penalty_dat`` path.

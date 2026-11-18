@@ -35,33 +35,21 @@ _DAT_INFINITE_ROOM = wp.constant(1.0e30)
 
 
 @wp.func
-def _dat_plane_room(
-    b: float,
+def _dat_plane_clearance(
+    point: wp.vec3,
     n: wp.vec3,
-    origin: wp.vec3,
     negative_pos: wp.mat33,
-    negative_disp: wp.mat33,
     negative_count: int,
     positive_pos: wp.mat33,
-    positive_disp: wp.mat33,
     positive_count: int,
-    margin: float,
-    eps: float,
 ):
-    """Smallest fraction of its remaining displacement any approaching vertex can
-    take before reaching the plane at offset ``b`` (heights relative to ``origin``)."""
-    room = float(_DAT_INFINITE_ROOM)
+    """Minimum signed distance of every endpoint using the stored representation."""
+    clearance = float(_DAT_INFINITE_ROOM)
     for i in range(negative_count):
-        rate = wp.dot(n, negative_disp[i])
-        if rate > eps:
-            height = wp.dot(n, negative_pos[i] - origin)
-            room = wp.min(room, (b - margin - height) / rate)
+        clearance = wp.min(clearance, wp.dot(-n, negative_pos[i] - point))
     for j in range(positive_count):
-        rate = -wp.dot(n, positive_disp[j])
-        if rate > eps:
-            height = wp.dot(n, positive_pos[j] - origin)
-            room = wp.min(room, (height - margin - b) / rate)
-    return room
+        clearance = wp.min(clearance, wp.dot(n, positive_pos[j] - point))
+    return clearance
 
 
 @wp.func
@@ -73,111 +61,98 @@ def dat_plane_offset(
     positive_pos: wp.mat33,
     positive_disp: wp.mat33,
     positive_count: int,
-    margin: float,
     eps: float,
 ):
-    """Place a division plane along ``n`` between two separated primitives.
+    """Place a representable plane for the largest common fraction, capped at one.
 
-    Positions are the committed (certified) pose, displacements the remaining
-    motion toward the trial pose. The plane is slid along ``n`` so that the
-    slowest approaching vertex on each side can take the same fraction of its
-    remaining displacement before touching it. With one approaching vertex per
-    side this is the proportional split of the DAT paper. Sides that do not
-    approach get no room reserved. Each side keeps at least ``eps`` (the DAT
-    separation band) and at most half the current gap, so the thickness margin
-    shrinks for pairs already closer than ``2 * margin``.
+    Intersect the endpoint half-space bounds directly. When the entire trial
+    fits, choose an interior plane instead of optimizing unused motion beyond
+    the trial. Otherwise the tight negative/positive bounds give the balanced
+    split. Every positive approach participates, however small.
 
-    Returns ``(plane_point, room, margin_eff)``: a point on the plane, the
-    balanced fraction (``_DAT_INFINITE_ROOM`` when nobody approaches), and the
-    margin actually reserved on each side.
+    Use eps for construction and the initial truncation clearance. Construction
+    is capped at half the anchor gap; the stored-plane check can reduce the
+    returned clearance if necessary. Double intermediates avoid losing the slow
+    side's clearance; the final plane and its clearance are float32, matching
+    truncation. A negative room reports that no tested stored point separates
+    the anchor; callers must retain an existing certified plane.
     """
-    origin = negative_pos[0]
-    negative_max = float(-_DAT_INFINITE_ROOM)
+    # 1. Project anchors and remaining trial displacements onto n. Each rate is
+    # the positive approach displacement over the full trial, not a velocity.
+    origin = wp.vec3d(negative_pos[0])
+    normal = wp.vec3d(n)
+    negative_height = wp.vec3d(0.0)
+    positive_height = wp.vec3d(0.0)
+    negative_rate = wp.vec3d(0.0)
+    positive_rate = wp.vec3d(0.0)
+    negative_max = wp.float64(-1.0e30)
+    positive_min = wp.float64(1.0e30)
     for i in range(negative_count):
-        negative_max = wp.max(negative_max, wp.dot(n, negative_pos[i] - origin))
-    positive_min = float(_DAT_INFINITE_ROOM)
+        negative_height[i] = wp.dot(normal, wp.vec3d(negative_pos[i]) - origin)
+        negative_rate[i] = wp.max(wp.float64(0.0), wp.dot(normal, wp.vec3d(negative_disp[i])))
+        negative_max = wp.max(negative_max, negative_height[i])
     for j in range(positive_count):
-        positive_min = wp.min(positive_min, wp.dot(n, positive_pos[j] - origin))
+        positive_height[j] = wp.dot(normal, wp.vec3d(positive_pos[j]) - origin)
+        positive_rate[j] = wp.max(wp.float64(0.0), -wp.dot(normal, wp.vec3d(positive_disp[j])))
+        positive_min = wp.min(positive_min, positive_height[j])
+    # 2. Use eps for both construction and truncation. Cap construction at half
+    # the gap; step 5 checks whether the stored plane can retain eps.
     gap = positive_min - negative_max
-    # reserve at least the separation band on each side (never place the plane on a
-    # primitive); fall back to the midpoint when the pair is thinner than the band
-    margin_eff = wp.min(wp.max(margin, eps), wp.max(0.0, 0.5 * gap))
-    b_lo = negative_max + margin_eff
-    b_hi = positive_min - margin_eff
+    construction_margin = wp.min(wp.float64(eps), wp.max(wp.float64(0.0), wp.float64(0.5) * gap))
+    margin_eff = eps
 
-    negative_approaches = int(0)
+    # 3. Find the largest common motion fraction in [0, 1] for which a plane
+    # can leave construction_margin on both sides of every endpoint pair.
+    fraction = wp.float64(1.0)
     for i in range(negative_count):
-        if wp.dot(n, negative_disp[i]) > eps:
-            negative_approaches = 1
-    positive_approaches = int(0)
+        for j in range(positive_count):
+            rate = negative_rate[i] + positive_rate[j]
+            if rate > wp.float64(0.0):
+                available = positive_height[j] - negative_height[i] - wp.float64(2.0) * construction_margin
+                fraction = wp.min(fraction, wp.max(wp.float64(0.0), available / rate))
+    # 4. Intersect the allowed plane offsets for that fraction and take the
+    # midpoint. When the full trial fits, this leaves room away from the bounds.
+    low = wp.float64(-1.0e30)
+    high = wp.float64(1.0e30)
+    for i in range(negative_count):
+        low = wp.max(low, negative_height[i] + construction_margin + fraction * negative_rate[i])
     for j in range(positive_count):
-        if -wp.dot(n, positive_disp[j]) > eps:
-            positive_approaches = 1
+        high = wp.min(high, positive_height[j] - construction_margin - fraction * positive_rate[j])
+    offset = wp.float64(0.5) * (low + high)
+    point = wp.vec3(origin + (offset / wp.dot(normal, normal)) * normal)
 
-    best_b = float(0.5 * (b_lo + b_hi))
-    best_room = float(_DAT_INFINITE_ROOM)
-    if negative_approaches == 1 and positive_approaches == 0:
-        best_b = b_hi
-    elif positive_approaches == 1 and negative_approaches == 0:
-        best_b = b_lo
-    if negative_approaches != positive_approaches:
-        best_room = _dat_plane_room(
-            best_b,
-            n,
-            origin,
-            negative_pos,
-            negative_disp,
-            negative_count,
-            positive_pos,
-            positive_disp,
-            positive_count,
-            margin_eff,
-            eps,
+    # 5. Check the actual float32 plane. margin_eff is the clearance that later
+    # truncation must preserve; the fallback may reduce it to fit stored geometry.
+    clearance = _dat_plane_clearance(point, n, negative_pos, negative_count, positive_pos, positive_count)
+    if clearance < margin_eff:
+        # Recenter a thin/unrepresentable optimized boundary before reducing its
+        # numerical band. Never accept a negative stored clearance as certified.
+        offset = wp.float64(0.5) * (negative_max + positive_min)
+        midpoint = wp.vec3(origin + (offset / wp.dot(normal, normal)) * normal)
+        midpoint_clearance = _dat_plane_clearance(
+            midpoint, n, negative_pos, negative_count, positive_pos, positive_count
         )
-    elif negative_approaches == 1 and positive_approaches == 1:
-        # the balanced fraction is a concave piecewise-linear function of b whose
-        # maximum sits where one negative-side line crosses one positive-side line
-        best_b = b_lo
-        best_room = _dat_plane_room(
-            b_lo,
-            n,
-            origin,
-            negative_pos,
-            negative_disp,
-            negative_count,
-            positive_pos,
-            positive_disp,
-            positive_count,
-            margin_eff,
-            eps,
-        )
+        if midpoint_clearance > clearance:
+            point = midpoint
+            clearance = midpoint_clearance
+        if clearance > 0.0:
+            margin_eff = wp.min(margin_eff, 0.5 * clearance)
+    # 6. Recompute motion room using the final stored plane and margin_eff.
+    # Unlike fraction, room can exceed 1; -1 means placement failed, while
+    # _DAT_INFINITE_ROOM means no endpoint approaches the plane.
+    room = float(_DAT_INFINITE_ROOM)
+    if clearance < margin_eff or clearance <= 0.0:
+        room = -1.0
+    else:
         for i in range(negative_count):
-            rate_i = wp.dot(n, negative_disp[i])
-            if rate_i > eps:
-                height_i = wp.dot(n, negative_pos[i] - origin)
-                for j in range(positive_count):
-                    rate_j = -wp.dot(n, positive_disp[j])
-                    if rate_j > eps:
-                        height_j = wp.dot(n, positive_pos[j] - origin)
-                        b_ij = (rate_j * (height_i + margin_eff) + rate_i * (height_j - margin_eff)) / (rate_i + rate_j)
-                        b_ij = wp.clamp(b_ij, b_lo, b_hi)
-                        room_ij = _dat_plane_room(
-                            b_ij,
-                            n,
-                            origin,
-                            negative_pos,
-                            negative_disp,
-                            negative_count,
-                            positive_pos,
-                            positive_disp,
-                            positive_count,
-                            margin_eff,
-                            eps,
-                        )
-                        if room_ij > best_room:
-                            best_room = room_ij
-                            best_b = b_ij
-    return origin + best_b * n, best_room, margin_eff
+            approach = wp.dot(n, negative_disp[i])
+            if approach > 0.0:
+                room = wp.min(room, (wp.dot(-n, negative_pos[i] - point) - margin_eff) / approach)
+        for j in range(positive_count):
+            approach = -wp.dot(n, positive_disp[j])
+            if approach > 0.0:
+                room = wp.min(room, (wp.dot(n, positive_pos[j] - point) - margin_eff) / approach)
+    return point, room, margin_eff
 
 
 @wp.struct
@@ -196,9 +171,15 @@ class ParticleContactDatPlanes:
     ee_point: wp.array[wp.vec3]
     ee_margin: wp.array[float]
     ee_valid: wp.array[wp.int32]
+    coverage: wp.array[wp.int32]
+    """Purely diagnostic: detection overflow or an uncertified pair clears this shared
+    step flag. The flag itself does not affect forces, truncation, or whether the
+    simulation continues."""
 
 
-def create_particle_contact_dat_planes(collision_info: TriMeshCollisionInfo, device) -> ParticleContactDatPlanes:
+def create_particle_contact_dat_planes(
+    collision_info: TriMeshCollisionInfo, device, *, coverage: wp.array[wp.int32] | None = None
+) -> ParticleContactDatPlanes:
     """Allocate plane storage matching the row capacities of ``collision_info``."""
     vt_capacity = max(collision_info.vertex_colliding_triangles.shape[0] // 2, 1)
     ee_capacity = max(collision_info.edge_colliding_edges.shape[0] // 2, 1)
@@ -211,6 +192,7 @@ def create_particle_contact_dat_planes(collision_info: TriMeshCollisionInfo, dev
     planes.ee_point = wp.zeros(ee_capacity, dtype=wp.vec3, device=device)
     planes.ee_margin = wp.zeros(ee_capacity, dtype=float, device=device)
     planes.ee_valid = wp.zeros(ee_capacity, dtype=wp.int32, device=device)
+    planes.coverage = wp.ones(1, dtype=wp.int32, device=device) if coverage is None else coverage
     return planes
 
 
@@ -238,7 +220,6 @@ def _build_contact_planes_kernel(
     tri_indices: wp.array2d[wp.int32],
     edge_indices: wp.array2d[wp.int32],
     collision_info: TriMeshCollisionInfo,
-    margin: float,
     refresh_normals: int,
     stride: int,
     planes: ParticleContactDatPlanes,
@@ -253,7 +234,8 @@ def _build_contact_planes_kernel(
     re-certified (pair thinner than the separation band) is kept as stored. Offsets follow
     :func:`dat_plane_offset` using the remaining displacement ``trial - anchor``.
     Edge-edge records are processed in the canonical direction only
-    (``e1 < e2``); mirrored records are marked invalid.
+    (``e1 < e2``); mirrored records are marked invalid. A failed normal search or
+    placement prints a warning, including whether a previous plane is retained.
     """
     t_id = wp.tid()
 
@@ -275,6 +257,9 @@ def _build_contact_planes_kernel(
             separation_eps = dat_separation_epsilon(_coordinate_scale(x_e1_a, x_e1_b, x_e2_a, x_e2_b))
 
             valid = int(planes.ee_valid[i])
+            previous_valid = valid
+            # Attempt a rebuild; false preserves the complete previous plane.
+            replace_plane = True
             n = planes.ee_normal[i]
             if refresh_normals == 1 or valid == 0:
                 hint = wp.vec3(0.0)
@@ -284,13 +269,23 @@ def _build_contact_planes_kernel(
                 found, n_found, _s0, _s1, _gap, _candidate = find_edge_edge_separator(
                     x_e1_a, x_e1_b, x_e2_a, x_e2_b, hint, separation_eps
                 )
+                replace_plane = found
                 if found:
                     n = n_found
                     valid = int(1)
-                # not found: a pair thinner than the separation band keeps its stored
-                # plane, which still separates the anchor because the committed motion
-                # never crossed it; a slot without a stored plane stays unconstrained
-            if valid == 1:
+                else:
+                    wp.printf(
+                        "Warning: ALM-DAT found no separating normal for EE row %d: "
+                        "edges=(%d, %d), retaining_previous_plane=%d\n",
+                        i,
+                        e1_idx,
+                        e2_idx,
+                        previous_valid,
+                    )
+                # If no new separator is found, retain the complete stored plane.
+                # Committed motion stayed inside it. With no stored plane, this
+                # pair remains unconstrained and clears the coverage certificate.
+            if valid == 1 and replace_plane:
                 positive = wp.mat33(0.0)
                 positive[0] = x_e1_a
                 positive[1] = x_e1_b
@@ -304,11 +299,24 @@ def _build_contact_planes_kernel(
                 negative_disp[0] = trial[e2_a] - x_e2_a
                 negative_disp[1] = trial[e2_b] - x_e2_b
                 point, _room, margin_eff = dat_plane_offset(
-                    n, negative, negative_disp, 2, positive, positive_disp, 2, margin, separation_eps
+                    n, negative, negative_disp, 2, positive, positive_disp, 2, separation_eps
                 )
-                planes.ee_normal[i] = n
-                planes.ee_point[i] = point
-                planes.ee_margin[i] = margin_eff
+                if _room >= 0.0:
+                    planes.ee_normal[i] = n
+                    planes.ee_point[i] = point
+                    planes.ee_margin[i] = margin_eff
+                else:
+                    valid = previous_valid
+                    wp.printf(
+                        "Warning: ALM-DAT found no valid stored plane for EE row %d: "
+                        "edges=(%d, %d), retaining_previous_plane=%d\n",
+                        i,
+                        e1_idx,
+                        e2_idx,
+                        previous_valid,
+                    )
+            if valid == 0:
+                wp.atomic_min(planes.coverage, 0, 0)
             planes.ee_valid[i] = valid
         else:
             planes.ee_valid[i] = 0
@@ -330,6 +338,9 @@ def _build_contact_planes_kernel(
         separation_eps = dat_separation_epsilon(_coordinate_scale(x_v, x_a, x_b, x_c))
 
         valid = int(planes.vt_valid[i])
+        previous_valid = valid
+        # Attempt a rebuild; false preserves the complete previous plane.
+        replace_plane = True
         n = planes.vt_normal[i]
         if refresh_normals == 1 or valid == 0:
             hint = wp.vec3(0.0)
@@ -339,11 +350,21 @@ def _build_contact_planes_kernel(
             found, n_found, _s0, _s1, _gap, _candidate = find_vertex_triangle_separator(
                 x_v, x_a, x_b, x_c, hint, separation_eps
             )
+            replace_plane = found
             if found:
                 n = n_found
                 valid = int(1)
+            else:
+                wp.printf(
+                    "Warning: ALM-DAT found no separating normal for VT row %d: "
+                    "vertex=%d, triangle=%d, retaining_previous_plane=%d\n",
+                    i,
+                    v,
+                    tri,
+                    previous_valid,
+                )
             # not found: keep a stored plane (see the edge-edge branch)
-        if valid == 1:
+        if valid == 1 and replace_plane:
             positive = wp.mat33(0.0)
             positive[0] = x_v
             positive_disp = wp.mat33(0.0)
@@ -357,11 +378,24 @@ def _build_contact_planes_kernel(
             negative_disp[1] = trial[tri_b] - x_b
             negative_disp[2] = trial[tri_c] - x_c
             point, _room, margin_eff = dat_plane_offset(
-                n, negative, negative_disp, 3, positive, positive_disp, 1, margin, separation_eps
+                n, negative, negative_disp, 3, positive, positive_disp, 1, separation_eps
             )
-            planes.vt_normal[i] = n
-            planes.vt_point[i] = point
-            planes.vt_margin[i] = margin_eff
+            if _room >= 0.0:
+                planes.vt_normal[i] = n
+                planes.vt_point[i] = point
+                planes.vt_margin[i] = margin_eff
+            else:
+                valid = previous_valid
+                wp.printf(
+                    "Warning: ALM-DAT found no valid stored plane for VT row %d: "
+                    "vertex=%d, triangle=%d, retaining_previous_plane=%d\n",
+                    i,
+                    v,
+                    tri,
+                    previous_valid,
+                )
+        if valid == 0:
+            wp.atomic_min(planes.coverage, 0, 0)
         planes.vt_valid[i] = valid
         i += stride
 
@@ -373,7 +407,6 @@ def build_contact_planes(
     collision_info: TriMeshCollisionInfo,
     planes: ParticleContactDatPlanes,
     *,
-    margin: float,
     refresh_normals: bool,
     launch_size: int | None = None,
 ) -> None:
@@ -389,7 +422,6 @@ def build_contact_planes(
             model.tri_indices,
             model.edge_indices,
             collision_info,
-            float(margin),
             1 if refresh_normals else 0,
             launch_size,
             planes,
