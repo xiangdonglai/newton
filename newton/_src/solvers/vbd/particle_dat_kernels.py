@@ -30,12 +30,9 @@ from .rigid_vbd_kernels import (
     planar_truncation_t,
 )
 
-# room reported when no vertex of a pair approaches its plane
-_DAT_INFINITE_ROOM = wp.constant(1.0e30)
-
 
 @wp.func
-def _dat_plane_clearance(
+def _measure_plane_clearance(
     point: wp.vec3,
     n: wp.vec3,
     negative_pos: wp.mat33,
@@ -43,13 +40,13 @@ def _dat_plane_clearance(
     positive_pos: wp.mat33,
     positive_count: int,
 ):
-    """Minimum signed distance of every endpoint using the stored representation."""
-    clearance = float(_DAT_INFINITE_ROOM)
+    """Measure the smallest signed endpoint distance from the stored plane."""
+    measured_clearance = float(1.0e30)
     for i in range(negative_count):
-        clearance = wp.min(clearance, wp.dot(-n, negative_pos[i] - point))
+        measured_clearance = wp.min(measured_clearance, wp.dot(-n, negative_pos[i] - point))
     for j in range(positive_count):
-        clearance = wp.min(clearance, wp.dot(n, positive_pos[j] - point))
-    return clearance
+        measured_clearance = wp.min(measured_clearance, wp.dot(n, positive_pos[j] - point))
+    return measured_clearance
 
 
 @wp.func
@@ -61,7 +58,7 @@ def dat_plane_offset(
     positive_pos: wp.mat33,
     positive_disp: wp.mat33,
     positive_count: int,
-    eps: float,
+    separation_eps: float,
 ):
     """Place a representable plane for the largest common fraction, capped at one.
 
@@ -70,12 +67,14 @@ def dat_plane_offset(
     the trial. Otherwise the tight negative/positive bounds give the balanced
     split. Every positive approach participates, however small.
 
-    Use eps for construction and the initial truncation clearance. Construction
-    is capped at half the anchor gap; the stored-plane check can reduce the
-    returned clearance if necessary. Double intermediates avoid losing the slow
-    side's clearance; the final plane and its clearance are float32, matching
-    truncation. A negative room reports that no tested stored point separates
-    the anchor; callers must retain an existing certified plane.
+    ``separation_eps`` is the requested minimum distance on each side. The
+    returned ``minimum_signed_distance`` is the requirement actually stored
+    for later truncation; it can be reduced by the fallback when the measured
+    endpoint distances cannot meet the request. Measured distances use the
+    stored float32 representation, matching truncation; construction uses
+    double intermediates. Return the point, whether placement succeeded, and
+    its required minimum distance. A failed placement must preserve any valid
+    plane already stored by the caller.
     """
     # 1. Project anchors and remaining trial displacements onto n. Each rate is
     # the positive approach displacement over the full trial, not a velocity.
@@ -95,64 +94,51 @@ def dat_plane_offset(
         positive_height[j] = wp.dot(normal, wp.vec3d(positive_pos[j]) - origin)
         positive_rate[j] = wp.max(wp.float64(0.0), -wp.dot(normal, wp.vec3d(positive_disp[j])))
         positive_min = wp.min(positive_min, positive_height[j])
-    # 2. Use eps for both construction and truncation. Cap construction at half
-    # the gap; step 5 checks whether the stored plane can retain eps.
+    # 2. Request the same minimum distance for construction and truncation.
+    # Construction must fit in the gap; step 5 checks the stored plane.
     gap = positive_min - negative_max
-    construction_margin = wp.min(wp.float64(eps), wp.max(wp.float64(0.0), wp.float64(0.5) * gap))
-    margin_eff = eps
+    construction_min_distance = wp.min(wp.float64(separation_eps), wp.max(wp.float64(0.0), wp.float64(0.5) * gap))
+    minimum_signed_distance = separation_eps
 
     # 3. Find the largest common motion fraction in [0, 1] for which a plane
-    # can leave construction_margin on both sides of every endpoint pair.
+    # can meet construction_min_distance on both sides of every endpoint pair.
     fraction = wp.float64(1.0)
     for i in range(negative_count):
         for j in range(positive_count):
             rate = negative_rate[i] + positive_rate[j]
             if rate > wp.float64(0.0):
-                available = positive_height[j] - negative_height[i] - wp.float64(2.0) * construction_margin
+                available = positive_height[j] - negative_height[i] - wp.float64(2.0) * construction_min_distance
                 fraction = wp.min(fraction, wp.max(wp.float64(0.0), available / rate))
     # 4. Intersect the allowed plane offsets for that fraction and take the
     # midpoint. When the full trial fits, this leaves room away from the bounds.
     low = wp.float64(-1.0e30)
     high = wp.float64(1.0e30)
     for i in range(negative_count):
-        low = wp.max(low, negative_height[i] + construction_margin + fraction * negative_rate[i])
+        low = wp.max(low, negative_height[i] + construction_min_distance + fraction * negative_rate[i])
     for j in range(positive_count):
-        high = wp.min(high, positive_height[j] - construction_margin - fraction * positive_rate[j])
+        high = wp.min(high, positive_height[j] - construction_min_distance - fraction * positive_rate[j])
     offset = wp.float64(0.5) * (low + high)
     point = wp.vec3(origin + (offset / wp.dot(normal, normal)) * normal)
 
-    # 5. Check the actual float32 plane. margin_eff is the clearance that later
-    # truncation must preserve; the fallback may reduce it to fit stored geometry.
-    clearance = _dat_plane_clearance(point, n, negative_pos, negative_count, positive_pos, positive_count)
-    if clearance < margin_eff:
-        # Recenter a thin/unrepresentable optimized boundary before reducing its
-        # numerical band. Never accept a negative stored clearance as certified.
+    # 5. Compare measured endpoint distances with the requested minimum.
+    # If they fall short, try the anchor midpoint and relax the requirement.
+    measured_clearance = _measure_plane_clearance(point, n, negative_pos, negative_count, positive_pos, positive_count)
+    if measured_clearance < minimum_signed_distance:
+        # Try the midpoint before reducing the required minimum distance.
+        # Never accept a plane with negative measured clearance.
         offset = wp.float64(0.5) * (negative_max + positive_min)
         midpoint = wp.vec3(origin + (offset / wp.dot(normal, normal)) * normal)
-        midpoint_clearance = _dat_plane_clearance(
+        midpoint_clearance = _measure_plane_clearance(
             midpoint, n, negative_pos, negative_count, positive_pos, positive_count
         )
-        if midpoint_clearance > clearance:
+        if midpoint_clearance > measured_clearance:
             point = midpoint
-            clearance = midpoint_clearance
-        if clearance > 0.0:
-            margin_eff = wp.min(margin_eff, 0.5 * clearance)
-    # 6. Recompute motion room using the final stored plane and margin_eff.
-    # Unlike fraction, room can exceed 1; -1 means placement failed, while
-    # _DAT_INFINITE_ROOM means no endpoint approaches the plane.
-    room = float(_DAT_INFINITE_ROOM)
-    if clearance < margin_eff or clearance <= 0.0:
-        room = -1.0
-    else:
-        for i in range(negative_count):
-            approach = wp.dot(n, negative_disp[i])
-            if approach > 0.0:
-                room = wp.min(room, (wp.dot(-n, negative_pos[i] - point) - margin_eff) / approach)
-        for j in range(positive_count):
-            approach = -wp.dot(n, positive_disp[j])
-            if approach > 0.0:
-                room = wp.min(room, (wp.dot(n, positive_pos[j] - point) - margin_eff) / approach)
-    return point, room, margin_eff
+            measured_clearance = midpoint_clearance
+        if measured_clearance > 0.0:
+            minimum_signed_distance = wp.min(minimum_signed_distance, 0.5 * measured_clearance)
+    # 6. Accept only a strictly separating stored plane that meets its requirement.
+    plane_placed = measured_clearance >= minimum_signed_distance and measured_clearance > 0.0
+    return point, plane_placed, minimum_signed_distance
 
 
 @wp.struct
@@ -166,10 +152,12 @@ class ParticleContactDatPlanes:
     vt_normal: wp.array[wp.vec3]
     vt_point: wp.array[wp.vec3]
     vt_margin: wp.array[float]
+    """Stored minimum signed distance required by VT motion truncation."""
     vt_valid: wp.array[wp.int32]
     ee_normal: wp.array[wp.vec3]
     ee_point: wp.array[wp.vec3]
     ee_margin: wp.array[float]
+    """Stored minimum signed distance required by EE motion truncation."""
     ee_valid: wp.array[wp.int32]
     coverage: wp.array[wp.int32]
     """Purely diagnostic: detection overflow or an uncertified pair clears this shared
@@ -298,13 +286,13 @@ def _build_contact_planes_kernel(
                 negative_disp = wp.mat33(0.0)
                 negative_disp[0] = trial[e2_a] - x_e2_a
                 negative_disp[1] = trial[e2_b] - x_e2_b
-                point, _room, margin_eff = dat_plane_offset(
+                point, plane_placed, minimum_signed_distance = dat_plane_offset(
                     n, negative, negative_disp, 2, positive, positive_disp, 2, separation_eps
                 )
-                if _room >= 0.0:
+                if plane_placed:
                     planes.ee_normal[i] = n
                     planes.ee_point[i] = point
-                    planes.ee_margin[i] = margin_eff
+                    planes.ee_margin[i] = minimum_signed_distance
                 else:
                     valid = previous_valid
                     wp.printf(
@@ -377,13 +365,13 @@ def _build_contact_planes_kernel(
             negative_disp[0] = trial[tri_a] - x_a
             negative_disp[1] = trial[tri_b] - x_b
             negative_disp[2] = trial[tri_c] - x_c
-            point, _room, margin_eff = dat_plane_offset(
+            point, plane_placed, minimum_signed_distance = dat_plane_offset(
                 n, negative, negative_disp, 3, positive, positive_disp, 1, separation_eps
             )
-            if _room >= 0.0:
+            if plane_placed:
                 planes.vt_normal[i] = n
                 planes.vt_point[i] = point
-                planes.vt_margin[i] = margin_eff
+                planes.vt_margin[i] = minimum_signed_distance
             else:
                 valid = previous_valid
                 wp.printf(
@@ -455,14 +443,14 @@ def _truncate_against_contact_planes_kernel(
             e2_idx = collision_info.edge_colliding_edges[2 * i + 1]
             n = planes.ee_normal[i]
             p = planes.ee_point[i]
-            m = planes.ee_margin[i]
+            minimum_signed_distance = planes.ee_margin[i]
             for k in range(2, 4):
                 v = edge_indices[e1_idx, k]
-                t = planar_truncation_t(anchor[v], trial[v] - anchor[v], n, p, gamma, m)
+                t = planar_truncation_t(anchor[v], trial[v] - anchor[v], n, p, gamma, minimum_signed_distance)
                 if t < 1.0:
                     wp.atomic_min(sigma, v, t)
                 v = edge_indices[e2_idx, k]
-                t = planar_truncation_t(anchor[v], trial[v] - anchor[v], -n, p, gamma, m)
+                t = planar_truncation_t(anchor[v], trial[v] - anchor[v], -n, p, gamma, minimum_signed_distance)
                 if t < 1.0:
                     wp.atomic_min(sigma, v, t)
         i += stride
@@ -476,13 +464,13 @@ def _truncate_against_contact_planes_kernel(
             tri = collision_info.vertex_colliding_triangles[2 * i + 1]
             n = planes.vt_normal[i]
             p = planes.vt_point[i]
-            m = planes.vt_margin[i]
-            t = planar_truncation_t(anchor[v], trial[v] - anchor[v], n, p, gamma, m)
+            minimum_signed_distance = planes.vt_margin[i]
+            t = planar_truncation_t(anchor[v], trial[v] - anchor[v], n, p, gamma, minimum_signed_distance)
             if t < 1.0:
                 wp.atomic_min(sigma, v, t)
             for k in range(3):
                 u = tri_indices[tri, k]
-                t = planar_truncation_t(anchor[u], trial[u] - anchor[u], -n, p, gamma, m)
+                t = planar_truncation_t(anchor[u], trial[u] - anchor[u], -n, p, gamma, minimum_signed_distance)
                 if t < 1.0:
                     wp.atomic_min(sigma, u, t)
         i += stride

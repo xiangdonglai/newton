@@ -30,7 +30,7 @@ def _plane_offset_kernel(
     positive_pos: wp.array[wp.vec3],
     positive_disp: wp.array[wp.vec3],
     positive_count: int,
-    eps: float,
+    separation_eps: float,
     out: wp.array[float],
 ):
     neg = wp.mat33(0.0)
@@ -43,20 +43,22 @@ def _plane_offset_kernel(
     for j in range(positive_count):
         pos[j] = positive_pos[j]
         pos_d[j] = positive_disp[j]
-    plane_point, room, margin_eff = dat_plane_offset(n, neg, neg_d, negative_count, pos, pos_d, positive_count, eps)
+    plane_point, plane_placed, minimum_signed_distance = dat_plane_offset(
+        n, neg, neg_d, negative_count, pos, pos_d, positive_count, separation_eps
+    )
     out[0] = wp.dot(n, plane_point)
-    out[1] = room
-    out[2] = margin_eff
+    out[1] = float(plane_placed)
+    out[2] = minimum_signed_distance
     if out.shape[0] > 3:
         for i in range(negative_count):
-            out[3 + i] = wp.dot(-n, neg[i] - plane_point) - margin_eff
-            out[9 + i] = planar_truncation_t(neg[i], neg_d[i], -n, plane_point, 0.85, margin_eff)
+            out[3 + i] = wp.dot(-n, neg[i] - plane_point) - minimum_signed_distance
+            out[9 + i] = planar_truncation_t(neg[i], neg_d[i], -n, plane_point, 0.85, minimum_signed_distance)
         for j in range(positive_count):
-            out[6 + j] = wp.dot(n, pos[j] - plane_point) - margin_eff
-            out[12 + j] = planar_truncation_t(pos[j], pos_d[j], n, plane_point, 0.85, margin_eff)
+            out[6 + j] = wp.dot(n, pos[j] - plane_point) - minimum_signed_distance
+            out[12 + j] = planar_truncation_t(pos[j], pos_d[j], n, plane_point, 0.85, minimum_signed_distance)
 
 
-def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, eps=1.0e-6):
+def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, separation_eps=1.0e-6):
     out = wp.zeros(3, dtype=float, device=device)
     wp.launch(
         _plane_offset_kernel,
@@ -69,7 +71,7 @@ def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, 
             wp.array(positive, dtype=wp.vec3, device=device),
             wp.array(positive_disp, dtype=wp.vec3, device=device),
             len(positive),
-            eps,
+            separation_eps,
         ],
         outputs=[out],
         device=device,
@@ -85,14 +87,16 @@ def test_plane_offset_balances_slowest_vertices(test, device):
     triangle_disp = [(0.0, 0.0, 2.0), (0.0, 0.0, 5.0), (0.0, 0.0, -1.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
-    offset, room, margin_eff = _run_plane_offset(device, triangle, triangle_disp, vertex, vertex_disp)
+    offset, plane_placed, minimum_signed_distance = _run_plane_offset(
+        device, triangle, triangle_disp, vertex, vertex_disp
+    )
     # the fast triangle vertex (rate 5) binds against the vertex (rate 3):
-    # offset = (3 * (-1 + eps) + 5 * (3 - eps)) / 8.
-    # Both limiting endpoints get (4 - 2*eps)/8 of their proposed motion.
-    eps = 1.0e-6
-    test.assertAlmostEqual(float(offset), 1.5 - 0.25 * eps, places=6)
-    test.assertAlmostEqual(float(room), 0.5 - 0.25 * eps, places=6)
-    test.assertAlmostEqual(float(margin_eff), eps, places=10)
+    # offset = (3 * (-1 + separation_eps) + 5 * (3 - separation_eps)) / 8.
+    # Both limiting endpoints get (4 - 2*separation_eps)/8 of their proposed motion.
+    separation_eps = 1.0e-6
+    test.assertAlmostEqual(float(offset), 1.5 - 0.25 * separation_eps, places=6)
+    test.assertEqual(float(plane_placed), 1.0)
+    test.assertAlmostEqual(float(minimum_signed_distance), separation_eps, places=10)
 
 
 def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
@@ -101,18 +105,20 @@ def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
     receding = [(0.0, 0.0, -2.0), (0.0, 0.0, -1.0), (0.0, 0.0, 0.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
-    offset, room, margin_eff = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
-    # The plane is eps above the highest triangle vertex. Truncation retains
-    # eps, giving the approaching vertex (3 - eps - eps)/3 of its motion.
-    eps = 1.0e-6
-    test.assertAlmostEqual(float(offset), eps, places=10)
-    test.assertAlmostEqual(float(room), 1 - 2 * eps / 3, places=6)
+    offset, plane_placed, minimum_signed_distance = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
+    # The plane is separation_eps above the highest triangle vertex. Truncation
+    # requires the same distance, leaving (3 - 2 * separation_eps)/3 of the motion.
+    separation_eps = 1.0e-6
+    test.assertAlmostEqual(float(offset), separation_eps, places=10)
+    test.assertEqual(float(plane_placed), 1.0)
     # Use a larger epsilon to exercise a gap narrower than the construction
     # band: construction takes half the gap. The stored-plane fallback reduces
-    # the truncation clearance to half of the measured clearance (gap/4).
+    # the required minimum distance to half of the measured clearance (gap/4).
     thin_vertex = [(0.3, 0.3, 0.1)]
-    _offset, _room, margin_eff = _run_plane_offset(device, triangle, receding, thin_vertex, vertex_disp, eps=0.125)
-    test.assertAlmostEqual(float(margin_eff), 0.025, places=6)
+    _offset, _plane_placed, minimum_signed_distance = _run_plane_offset(
+        device, triangle, receding, thin_vertex, vertex_disp, separation_eps=0.125
+    )
+    test.assertAlmostEqual(float(minimum_signed_distance), 0.025, places=6)
 
 
 def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, device):
@@ -158,7 +164,7 @@ def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, devi
         for shift in (0.0, -10.0, 10.0, 1000.0):
             with test.subTest(case=case, shift=shift):
                 shifted_np = (anchor_np.astype(np.float64) + shift).astype(np.float32)
-                eps = max(1e-6, 4 * np.finfo(np.float32).eps * max(1.0, float(np.abs(shifted_np).max())))
+                separation_eps = max(1e-6, 4 * np.finfo(np.float32).eps * max(1.0, float(np.abs(shifted_np).max())))
                 out = wp.zeros(15, dtype=float, device=device)
                 wp.launch(
                     _plane_offset_kernel,
@@ -171,7 +177,7 @@ def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, devi
                         wp.array(shifted_np[:2], dtype=wp.vec3, device=device),
                         wp.array(displacement_np[:2], dtype=wp.vec3, device=device),
                         2,
-                        eps,
+                        separation_eps,
                     ],
                     outputs=[out],
                     device=device,
