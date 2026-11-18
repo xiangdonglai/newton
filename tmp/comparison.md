@@ -3,14 +3,14 @@
 Code: `donglaix/rigid-soft-alm-dat-design`, commit `cfd6e07b5`.
 Updated November 17, 2026.
 
-An [animated illustration](alm-dat-truncation.html) follows a real free particle
+An [animated illustration](alm-dat/alm-dat-truncation.html) follows a real free particle
 falling onto a fixed soft triangle. It shows the recorded first substep:
 prediction, two VBD iterations, and two final anchor advances. The intentionally
 coarse 120 ms timestep and low iteration count keep the final trial penetrating,
 making the separate anchor advances visible. A magnified view shows the small
 final advances. The page includes exact values, reproduction instructions,
 downloadable traces, and a ten-iteration comparison. The original
-[schematic illustration](alm-dat-truncation-schematic.html) is archived separately.
+[schematic illustration](../ctx/2026-11-17-minimal-alm-dat/website-support/alm-dat-truncation-schematic.html) is archived locally.
 
 This compares the implemented soft self-contact modes `penalty_dat` and
 `alm_dat`. The latter does not yet support rigid-soft DAT. We leave the
@@ -208,7 +208,7 @@ this ALM-DAT implementation rejects that schedule. The comparison above uses
 
 ## Code locations and verification
 
-In [solver_vbd.py](../../newton/_src/solvers/vbd/solver_vbd.py):
+In [solver_vbd.py](../newton/_src/solvers/vbd/solver_vbd.py):
 
 - `_initialize_particles`: prediction followed by the selected initialization path.
 - `_alm_dat_initialize` and `_alm_dat_redetect`: initial anchor advancement and optional second detection.
