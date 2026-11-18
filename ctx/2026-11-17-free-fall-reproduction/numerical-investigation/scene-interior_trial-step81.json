@@ -1,0 +1,241 @@
+{
+  "variant": "interior_trial",
+  "checkpoint": true,
+  "samples": [
+    {
+      "step": 81,
+      "downward_speed_m_s": 3.6483300377711774,
+      "theoretical_gravity_only_speed_m_s": 3.6487,
+      "last_advance": {
+        "step": 81,
+        "trial_speed_m_s": 3.6483300075058107,
+        "accepted_speed_m_s": 3.6483300075058107,
+        "max_trial_minus_accepted_mm": 0.0,
+        "zero_particle_fractions": 0,
+        "budget_inactive": true
+      }
+    }
+  ],
+  "audits": [
+    {
+      "step": 81,
+      "counts": [
+        534902,
+        17205,
+        0,
+        0
+      ],
+      "minima_cm": [
+        -2.0196966943331063e-06,
+        2.7168443921254948e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        534902,
+        8035,
+        0,
+        0
+      ],
+      "minima_cm": [
+        -1.9296330719953403e-06,
+        2.7264963136985898e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        8035,
+        0,
+        0
+      ],
+      "minima_cm": [
+        -1.9296330719953403e-06,
+        2.7264963136985898e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        3439,
+        0,
+        0
+      ],
+      "minima_cm": [
+        -1.9171002350049093e-06,
+        2.7375650461181067e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        918,
+        0,
+        0
+      ],
+      "minima_cm": [
+        -1.8886821635533124e-06,
+        2.7494161258800887e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        0,
+        0,
+        0
+      ],
+      "minima_cm": [
+        0.12176577001810074,
+        0.12179543077945709
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        0,
+        0,
+        0
+      ],
+      "minima_cm": [
+        0.1234823688864708,
+        0.12351226806640625
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        0,
+        0,
+        0
+      ],
+      "minima_cm": [
+        0.12348618358373642,
+        0.12351608276367188
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        0,
+        0,
+        0
+      ],
+      "minima_cm": [
+        0.12348618358373642,
+        0.12351608276367188
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        500124,
+        0,
+        0,
+        0
+      ],
+      "minima_cm": [
+        0.12348618358373642,
+        0.12351608276367188
+      ]
+    }
+  ],
+  "advances": [
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.64833696854016,
+      "accepted_speed_m_s": 1.261056915787626,
+      "max_trial_minus_accepted_mm": 10.06557498328167,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6483338852559233,
+      "accepted_speed_m_s": 2.251309071690583,
+      "max_trial_minus_accepted_mm": 7.943687449686018,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.648332636809546,
+      "accepted_speed_m_s": 2.9699769075251807,
+      "max_trial_minus_accepted_mm": 5.811539114806507,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.648331501858294,
+      "accepted_speed_m_s": 3.430151026702124,
+      "max_trial_minus_accepted_mm": 3.678882542570166,
+      "zero_particle_fractions": 2,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.648330593897291,
+      "accepted_speed_m_s": 3.648330593897291,
+      "max_trial_minus_accepted_mm": 0.0,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6483300075058107,
+      "accepted_speed_m_s": 3.6483300075058107,
+      "max_trial_minus_accepted_mm": 0.0,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6483300075058107,
+      "accepted_speed_m_s": 3.6483300075058107,
+      "max_trial_minus_accepted_mm": 0.0,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6483300075058107,
+      "accepted_speed_m_s": 3.6483300075058107,
+      "max_trial_minus_accepted_mm": 0.0,
+      "zero_particle_fractions": 0,
+      "budget_inactive": true
+    }
+  ],
+  "detection_counts": [
+    [
+      161535,
+      0,
+      746734,
+      0
+    ],
+    [
+      150768,
+      0,
+      698712,
+      0
+    ]
+  ],
+  "audit_count_columns": [
+    "valid_planes",
+    "planes_violating_reserved_margin",
+    "planes_violating_geometric_side",
+    "planes_with_zero_fraction"
+  ],
+  "audit_minima_columns": [
+    "minimum_clearance_after_margin_cm",
+    "minimum_geometric_signed_distance_cm"
+  ]
+}

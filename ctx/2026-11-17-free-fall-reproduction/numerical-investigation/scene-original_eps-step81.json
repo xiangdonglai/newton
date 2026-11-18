@@ -1,0 +1,241 @@
+{
+  "variant": "original_eps",
+  "checkpoint": true,
+  "samples": [
+    {
+      "step": 81,
+      "downward_speed_m_s": 3.487806485010573,
+      "theoretical_gravity_only_speed_m_s": 3.6487,
+      "last_advance": {
+        "step": 81,
+        "trial_speed_m_s": 3.6481608619374675,
+        "accepted_speed_m_s": 3.4878064557540513,
+        "max_trial_minus_accepted_mm": 8.449781018140051,
+        "zero_particle_fractions": 173,
+        "budget_inactive": true
+      }
+    }
+  ],
+  "audits": [
+    {
+      "step": 81,
+      "counts": [
+        534902,
+        229079,
+        0,
+        276
+      ],
+      "minima_cm": [
+        -2.0196966943331063e-06,
+        2.7168443921254948e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        534902,
+        220045,
+        0,
+        53
+      ],
+      "minima_cm": [
+        -2.20220499613788e-06,
+        2.7185618819203228e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        203491,
+        0,
+        53
+      ],
+      "minima_cm": [
+        -2.20220499613788e-06,
+        2.7185618819203228e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        195502,
+        0,
+        933
+      ],
+      "minima_cm": [
+        -2.08857272809837e-06,
+        2.7278965717414394e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        179477,
+        0,
+        22702
+      ],
+      "minima_cm": [
+        -2.683980710571632e-06,
+        2.7283676899969578e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        188215,
+        0,
+        8411
+      ],
+      "minima_cm": [
+        -2.683980710571632e-06,
+        2.7294905521557666e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        187858,
+        0,
+        6473
+      ],
+      "minima_cm": [
+        -2.683980710571632e-06,
+        2.7332394893164746e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        182798,
+        0,
+        5836
+      ],
+      "minima_cm": [
+        -2.236838554381393e-06,
+        2.7393260097596794e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        174965,
+        0,
+        5166
+      ],
+      "minima_cm": [
+        -2.275417500641197e-06,
+        2.7506488549988717e-05
+      ]
+    },
+    {
+      "step": 81,
+      "counts": [
+        498809,
+        151632,
+        0,
+        3940
+      ],
+      "minima_cm": [
+        -2.012848199228756e-06,
+        2.7643476641969755e-05
+      ]
+    }
+  ],
+  "advances": [
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.64833696854016,
+      "accepted_speed_m_s": 1.2068140014144015,
+      "max_trial_minus_accepted_mm": 12.162132276070206,
+      "zero_particle_fractions": 43,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.648289754568052,
+      "accepted_speed_m_s": 2.1316243384495253,
+      "max_trial_minus_accepted_mm": 12.225658292496979,
+      "zero_particle_fractions": 38,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6482944646157507,
+      "accepted_speed_m_s": 2.6175003556180587,
+      "max_trial_minus_accepted_mm": 12.353441918055415,
+      "zero_particle_fractions": 185,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6481244300022593,
+      "accepted_speed_m_s": 2.8663424657396046,
+      "max_trial_minus_accepted_mm": 12.35669225067892,
+      "zero_particle_fractions": 254,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.648111737464085,
+      "accepted_speed_m_s": 3.002980930549054,
+      "max_trial_minus_accepted_mm": 12.238749765371706,
+      "zero_particle_fractions": 289,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6481608619374675,
+      "accepted_speed_m_s": 3.1156137576773144,
+      "max_trial_minus_accepted_mm": 12.126832852630669,
+      "zero_particle_fractions": 310,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6481608619374675,
+      "accepted_speed_m_s": 3.3014199942596685,
+      "max_trial_minus_accepted_mm": 9.872354596583007,
+      "zero_particle_fractions": 181,
+      "budget_inactive": true
+    },
+    {
+      "step": 81,
+      "trial_speed_m_s": 3.6481608619374675,
+      "accepted_speed_m_s": 3.4878064557540513,
+      "max_trial_minus_accepted_mm": 8.449781018140051,
+      "zero_particle_fractions": 173,
+      "budget_inactive": true
+    }
+  ],
+  "detection_counts": [
+    [
+      161535,
+      0,
+      746734,
+      0
+    ],
+    [
+      150364,
+      0,
+      696890,
+      0
+    ]
+  ],
+  "audit_count_columns": [
+    "valid_planes",
+    "planes_violating_reserved_margin",
+    "planes_violating_geometric_side",
+    "planes_with_zero_fraction"
+  ],
+  "audit_minima_columns": [
+    "minimum_clearance_after_margin_cm",
+    "minimum_geometric_signed_distance_cm"
+  ]
+}
