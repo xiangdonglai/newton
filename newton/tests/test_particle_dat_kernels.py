@@ -43,23 +43,22 @@ def _plane_offset_kernel(
     for j in range(positive_count):
         pos[j] = positive_pos[j]
         pos_d[j] = positive_disp[j]
-    plane_point, plane_placed, minimum_signed_distance = dat_plane_offset(
+    plane_point, plane_placed = dat_plane_offset(
         n, neg, neg_d, negative_count, pos, pos_d, positive_count, separation_eps
     )
     out[0] = wp.dot(n, plane_point)
     out[1] = float(plane_placed)
-    out[2] = minimum_signed_distance
-    if out.shape[0] > 3:
+    if out.shape[0] > 2:
         for i in range(negative_count):
-            out[3 + i] = wp.dot(-n, neg[i] - plane_point) - minimum_signed_distance
-            out[9 + i] = planar_truncation_t(neg[i], neg_d[i], -n, plane_point, 0.85, minimum_signed_distance)
+            out[2 + i] = wp.dot(-n, neg[i] - plane_point) - separation_eps
+            out[8 + i] = planar_truncation_t(neg[i], neg_d[i], -n, plane_point, 0.85, separation_eps)
         for j in range(positive_count):
-            out[6 + j] = wp.dot(n, pos[j] - plane_point) - minimum_signed_distance
-            out[12 + j] = planar_truncation_t(pos[j], pos_d[j], n, plane_point, 0.85, minimum_signed_distance)
+            out[5 + j] = wp.dot(n, pos[j] - plane_point) - separation_eps
+            out[11 + j] = planar_truncation_t(pos[j], pos_d[j], n, plane_point, 0.85, separation_eps)
 
 
 def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, separation_eps=1.0e-6):
-    out = wp.zeros(3, dtype=float, device=device)
+    out = wp.zeros(2, dtype=float, device=device)
     wp.launch(
         _plane_offset_kernel,
         dim=1,
@@ -87,16 +86,13 @@ def test_plane_offset_balances_slowest_vertices(test, device):
     triangle_disp = [(0.0, 0.0, 2.0), (0.0, 0.0, 5.0), (0.0, 0.0, -1.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
-    offset, plane_placed, minimum_signed_distance = _run_plane_offset(
-        device, triangle, triangle_disp, vertex, vertex_disp
-    )
+    offset, plane_placed = _run_plane_offset(device, triangle, triangle_disp, vertex, vertex_disp)
     # the fast triangle vertex (rate 5) binds against the vertex (rate 3):
     # offset = (3 * (-1 + separation_eps) + 5 * (3 - separation_eps)) / 8.
     # Both limiting endpoints get (4 - 2*separation_eps)/8 of their proposed motion.
     separation_eps = 1.0e-6
     test.assertAlmostEqual(float(offset), 1.5 - 0.25 * separation_eps, places=6)
     test.assertEqual(float(plane_placed), 1.0)
-    test.assertAlmostEqual(float(minimum_signed_distance), separation_eps, places=10)
 
 
 def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
@@ -105,20 +101,18 @@ def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
     receding = [(0.0, 0.0, -2.0), (0.0, 0.0, -1.0), (0.0, 0.0, 0.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
-    offset, plane_placed, minimum_signed_distance = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
+    offset, plane_placed = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
     # The plane is separation_eps above the highest triangle vertex. Truncation
     # requires the same distance, leaving (3 - 2 * separation_eps)/3 of the motion.
     separation_eps = 1.0e-6
     test.assertAlmostEqual(float(offset), separation_eps, places=10)
     test.assertEqual(float(plane_placed), 1.0)
-    # Use a larger epsilon to exercise a gap narrower than the construction
-    # band: construction takes half the gap. The stored-plane fallback reduces
-    # the required minimum distance to half of the measured clearance (gap/4).
+    # A gap narrower than 2 * separation_eps cannot meet the fixed distance
+    # requirement on both sides, even after trying the anchor midpoint.
     thin_vertex = [(0.3, 0.3, 0.1)]
-    _offset, _plane_placed, minimum_signed_distance = _run_plane_offset(
-        device, triangle, receding, thin_vertex, vertex_disp, separation_eps=0.125
-    )
-    test.assertAlmostEqual(float(minimum_signed_distance), 0.025, places=6)
+    offset, plane_placed = _run_plane_offset(device, triangle, receding, thin_vertex, vertex_disp, separation_eps=0.075)
+    test.assertAlmostEqual(float(offset), 0.05, places=6)
+    test.assertEqual(float(plane_placed), 0.0)
 
 
 def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, device):
@@ -165,7 +159,7 @@ def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, devi
             with test.subTest(case=case, shift=shift):
                 shifted_np = (anchor_np.astype(np.float64) + shift).astype(np.float32)
                 separation_eps = max(1e-6, 4 * np.finfo(np.float32).eps * max(1.0, float(np.abs(shifted_np).max())))
-                out = wp.zeros(15, dtype=float, device=device)
+                out = wp.zeros(14, dtype=float, device=device)
                 wp.launch(
                     _plane_offset_kernel,
                     1,
@@ -183,8 +177,9 @@ def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, devi
                     device=device,
                 )
                 values_np = out.numpy()
-                test.assertGreaterEqual(float(values_np[[3, 4, 6, 7]].min()), 0.0)
-                np.testing.assert_array_equal(values_np[[9, 10, 12, 13]], np.ones(4))
+                test.assertEqual(float(values_np[1]), 1.0)
+                test.assertGreaterEqual(float(values_np[[2, 3, 5, 6]].min()), 0.0)
+                np.testing.assert_array_equal(values_np[[8, 9, 11, 12]], np.ones(4))
 
 
 def _two_layer_model(device, layer_gap=0.012):

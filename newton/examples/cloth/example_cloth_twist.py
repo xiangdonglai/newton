@@ -187,6 +187,7 @@ class Example:
             particle_enable_self_contact=True,
             particle_self_contact_margin=0.002,
             particle_self_contact_gap=0.0015,
+            particle_self_contact_method="alm_dat",
             # The shared contact pool covers the tight twist at the default
             # budgets (measured full-run peak: 5.4 vertex-triangle pairs per
             # vertex, 12.3 edge-edge pairs per edge on average).
