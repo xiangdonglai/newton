@@ -601,7 +601,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             particle_self_contact_method: Experimental selector for the soft self-contact
                 scheme. ``"penalty_dat"`` (default) keeps the existing penalty contact
                 force with per-color Divide-and-Truncate. ``"alm_dat"`` stores one
-                division plane for each processed VT and canonical EE pair at a certified anchor pose, lets the
+                division plane for each processed VT and canonical EE pair that it can separate at the anchor, lets the
                 VBD iterate penetrate, and truncates the accumulated motion against
                 the stored planes at a fixed cadence and once more at the end of the
                 step. Each certified plane separates its pair throughout the accepted advance.
@@ -1536,7 +1536,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if self._alm_dat:
             # plane and multiplier storage is indexed by row slot, so it follows the
             # row capacity; a capacity change drops the matching history once
-            self._dat_planes = create_particle_contact_dat_planes(info, self.device, coverage=self._dat_coverage)
+            planes = create_particle_contact_dat_planes(info, self.device, coverage=self._dat_coverage)
+            if self._dat_planes is not None:
+                planes.use_plane_failure_fallback = self._dat_planes.use_plane_failure_fallback
+            self._dat_planes = planes
             self._dat_alm_state = create_particle_contact_alm_state(self.model, info, self.device)
         self._self_contact_info_source = info
         self._self_contact_storage_generation = generation
@@ -4194,7 +4197,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         The solver processes stored VT records and EE records with the smaller edge index first.
         This diagnostic cannot detect pairs missed by the distance query.
         ``False`` means detection overflowed or a processed pair could not be separated by a
-        certified stored plane. A stored pair without a valid plane holds its anchor positions.
+        certified stored plane. By default, a failed rebuild keeps the previous plane when available.
+        A pair with no stored plane contributes no constraint.
         On overflow, the solver advances using the stored pairs. Call :meth:`check_and_grow_self_contact_buffers`
         between steps to grow the buffers. Already intersecting or numerically unresolved geometry
         requires correcting the input state or increasing geometric resolution.

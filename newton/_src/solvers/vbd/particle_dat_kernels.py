@@ -22,6 +22,7 @@ from ...geometry import ParticleFlags
 from ...geometry.kernels import EE_PAIR_OVERFLOW, VT_PAIR_OVERFLOW, triangle_closest_point
 from ...geometry.tri_mesh_collision import TriMeshCollisionInfo
 from ...utils.mesh import MeshAdjacencyData, get_vertex_adjacent_spring_id, get_vertex_num_adjacent_springs
+from .interval_arithmetic import next_float_down
 from .particle_vbd_kernels import accumulate_elasticity_force_and_hessian, evaluate_spring_force_and_hessian
 from .rigid_vbd_kernels import (
     dat_separation_epsilon,
@@ -40,17 +41,17 @@ def _signed_plane_distance(x: wp.vec3, n: wp.vec3, plane: wp.vec4):
 def _certifies_anchors(
     n: wp.vec3,
     plane: wp.vec4,
-    eps: float,
+    margin: float,
     positive: wp.mat33,
     positive_count: int,
     negative: wp.mat33,
     negative_count: int,
 ):
     for j in range(positive_count):
-        if _signed_plane_distance(positive[j], n, plane) < wp.float64(eps):
+        if _signed_plane_distance(positive[j], n, plane) < wp.float64(margin):
             return False
     for j in range(negative_count):
-        if -_signed_plane_distance(negative[j], n, plane) < wp.float64(eps):
+        if -_signed_plane_distance(negative[j], n, plane) < wp.float64(margin):
             return False
     return True
 
@@ -75,6 +76,8 @@ def dat_plane_offset(
 
     Store the offset relative to a fixed anchor endpoint. Placement and clipping
     both evaluate the rounded float32 offset using double-precision projections.
+    Return the plane and the positive per-side margin it can preserve, or zero
+    if this direction has no representable strictly separating plane.
     """
     # 1. Project anchors and remaining trial displacements onto n. Each rate is
     # the positive approach displacement over the full trial, not a velocity.
@@ -94,31 +97,41 @@ def dat_plane_offset(
         positive_height[j] = wp.dot(normal, wp.vec3d(positive_pos[j]) - origin)
         positive_rate[j] = wp.max(wp.float64(0.0), -wp.dot(normal, wp.vec3d(positive_disp[j])))
         positive_min = wp.min(positive_min, positive_height[j])
-    # 2. Find the largest common motion fraction in [0, 1] for which a plane
-    # can leave separation_eps on both sides of every endpoint pair.
+    gap = positive_min - negative_max
+    if gap <= wp.float64(0.0):
+        return wp.vec4(0.0), float(0.0)
+    # A thin pair can reserve at most half its projected anchor gap on each side.
+    margin = wp.min(wp.float64(separation_eps), wp.float64(0.5) * gap)
+    # 2. Find the largest common motion fraction that leaves this margin on both sides.
     fraction = wp.float64(1.0)
     for i in range(negative_count):
         for j in range(positive_count):
             rate = negative_rate[i] + positive_rate[j]
             if rate > wp.float64(0.0):
-                available = positive_height[j] - negative_height[i] - wp.float64(2.0) * wp.float64(separation_eps)
+                available = positive_height[j] - negative_height[i] - wp.float64(2.0) * margin
                 fraction = wp.min(fraction, wp.max(wp.float64(0.0), available / rate))
     # 3. Intersect the allowed plane offsets for that fraction and take the
     # midpoint. When the full trial fits, this leaves room away from the bounds.
     low = wp.float64(-1.0e30)
     high = wp.float64(1.0e30)
     for i in range(negative_count):
-        low = wp.max(low, negative_height[i] + wp.float64(separation_eps) + fraction * negative_rate[i])
+        low = wp.max(low, negative_height[i] + margin + fraction * negative_rate[i])
     for j in range(positive_count):
-        high = wp.min(high, positive_height[j] - wp.float64(separation_eps) - fraction * positive_rate[j])
+        high = wp.min(high, positive_height[j] - margin - fraction * positive_rate[j])
     # Clamp to the anchor's feasible interval in case the motion fraction
     # rounded outward. The signed-distance checks use clipping's arithmetic.
-    eps = wp.float64(separation_eps)
-    offset = wp.float32(wp.clamp(wp.float64(0.5) * (low + high), negative_max + eps, positive_min - eps))
-    if wp.float64(offset) - negative_max < eps or positive_min - wp.float64(offset) < eps:
+    offset = wp.float32(wp.clamp(wp.float64(0.5) * (low + high), negative_max + margin, positive_min - margin))
+    if wp.float64(offset) - negative_max < margin or positive_min - wp.float64(offset) < margin:
         offset = wp.float32(wp.float64(0.5) * (negative_max + positive_min))
+    # Round the stored margin down if needed so the anchors satisfy the exact
+    # same bound that clipping will use with this float32 plane offset.
+    clearance = wp.min(wp.float64(offset) - negative_max, positive_min - wp.float64(offset))
+    margin = wp.clamp(clearance, wp.float64(0.0), margin)
+    stored_margin = wp.float32(margin)
+    if wp.float64(stored_margin) > margin:
+        stored_margin = next_float_down(stored_margin)
     plane = wp.vec4(negative_pos[0, 0], negative_pos[0, 1], negative_pos[0, 2], offset)
-    return plane, wp.float64(offset) - negative_max >= eps and positive_min - wp.float64(offset) >= eps
+    return plane, stored_margin
 
 
 @wp.func
@@ -133,10 +146,10 @@ def _place_self_contact_plane(
     separation_eps: float,
     allow_new_normal: bool,
 ):
-    plane, placed = dat_plane_offset(
+    plane, margin = dat_plane_offset(
         n, negative, negative_disp, negative_count, positive, positive_disp, positive_count, separation_eps
     )
-    if not placed and allow_new_normal:
+    if margin == 0.0 and allow_new_normal:
         # A closest-point normal can barely separate the endpoints after float32
         # rounding. Try the face normal for VT or the common perpendicular for EE.
         edge = wp.vec3d(negative[1]) - wp.vec3d(negative[0])
@@ -148,7 +161,7 @@ def _place_self_contact_plane(
             if wp.dot(axis, wp.vec3d(positive[0]) - wp.vec3d(negative[0])) < wp.float64(0.0):
                 axis = -axis
             retry_normal = wp.vec3(wp.normalize(axis))
-            retry_plane, retry_placed = dat_plane_offset(
+            retry_plane, retry_margin = dat_plane_offset(
                 retry_normal,
                 negative,
                 negative_disp,
@@ -158,9 +171,9 @@ def _place_self_contact_plane(
                 positive_count,
                 separation_eps,
             )
-            if retry_placed:
-                return retry_normal, retry_plane, True
-    return n, plane, placed
+            if retry_margin > 0.0:
+                return retry_normal, retry_plane, retry_margin
+    return n, plane, margin
 
 
 @wp.struct
@@ -169,24 +182,25 @@ class ParticleContactDatPlanes:
     detector's CSR row slot. Arrays are sized to each family's row capacity.
     Each ``*_plane`` stores the fixed world-space origin in xyz and the signed
     offset in w, so points on the plane satisfy ``dot(normal, x - origin) = w``.
-    ``*_valid`` is 1 when the slot owns a certified plane (0 for edge-edge
-    records stored in the non-canonical direction and for pairs without a
-    strict separator at the anchor)."""
+    ``*_valid`` is 1 when the slot has a plane used for clipping. A failed
+    rebuild can retain the previous plane. Reverse EE records have no plane."""
 
     vt_normal: wp.array[wp.vec3]
     vt_plane: wp.array[wp.vec4]
     vt_margin: wp.array[float]
-    """The separation_eps used to construct this VT plane and required by truncation."""
+    """Positive per-side clearance required by truncation for this VT plane."""
     vt_valid: wp.array[wp.int32]
     ee_normal: wp.array[wp.vec3]
     ee_plane: wp.array[wp.vec4]
     ee_margin: wp.array[float]
-    """The separation_eps used to construct this EE plane and required by truncation."""
+    """Positive per-side clearance required by truncation for this EE plane."""
     ee_valid: wp.array[wp.int32]
     vertex_plane_offsets: wp.array[wp.int32]
     """Offsets into the incident contact endpoints of each particle."""
     vertex_plane_endpoints: wp.array[wp.int32]
     """Endpoint IDs of the incident planes. Each VT row, then each EE row, owns four endpoint IDs."""
+    use_plane_failure_fallback: wp.bool
+    """Retry placement and hold uncovered endpoints if no plane certifies their anchors."""
     coverage: wp.array[wp.int32]
     """Purely diagnostic: detection overflow or an uncertified pair clears this shared
     step flag. The flag itself does not affect forces, truncation, or whether the
@@ -200,6 +214,7 @@ def create_particle_contact_dat_planes(
     vt_capacity = max(collision_info.vertex_colliding_triangles.shape[0] // 2, 1)
     ee_capacity = max(collision_info.edge_colliding_edges.shape[0] // 2, 1)
     planes = ParticleContactDatPlanes()
+    planes.use_plane_failure_fallback = False
     planes.vt_normal = wp.zeros(vt_capacity, dtype=wp.vec3, device=device)
     planes.vt_plane = wp.zeros(vt_capacity, dtype=wp.vec4, device=device)
     planes.vt_margin = wp.zeros(vt_capacity, dtype=float, device=device)
@@ -337,7 +352,7 @@ def _build_contact_planes_kernel(
                 )
                 if has_separating_normal:
                     n = n_found
-            plane_placed = False
+            margin = float(0.0)
             if has_separating_normal:
                 positive_disp = wp.mat33(0.0)
                 positive_disp[0] = trial[e1_a] - x_e1_a
@@ -345,7 +360,7 @@ def _build_contact_planes_kernel(
                 negative_disp = wp.mat33(0.0)
                 negative_disp[0] = trial[e2_a] - x_e2_a
                 negative_disp[1] = trial[e2_b] - x_e2_b
-                n, plane, plane_placed = _place_self_contact_plane(
+                n, plane, margin = _place_self_contact_plane(
                     n,
                     negative,
                     negative_disp,
@@ -354,13 +369,13 @@ def _build_contact_planes_kernel(
                     positive_disp,
                     2,
                     separation_eps,
-                    refresh_normals == 1 or previous_valid == 0,
+                    planes.use_plane_failure_fallback and (refresh_normals == 1 or previous_valid == 0),
                 )
-                if plane_placed:
+                if margin > 0.0:
                     planes.ee_normal[i] = n
                     planes.ee_plane[i] = plane
-                    planes.ee_margin[i] = separation_eps
-            valid = int(has_separating_normal and plane_placed)
+                    planes.ee_margin[i] = margin
+            valid = int(margin > 0.0)
             if valid == 0:
                 if previous_valid == 1:
                     valid = int(
@@ -368,6 +383,10 @@ def _build_contact_planes_kernel(
                             planes.ee_normal[i], planes.ee_plane[i], planes.ee_margin[i], positive, 2, negative, 2
                         )
                     )
+                if valid == 0:
+                    wp.atomic_min(planes.coverage, 0, 0)
+                    if not planes.use_plane_failure_fallback:
+                        valid = previous_valid
                 if has_separating_normal:
                     wp.printf(
                         "Warning: ALM-DAT found no valid stored plane for EE row %d: "
@@ -386,8 +405,6 @@ def _build_contact_planes_kernel(
                         e2_idx,
                         valid,
                     )
-                if valid == 0:
-                    wp.atomic_min(planes.coverage, 0, 0)
             planes.ee_valid[i] = valid
         else:
             planes.ee_valid[i] = 0
@@ -428,7 +445,7 @@ def _build_contact_planes_kernel(
             )
             if has_separating_normal:
                 n = n_found
-        plane_placed = False
+        margin = float(0.0)
         if has_separating_normal:
             positive_disp = wp.mat33(0.0)
             positive_disp[0] = trial[v] - x_v
@@ -436,7 +453,7 @@ def _build_contact_planes_kernel(
             negative_disp[0] = trial[tri_a] - x_a
             negative_disp[1] = trial[tri_b] - x_b
             negative_disp[2] = trial[tri_c] - x_c
-            n, plane, plane_placed = _place_self_contact_plane(
+            n, plane, margin = _place_self_contact_plane(
                 n,
                 negative,
                 negative_disp,
@@ -445,13 +462,13 @@ def _build_contact_planes_kernel(
                 positive_disp,
                 1,
                 separation_eps,
-                refresh_normals == 1 or previous_valid == 0,
+                planes.use_plane_failure_fallback and (refresh_normals == 1 or previous_valid == 0),
             )
-            if plane_placed:
+            if margin > 0.0:
                 planes.vt_normal[i] = n
                 planes.vt_plane[i] = plane
-                planes.vt_margin[i] = separation_eps
-        valid = int(has_separating_normal and plane_placed)
+                planes.vt_margin[i] = margin
+        valid = int(margin > 0.0)
         if valid == 0:
             if previous_valid == 1:
                 valid = int(
@@ -459,6 +476,10 @@ def _build_contact_planes_kernel(
                         planes.vt_normal[i], planes.vt_plane[i], planes.vt_margin[i], positive, 1, negative, 3
                     )
                 )
+            if valid == 0:
+                wp.atomic_min(planes.coverage, 0, 0)
+                if not planes.use_plane_failure_fallback:
+                    valid = previous_valid
             if has_separating_normal:
                 wp.printf(
                     "Warning: ALM-DAT found no valid stored plane for VT row %d: "
@@ -477,8 +498,6 @@ def _build_contact_planes_kernel(
                     tri,
                     valid,
                 )
-            if valid == 0:
-                wp.atomic_min(planes.coverage, 0, 0)
         planes.vt_valid[i] = valid
         i += stride
 
@@ -536,12 +555,12 @@ def _contact_plane_fraction(
     plane: wp.vec4,
     side: float,
     gamma: float,
-    separation_eps: float,
+    margin: float,
 ):
-    end = wp.float64(side) * _signed_plane_distance(trial, n, plane) - wp.float64(separation_eps)
+    end = wp.float64(side) * _signed_plane_distance(trial, n, plane) - wp.float64(margin)
     if end >= wp.float64(0.0):
         return 1.0
-    start = wp.float64(side) * _signed_plane_distance(anchor, n, plane) - wp.float64(separation_eps)
+    start = wp.float64(side) * _signed_plane_distance(anchor, n, plane) - wp.float64(margin)
     if start <= wp.float64(0.0):
         return 0.0
     return float(wp.float64(gamma) * start / (start - end))
@@ -613,11 +632,12 @@ def _advance_contact_anchors_kernel(
     end = planes.vertex_plane_offsets[v + 1]
     fraction = float(1.0)
     for i in range(begin + lane, end, wp.block_dim()):
-        normal, plane, eps, side, valid = _incident_plane(planes, planes.vertex_plane_endpoints[i])
+        normal, plane, margin, side, valid = _incident_plane(planes, planes.vertex_plane_endpoints[i])
         if valid == 0:
-            fraction = 0.0
+            if planes.use_plane_failure_fallback:
+                fraction = 0.0
         else:
-            allowed = _contact_plane_fraction(start, target, normal, plane, side, relaxation, eps)
+            allowed = _contact_plane_fraction(start, target, normal, plane, side, relaxation, margin)
             if allowed < fraction:
                 fraction = allowed
     fraction = wp.tile_min(wp.tile(fraction))[0]
@@ -646,8 +666,10 @@ def _advance_contact_anchors_kernel(
             fraction = 0.0
     if fraction > 0.0:
         for i in range(begin + lane, end, wp.block_dim()):
-            normal, plane, eps, side, _valid = _incident_plane(planes, planes.vertex_plane_endpoints[i])
-            if not (wp.float64(side) * _signed_plane_distance(candidate, normal, plane) >= wp.float64(eps)):
+            normal, plane, margin, side, valid = _incident_plane(planes, planes.vertex_plane_endpoints[i])
+            if valid == 1 and not (
+                wp.float64(side) * _signed_plane_distance(candidate, normal, plane) >= wp.float64(margin)
+            ):
                 fraction = 0.0
                 break
     fraction = wp.tile_min(wp.tile(fraction))[0]

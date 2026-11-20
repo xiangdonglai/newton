@@ -154,9 +154,11 @@ def test_alm_dat_reports_lost_coverage_on_buffer_overflow(test, device):
     solver.step(state, output, None, None, dt)
     test.assertGreater(np.max(np.abs(output.particle_q.numpy() - initial_positions_np)), 0.0)
     test.assertFalse(solver.particle_dat_coverage_ok())
+    solver._dat_planes.use_plane_failure_fallback = True
     with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "overflowed"):
         grew = solver.check_and_grow_self_contact_buffers()
     test.assertTrue(grew)
+    test.assertTrue(solver._dat_planes.use_plane_failure_fallback)
     solver.step(output, state, None, None, dt)
     test.assertTrue(solver.particle_dat_coverage_ok())
 

@@ -45,16 +45,16 @@ def _plane_offset_kernel(
     for j in range(positive_count):
         pos[j] = positive_pos[j]
         pos_d[j] = positive_disp[j]
-    plane, plane_placed = dat_plane_offset(n, neg, neg_d, negative_count, pos, pos_d, positive_count, separation_eps)
+    plane, margin = dat_plane_offset(n, neg, neg_d, negative_count, pos, pos_d, positive_count, separation_eps)
     out[0] = float(-_signed_plane_distance(wp.vec3(0.0), n, plane))  # world-space plane offset
-    out[1] = float(plane_placed)
+    out[1] = margin
     if out.shape[0] > 2:
         for i in range(negative_count):
-            out[2 + i] = float(-_signed_plane_distance(neg[i], n, plane) - wp.float64(separation_eps))
-            out[8 + i] = _contact_plane_fraction(neg[i], neg[i] + neg_d[i], n, plane, -1.0, 0.85, separation_eps)
+            out[2 + i] = float(-_signed_plane_distance(neg[i], n, plane) - wp.float64(margin))
+            out[8 + i] = _contact_plane_fraction(neg[i], neg[i] + neg_d[i], n, plane, -1.0, 0.85, margin)
         for j in range(positive_count):
-            out[5 + j] = float(_signed_plane_distance(pos[j], n, plane) - wp.float64(separation_eps))
-            out[11 + j] = _contact_plane_fraction(pos[j], pos[j] + pos_d[j], n, plane, 1.0, 0.85, separation_eps)
+            out[5 + j] = float(_signed_plane_distance(pos[j], n, plane) - wp.float64(margin))
+            out[11 + j] = _contact_plane_fraction(pos[j], pos[j] + pos_d[j], n, plane, 1.0, 0.85, margin)
 
 
 def _run_plane_offset(device, negative, negative_disp, positive, positive_disp, separation_eps=1.0e-6):
@@ -86,13 +86,13 @@ def test_plane_offset_balances_slowest_vertices(test, device):
     triangle_disp = [(0.0, 0.0, 2.0), (0.0, 0.0, 5.0), (0.0, 0.0, -1.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
-    offset, plane_placed = _run_plane_offset(device, triangle, triangle_disp, vertex, vertex_disp)
+    offset, margin = _run_plane_offset(device, triangle, triangle_disp, vertex, vertex_disp)
     # the fast triangle vertex (rate 5) binds against the vertex (rate 3):
     # offset = (3 * (-1 + separation_eps) + 5 * (3 - separation_eps)) / 8.
     # Both limiting endpoints get (4 - 2*separation_eps)/8 of their proposed motion.
     separation_eps = 1.0e-6
     test.assertAlmostEqual(float(offset), 1.5 - 0.25 * separation_eps, places=6)
-    test.assertEqual(float(plane_placed), 1.0)
+    test.assertEqual(margin, np.float32(separation_eps))
 
 
 def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
@@ -101,29 +101,33 @@ def test_plane_offset_gives_all_room_to_the_only_approaching_side(test, device):
     receding = [(0.0, 0.0, -2.0), (0.0, 0.0, -1.0), (0.0, 0.0, 0.0)]
     vertex = [(0.3, 0.3, 3.0)]
     vertex_disp = [(0.0, 0.0, -3.0)]
-    offset, plane_placed = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
+    offset, margin = _run_plane_offset(device, triangle, receding, vertex, vertex_disp)
     # The plane is separation_eps above the highest triangle vertex. Truncation
     # requires the same distance, leaving (3 - 2 * separation_eps)/3 of the motion.
     separation_eps = 1.0e-6
     test.assertAlmostEqual(float(offset), separation_eps, places=10)
-    test.assertEqual(float(plane_placed), 1.0)
-    # A gap narrower than 2 * separation_eps cannot meet the fixed distance
-    # requirement on both sides, even after trying the anchor midpoint.
+    test.assertEqual(margin, np.float32(separation_eps))
+    # A positive gap narrower than two requested margins uses half the gap on each side.
     thin_vertex = [(0.3, 0.3, 0.1)]
-    offset, plane_placed = _run_plane_offset(device, triangle, receding, thin_vertex, vertex_disp, separation_eps=0.075)
+    offset, margin = _run_plane_offset(device, triangle, receding, thin_vertex, vertex_disp, separation_eps=0.075)
     test.assertAlmostEqual(float(offset), 0.05, places=6)
-    test.assertEqual(float(plane_placed), 0.0)
+    test.assertEqual(margin, np.float32(0.05))
 
-    # The gap spans two 1 µm margins, but their midpoint lies between adjacent float32 offsets.
-    gap = 17.0 * float(np.spacing(np.float32(1.0)))
-    _, plane_placed = _run_plane_offset(
-        device,
-        [(0, 0, 0), (0, 0, 1), (0, 1, 1)],
-        [(0, 0, 0)] * 3,
-        [(0, 0.5, 1.0 + gap)],
-        [(0, 0, 0)],
-    )
-    test.assertEqual(plane_placed, 0.0)
+    # With 17 float32 steps across the gap, the best stored offset leaves
+    # eight steps on the closer side. With one step, no interior offset exists.
+    ulp = float(np.spacing(np.float32(1.0)))
+    for width, expected_margin in ((17 * ulp, 8 * ulp), (ulp, 0.0)):
+        _, margin = _run_plane_offset(
+            device,
+            [(0, 0, 0), (0, 0, 1), (0, 1, 1)],
+            [(0, 0, 0)] * 3,
+            [(0, 0.5, 1.0 + width)],
+            [(0, 0, 0)],
+        )
+        test.assertEqual(margin, expected_margin)
+    for height in (0.0, -0.01):
+        _, margin = _run_plane_offset(device, triangle, receding, [(0.3, 0.3, height)], vertex_disp)
+        test.assertEqual(margin, 0.0)
 
 
 def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, device):
@@ -188,7 +192,7 @@ def test_plane_offset_preserves_small_approaches_and_stored_clearance(test, devi
                     device=device,
                 )
                 values_np = out.numpy()
-                test.assertEqual(float(values_np[1]), 1.0)
+                test.assertEqual(values_np[1], np.float32(separation_eps))
                 test.assertGreaterEqual(float(values_np[[2, 3, 5, 6]].min()), 0.0)
                 np.testing.assert_array_equal(values_np[[8, 9, 11, 12]], np.ones(4))
 
@@ -288,7 +292,8 @@ def test_short_edges_use_segment_distance(test, device):
 
 def test_build_contact_planes_certifies_every_stored_pair(test, device):
     """Build one certified plane per stored pair with the vertex side positive and only canonical edge records valid."""
-    model = _two_layer_model(device)
+    layer_gap = 8 * float(np.spacing(np.float32(1.0)))
+    model = _two_layer_model(device, layer_gap=layer_gap)
     _detector, info = _detect(model)
     planes = create_particle_contact_dat_planes(info, device)
     anchor = wp.clone(model.particle_q)
@@ -296,7 +301,13 @@ def test_build_contact_planes_certifies_every_stored_pair(test, device):
     # The order of each vertex's incident planes can vary in deterministic mode.
     with patch.object(wp.config, "deterministic", wp.DeterministicMode.RUN_TO_RUN):
         build_contact_planes(model, anchor, trial, info, planes, refresh_normals=True, new_contacts=True)
-    worst, checked = _plane_sides(model, info, planes, anchor)
+    # Overlapping projections of the two parallel layers leave half their
+    # height difference as the maximum clearance on either side.
+    for margins, validity in ((planes.vt_margin, planes.vt_valid), (planes.ee_margin, planes.ee_valid)):
+        margins_np = margins.numpy()[validity.numpy().astype(bool)]
+        test.assertTrue(np.all(margins_np > 0.0))
+        test.assertTrue(np.any(margins_np == layer_gap / 2))
+    worst, checked = _plane_sides(model, info, planes, anchor, margin_tol=1.0e-14)
     test.assertGreater(checked, 0)
     test.assertLessEqual(worst, 0.0)
     test.assertTrue(bool(planes.coverage.numpy()[0]))
@@ -305,39 +316,57 @@ def test_build_contact_planes_certifies_every_stored_pair(test, device):
     for slot in range(int(info.edge_colliding_edges_offsets.numpy()[-1])):
         if int(rows[2 * slot]) > int(rows[2 * slot + 1]):
             test.assertEqual(int(valid[slot]), 0)
-    # Force one canonical row to lose its certificate. Only its endpoints
-    # must hold; reversed EE rows always have valid=0 and must be ignored.
+    # Poison one invalid slot. The default skips it in both clipping passes.
+    # The optional fallback holds just its four vertices.
     ee_slots = np.flatnonzero(valid)
     vt_rows = info.vertex_colliding_triangles.numpy().reshape(-1, 2)
-    for flags, slot, endpoints in (
-        (planes.ee_valid, ee_slots[0], model.edge_indices.numpy()[rows.reshape(-1, 2)[ee_slots[0]], 2:].ravel()),
-        (planes.vt_valid, 0, np.r_[vt_rows[0, 0], model.tri_indices.numpy()[vt_rows[0, 1]]]),
+    test.assertFalse(planes.use_plane_failure_fallback)
+    for flags, margins, slot, endpoints in (
+        (
+            planes.ee_valid,
+            planes.ee_margin,
+            ee_slots[0],
+            model.edge_indices.numpy()[rows.reshape(-1, 2)[ee_slots[0]], 2:].ravel(),
+        ),
+        (planes.vt_valid, planes.vt_margin, 0, np.r_[vt_rows[0, 0], model.tri_indices.numpy()[vt_rows[0, 1]]]),
     ):
         before = flags.numpy().copy()
         missing = before.copy()
         missing[slot] = 0
         flags.assign(missing)
+        stored_margins = margins.numpy().copy()
+        poisoned = stored_margins.copy()
+        poisoned[slot] = 100.0
+        margins.assign(poisoned)
         truncation_ts = wp.empty(model.particle_count, dtype=float, device=device)
-        advance_contact_anchors(
-            model.particle_q, anchor, trial, planes, truncation_ts, relaxation=0.85, motion_budget=1.0
-        )
-        expected = np.ones(model.particle_count)
-        expected[endpoints] = 0.0
-        np.testing.assert_array_equal(truncation_ts.numpy(), expected)
+        for enable_fallback in (False, True):
+            planes.use_plane_failure_fallback = enable_fallback
+            advance_contact_anchors(
+                model.particle_q, anchor, trial, planes, truncation_ts, relaxation=0.85, motion_budget=1.0
+            )
+            expected = np.ones(model.particle_count)
+            if enable_fallback:
+                expected[endpoints] = 0.0
+            np.testing.assert_array_equal(truncation_ts.numpy(), expected)
+        margins.assign(stored_margins)
         flags.assign(before)
     # A caller can supply a new anchor outside the previous plane. A collapsed
     # pair has no strict separator and the old certificate no longer applies.
     anchor.zero_()
     trial.zero_()
-    for family in ("EE", "VT"):
-        test.expectOutputRegex(
-            rf"Warning: ALM-DAT found no separating normal for {family} row \d+: [^\n]+retaining_previous_plane=0",
-            stream="stdout",
-        )
-    build_contact_planes(model, anchor, trial, info, planes, refresh_normals=True)
-    test.assertFalse(bool(planes.coverage.numpy()[0]))
-    test.assertFalse(planes.ee_valid.numpy().any())
-    test.assertFalse(planes.vt_valid.numpy().any())
+    for enable_fallback in (False, True):
+        planes.use_plane_failure_fallback = enable_fallback
+        planes.coverage.fill_(1)
+        for family in ("EE", "VT"):
+            test.expectOutputRegex(
+                rf"Warning: ALM-DAT found no separating normal for {family} row \d+: [^\n]+"
+                rf"retaining_previous_plane={int(not enable_fallback)}",
+                stream="stdout",
+            )
+        build_contact_planes(model, anchor, trial, info, planes, refresh_normals=True)
+        test.assertFalse(bool(planes.coverage.numpy()[0]))
+        test.assertEqual(bool(planes.ee_valid.numpy().any()), not enable_fallback)
+        test.assertEqual(bool(planes.vt_valid.numpy().any()), not enable_fallback)
     # Redetection with no stored pairs also clears the preceding vertex-to-plane index.
     info.vertex_colliding_triangles_offsets.zero_()
     info.edge_colliding_edges_offsets.zero_()
@@ -442,7 +471,7 @@ def test_plane_certifies_recorded_cloth_twist_gap(test, device):
         device=device,
     )
     values = out.numpy()
-    test.assertEqual(values[1], 1)
+    test.assertEqual(values[1], np.float32(1e-6))
     # The reported distances are relative to the required margin.
     test.assertAlmostEqual(float(values[2:6].min()) * 1e9, 4.29, delta=0.05)
 

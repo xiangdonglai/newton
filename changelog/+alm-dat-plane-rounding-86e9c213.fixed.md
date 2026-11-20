@@ -4,6 +4,8 @@ stored float32 clearance, and report uncertified pairs through
 `SolverVBD.particle_dat_coverage_ok()`. Print warnings when separating-normal
 search or stored-plane placement fails, including whether a previous plane
 was retained.
-Use the requested separation tolerance unchanged during plane placement and
-truncation; reject a new plane if neither its optimized point nor the anchor
-midpoint provides that distance on both sides.
+For thin, strictly separated self-contact pairs, cap the per-side margin at
+half the projected anchor gap. Clip against the positive clearance that the
+stored plane actually provides, up to that margin.
+The internal plane-failure fallback can retry along a second normal and hold
+uncovered endpoints. By default, a pair without a plane contributes no constraint.
