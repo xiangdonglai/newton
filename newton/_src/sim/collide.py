@@ -2787,7 +2787,9 @@ class CollisionPipeline:
             edge_buffer_pre_alloc: Sizes the global edge-edge contact buffer
                 shared by all edges: capacity = this value x ``edge_count``;
                 excess pairs are dropped and flagged.
-            edge_edge_parallel_epsilon: Near-parallel edge-pair threshold.
+            edge_edge_parallel_epsilon: Near-parallel threshold used to choose a rigid-soft edge
+                contact normal when that path shares the detector. Soft self-contact detection
+                uses zero length tolerance for its edge distance queries.
             record_triangle_contacting_vertices: Also record per-triangle
                 contacting vertices.
             topological_filter_threshold: Ring distance under which candidate

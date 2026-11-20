@@ -1257,7 +1257,7 @@ class TriMeshCollisionDetector:
                 self.model.edge_indices,
                 self.model.particle_world,
                 self.model.world_count,
-                self.edge_edge_parallel_epsilon,
+                0.0,  # Warp compares this to squared edge length. Keep short edges in the distance query.
                 self.edge_filtering_list,
                 self.edge_filtering_list_offsets,
                 min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,

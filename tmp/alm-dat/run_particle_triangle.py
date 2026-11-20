@@ -42,6 +42,13 @@ import newton  # noqa: E402
 class RecordedSolver(newton.solvers.SolverVBD):
     """Observe truncation without changing its inputs or the solver algorithm."""
 
+    def _vt_plane_points(self, count):
+        plane = self._dat_planes.vt_plane.numpy()[:count]
+        normal = self._dat_planes.vt_normal.numpy()[:count].astype(np.float64)
+        norm2 = np.einsum("ij,ij->i", normal, normal)
+        shift = np.divide(plane[:, 3], norm2, out=np.zeros_like(norm2), where=norm2 > 0)
+        return (plane[:, :3] + normal * shift[:, None]).tolist()
+
     def _alm_dat_truncate(self, trial, *, refresh_normals):
         before = trial.numpy().copy()
         count = int(self.trimesh_collision_info.vertex_colliding_triangles_offsets.numpy()[-1])
@@ -59,7 +66,7 @@ class RecordedSolver(newton.solvers.SolverVBD):
             "anchor_before": self._dat_anchor.numpy()[3].tolist(),
             "trial": before[3].tolist(),
             "vt_normal_before": self._dat_planes.vt_normal.numpy()[:count].tolist(),
-            "vt_point_before": self._dat_planes.vt_point.numpy()[:count].tolist(),
+            "vt_point_before": self._vt_plane_points(count),
             "vt_margin_before": self._dat_planes.vt_margin.numpy()[:count].tolist(),
         }
         super()._alm_dat_truncate(trial, refresh_normals=refresh_normals)
@@ -70,7 +77,7 @@ class RecordedSolver(newton.solvers.SolverVBD):
                 "vt_count": count,
                 "vt_valid": self._dat_planes.vt_valid.numpy()[:count].tolist(),
                 "vt_normal": self._dat_planes.vt_normal.numpy()[:count].tolist(),
-                "vt_point": self._dat_planes.vt_point.numpy()[:count].tolist(),
+                "vt_point": self._vt_plane_points(count),
                 "vt_margin": self._dat_planes.vt_margin.numpy()[:count].tolist(),
                 "truncation_t": float(self.truncation_ts.numpy()[3]),
                 "normal_multipliers": self._dat_alm_state.vt_lambda.numpy()[:count].tolist(),

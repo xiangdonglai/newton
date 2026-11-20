@@ -46,8 +46,8 @@ from ..xpbd.kernels import apply_joint_forces, project_joint_mimics
 from . import particle_vbd_kernels, rigid_vbd_kernels, vbd_coupling_kernels
 from .particle_dat_kernels import (
     accumulate_alm_contact_force_and_hessian,
+    advance_contact_anchors,
     build_contact_planes,
-    commit_truncated_displacement,
     compute_particle_material_hessian,
     create_particle_contact_alm_state,
     create_particle_contact_dat_planes,
@@ -55,7 +55,6 @@ from .particle_dat_kernels import (
     rebase_displacement,
     record_contact_coverage,
     snapshot_contact_history,
-    truncate_against_contact_planes,
     update_alm_contact_multipliers,
 )
 from .particle_vbd_kernels import (
@@ -497,6 +496,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         particle_edge_parallel_epsilon: float = 1e-5,
         particle_enable_tile_solve: bool = True,
         particle_self_contact_method: str = "penalty_dat",
+        particle_penalty_dat_report_failed_planes: bool = False,
         particle_dat_plane_update_interval: int = 1,
         particle_dat_truncation_iterations: int = 2,
         particle_contact_alm_hard_gap: float | None = None,
@@ -601,10 +601,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             particle_self_contact_method: Experimental selector for the soft self-contact
                 scheme. ``"penalty_dat"`` (default) keeps the existing penalty contact
                 force with per-color Divide-and-Truncate. ``"alm_dat"`` stores one
-                division plane per detected pair at a certified anchor pose, lets the
+                division plane for each processed VT and canonical EE pair at a certified anchor pose, lets the
                 VBD iterate penetrate, and truncates the accumulated motion against
                 the stored planes at a fixed cadence and once more at the end of the
-                step; the committed state is penetration-free for every stored pair.
+                step. Each certified plane separates its pair throughout the accepted advance.
                 The contact row is a compliant ALM cushion (``soft_contact_ke`` over the
                 margin) with a hard wall, plus gap-rate damping with ``soft_contact_kd``
                 on the closing motion inside the margin and Coulomb friction with
@@ -624,6 +624,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     and ``particle_dat_truncation_iterations`` may change without the
                     normal deprecation period.
 
+            particle_penalty_dat_report_failed_planes: Print the primitive IDs when penalty-DAT cannot find a
+                separating normal or verify the required plane clearance at the detection pose.
             particle_dat_plane_update_interval: With ``"alm_dat"``, truncate and rebuild
                 the stored planes after every this many VBD iterations (``0`` disables
                 the in-iteration refresh). Defaults to ``1``.
@@ -1088,6 +1090,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError(
                 f"particle_self_contact_method must be 'penalty_dat' or 'alm_dat', got {particle_self_contact_method!r}"
             )
+        self.particle_penalty_dat_report_failed_planes = particle_penalty_dat_report_failed_planes
         self.particle_self_contact_method = particle_self_contact_method
         self._alm_dat = particle_self_contact_method == "alm_dat"
 
@@ -3958,6 +3961,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.trimesh_collision_info,
                     self.dat_conservative_bound_relaxation,
                     self.particle_self_contact_evaluation_kernel_launch_size,
+                    self.particle_penalty_dat_report_failed_planes,
                 ],
                 outputs=[
                     self.truncation_ts,
@@ -4092,24 +4096,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
     def _alm_dat_truncate(self, trial: wp.array, *, refresh_normals: bool) -> None:
         """Advance the certified anchor toward ``trial`` and rebuild the stored planes there."""
-        launch_size = self.particle_self_contact_evaluation_kernel_launch_size
-        truncate_against_contact_planes(
-            self.model,
-            self._dat_anchor,
-            trial,
-            self.trimesh_collision_info,
-            self._dat_planes,
-            gamma=self.dat_conservative_bound_relaxation,
-            sigma=self.truncation_ts,
-            launch_size=launch_size,
-        )
-        commit_truncated_displacement(
+        advance_contact_anchors(
             self.pos_prev_collision_detection,
             self._dat_anchor,
             trial,
+            self._dat_planes,
             self.truncation_ts,
-            budget=self._alm_dat_budget(),
-            anchor_out=self._dat_anchor,
+            relaxation=self.dat_conservative_bound_relaxation,
+            motion_budget=self._alm_dat_budget(),
         )
         build_contact_planes(
             self.model,
@@ -4118,7 +4112,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.trimesh_collision_info,
             self._dat_planes,
             refresh_normals=refresh_normals,
-            launch_size=launch_size,
+            launch_size=self.particle_self_contact_evaluation_kernel_launch_size,
         )
 
     def _alm_dat_initialize(self, state_in: State, dt: float) -> None:
@@ -4141,8 +4135,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._dat_anchor.assign(self.pos_prev_collision_detection)
         self._alm_dat_materialize_trial(state_in)
         # the detection re-assigned the row slots: stored planes belong to last step's pairs
-        self._dat_planes.vt_valid.zero_()
-        self._dat_planes.ee_valid.zero_()
         build_contact_planes(
             self.model,
             self._dat_anchor,
@@ -4150,6 +4142,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.trimesh_collision_info,
             self._dat_planes,
             refresh_normals=True,
+            new_contacts=True,
             launch_size=self.particle_self_contact_evaluation_kernel_launch_size,
         )
         match_contact_history(self._self_contact_info_source, self._dat_alm_state, self.device)
@@ -4160,10 +4153,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     ) -> None:
         """Second certified anchor (``PRE_POST_INIT``): detect again at the anchor after the inertial commit.
 
-        The anchor is penetration-free for every stored pair, so it serves as the new
-        detection pose: the motion reference and the budget restart there, the planes
-        are rebuilt for the re-assigned slots and the multipliers follow their rows
-        through matching. The trial keeps its position; only its reference changes.
+        Use the accepted anchor as the new detection pose. Restart the motion budget
+        there, rebuild the planes for the new rows, and match their multipliers.
+        Rebase the trial displacement to preserve its world-space position.
         """
         # the detection view carries the anchor; keep the trial aside meanwhile
         self._dat_trial_scratch.assign(state_in.particle_q)
@@ -4184,8 +4176,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._dat_trial_scratch, self.pos_prev_collision_detection, self.particle_displacements, self.device
         )
         state_in.particle_q.assign(self._dat_trial_scratch)
-        self._dat_planes.vt_valid.zero_()
-        self._dat_planes.ee_valid.zero_()
         build_contact_planes(
             self.model,
             self._dat_anchor,
@@ -4193,17 +4183,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.trimesh_collision_info,
             self._dat_planes,
             refresh_normals=True,
+            new_contacts=True,
             launch_size=self.particle_self_contact_evaluation_kernel_launch_size,
         )
         match_contact_history(self._self_contact_info_source, self._dat_alm_state, self.device)
 
     def particle_dat_coverage_ok(self) -> bool:
-        """Return whether the last ``alm_dat`` step retained a certified plane for every found pair.
+        """Return whether the last ``alm_dat`` step avoided overflow and covered each processed self-contact pair.
 
-        ``False`` means detection overflowed or a pair could not be separated by a
-        certified stored plane. The penetration-free certificate does not cover
-        that step. For overflow, call :meth:`check_and_grow_self_contact_buffers`
-        between steps; already intersecting or numerically unresolved geometry
+        The solver processes stored VT records and EE records with the smaller edge index first.
+        This diagnostic cannot detect pairs missed by the distance query.
+        ``False`` means detection overflowed or a processed pair could not be separated by a
+        certified stored plane. A stored pair without a valid plane holds its anchor positions.
+        On overflow, the solver advances using the stored pairs. Call :meth:`check_and_grow_self_contact_buffers`
+        between steps to grow the buffers. Already intersecting or numerically unresolved geometry
         requires correcting the input state or increasing geometric resolution.
         Reads one device integer back (synchronizes); graph users can read the
         same flag from ``self._dat_coverage``. Always ``True`` on the

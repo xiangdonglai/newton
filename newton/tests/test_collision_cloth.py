@@ -642,7 +642,7 @@ def test_edge_edge_collision(test, device):
     model, collision_detector = init_model(vertices, faces, device)
 
     rs = [1e-2, 2e-2, 5e-2, 1e-1]
-    edge_edge_parallel_epsilon = 1e-5
+    edge_edge_parallel_epsilon = 0.0
 
     for query_radius in rs:
         collision_detector.edge_edge_collision_detection(query_radius)
@@ -1310,7 +1310,7 @@ def test_collision_filtering(test, device):
             particle_q_new,
             vbd.particle_q_rest,
             model.edge_indices,
-            1e-6,
+            0.0,
             vbd.trimesh_collision_detector.collision_info,
         ],
         device=device,

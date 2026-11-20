@@ -1,371 +1,71 @@
-# DAT plane construction and motion truncation
+# Soft self-contact ALM-DAT plane placement and truncation
 
-Plane construction and motion truncation are two separate operations.
-During **plane construction**, the current anchors and trial positions are
-fixed inputs: we choose a plane, then check the anchors' distances to it.
-During **motion truncation**, the stored plane stays fixed while we decide
-how far each anchor may advance toward its trial.
+At an anchor advance the solver has an accepted vertex position $a$ and a proposed position $y$ for every vertex. The **reference** $r$ is the position at the last collision detection. It sets a bound on total travel. A **plane** separates the endpoints of one detected primitive pair. The solver chooses its position using the motion $a\to y$, then holds it fixed while clipping that motion. All distances below use the scene's length unit.
 
-The distinction between the two distances is:
+## 1. Define the required distance
 
-| Quantity | Meaning | When it is known |
-| --- | --- | --- |
-| `separation_eps` ($\varepsilon$) | The required minimum distance from every anchor endpoint to the plane, on its assigned side. | Before choosing the plane. It remains fixed for that plane. |
-| `measured_clearance` ($C_{\mathrm{anchor}}(p)$) | The smallest actual signed distance from those anchor endpoints to the stored plane. | After placing the plane point $p$. |
+For an edge–edge pair, put one edge on each side. For a vertex–triangle pair, put the vertex on the positive side. Let $n$ be the stored unit normal pointing toward the positive side and let $\varepsilon>0$ be the required distance on **each** side. The solver computes $\varepsilon$ from the coordinate scale before choosing the plane.
 
-The plane passes the check when
+Take one negative-side anchor endpoint as a fixed origin $o$. A scalar $c$ locates the plane. Its equation and signed distance are
 
 $$
-\boxed{C_{\mathrm{anchor}}(p)\geq\varepsilon.}
+D(x)=n\cdot(x-o)-c,\qquad D(x)=0\text{ on the plane}.
 $$
 
-The anchors do not move during this check. “After placing the plane” means
-that the **plane point** has been chosen and stored; it does not mean that
-particle motion has been applied. The distance measured after a later
-truncation is a different measurement.
+Every negative anchor must satisfy $D(a_i^-)\le-\varepsilon$ and every positive anchor must satisfy $D(a_j^+)\ge\varepsilon$. The solver stores $(o_x,o_y,o_z,c)$ together as four float32 values. It evaluates $D$ in float64 using that stored offset, so placement and truncation agree on the plane. If no float32 offset along the chosen normal gives every endpoint its required clearance, placement fails for that normal.
 
-## Inputs and the two stages
+## 2. Find the greatest common motion fraction the plane can accommodate
 
-For the primitive pair, let
+For each endpoint let $h=n\cdot(a-o)$ be its anchor height. Let $u_i=\max(0,n\cdot(y_i^--a_i^-))$ and $v_j=\max(0,-n\cdot(y_j^+-a_j^+))$ be the amounts of proposed motion toward the opposite side. An endpoint moving away has its closest approach at its starting position, so its approach amount is zero.
 
-- $x_i^-$ and $x_j^+$ be the **current anchor endpoints** assigned to the
-  negative and positive sides of the plane;
-- $y_i^-$ and $y_j^+$ be their **trial positions**;
-- $\Delta x_i^-=y_i^--x_i^-$ and $\Delta x_j^+=y_j^+-x_j^+$ be the proposed
-  displacements;
-- $n$ be the fixed, normalized plane normal, pointing from the negative side
-  toward the positive side;
-- $p$ be the point on the plane that construction will choose;
-- $\varepsilon>0$ be `separation_eps`, chosen from the coordinate scale
-  before constructing this plane.
-
-A plane through $p$ has equation $n\cdot(z-p)=0$ for a spatial point $z$.
-Each signed distance is positive on its endpoint's assigned side:
+For a common fraction $\alpha\in[0,1]$, the full endpoint segments fit when
 
 $$
-d_i^-(p)=(-n)\cdot(x_i^- -p),
-\qquad
-d_j^+(p)=n\cdot(x_j^+ -p).
+L(\alpha)=\max_i(h_i^-+\alpha u_i)+\varepsilon
+\quad\le c\le\quad
+U(\alpha)=\min_j(h_j^+-\alpha v_j)-\varepsilon.
 $$
 
-Therefore the measurement used to accept the plane is
+A plane can fit the anchors along this normal only if $L(0)\le U(0)$. For separated anchors, the largest admissible fraction is
 
 $$
-\boxed{
-C_{\mathrm{anchor}}(p)
-=\min\left(\min_i d_i^-(p),\;\min_j d_j^+(p)\right).
-}
+\alpha_* = \min\!\left(1,\min_{i,j:\,u_i+v_j>0}
+\frac{h_j^+-h_i^- - 2\varepsilon}{u_i+v_j}\right).
 $$
 
-This is a measurement at $x$, not at $y$ or at the accepted positions after
-truncation. Positive means all anchors lie on their assigned sides; zero
-means at least one lies on the plane; negative means at least one lies on
-the wrong side. The code evaluates these distances with the stored float32
-geometry, as described in step 4.
+If no endpoint approaches, $\alpha_*=1$. This fraction guides plane placement; the solver computes the actual accepted motion per vertex in step 4.
 
-| Stage | What stays fixed | What is computed |
-| --- | --- | --- |
-| Construct and check the plane | Anchors $x$, trials $y$, normal $n$, and required distance $\varepsilon$. | Plane point $p$ and the measurement $C_{\mathrm{anchor}}(p)$. |
-| Truncate the proposed motion | Stored plane $(p,n)$, its $\varepsilon$, and proposed motion $y-x$. | An accepted fraction $t$ and positions $x_{\mathrm{accepted}}=x+t(y-x)$. |
+## 3. Place the plane and certify the anchors
 
-The anchors may themselves be the result of an earlier truncation. For this
-construction call, however, they remain unchanged throughout all six steps.
-The proposed displacements help choose a useful plane; they are not applied
-while constructing or checking it.
-
-## 1. Project the fixed anchors and proposed displacements
-
-Use one negative-side anchor as the common origin:
+Choose $c=(L(\alpha_*)+U(\alpha_*))/2$ and clamp it to the anchor interval $[L(0),U(0)]$ when that interval is feasible. Measure the clearance on the **current anchors**,
 
 $$
-o=x_1^-.
+C=\min\!\left(c-\max_i h_i^-,\;\min_j h_j^+ -c\right).
 $$
 
-Project the anchors onto the normal relative to that origin:
+The requirement is $\varepsilon$; the clearance the chosen plane actually provides is $C$. If rounding puts $C$ below $\varepsilon$, try the midpoint of the anchor interval and measure again. Accept only when $C\ge\varepsilon$.
+
+During a normal rebuild, a failed placement can also try the face normal (vertex–triangle) or the common perpendicular (edge–edge). If rebuilding fails, a previous plane can be retained only when it still certifies all current endpoints. If neither plane certifies the anchors, the solver warns, clears the diagnostic coverage flag, and holds the four endpoints at their anchors. A separated pair then keeps its existing gap, even when that gap is smaller than twice the required clearance.
+
+## 4. Clip the current trial
+
+A new VBD trial can reverse direction relative to the trial used at the last checkpoint. This version keeps the original schedule. It clips the current trial against the plane stored at the preceding checkpoint, then places a plane for the next advance. For an endpoint let $s=+1$ on the positive side and $s=-1$ on the negative side. The available distances at the anchor and trial are $b_0=sD(a)-\varepsilon$ and $b_1=sD(y)-\varepsilon$. Starting at a certified anchor, this plane allows
 
 $$
-a_i=n\cdot(x_i^- -o),
-\qquad
-b_j=n\cdot(x_j^+ -o).
-$$
-
-Keep the part of each proposed displacement directed toward the plane:
-
-$$
-u_i=\max(0,n\cdot\Delta x_i^-),
-\qquad
-v_j=\max(0,-n\cdot\Delta x_j^+).
-$$
-
-These are displacements, not velocities. For an endpoint moving away from
-the plane, its starting anchor is the closest position along that segment;
-using zero accounts for that case.
-
-The code uses `negative_height`, `positive_height`, `negative_rate`, and
-`positive_rate`. These projections use float64 intermediates from the
-float32 input positions, displacements, and normal.
-
-## 2. Find a common fraction for choosing the plane
-
-Let $\alpha\in[0,1]$ be a candidate common fraction of the proposed motion,
-and let $c$ be the plane offset relative to $o$:
-
-$$
-n\cdot(z-o)=c.
-$$
-
-To accommodate this fraction while leaving the required distance
-$\varepsilon$ on both sides, every endpoint pair imposes
-
-$$
-a_i+\alpha u_i+\varepsilon
-\;\leq\;c\;\leq\;
-b_j-\alpha v_j-\varepsilon.
-$$
-
-For a pair with $u_i+v_j>0$, this gives
-
-$$
-\alpha\leq\frac{b_j-a_i-2\varepsilon}{u_i+v_j}.
-$$
-
-The code computes
-
-$$
-\boxed{
-\alpha_*=
-\min\left(
-1,\;
-\min_{i,j:\,u_i+v_j>0}
-\max\left(0,\frac{b_j-a_i-2\varepsilon}{u_i+v_j}\right)
-\right).
-}
-$$
-
-If no pair approaches, $\alpha_*=1$. The maximum with zero keeps the computed
-fraction nonnegative; it does not make an insufficient starting gap valid.
-The stored-plane check in steps 4–6 decides whether the result is acceptable.
-
-Only $\varepsilon$ is used as a distance requirement. In exact arithmetic,
-a projected anchor gap
-
-$$
-g=\min_j b_j-\max_i a_i
-$$
-
-must satisfy $g\geq2\varepsilon$ to fit that distance on both sides.
-Reducing the construction distance cannot satisfy this fixed requirement.
-
-`fraction` ($\alpha_*$) helps **choose the plane**. No endpoint is moved by
-this calculation. The fraction actually applied to motion is computed later.
-
-## 3. Choose and store the plane point
-
-For the computed $\alpha_*$, form the candidate offset bounds
-
-$$
-L=\max_i(a_i+\alpha_*u_i+\varepsilon),
-\qquad
-U=\min_j(b_j-\alpha_*v_j-\varepsilon).
-$$
-
-When the requirements fit, these bound a feasible interval. Choose its
-midpoint:
-
-$$
-c=\frac{L+U}{2}.
-$$
-
-Store the point in float32:
-
-$$
-\boxed{
-p=\operatorname{fl}_{32}\left(o+\frac{c}{n\cdot n}\,n\right).
-}
-$$
-
-$\operatorname{fl}_{32}$ denotes conversion to float32. The division by
-$n\cdot n$ accounts for the stored normal not having exactly unit length.
-The code names are `low`, `high`, `offset`, and `point`.
-
-If the full proposed motion fits, choosing the midpoint avoids placing the
-plane unnecessarily close to an allowed bound. If the bounds are inconsistent
-or rounding spoils the placement, the following measurement catches it.
-The anchors are still at their input positions.
-
-## 4. Measure the anchors' distances to the stored plane
-
-Now evaluate the actual distances using float32 subtraction and dot products:
-
-$$
-d_i^-(p)=(-n)\cdot_{32}(x_i^- -_{32}p),
-\qquad
-d_j^+(p)=n\cdot_{32}(x_j^+ -_{32}p).
-$$
-
-`_measure_plane_clearance` returns their minimum,
-$C_{\mathrm{anchor}}(p)$. It uses the stored point from step 3, rather than
-its float64 value before rounding, so the check matches the representation
-used by truncation.
-
-The two quantities being compared are now explicit:
-
-$$
-\underbrace{C_{\mathrm{anchor}}(p)}_{\text{measured at the unchanged anchors}}
-\quad\text{versus}\quad
-\underbrace{\varepsilon}_{\text{required before the plane was chosen}}.
-$$
-
-If $C_{\mathrm{anchor}}(p)\geq\varepsilon$, the point needs no adjustment.
-
-## 5. Try the anchor-gap midpoint if the measurement falls short
-
-If $C_{\mathrm{anchor}}(p)<\varepsilon$, try another plane point with the
-same normal. Place it halfway between the projected anchors:
-
-$$
-c_{\mathrm{mid}}=\frac{\max_i a_i+\min_j b_j}{2},
-\qquad
-p_{\mathrm{mid}}=
-\operatorname{fl}_{32}\left(o+\frac{c_{\mathrm{mid}}}{n\cdot n}\,n\right).
-$$
-
-Measure the same anchors against this new point. Keep it only if the
-measurement improves:
-
-$$
-p\leftarrow
-\begin{cases}
-p_{\mathrm{mid}},&C_{\mathrm{anchor}}(p_{\mathrm{mid}})>C_{\mathrm{anchor}}(p),\\
-p,&\text{otherwise}.
+t=\begin{cases}
+1,& b_1\ge0,\\
+\gamma\, b_0/(b_0-b_1),& b_1<0,
 \end{cases}
 $$
 
-This is the **midpoint fallback**. It changes the plane point and therefore
-its measured anchor distances. It changes neither the anchors nor the
-required distance $\varepsilon$.
+where $\gamma$ is the solver's existing backoff factor. Take the smallest fraction over all incident planes and shorten further if needed to stay inside the motion budget around $r$. The unconstrained trial $y$ remains available to the VBD solver.
 
-## 6. Accept or reject the plane at the unchanged anchors
+## 5. Certify the position that will actually be stored
 
-The implementation accepts the final candidate when
+Let $B=\gamma R/2$ be the motion budget and $r$ the position at detection. Compute the budget-clipped candidate $q$ in float32 and check $\lVert q-r\rVert^2\le B^2$ in float64. If rounding took it outside, bisect along the same proposed step, starting at the existing anchor, and keep the farthest sampled float32 position that passes. The vertex stays at its anchor if no sampled advance fits.
 
-$$
-\boxed{
-\texttt{plane\_placed}
-=(C_{\mathrm{anchor}}(p)>0)
-\;\land\;
-(C_{\mathrm{anchor}}(p)\geq\varepsilon).
-}
-$$
+Check $sD(q)\ge\varepsilon$ against every incident stored plane. If all checks pass, copy $q$ to this vertex's anchor. If any check fails, keep its existing anchor. Each endpoint then lies in its assigned closed half-space at both ends of the accepted straight segment. Convexity keeps it there throughout that segment.
 
-Since $\varepsilon>0$, meeting the distance requirement also ensures strict
-separation. The function returns $(p,\texttt{plane\_placed})$; the anchors
-and trials remain unchanged.
+A complete detection bounds the motion of every endpoint from its detection position. If its radius is $R$, each endpoint stays within $\gamma R/2$ of that position. Two features initially farther than $R$ apart therefore cannot meet. The self-contact detector passes zero length tolerance to the edge–edge distance kernel so the query retains the full extent of short edges. On buffer overflow, the solver advances using the stored pairs and reports incomplete coverage. Dropped pairs have no separating plane. The guarantee begins with a separated input and covers the pairs enabled for collision, provided detection returns every pair within $R$.
 
-On success, the builder stores the point, normal, and input $\varepsilon$.
-The existing `vt_margin` and `ee_margin` arrays hold that same input value.
-On failure, it prints a warning and retains a previous valid plane when
-available. Without a valid stored plane, it reports missing coverage.
-
-A retained plane keeps its original $\varepsilon$: changing the tolerance
-would change its allowed motion. These stored values are not new distance
-parameters or adjusted measurements.
-
-## Later: truncate motion against the accepted plane
-
-Only now consider advancing an anchor $x$ toward its trial $y$. For one
-endpoint, let $\nu$ denote its allowed-side normal: $n$ on the positive side
-and $-n$ on the negative side. With $\Delta x=y-x$, the accepted position must
-satisfy
-
-$$
-\nu\cdot(x_{\mathrm{accepted}}-p)\geq\varepsilon.
-$$
-
-`planar_truncation_t` receives the stored $\varepsilon$ through its existing
-parameter `minimum_signed_distance`. It evaluates the excess above the
-required distance at the anchor and the trial:
-
-$$
-s_0=\nu\cdot_{32}(x-_{32}p)-\varepsilon,
-\qquad
-s_1=s_0+\nu\cdot_{32}\Delta x.
-$$
-
-For a valid starting anchor ($s_0\geq0$), using the solver's safety factor
-$\gamma\in[0,1]$, it returns
-
-$$
-t=
-\begin{cases}
-1,&s_1\geq0,\\
-\operatorname{clamp}\left(\gamma\frac{s_0}{s_0-s_1},0,1\right),&s_1<0.
-\end{cases}
-$$
-
-The resulting motion is
-
-$$
-x_{\mathrm{accepted}}=x+t\Delta x.
-$$
-
-With multiple incident planes, a particle takes their most restrictive
-fraction; the collision-query motion bound may restrict it further. For an
-already invalid start ($s_0<0$), the helper permits only motion that does not
-make its signed distance more negative.
-
-The distances at $x_{\mathrm{accepted}}$ describe the **result of motion
-truncation**. They are not the anchor measurement used to accept the plane
-in steps 4–6. The stored $\varepsilon$ is used for truncation, not by the
-ALM force formulas.
-
-## Worked example: required distance, plane check, and accepted motion
-
-Use one endpoint on each side in one dimension:
-
-$$
-x^-=0,\quad x^+=10,\quad
-y^-=12,\quad y^+=6,\quad
-n=1,\quad\varepsilon=1.
-$$
-
-The proposed displacements are $12$ and $-4$. All six construction steps use
-the unchanged anchors $0$ and $10$:
-
-$$
-\begin{aligned}
-1.&\quad a=0,\ b=10,\ u=12,\ v=4,\\
-2.&\quad \alpha_*=(10-2)/(12+4)=1/2,\\
-3.&\quad L=U=7,\ p=7,\\
-4.&\quad C_{\mathrm{anchor}}(7)=\min(7-0,10-7)=3,\\
-5.&\quad 3\geq\varepsilon=1\quad\text{so no midpoint fallback},\\
-6.&\quad \texttt{plane\_placed}=\texttt{true}.
-\end{aligned}
-$$
-
-Here **the required distance is 1 and the measured anchor distance is 3**.
-Choosing the plane has not moved either endpoint.
-
-Later, with $\gamma=0.85$, truncation gives
-
-$$
-t^-=0.85\frac{7-1}{12}=0.425,
-\qquad
-t^+=0.85\frac{3-1}{4}=0.425.
-$$
-
-The accepted positions are $5.1$ and $8.3$:
-
-| Evaluation | Negative / positive positions | Signed distances to the plane at 7 | Smallest distance |
-| --- | --- | --- | --- |
-| Plane acceptance, at anchors | $0,\ 10$ | $7,\ 3$ | $3$: this is `measured_clearance`. |
-| Proposed trial, before truncation | $12,\ 6$ | $-5,\ -1$ | $-5$: the complete motion violates the requirement. |
-| Accepted motion, after truncation | $5.1,\ 8.3$ | $1.9,\ 1.3$ | $1.3$: the accepted endpoints still satisfy $\varepsilon=1$. |
-
-The requirement stays at 1 through all three evaluations. The measured
-anchor distance of 3 and the post-truncation distance of 1.3 refer to
-different positions.
-
-For a separate thin-gap case with gap $1.5\varepsilon$, even a midpoint
-plane leaves only $0.75\varepsilon$ on each side. That plane is rejected;
-we do not reduce the requirement to make it pass.
+The solver defaults to a topology threshold of 2 for both contact methods. For the cloth-twist diagnostics we explicitly set the threshold to 1 so distinct features one mesh edge apart can collide during a tight fold. Explicit exclusion maps or a wider topology filter remove protection for the excluded pairs.

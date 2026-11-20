@@ -4,7 +4,6 @@
 """Behavioral tests for the ALM-DAT self-contact path of SolverVBD."""
 
 import unittest
-import warnings
 
 import numpy as np
 import warp as wp
@@ -146,15 +145,16 @@ def test_alm_dat_pinched_strip_never_crosses_the_fixed_plate(test, device):
 
 
 def test_alm_dat_reports_lost_coverage_on_buffer_overflow(test, device):
-    """Flag the step as uncertified when the shared contact buffer drops pairs, and recover after growth."""
+    """Advance with the stored pairs on overflow, flag the lost coverage, and recover after growth."""
     model, _counts = _pinch_model(device)
     solver = _solver(model, "alm_dat", particle_vertex_contact_buffer_size=1, particle_edge_contact_buffer_size=1)
     state, output = model.state(), model.state()
     dt = 1.0 / 60.0
+    initial_positions_np = state.particle_q.numpy().copy()
     solver.step(state, output, None, None, dt)
+    test.assertGreater(np.max(np.abs(output.particle_q.numpy() - initial_positions_np)), 0.0)
     test.assertFalse(solver.particle_dat_coverage_ok())
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "overflowed"):
         grew = solver.check_and_grow_self_contact_buffers()
     test.assertTrue(grew)
     solver.step(output, state, None, None, dt)

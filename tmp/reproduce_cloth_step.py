@@ -23,7 +23,6 @@ import warp as wp
 
 sys.path.insert(0, str(Path.cwd()))
 
-import newton._src.solvers.vbd.solver_vbd as solver_module
 import newton.viewer
 from newton.examples.vbd.example_vbd_rest_on_contact import Example
 
@@ -83,7 +82,7 @@ def replay(example):
     ideal_start_velocity_np = initial_velocity_np + example.sim_time * gravity_np
     expected_velocity_np = input_velocity_np + example.sim_dt * gravity_np
     input_speed = -float(np.average(input_velocity_np[:, 2], weights=masses_np))
-    original_commit = solver_module.commit_truncated_displacement
+    original_advance = solver._alm_dat_truncate
     original_detection = solver._collision_detection_penetration_free
     records = []
     arrays = {"step_start": previous_np, "tri_indices": example.model.tri_indices.numpy()}
@@ -100,12 +99,15 @@ def replay(example):
         detections += 1
         return result
 
-    def observe(reference, anchor, trial, sigma, *, budget, anchor_out):
+    def observe(trial, *, refresh_normals):
         index = len(records)
-        reference_np, anchor_np = reference.numpy(), anchor.numpy()
-        trial_np, sigma_np = trial.numpy(), sigma.numpy()
-        original_commit(reference, anchor, trial, sigma, budget=budget, anchor_out=anchor_out)
-        accepted_np = anchor_out.numpy()
+        reference_np = solver.pos_prev_collision_detection.numpy().copy()
+        anchor_np = solver._dat_anchor.numpy().copy()
+        trial_np = trial.numpy().copy()
+        budget = solver._alm_dat_budget()
+        original_advance(trial, refresh_normals=refresh_normals)
+        accepted_np = solver._dat_anchor.numpy().copy()
+        sigma_np = solver.truncation_ts.numpy().copy()
         for field, value in (
             ("reference", reference_np),
             ("anchor_before", anchor_np),
@@ -127,12 +129,12 @@ def replay(example):
             }
         )
 
-    solver_module.commit_truncated_displacement = observe
+    solver._alm_dat_truncate = observe
     solver._collision_detection_penetration_free = checked_detection
     try:
         example.step()
     finally:
-        solver_module.commit_truncated_displacement = original_commit
+        solver._alm_dat_truncate = original_advance
         solver._collision_detection_penetration_free = original_detection
     assert len(records) == 8 and detections == 2
     assert solver._self_contact_mode_this_step.name == "PRE_POST_INIT"

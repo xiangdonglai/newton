@@ -7685,6 +7685,7 @@ def _run_soft_self_dat_truncation(
             collision_info,
             0.85,
             stride,
+            False,  # separator diagnostics
         ],
         outputs=[truncation_t],
         device=device,

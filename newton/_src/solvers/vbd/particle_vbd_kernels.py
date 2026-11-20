@@ -2067,6 +2067,29 @@ def create_edge_edge_division_plane_closest_pt(
     return True, n, d, separation_eps
 
 
+@wp.func
+def _dat_midpoint_clearance(
+    n: wp.vec3, positive_a: wp.vec3, positive_b: wp.vec3, negative_a: wp.vec3, negative_b: wp.vec3, negative_c: wp.vec3
+):
+    """Measure the best-centered float32 plane along this normal after the proposed plane misses the band.
+
+    Repeat an endpoint for a vertex or edge with fewer corners. This diagnostic uses the
+    same midpoint fallback as ALM-DAT and leaves the penalty-DAT truncation unchanged.
+    """
+    origin = wp.vec3d(negative_a)
+    normal = wp.vec3d(n)
+    pos = wp.min(wp.dot(normal, wp.vec3d(positive_a) - origin), wp.dot(normal, wp.vec3d(positive_b) - origin))
+    neg = wp.max(
+        wp.float64(0.0),
+        wp.max(wp.dot(normal, wp.vec3d(negative_b) - origin), wp.dot(normal, wp.vec3d(negative_c) - origin)),
+    )
+    point = wp.vec3(origin + ((pos + neg) / (wp.float64(2.0) * wp.dot(normal, normal))) * normal)
+    return wp.min(
+        wp.min(wp.dot(n, positive_a - point), wp.dot(n, positive_b - point)),
+        wp.min(wp.dot(-n, negative_a - point), wp.min(wp.dot(-n, negative_b - point), wp.dot(-n, negative_c - point))),
+    )
+
+
 @wp.kernel
 def apply_planar_truncation_parallel_by_collision(
     # inputs
@@ -2077,6 +2100,7 @@ def apply_planar_truncation_parallel_by_collision(
     collision_info: TriMeshCollisionInfo,
     gamma: float,
     stride: int,
+    report_failed_planes: bool,
     truncation_t_out: wp.array[float],
 ):
     """Clip displacements against certified contact separation planes: one
@@ -2130,6 +2154,23 @@ def apply_planar_truncation_parallel_by_collision(
         # reference indefinitely. Contact forces separate it and a later detection
         # certifies a separator.
         if valid_plane:
+            if report_failed_planes:
+                clearance = wp.min(
+                    wp.min(wp.dot(n, e1_v1_pos - d), wp.dot(n, e1_v2_pos - d)),
+                    wp.min(wp.dot(-n, e2_v1_pos - d), wp.dot(-n, e2_v2_pos - d)),
+                )
+                if clearance < separation_eps:
+                    clearance = _dat_midpoint_clearance(n, e1_v1_pos, e1_v2_pos, e2_v1_pos, e2_v2_pos, e2_v2_pos)
+                if clearance < separation_eps:
+                    wp.printf(
+                        "Warning: penalty-DAT found no valid separation plane for EE row %d: "
+                        "edges=(%d, %d), clearance=%g, required=%g\n",
+                        i,
+                        e1_idx,
+                        e2_idx,
+                        clearance,
+                        separation_eps,
+                    )
             t = planar_truncation_t(e1_v1_pos, delta_e1_v1, n, d, gamma, separation_eps)
             if t < 1.0:
                 wp.atomic_min(truncation_t_out, e1_v1, t)
@@ -2142,6 +2183,13 @@ def apply_planar_truncation_parallel_by_collision(
             t = planar_truncation_t(e2_v2_pos, delta_e2_v2, -n, d, gamma, separation_eps)
             if t < 1.0:
                 wp.atomic_min(truncation_t_out, e2_v2, t)
+        elif report_failed_planes:
+            wp.printf(
+                "Warning: penalty-DAT found no separating normal for EE row %d: edges=(%d, %d)\n",
+                i,
+                e1_idx,
+                e2_idx,
+            )
         i += stride
 
     # vertex-triangle pairs
@@ -2180,6 +2228,23 @@ def apply_planar_truncation_parallel_by_collision(
         # Same policy as the edge-edge pass: a zero-gap or intersecting pair has no
         # strict separator and is left unconstrained for this pass.
         if valid_plane:
+            if report_failed_planes:
+                clearance = wp.min(
+                    wp.min(wp.dot(n, colliding_particle_pos - d), wp.dot(-n, t1 - d)),
+                    wp.min(wp.dot(-n, t2 - d), wp.dot(-n, t3 - d)),
+                )
+                if clearance < separation_eps:
+                    clearance = _dat_midpoint_clearance(n, colliding_particle_pos, colliding_particle_pos, t1, t2, t3)
+                if clearance < separation_eps:
+                    wp.printf(
+                        "Warning: penalty-DAT found no valid separation plane for VT row %d: "
+                        "vertex=%d, triangle=%d, clearance=%g, required=%g\n",
+                        i,
+                        particle_idx,
+                        tri_idx,
+                        clearance,
+                        separation_eps,
+                    )
             t = planar_truncation_t(
                 colliding_particle_pos, colliding_particle_displacement, n, d, gamma, separation_eps
             )
@@ -2194,6 +2259,13 @@ def apply_planar_truncation_parallel_by_collision(
             t = planar_truncation_t(t3, delta_t3, -n, d, gamma, separation_eps)
             if t < 1.0:
                 wp.atomic_min(truncation_t_out, tri_c, t)
+        elif report_failed_planes:
+            wp.printf(
+                "Warning: penalty-DAT found no separating normal for VT row %d: vertex=%d, triangle=%d\n",
+                i,
+                particle_idx,
+                tri_idx,
+            )
 
         i += stride
 
