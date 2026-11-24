@@ -50,6 +50,57 @@ The central difference is:
 | Update | $\mathbf y \leftarrow \mathcal T_{\mathbf r}(\mathbf r,\mathbf y)$ | $\mathbf a \leftarrow \mathcal T_{\mathbf r}(\mathbf a,\mathbf y)$ |
 | What stays unchanged by this operation? | Reference | Reference **and trial** |
 
+### One ALM-DAT substep in pseudocode
+
+Here `r` is the collision-detection reference, `a` is the accepted anchor, and
+`y` is the solver trial. `P` contains one separating plane per detected pair.
+`build_planes(pairs, a, y)` finds separating normals at `a` and places the
+planes using the proposed motion from `a` to `y`. The design branch uses
+stored planes. The optional `slide` and `rotate` modes below are in the
+[current-trial worktree](../../newton-alm-dat-trial-study/newton/_src/solvers/vbd/solver_vbd.py#L4102).
+
+```text
+ 1 | function _alm_dat_truncate(r, a, y, P):
+ 2 |     optionally P = build_planes(the same pairs, a, y)  # Reuse, slide or rotate at the current anchor
+ 3 |     a = advance_contact_anchors(a toward y, subject to P and the motion bound around r)
+ 4 |     P = build_planes(the same pairs, a, y)             # Refresh normals at the updated anchor, same trial
+ 5 |     return a, P
+ 6 |
+ 7 | # Start the substep at the accepted particle positions x0.
+ 8 | r = x0
+ 9 | pairs = detect_self_contacts(r)
+10 | a = r
+11 | y = predict_positions(x0, velocity, external_forces, dt)
+12 | P = build_planes(pairs, a, y)
+13 | restore contact multipliers for matching pairs
+14 | a, P = _alm_dat_truncate(r, a, y, P)      # Same y that was just used to place P
+15 |
+16 | if collision schedule is PRE_POST_INIT:
+17 |     save the current contact multipliers
+18 |     r = a                                # Restart the motion bound at this accepted anchor
+19 |     pairs = detect_self_contacts(r)
+20 |     P = build_planes(pairs, a, y)         # Preserve the trial's world-space positions
+21 |     restore contact multipliers for matching pairs
+22 |
+23 | for iteration = 1 through the number of VBD iterations:
+24 |     for each vertex color group:
+25 |         update that group's positions in y using forces evaluated at y
+26 |     update the contact multipliers using y
+27 |     if the configured checkpoint is due:  # By default, after every full iteration
+28 |         a, P = _alm_dat_truncate(r, a, y, P)
+29 |
+30 | repeat particle_dat_truncation_iterations times (default 2):
+31 |     a, P = _alm_dat_truncate(r, a, y, P)  # Every final round targets the same y
+32 | save the contact multipliers for the next substep
+33 | return positions = a, velocity = (a - x0) / dt
+```
+
+Initialization and the iteration checkpoint call the same truncation function.
+At initialization the plane was just built for the prediction. At a later
+checkpoint VBD may have changed the trial, which is when the optional pre-advance
+refit can help. In all three modes truncation updates the anchor and leaves the
+trial available to the next solver iteration. [Initialization and anchor advance](../newton/_src/solvers/vbd/solver_vbd.py#L4100)
+
 ## 2. Initialization
 
 Both methods detect contacts at the input configuration and set
