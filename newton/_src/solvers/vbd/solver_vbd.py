@@ -1093,6 +1093,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.particle_penalty_dat_report_failed_planes = particle_penalty_dat_report_failed_planes
         self.particle_self_contact_method = particle_self_contact_method
         self._alm_dat = particle_self_contact_method == "alm_dat"
+        # Temporary ALM self-contact Hessian switch: 0 = original, 1 = same-color weighted bound.
+        # Set before CUDA graph capture; changing it afterward requires recapture.
+        self._particle_contact_stiffness_mode = 1
 
         # With an owned pipeline, seed its self-contact configuration from the solver's
         # parameters before the base class allocates the owned Contacts buffer.
@@ -4911,6 +4914,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self._dat_planes,
                     self._dat_alm_state,
                     self._dat_material_hessian,
+                    contact_stiffness_mode=self._particle_contact_stiffness_mode,
                     stiffness=self.model.soft_contact_ke,
                     radius=self.particle_self_contact_margin,
                     hard_gap=self.particle_contact_alm_hard_gap,

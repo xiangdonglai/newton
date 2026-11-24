@@ -1206,13 +1206,53 @@ def _alm_contact_response(
     return normal_force, normal_stiffness, friction_force, friction_jacobian, transmitted
 
 
+@wp.func
+def _accumulate_alm_contact_for_color(
+    ids: wp.vec4i,
+    weights: wp.vec4,
+    force: wp.vec3,
+    hessian: wp.mat33,
+    color: int,
+    contact_stiffness_mode: int,
+    particle_colors: wp.array[int],
+    particle_flags: wp.array[int],
+    inv_mass: wp.array[float],
+    particle_forces: wp.array[wp.vec3],
+    particle_hessians: wp.array[wp.mat33],
+):
+    """Accumulate one VT or EE contact for the vertices updated simultaneously in this color."""
+    color_weights = wp.vec4(0.0)
+    weight_sum = float(0.0)
+    for j in range(4):
+        p = ids[j]
+        if particle_colors[p] == color:
+            color_weights[j] = weights[j]
+            if contact_stiffness_mode == 1 and inv_mass[p] > 0.0 and particle_flags[p] & ParticleFlags.ACTIVE:
+                weight_sum += wp.abs(weights[j])
+
+    # A contact couples same-color vertices even when they share no material element.
+    # For their simultaneous displacements d_j, Cauchy-Schwarz bounds the contact curvature
+    # ||sum_j w_j d_j||_H^2 by (sum_j |w_j|) sum_j |w_j| ||d_j||_H^2.
+    for j in range(4):
+        w = color_weights[j]
+        if w != 0.0:
+            p = ids[j]
+            curvature_weight = w * w
+            if contact_stiffness_mode == 1 and inv_mass[p] > 0.0 and particle_flags[p] & ParticleFlags.ACTIVE:
+                curvature_weight = wp.abs(w) * weight_sum
+            wp.atomic_add(particle_forces, p, w * force)
+            wp.atomic_add(particle_hessians, p, curvature_weight * hessian)
+
+
 @wp.kernel
 def _accumulate_alm_contact_force_and_hessian_kernel(
     dt: float,
     current_color: int,
+    contact_stiffness_mode: int,
     pos: wp.array[wp.vec3],
     pos_prev: wp.array[wp.vec3],
     particle_colors: wp.array[int],
+    particle_flags: wp.array[int],
     inv_mass: wp.array[float],
     material_hessian: wp.array[wp.mat33],
     tri_indices: wp.array2d[wp.int32],
@@ -1240,8 +1280,9 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
     is the thickness at which the hard wall sits above the stored division plane,
     so a loaded contact rests on the wall and never touches the safety plane; the
     cushion spans ``hard_gap`` to ``radius``. A vertex with signed weight ``w``
-    receives ``w * normal_force * n - w * friction_force`` and the Hessian
-    ``w^2 (normal_stiffness n n^T + friction_jacobian)``."""
+    receives ``w * (normal_force * n - friction_force)``. The diagonal Hessian
+    uses w^2 B in mode 0 or |w| sum_j |w_j| B in mode 1 for movable vertices
+    solved in the same color."""
     t_id = wp.tid()
 
     ee_offsets = collision_info.edge_colliding_edges_offsets
@@ -1272,28 +1313,19 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
                 friction_mu,
             )
             if normal_force > 0.0 or normal_stiffness > 0.0 or wp.length_sq(friction_force) > 0.0:
-                force_vec = normal_force * n
-                hessian = normal_stiffness * wp.outer(n, n) + friction_jacobian
-                w0 = 1.0 - s
-                w1 = s
-                w2 = -(1.0 - t)
-                w3 = -t
-                v0 = edge_indices[e1, 2]
-                v1 = edge_indices[e1, 3]
-                v2 = edge_indices[e2, 2]
-                v3 = edge_indices[e2, 3]
-                if particle_colors[v0] == current_color:
-                    wp.atomic_add(particle_forces, v0, w0 * force_vec - w0 * friction_force)
-                    wp.atomic_add(particle_hessians, v0, w0 * w0 * hessian)
-                if particle_colors[v1] == current_color:
-                    wp.atomic_add(particle_forces, v1, w1 * force_vec - w1 * friction_force)
-                    wp.atomic_add(particle_hessians, v1, w1 * w1 * hessian)
-                if particle_colors[v2] == current_color:
-                    wp.atomic_add(particle_forces, v2, w2 * force_vec - w2 * friction_force)
-                    wp.atomic_add(particle_hessians, v2, w2 * w2 * hessian)
-                if particle_colors[v3] == current_color:
-                    wp.atomic_add(particle_forces, v3, w3 * force_vec - w3 * friction_force)
-                    wp.atomic_add(particle_hessians, v3, w3 * w3 * hessian)
+                _accumulate_alm_contact_for_color(
+                    wp.vec4i(edge_indices[e1, 2], edge_indices[e1, 3], edge_indices[e2, 2], edge_indices[e2, 3]),
+                    wp.vec4(1.0 - s, s, t - 1.0, -t),
+                    normal_force * n - friction_force,
+                    normal_stiffness * wp.outer(n, n) + friction_jacobian,
+                    current_color,
+                    contact_stiffness_mode,
+                    particle_colors,
+                    particle_flags,
+                    inv_mass,
+                    particle_forces,
+                    particle_hessians,
+                )
         i += stride
 
     vt_offsets = collision_info.vertex_colliding_triangles_offsets
@@ -1324,16 +1356,19 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
                 friction_mu,
             )
             if normal_force > 0.0 or normal_stiffness > 0.0 or wp.length_sq(friction_force) > 0.0:
-                force_vec = normal_force * n
-                hessian = normal_stiffness * wp.outer(n, n) + friction_jacobian
-                if particle_colors[v] == current_color:
-                    wp.atomic_add(particle_forces, v, force_vec - friction_force)
-                    wp.atomic_add(particle_hessians, v, hessian)
-                for j in range(3):
-                    u = tri_indices[tri, j]
-                    if particle_colors[u] == current_color:
-                        wp.atomic_add(particle_forces, u, -bary[j] * force_vec + bary[j] * friction_force)
-                        wp.atomic_add(particle_hessians, u, bary[j] * bary[j] * hessian)
+                _accumulate_alm_contact_for_color(
+                    wp.vec4i(v, tri_indices[tri, 0], tri_indices[tri, 1], tri_indices[tri, 2]),
+                    wp.vec4(1.0, -bary[0], -bary[1], -bary[2]),
+                    normal_force * n - friction_force,
+                    normal_stiffness * wp.outer(n, n) + friction_jacobian,
+                    current_color,
+                    contact_stiffness_mode,
+                    particle_colors,
+                    particle_flags,
+                    inv_mass,
+                    particle_forces,
+                    particle_hessians,
+                )
         i += stride
 
 
@@ -1479,6 +1514,7 @@ def accumulate_alm_contact_force_and_hessian(
     alm: ParticleContactAlmState,
     material_hessian: wp.array,
     *,
+    contact_stiffness_mode: int = 1,
     stiffness: float,
     radius: float,
     hard_gap: float,
@@ -1498,9 +1534,11 @@ def accumulate_alm_contact_force_and_hessian(
         inputs=[
             float(dt),
             int(color),
+            int(contact_stiffness_mode),
             pos,
             pos_prev,
             model.particle_colors,
+            model.particle_flags,
             model.particle_inv_mass,
             material_hessian,
             model.tri_indices,

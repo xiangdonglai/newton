@@ -10,6 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.particle_dat_kernels import (
+    accumulate_alm_contact_force_and_hessian,
     alm_contact_row,
     alm_contact_row_smooth,
     alm_friction_row,
@@ -522,6 +523,80 @@ def test_smooth_transition_raises_the_stiffness_toward_the_wall_without_a_jump(t
     np.testing.assert_allclose(force_fp, expected, rtol=1.0e-4, atol=1.0e-5)
 
 
+def test_loaded_contact_between_same_color_vertices(test, device):
+    """A free vertex pressed against the center of a four-triangle fan should support the applied load."""
+    hard_gap = 0.0005
+    load = 24.0
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_particle(wp.vec3(0.0), wp.vec3(0.0), 1.0)
+    builder.add_particle(wp.vec3(0.0, 0.0, hard_gap), wp.vec3(0.0), 1.0)
+    for x, y in ((0.25, 0.0), (0.0, 0.25), (-0.25, 0.0), (0.0, -0.25)):
+        builder.add_particle(wp.vec3(x, y, 0.0), wp.vec3(0.0), 0.0)
+    for i in range(4):
+        builder.add_triangle(0, 2 + i, 2 + (i + 1) % 4, tri_ke=0.0, tri_ka=0.0, tri_kd=0.0)
+    # The two central vertices share the four contact rows but no material element.
+    builder.particle_color_groups = [np.array(group, dtype=int) for group in ([0, 1], [2, 4], [3, 5])]
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 1000.0
+    model.soft_contact_kd = 0.0
+    model.soft_contact_mu = 0.0
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=16,
+        particle_enable_self_contact=True,
+        particle_self_contact_method="alm_dat",
+        particle_self_contact_margin=0.002,
+        particle_self_contact_gap=0.002,
+        particle_contact_alm_hard_gap=hard_gap,
+        particle_topological_contact_filter_threshold=1,
+    )
+    state_in, state_out = model.state(), model.state()
+    external_force = np.zeros((model.particle_count, 3), dtype=np.float32)
+    external_force[:2, 2] = (load, -load)
+    state_in.particle_f.assign(external_force)
+    solver.step(state_in, state_out, None, None, 1.0 / 600.0)
+
+    # Equal and opposite forces leave both vertices stationary at the hard gap.
+    count = solver.trimesh_collision_info.vertex_colliding_triangles_offsets.numpy()[-1]
+    test.assertEqual(count, 4)
+    np.testing.assert_allclose(state_out.particle_q.numpy()[:2, 2], [0.0, hard_gap], atol=1.0e-7)
+    reaction = np.dot(solver._dat_alm_state.vt_lambda.numpy()[:count], solver._dat_planes.vt_normal.numpy()[:count, 2])
+    test.assertAlmostEqual(float(reaction), load, places=3)
+
+    # At this contact the two free vertices have weights +1 and -1. Switching
+    # to the weighted bound doubles their contact blocks while keeping forces.
+    responses = []
+    for mode in (0, 1):
+        forces = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
+        hessians = wp.zeros(model.particle_count, dtype=wp.mat33, device=device)
+        accumulate_alm_contact_force_and_hessian(
+            model,
+            1.0 / 600.0,
+            0,
+            state_out.particle_q,
+            solver.particle_q_prev,
+            solver.trimesh_collision_info,
+            solver._dat_planes,
+            solver._dat_alm_state,
+            solver._dat_material_hessian,
+            contact_stiffness_mode=mode,
+            stiffness=model.soft_contact_ke,
+            radius=solver.particle_self_contact_margin,
+            hard_gap=solver.particle_contact_alm_hard_gap,
+            damping=model.soft_contact_kd,
+            friction_mu=model.soft_contact_mu,
+            parallel_eps=solver._self_contact_edge_edge_parallel_epsilon,
+            launch_size=solver.particle_self_contact_evaluation_kernel_launch_size,
+            particle_forces=forces,
+            particle_hessians=hessians,
+        )
+        responses.append((forces.numpy(), hessians.numpy()))
+    test.assertGreater(np.linalg.norm(responses[0][0]), 0.0)
+    test.assertGreater(np.linalg.norm(responses[0][1]), 0.0)
+    np.testing.assert_allclose(responses[1][0], responses[0][0], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(responses[1][1], 2.0 * responses[0][1], rtol=1e-6, atol=1e-6)
+
+
 def test_overloaded_vertex_rests_inside_the_transition_band(test, device):
     """With the smooth law a vertex heavier than the cushion rests above the wall, inside the band,
     with the multiplier equal to its weight and without sinking."""
@@ -636,6 +711,13 @@ add_function_test(
     TestParticleContactAlm,
     "test_overloaded_vertex_rests_inside_the_transition_band",
     test_overloaded_vertex_rests_inside_the_transition_band,
+    devices=devices,
+)
+
+add_function_test(
+    TestParticleContactAlm,
+    "test_loaded_contact_between_same_color_vertices",
+    test_loaded_contact_between_same_color_vertices,
     devices=devices,
 )
 
