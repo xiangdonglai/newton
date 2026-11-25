@@ -1092,6 +1092,147 @@ def _eval_vertex_triangle_contact_rigid_motion_kernel(
     damping_delta_norms[sample] = soft_delta
 
 
+@wp.kernel
+def _self_contact_friction_normal_derivative_kernel(
+    pos: wp.array[wp.vec3],
+    pos_prev: wp.array[wp.vec3],
+    triangles: wp.array2d[int],
+    edge_pos: wp.array[wp.vec3],
+    edge_pos_prev: wp.array[wp.vec3],
+    edges: wp.array2d[int],
+    friction_normal_derivative: int,
+    forces: wp.array2d[wp.vec3],
+    normal_columns: wp.array2d[wp.vec3],
+):
+    i = wp.tid()
+    f, h = particle_vbd_kernels.evaluate_vertex_triangle_collision_force_hessian(
+        4 * i + 3,
+        3,
+        i,
+        pos,
+        pos_prev,
+        triangles,
+        0.003,
+        20000.0,
+        0.0,
+        0.2,
+        0.01,
+        1.0 / 600.0,
+        friction_normal_derivative,
+    )
+    forces[0, i] = f
+    normal_columns[0, i] = h * wp.vec3(0.0, 0.0, 1.0)
+    _active, _f0, _f1, _f2, f, _h0, _h1, _h2, h = evaluate_vertex_triangle_collision_force_hessian_4_vertices(
+        4 * i + 3,
+        i,
+        pos,
+        pos_prev,
+        triangles,
+        0.003,
+        20000.0,
+        0.0,
+        0.2,
+        0.01,
+        1.0 / 600.0,
+        friction_normal_derivative,
+    )
+    forces[1, i] = f
+    normal_columns[1, i] = h * wp.vec3(0.0, 0.0, 1.0)
+    f, h = particle_vbd_kernels.evaluate_edge_edge_contact(
+        4 * i,
+        0,
+        2 * i,
+        2 * i + 1,
+        edge_pos,
+        edge_pos_prev,
+        edges,
+        0.003,
+        20000.0,
+        0.0,
+        0.2,
+        0.01,
+        1.0 / 600.0,
+        0.0,
+        friction_normal_derivative,
+    )
+    forces[2, i] = f
+    # Both endpoints move together; the midpoint contact has weight 1/2 per endpoint.
+    normal_columns[2, i] = 2.0 * h * wp.vec3(0.0, 0.0, 1.0)
+    _active, f, _f1, h, _h1 = particle_vbd_kernels.evaluate_edge_edge_contact_2_vertices(
+        2 * i,
+        2 * i + 1,
+        edge_pos,
+        edge_pos_prev,
+        edges,
+        0.003,
+        20000.0,
+        0.0,
+        0.2,
+        0.01,
+        1.0 / 600.0,
+        0.0,
+        friction_normal_derivative,
+    )
+    forces[3, i] = f
+    normal_columns[3, i] = 2.0 * h * wp.vec3(0.0, 0.0, 1.0)
+
+
+def test_self_contact_friction_normal_derivative(test, device):
+    """Differentiate pressure-dependent friction in the penalty, barrier and released regimes."""
+    epsilon = 1.0e-6
+    positions, previous, triangles = [], [], []
+    edge_positions, edge_previous, edges = [], [], []
+    for gap in (0.002, 0.00075, 0.004):
+        for delta in (-epsilon, 0.0, epsilon):
+            i = len(triangles)
+            triangle = [[-0.1, -0.1, 0.0], [0.1, -0.1, 0.0], [0.0, 0.1, 0.0]]
+            positions.extend([*triangle, [0.0, 0.0, gap + delta]])
+            previous.extend([*triangle, [-0.0005, 0.0, gap]])
+            triangles.append([4 * i, 4 * i + 1, 4 * i + 2])
+            edge_positions.extend(
+                [[-0.1, 0.0, gap + delta], [0.1, 0.0, gap + delta], [0.0, -0.1, 0.0], [0.0, 0.1, 0.0]]
+            )
+            edge_previous.extend([[-0.1005, 0.0, gap], [0.0995, 0.0, gap], [0.0, -0.1, 0.0], [0.0, 0.1, 0.0]])
+            edges.extend([[-1, -1, 4 * i, 4 * i + 1], [-1, -1, 4 * i + 2, 4 * i + 3]])
+    forces = wp.empty((4, 9), dtype=wp.vec3, device=device)
+    normal_columns = wp.empty_like(forces)
+    inputs = [
+        wp.array(positions, dtype=wp.vec3, device=device),
+        wp.array(previous, dtype=wp.vec3, device=device),
+        wp.array(triangles, dtype=int, device=device),
+        wp.array(edge_positions, dtype=wp.vec3, device=device),
+        wp.array(edge_previous, dtype=wp.vec3, device=device),
+        wp.array(edges, dtype=int, device=device),
+    ]
+    wp.launch(
+        _self_contact_friction_normal_derivative_kernel,
+        dim=9,
+        inputs=[*inputs, 1],
+        outputs=[forces, normal_columns],
+        device=device,
+    )
+    f = forces.numpy().copy().reshape(4, 3, 3, 3)
+    columns = normal_columns.numpy().copy().reshape(4, 3, 3, 3)
+    np.testing.assert_allclose(f[0], f[1], atol=1.0e-6)
+    np.testing.assert_allclose(f[2], f[3], atol=1.0e-6)
+    for variant in range(4):
+        numeric = -(f[variant, :, 2] - f[variant, :, 0]) / (2.0 * epsilon)
+        np.testing.assert_allclose(columns[variant, :, 1], numeric, rtol=2.0e-3, atol=0.1)
+
+    wp.launch(
+        _self_contact_friction_normal_derivative_kernel,
+        dim=9,
+        inputs=[*inputs, 0],
+        outputs=[forces, normal_columns],
+        device=device,
+    )
+    np.testing.assert_array_equal(forces.numpy().reshape(f.shape), f)
+    original_columns = normal_columns.numpy().reshape(columns.shape)
+    np.testing.assert_array_equal(original_columns[..., 2], columns[..., 2])
+    np.testing.assert_allclose(original_columns[..., :2], 0.0, atol=1.0e-6)
+    test.assertGreater(float(np.max(np.abs(columns[..., 0]))), 1.0)
+
+
 def test_self_contact_barrier_c2_at_tau(test, device):
     """Barrier must be C2-continuous at d = tau (= collision_radius / 2).
 
@@ -9144,6 +9285,14 @@ add_function_test(
     "test_provenance_graph_replay",
     _rigid_contact_history_provenance_graph_replay,
     devices=cuda_devices,
+)
+
+
+add_function_test(
+    TestSolverVBD,
+    "test_self_contact_friction_normal_derivative",
+    test_self_contact_friction_normal_derivative,
+    devices=devices,
 )
 
 

@@ -964,7 +964,14 @@ def alm_contact_row_smooth(
 
 
 @wp.func
-def alm_friction_row(lambda_t: wp.vec3, rho_t: float, rel: wp.vec3, n: wp.vec3, radius: float):
+def alm_friction_row(
+    lambda_t: wp.vec3,
+    rho_t: float,
+    rel: wp.vec3,
+    n: wp.vec3,
+    radius: float,
+    radius_normal_derivative: float = 0.0,
+):
     """Coulomb friction as a tangential multiplier capped by the normal force.
 
     ``rel`` is the displacement of the positive side relative to the negative
@@ -976,7 +983,10 @@ def alm_friction_row(lambda_t: wp.vec3, rho_t: float, rel: wp.vec3, n: wp.vec3, 
     side (the positive side receives its negative, so friction opposes the slip),
     and the local Jacobian with respect to the positive side's displacement:
     ``rho_t P`` inside the disk, ``rho_t r / |trial| (P - u u^T)`` on its rim
-    and zero when released. Both blocks are positive semidefinite.
+    and zero when released. These fixed-radius blocks are positive semidefinite.
+    On the rim, also include ``radius_normal_derivative u n^T`` when normal
+    separation changes the force cap. That term is generally nonsymmetric;
+    the default keeps the disk radius fixed for multiplier projection.
     """
     projector = wp.identity(3, float) - wp.outer(n, n)
     if radius <= 0.0:
@@ -986,7 +996,9 @@ def alm_friction_row(lambda_t: wp.vec3, rho_t: float, rel: wp.vec3, n: wp.vec3, 
     if magnitude <= radius:
         return trial, rho_t * projector
     u = trial / magnitude
-    return radius * u, rho_t * (radius / magnitude) * (projector - wp.outer(u, u))
+    jacobian = rho_t * (radius / magnitude) * (projector - wp.outer(u, u))
+    jacobian += radius_normal_derivative * wp.outer(u, n)
+    return radius * u, jacobian
 
 
 @wp.func
@@ -1181,6 +1193,7 @@ def _alm_contact_response(
     wall_stiffness_ratio: float,
     damping: float,
     friction_mu: float,
+    friction_normal_derivative: int = 1,
 ):
     """Evaluate one pair's full response at the current pose.
 
@@ -1202,7 +1215,15 @@ def _alm_contact_response(
     if friction_mu > 0.0 and transmitted > 0.0:
         # the tangential metric stays at the inertia scale: with the stiffness floor a
         # row saturates its Coulomb disk after microns of slip and acts as kinetic friction
-        friction_force, friction_jacobian = alm_friction_row(lambda_t, rho_t, rel, n, friction_mu * transmitted)
+        # The friction cap depends on transmitted force, excluding damping.
+        friction_force, friction_jacobian = alm_friction_row(
+            lambda_t,
+            rho_t,
+            rel,
+            n,
+            friction_mu * transmitted,
+            -friction_mu * k if friction_normal_derivative != 0 else 0.0,
+        )
     return normal_force, normal_stiffness, friction_force, friction_jacobian, transmitted
 
 
@@ -1231,8 +1252,10 @@ def _accumulate_alm_contact_for_color(
                 weight_sum += wp.abs(weights[j])
 
     # A contact couples same-color vertices even when they share no material element.
-    # For their simultaneous displacements d_j, Cauchy-Schwarz bounds the contact curvature
+    # For a positive-semidefinite contact block H, Cauchy-Schwarz bounds its curvature
     # ||sum_j w_j d_j||_H^2 by (sum_j |w_j|) sum_j |w_j| ||d_j||_H^2.
+    # Apply the same weighting to the full update matrix, including the nonsymmetric
+    # pressure derivative of sliding friction; that full matrix has no energy bound here.
     for j in range(4):
         w = color_weights[j]
         if w != 0.0:
@@ -1249,6 +1272,7 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
     dt: float,
     current_color: int,
     contact_stiffness_mode: int,
+    friction_normal_derivative: int,
     pos: wp.array[wp.vec3],
     pos_prev: wp.array[wp.vec3],
     particle_colors: wp.array[int],
@@ -1280,7 +1304,7 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
     is the thickness at which the hard wall sits above the stored division plane,
     so a loaded contact rests on the wall and never touches the safety plane; the
     cushion spans ``hard_gap`` to ``radius``. A vertex with signed weight ``w``
-    receives ``w * (normal_force * n - friction_force)``. The diagonal Hessian
+    receives ``w * (normal_force * n - friction_force)``. The diagonal update matrix
     uses w^2 B in mode 0 or |w| sum_j |w_j| B in mode 1 for movable vertices
     solved in the same color."""
     t_id = wp.tid()
@@ -1311,6 +1335,7 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
                 wall_stiffness_ratio,
                 damping,
                 friction_mu,
+                friction_normal_derivative,
             )
             if normal_force > 0.0 or normal_stiffness > 0.0 or wp.length_sq(friction_force) > 0.0:
                 _accumulate_alm_contact_for_color(
@@ -1354,6 +1379,7 @@ def _accumulate_alm_contact_force_and_hessian_kernel(
                 wall_stiffness_ratio,
                 damping,
                 friction_mu,
+                friction_normal_derivative,
             )
             if normal_force > 0.0 or normal_stiffness > 0.0 or wp.length_sq(friction_force) > 0.0:
                 _accumulate_alm_contact_for_color(
@@ -1515,6 +1541,7 @@ def accumulate_alm_contact_force_and_hessian(
     material_hessian: wp.array,
     *,
     contact_stiffness_mode: int = 1,
+    friction_normal_derivative: int = 1,
     stiffness: float,
     radius: float,
     hard_gap: float,
@@ -1535,6 +1562,7 @@ def accumulate_alm_contact_force_and_hessian(
             float(dt),
             int(color),
             int(contact_stiffness_mode),
+            int(friction_normal_derivative),
             pos,
             pos_prev,
             model.particle_colors,

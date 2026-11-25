@@ -1093,9 +1093,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.particle_penalty_dat_report_failed_planes = particle_penalty_dat_report_failed_planes
         self.particle_self_contact_method = particle_self_contact_method
         self._alm_dat = particle_self_contact_method == "alm_dat"
-        # Temporary ALM self-contact Hessian switch: 0 = original, 1 = same-color weighted bound.
+        # Temporary ALM self-contact stiffness switch: 0 = original, 1 = same-color weighting.
         # Set before CUDA graph capture; changing it afterward requires recapture.
         self._particle_contact_stiffness_mode = 1
+        # Temporary self-contact switch: 0 = original friction matrix, 1 = include dN/dd.
+        # Applies to penalty-DAT and ALM-DAT; set before CUDA graph capture.
+        self._particle_contact_friction_normal_derivative = 1
 
         # With an owned pipeline, seed its self-contact configuration from the solver's
         # parameters before the base class allocates the owned Contacts buffer.
@@ -4915,6 +4918,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self._dat_alm_state,
                     self._dat_material_hessian,
                     contact_stiffness_mode=self._particle_contact_stiffness_mode,
+                    friction_normal_derivative=self._particle_contact_friction_normal_derivative,
                     stiffness=self.model.soft_contact_ke,
                     radius=self.particle_self_contact_margin,
                     hard_gap=self.particle_contact_alm_hard_gap,
@@ -4947,6 +4951,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self.model.soft_contact_mu,
                         self.friction_epsilon,
                         self._self_contact_edge_edge_parallel_epsilon,
+                        self._particle_contact_friction_normal_derivative,
                         self.particle_self_contact_evaluation_kernel_launch_size,
                     ],
                     outputs=[self.particle_forces, self.particle_hessians],

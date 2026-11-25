@@ -914,9 +914,10 @@ def evaluate_edge_edge_contact(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    friction_normal_derivative: int = 1,
 ):
     r"""
-    Returns the edge-edge contact force and hessian, including the friction force.
+    Return the edge-edge contact force and local update matrix, including friction.
     Args:
         v:
         v_order: \in {0, 1, 2, 3}, 0, 1 is vertex 0, 1 of e1, 2,3 is vertex 0, 1 of e2
@@ -992,7 +993,9 @@ def evaluate_edge_edge_contact(
             )
         # fmt: on
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient, -dEdD, T, u, eps_U, d2E_dDdD, collision_normal, friction_normal_derivative
+        )
         friction_force = friction_force * v_bary
         friction_hessian = friction_hessian * v_bary * v_bary
 
@@ -1033,9 +1036,10 @@ def evaluate_edge_edge_contact_2_vertices(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    friction_normal_derivative: int = 1,
 ):
     r"""
-    Returns the edge-edge contact force and hessian, including the friction force.
+    Return the edge-edge contact force and local update matrix, including friction.
     Args:
         v:
         v_order: \in {0, 1, 2, 3}, 0, 1 is vertex 0, 1 of e1, 2,3 is vertex 0, 1 of e2
@@ -1108,7 +1112,9 @@ def evaluate_edge_edge_contact_2_vertices(
             )
         # fmt: on
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient, -dEdD, T, u, eps_U, d2E_dDdD, collision_normal, friction_normal_derivative
+        )
 
         # # fmt: off
         # if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1157,6 +1163,7 @@ def evaluate_vertex_triangle_collision_force_hessian(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    friction_normal_derivative: int = 1,
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1197,7 +1204,9 @@ def evaluate_vertex_triangle_collision_force_hessian(
         u = wp.transpose(T) * dx
         eps_U = friction_epsilon * dt
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient, -dEdD, T, u, eps_U, d2E_dDdD, collision_normal, friction_normal_derivative
+        )
 
         # fmt: off
         if wp.static("contact_force_hessian_vt" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1237,6 +1246,7 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    friction_normal_derivative: int = 1,
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1276,7 +1286,9 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
         u = wp.transpose(T) * dx
         eps_U = friction_epsilon * dt
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient, -dEdD, T, u, eps_U, d2E_dDdD, collision_normal, friction_normal_derivative
+        )
 
         # fmt: off
         if wp.static("contact_force_hessian_vt" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1346,14 +1358,31 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
 
 
 @wp.func
-def compute_friction(mu: float, normal_contact_force: float, T: mat32, u: wp.vec2, eps_u: float):
+def compute_friction(
+    mu: float,
+    normal_contact_force: float,
+    T: mat32,
+    u: wp.vec2,
+    eps_u: float,
+    normal_contact_stiffness: float,
+    normal: wp.vec3,
+    friction_normal_derivative: int = 1,
+):
     """
-    Returns the 1D friction force and hessian.
+    Return friction force and its local update matrix.
+
+    Retain the existing positive tangential approximation and include how
+    normal separation changes the friction magnitude. The added term is a
+    nonsymmetric negative force derivative, not an energy Hessian.
     Args:
         mu: Friction coefficient.
         normal_contact_force: normal contact force.
         T: Transformation matrix (3x2 matrix).
         u: 2D displacement vector.
+        eps_u: Tangential regularization length [m].
+        normal_contact_stiffness: Negative derivative of normal force with respect to separation [N/m].
+        normal: Unit direction from the negative contact side to the positive side.
+        friction_normal_derivative: Include normal-force dependence in the matrix when nonzero.
     """
     # Friction
     u_norm = wp.length(u)
@@ -1372,6 +1401,11 @@ def compute_friction(mu: float, normal_contact_force: float, T: mat32, u: wp.vec
         # Different from IPC, we treat the contact normal as constant
         # this significantly improves the stability
         hessian = mu * normal_contact_force * T * (f1_SF_over_x * wp.identity(2, float)) * wp.transpose(T)
+        if friction_normal_derivative != 0 and normal_contact_force > 0.0:
+            # Reducing normal pressure also reduces friction in this update.
+            pressure_derivative = -mu * normal_contact_stiffness * T * (f1_SF_over_x * u)
+            hessian += wp.outer(pressure_derivative, normal)
+
     else:
         force = wp.vec3(0.0, 0.0, 0.0)
         hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -1461,6 +1495,7 @@ def accumulate_self_contact_force_and_hessian(
     friction_mu: float,
     friction_epsilon: float,
     edge_edge_parallel_epsilon: float,
+    friction_normal_derivative: int,
     stride: int,
     # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
@@ -1502,6 +1537,7 @@ def accumulate_self_contact_force_and_hessian(
                     friction_epsilon,
                     dt,
                     edge_edge_parallel_epsilon,
+                    friction_normal_derivative,
                 )
             )
 
@@ -1554,6 +1590,7 @@ def accumulate_self_contact_force_and_hessian(
                 friction_mu,
                 friction_epsilon,
                 dt,
+                friction_normal_derivative,
             )
 
             if has_contact:

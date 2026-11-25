@@ -10,6 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.particle_dat_kernels import (
+    _alm_contact_response,
     accumulate_alm_contact_force_and_hessian,
     alm_contact_row,
     alm_contact_row_smooth,
@@ -121,6 +122,39 @@ def _run_friction_row(device, lambda_t, rel, n=(0.0, 0.0, 1.0), rho_t=100.0, rad
     return out_force.numpy(), out_jacobian.numpy()
 
 
+@wp.kernel
+def _contact_response_derivative_kernel(
+    delta: wp.array[wp.vec3],
+    gap: wp.array[float],
+    slip: wp.array[float],
+    friction_normal_derivative: int,
+    force: wp.array[wp.vec3],
+    negative_derivative: wp.array[wp.mat33],
+):
+    i = wp.tid()
+    n = wp.vec3(0.0, 0.6, 0.8)
+    normal_force, normal_stiffness, friction_force, friction_jacobian, _transmitted = _alm_contact_response(
+        gap[i] + wp.dot(n, delta[i]),
+        wp.vec3(slip[i], 0.0, 0.0) - 0.0001 * n + delta[i],
+        n,
+        0.7,
+        wp.vec3(0.01, 0.0, 0.0),
+        3000.0,
+        3000.0,
+        1.0 / 600.0,
+        1000.0,
+        0.01,
+        0.0001,
+        0.001,
+        10.0,
+        0.2,
+        0.2,
+        friction_normal_derivative,
+    )
+    force[i] = normal_force * n - friction_force
+    negative_derivative[i] = normal_stiffness * wp.outer(n, n) + friction_jacobian
+
+
 def test_friction_row_clamps_to_the_coulomb_disk(test, device):
     """Keep the tangential multiplier inside the Coulomb disk and drop its normal component."""
     lambda_t = [(0.2, 0.0, 0.5), (0.2, 0.0, 0.0), (0.0, 0.0, 0.0), (3.0, 0.0, 0.0)]
@@ -161,6 +195,46 @@ def test_friction_row_jacobian_matches_finite_differences(test, device):
             numeric[:, k] = (plus[0] - minus[0]) / (2.0 * h)
         np.testing.assert_allclose(jacobian[0], numeric, atol=2e-2 * 100.0, rtol=2e-2)
         test.assertGreaterEqual(np.linalg.eigvalsh(0.5 * (jacobian[0] + jacobian[0].T)).min(), -1e-4)
+
+    # The force consumer must also differentiate its normal-load-dependent cap.
+    # Test sticking, saturated sliding and release, with unchanged multipliers.
+    h = 1.0e-6
+    perturbations = np.concatenate([np.zeros((1, 3)), h * np.eye(3), -h * np.eye(3)])
+    delta = np.tile(perturbations, (3, 1))
+    gaps = np.repeat([0.005, 0.005, 0.02], 7)
+    slips = np.repeat([0.00001, 0.02, 0.02], 7)
+    force = wp.empty(21, dtype=wp.vec3, device=device)
+    derivative = wp.empty(21, dtype=wp.mat33, device=device)
+    inputs = [
+        wp.array(delta, dtype=wp.vec3, device=device),
+        wp.array(gaps, dtype=float, device=device),
+        wp.array(slips, dtype=float, device=device),
+    ]
+    wp.launch(
+        _contact_response_derivative_kernel,
+        dim=21,
+        inputs=[*inputs, 1],
+        outputs=[force, derivative],
+        device=device,
+    )
+    f = force.numpy().copy().reshape(3, 7, 3)
+    matrices = derivative.numpy().copy().reshape(3, 7, 3, 3)
+    for i in range(3):
+        numeric = -((f[i, 1:4] - f[i, 4:7]) / (2.0 * h)).T
+        np.testing.assert_allclose(matrices[i, 0], numeric, rtol=5.0e-3, atol=0.3)
+
+    wp.launch(
+        _contact_response_derivative_kernel,
+        dim=21,
+        inputs=[*inputs, 0],
+        outputs=[force, derivative],
+        device=device,
+    )
+    np.testing.assert_array_equal(force.numpy().reshape(f.shape), f)
+    original_matrices = derivative.numpy().reshape(matrices.shape)
+    np.testing.assert_allclose(original_matrices[:, 0], original_matrices[:, 0].transpose(0, 2, 1), atol=1.0e-5)
+    np.testing.assert_array_equal(original_matrices[[0, 2], 0], matrices[[0, 2], 0])
+    test.assertGreater(float(np.linalg.norm(original_matrices[1, 0] - matrices[1, 0])), 1.0)
 
 
 def _vertex_over_fixed_cloth(device, height):
