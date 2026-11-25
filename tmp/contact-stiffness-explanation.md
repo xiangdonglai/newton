@@ -2,7 +2,7 @@
 
 This document explains the geometry and intended contact condition first, then follows the calculation through ALM and the VBD position update. The change in this worktree concerns the **per-vertex contact Hessian approximation used when several vertices of one contact update simultaneously**. The contact model and DAT procedure described first provide the context for that change. Sections 6–7 define the coupled contact Hessian, construct the new per-vertex blocks, and prove why minimizing their quadratic upper bound decreases the coupled quadratic.
 
-The mathematical notation follows [Compliant Augmented Lagrangian Constraints with Automatic Metrics](/mnt/nvme1/Workspace/robotics/newton-collision/ctx/compliant_alm.pdf), revised November 15, 2026. Throughout this document, $\mathcal R$ means deformation calculated from the geometry, and $z$ means auxiliary deformation, as in the PDF's Equation (1).
+The notation follows `alm_contact_row`: $g(y)$ is the geometric gap above the hard limit, and $z$ is an auxiliary gap constrained to equal it. Section 2 defines the original contact energy before ALM is introduced. Section 8 connects this separation convention to the deformation convention in [Compliant Augmented Lagrangian Constraints with Automatic Metrics](/mnt/nvme1/Workspace/robotics/newton-collision/ctx/compliant_alm.pdf), revised November 15, 2026.
 
 **1. The geometry and the positions being evaluated**
 
@@ -25,7 +25,7 @@ $$
 d(y)=n^T\bigl(p_A(y)-p_B(y)\bigr).
 $$
 
-The picture below is a one-dimensional projection along $n$.
+Let $N\geq0$ denote the undamped repulsive force magnitude. The picture below is a one-dimensional projection along $n$.
 
 ```text
                      direction +n
@@ -39,7 +39,7 @@ The picture below is a one-dimensional projection along $n$.
 
 Thus $d$ is the separation between the two contact points along the stored normal. The individual distances from those points to the division plane are different quantities. In particular, moving the plane parallel to itself leaves this $d$ unchanged while the contact points and normal are fixed.
 
-The source computes closest-point interpolation weights, but uses the **stored plane normal** for the force direction and the signed separation. [Vertex–triangle geometry](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:1061) · [Edge–edge geometry](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:1112)
+The source computes closest-point interpolation weights, but uses the **stored plane normal** for the force direction and the signed separation. [Vertex–triangle geometry](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:1061) · [Edge–edge geometry](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:1112)
 
 **2. What contact condition do we want?**
 
@@ -47,76 +47,86 @@ For this scalar contact-force model, specify two distances.
 
 | Parameter | Meaning |
 |---|---|
-| $r$ | Separation at which the contact spring is uncompressed; the code calls it `radius` |
+| $r$ | Separation at which the contact spring is uncompressed; `radius` in `_alm_contact_response` |
 | $d_h$ | Minimum separation requested by this contact material model; the code calls it `hard_gap` |
+
+Measure the geometric gap from the hard limit, and define the width of the compressible layer:
+
+$$
+\boxed{g(y)=d(y)-d_h,\qquad R=r-d_h.}
+$$
+
+These are exactly `gap` and `radius` passed to `alm_contact_row`. The outer function `_alm_contact_response` takes the unshifted $d$ and $r$, then subtracts `hard_gap` from both before calling the scalar contact function. Thus $d$ and $g$ are different distances, and $r$ and $R$ are different widths.
 
 The intended material response is
 
 ```text
-d ≥ r           No spring compression and no material spring force.
-d_h < d < r     Compression r − d is allowed and resisted by a spring.
-d = d_h         The spring has reached its allowed compression limit.
-d < d_h         Violates the requested lower limit.
+g ≥ R           No spring compression and no material spring force.
+0 < g < R       Compression R − g is allowed and resisted by a spring.
+g = 0           The spring has reached its allowed compression limit.
+g < 0           Violates the requested lower limit.
 ```
 
-Define the geometric deformation, with compression positive, by
+The spring compression is unchanged by this shift:
 
 $$
-\boxed{\mathcal R(y)=r-d(y).}
+R-g(y)=(r-d_h)-(d(y)-d_h)=r-d(y).
 $$
 
-This $\mathcal R$ has the meaning of the geometric residual in the PDF's Equation (1). It is calculated from the proposed particle positions. A negative value means the contact points are farther apart than $r$.
-
-For one contact, the intended normal-contact problem can be written
+**Before applying ALM**, the normal-contact energy is
 
 $$
-\min_y\ E_0(y)+\frac K2\bigl[\max(\mathcal R(y),0)\bigr]^2
-\qquad\text{subject to}\qquad d(y)\geq d_h.
+\boxed{
+E_{\mathrm{contact}}(y)=
+\begin{cases}
+\displaystyle \frac K2[\max(R-g(y),0)]^2,&g(y)\geq0,\\[4pt]
++\infty,&g(y)<0.
+\end{cases}
+}
 $$
 
-Here $K$ is the finite contact spring stiffness. $E_0$ contains the timestep's inertia and elastic energy; damping and friction are added separately in the implementation. The spring resists compression, and the inequality imposes its maximum allowed compression. The upper distance $r$ is therefore not a hard minimum separation.
+Here $K$ is the finite spring stiffness. Infinite energy expresses the hard constraint; the code does not evaluate an infinite force. Equivalently, the intended position problem for one contact is
+
+$$
+\min_y\ E_0(y)+\frac K2[\max(R-g(y),0)]^2
+\qquad\text{subject to}\qquad g(y)\geq0.
+$$
+
+$E_0$ contains the timestep's inertia and elastic energy; damping and friction are added separately in the implementation. **The spring resists compression; the inequality supplies the hard limit.** The upper distance $r$ is not a hard minimum separation. At the limit $d=d_h$, the total reaction can exceed the spring's force $KR$ to resist further compression.
 
 This is the target of the **scalar force model**. A finite number of ALM iterations need not satisfy its inequality exactly. Also, a condition on these two interpolated points alone does not certify that the entire primitives remain disjoint.
 
 **DAT supplies the separate geometric check.** At a checkpoint, it limits motion from accepted positions $a_i$ toward proposed positions $y_i$, checking the primitive vertices against their separating planes and the collision-detection motion bounds. It then accepts the limited positions. The contact force helps solve for physically supported motion; DAT controls which motion is accepted.
 
-In this worktree, `particle_contact_alm_hard_gap` is used only by `alm_dat`. Its default is $r/4$. `penalty_dat` has its own penalty force calculation and does not use this parameter. [Mode-dependent force calls](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/solver_vbd.py:4903)
+In this worktree, `particle_contact_alm_hard_gap` is used only by `alm_dat`. Its default is $r/4$. `penalty_dat` has its own penalty force calculation and does not use this parameter. [Mode-dependent force calls](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/solver_vbd.py:4907)
 
-**3. ALM introduces an auxiliary deformation**
+**3. ALM introduces an auxiliary gap**
 
-The PDF's Equation (1) introduces $z$, an auxiliary deformation. Use that same meaning here. The equality we want is
-
-$$
-\boxed{\mathcal R(y)-z=0.}
-$$
-
-In words, **the deformation used in the material law should equal the deformation calculated from the proposed positions**. There is no second mesh or particle at $z$. It is a scalar used in evaluating the force.
-
-The maximum allowed compression is
+Introduce an auxiliary gap $z$, with the same separation convention as the code. The equality we want is
 
 $$
-z_{\max}=r-d_h.
+\boxed{z=g(y).}
 $$
 
-Replacing the direct material deformation by $z$ gives an equivalent constrained formulation
+In words, **the gap used in the material law should equal the gap calculated from the proposed positions**. There is no second mesh or particle at $z$. It is a scalar solved during force evaluation. Replacing the geometric gap in the spring energy by $z$ gives the equivalent constrained formulation
 
 $$
-\min_{y,\ z\leq z_{\max}}\ E_0(y)+\frac K2[\max(z,0)]^2
-\qquad\text{subject to}\qquad \mathcal R(y)-z=0.
+\min_{y,\ z\geq0}\ E_0(y)+\frac K2[\max(R-z,0)]^2
+\qquad\text{subject to}\qquad z-g(y)=0.
 $$
 
-When the equality holds, $z=r-d$, so $z\leq z_{\max}$ is exactly $d\geq d_h$. Negative $z$ is allowed and represents an open, uncompressed contact.
+When the equality holds, $z\geq0$ is exactly $g(y)\geq0$, or $d(y)\geq d_h$. For the auxiliary gap, $z\geq R$ means no spring compression, $0<z<R$ means compression, and $z=0$ reaches the hard limit. Negative $z$ is not allowed.
 
-ALM enforces the equality using a stored multiplier $\lambda$ and a numerical stiffness $\rho$. Call the contact contribution $L_{\mathrm{contact}}$; the full augmented objective is $E_0(y)+L_{\mathrm{contact}}$. At fixed proposed positions and fixed $\lambda$, the auxiliary calculation minimizes the following contact contribution over $z$:
+ALM enforces the equality using a stored multiplier $\lambda$ and a numerical stiffness $\rho$. Use the residual $z-g(y)$ so that $\lambda$ is positive for compression, as in the code. Call the contact contribution $L_{\mathrm{contact}}$; the full augmented objective is $E_0(y)+L_{\mathrm{contact}}$. At fixed proposed positions and fixed $\lambda$, the auxiliary calculation minimizes
 
 $$
 \boxed{
 L_{\mathrm{contact}}(y,z,\lambda)=
-\underbrace{\frac K2[\max(z,0)]^2}_{\text{material spring energy}}
+\underbrace{\frac K2[\max(R-z,0)]^2}_{\text{material spring energy}}
 +
-\underbrace{\lambda\bigl(\mathcal R(y)-z\bigr)
-+\frac\rho2\bigl(\mathcal R(y)-z\bigr)^2}_{\text{enforce agreement with the geometry}},
-\qquad z\leq z_{\max}.
+\underbrace{\lambda\bigl(z-g(y)\bigr)
++\frac\rho2\bigl(z-g(y)\bigr)^2}_{\text{enforce auxiliary gap = geometric gap}},
+\qquad z\geq0.
 }
 $$
 
@@ -124,20 +134,81 @@ The quantities have distinct roles.
 
 | Quantity | Meaning | Units |
 |---|---|---|
-| $\mathcal R(y)$ | Deformation from the current proposed geometry | m |
-| $z$ | Auxiliary deformation solved during this force evaluation | m |
+| $g(y)=d(y)-d_h$ | Geometric gap above the hard limit | m |
+| $R=r-d_h$ | Width of the compressible contact layer | m |
+| $z$ | Auxiliary gap solved during this force evaluation; constrained to be nonnegative | m |
 | $K$ | Material spring stiffness | N/m |
-| $\rho$ | Numerical stiffness used to enforce $\mathcal R=z$; called the row metric in the PDF | N/m |
+| $\rho$ | Numerical stiffness used to enforce $z=g(y)$; called the row metric in the PDF | N/m |
 | $\lambda$ | Stored compressive multiplier | N |
 | $N$ | Undamped repulsive force returned by the current evaluation | N |
 
-The calculation needs $\mathcal R(y)$ because that is its connection to the particle positions. If the particles move closer, $\mathcal R$ increases; if they move apart, it decreases. The ALM terms make the auxiliary deformation respond to that change.
+The calculation needs $g(y)$ because that is its connection to the particle positions. If the particles move closer, $g$ decreases; if they move apart, it increases. The ALM terms make the auxiliary gap respond to that change.
 
-The PDF's Equation (1) has the quadratic material energy $Kz^2/2$. This soft-contact code uses its compression-only version and adds the upper bound $z\leq z_{\max}$. The PDF's Section 3.1 describes compression-only normal reactions, but **does not specify this additional hard compression limit or its smooth transition**.
+The auxiliary solve enforces $z\geq0$ exactly. It does not enforce $z=g(y)$ exactly before the position and multiplier iterations converge. Consequently, trial positions can still have $g(y)<0$. DAT separately controls which particle positions are accepted.
+
+**Eliminate $z$, then update positions and the multiplier.** Define the eliminated contact energy:
+
+$$
+L'(y,\lambda)=\min_{z\geq0}L_{\mathrm{contact}}(y,z,\lambda).
+$$
+
+For the quadratic spring above and $\rho>0$, the auxiliary minimizer has a closed form. With $g=g(y)$,
+
+$$
+\boxed{
+z_*(y,\lambda)=
+\begin{cases}
+\displaystyle g-\frac{\lambda}{\rho},
+&\displaystyle g-\frac{\lambda}{\rho}\geq R,\\[8pt]
+\displaystyle \max\!\left(0,\frac{KR-\lambda+\rho g}{K+\rho}\right),
+&\text{otherwise}.
+\end{cases}
+}
+$$
+
+During the primal update, hold $\lambda$ fixed and update the trial positions $y$ using the gradient and local Hessian approximation of $E_0(y)+L'(y,\lambda)$. After a full VBD iteration, let the new trial positions be $y^{j+1}$. Evaluate the auxiliary minimizer at these positions, using the **old multiplier**:
+
+$$
+z_*=\arg\min_{z\geq0}
+L_{\mathrm{contact}}(y^{j+1},z,\lambda^j).
+$$
+
+Then the ALM multiplier update is
+
+$$
+\boxed{
+\lambda^{j+1}
+=\lambda^j+\rho\bigl(z_*-g(y^{j+1})\bigr).
+}
+$$
+
+This is the dual gradient-ascent step with step size $\rho$, since
+
+$$
+\frac{\partial L'}{\partial\lambda}=z_*(y,\lambda)-g(y).
+$$
+
+At the updated trial positions:
+
+- $z_*>g(y^{j+1})$: the actual gap is smaller than the auxiliary gap; increase the repulsive multiplier.
+- $z_*<g(y^{j+1})$: decrease it.
+- $z_*=g(y^{j+1})$: the equality is satisfied; leave it unchanged.
+
+The normal force magnitude derived in Section 4 is
+
+$$
+N(y,\lambda)=\lambda+\rho\bigl(z_*(y,\lambda)-g(y)\bigr).
+$$
+
+Therefore the multiplier update can also be written
+
+$$
+\boxed{\lambda^{j+1}=N(y^{j+1},\lambda^j).}
+$$
 
 **4. How ALM produces the contact force and selects its region**
 
-For fixed proposed positions and multiplier, choose the allowed value of $z$ that gives the smallest $L_{\mathrm{contact}}$. Call that result $z_*$. The quantity being minimized is the energy, not the deformation itself. This scalar calculation supplies the auxiliary deformation for the force evaluation; it does not move a particle.
+For fixed proposed positions and multiplier, choose $z\geq0$ that gives the smallest $L_{\mathrm{contact}}$. Call that result $z_*$. The quantity being minimized is the energy, not the gap itself. This scalar calculation supplies the auxiliary gap for force evaluation; it does not move a particle. This section uses the default constant-stiffness spring; Section 8 describes optional smoothing.
 
 **Why does an augmented-Lagrangian derivative represent a contact force?** In ALM, the position iterations try to minimize the full objective $E_0(y)+L_{\mathrm{contact}}$ while holding the multiplier fixed. The position equation they aim to satisfy is
 
@@ -147,93 +218,111 @@ $$
 
 This is the balance between inertia, elastic forces, and the contact reaction. A finite number of iterations may leave an error in this equation. For the local calculation, hold the normal, interpolation weights, and numerical metric fixed, as the solver does.
 
-First differentiate the contact contribution with respect to its scalar geometric deformation, holding $z$ and $\lambda$ fixed:
+First differentiate the contact contribution with respect to its geometric gap, holding $z$ and $\lambda$ fixed:
 
 $$
-\frac{\partial L_{\mathrm{contact}}}{\partial\mathcal R}
-=\lambda+\rho(\mathcal R-z).
+\frac{\partial L_{\mathrm{contact}}}{\partial g}
+=-\lambda-\rho(z-g).
 $$
 
-The spring term depends on $z$, so it contributes zero to this particular partial derivative. Substituting the solved auxiliary deformation defines the scalar $N$:
+The spring term depends on $z$, so it contributes zero to this particular partial derivative. Substituting the solved auxiliary gap defines the scalar $N$:
 
 $$
 \boxed{
-N:=\left.\frac{\partial L_{\mathrm{contact}}}{\partial\mathcal R}\right|_{z=z_*}
-=\lambda+\rho(\mathcal R-z_*).
+N:=-\left.\frac{\partial L_{\mathrm{contact}}}{\partial g}\right|_{z=z_*}
+=\lambda+\rho(z_*-g).
 }
 $$
 
-The symbol $:=$ means “define.” **$N$ names this derivative; it is not another independent unknown.** Eliminating $z$ gives the same derivative of the minimized contact energy: inside a region the auxiliary derivative is zero, or $z_*$ is fixed at its bound.
+The symbol $:=$ means “define.” **$N$ is the negative gap derivative, not another independent unknown.** A positive force pushes the contact points farther apart, increasing $g$. Eliminating $z$ gives the same gap derivative of the minimized contact energy: inside a region the auxiliary derivative is zero, or $z_*$ is fixed at zero.
 
 The chain rule then puts this exact coefficient into the position equation:
 
 $$
-\nabla_y E_0
-+\underbrace{\left.\frac{\partial L_{\mathrm{contact}}}{\partial\mathcal R}\right|_{z=z_*}}_{N}
-\nabla_y\mathcal R=0.
+\nabla_y E_0-N\nabla_y g=0.
 $$
 
 The corresponding contact force is the negative position gradient,
 
 $$
-f_{\mathrm{contact}}=-N\nabla_y\mathcal R.
+f_{\mathrm{contact}}=N\nabla_y g.
 $$
 
-For the contact points, $\mathcal R=r-n^T(p_A-p_B)$ gives $\nabla_{p_A}\mathcal R=-n$ and $\nabla_{p_B}\mathcal R=+n$. The forces are therefore $+Nn$ on A and $-Nn$ on B. This is why $N$ is called the normal reaction. The interpolation weights distribute these point forces to the primitive vertices, as described in Section 6.
+For the contact points, $g=n^T(p_A-p_B)-d_h$ gives $\nabla_{p_A}g=+n$ and $\nabla_{p_B}g=-n$. The forces are therefore $+Nn$ on A and $-Nn$ on B. This is why $N$ is called the normal reaction. The interpolation weights distribute these point forces to the primitive vertices, as described in Section 6.
 
-The PDF calls the scalar derivative $g$ for a general constraint row in Section 1.1, Equation (5), and uses $N$ for normal contact in Section 3.1. Its $L_\rho$ in Equation (1) is the contact/constraint contribution corresponding to $L_{\mathrm{contact}}$ here; $E_0$ is added to form the full position objective. At an unfinished solve, $N$ includes the numerical correction $\rho(\mathcal R-z_*)$ and need not yet equal the converged material force from the geometric compression.
+At an unfinished solve, $N$ includes the numerical correction $\rho(z_*-g)$ and need not yet equal the converged material force from the geometric compression $R-g$.
 
 The normal stiffness used in the local position solve is
 
 $$
-k_n=\frac{\partial N}{\partial\mathcal R}
+k_n=-\frac{\partial N}{\partial g}
 =-\frac{\partial N}{\partial d},
 $$
 
 with the multiplier and geometry coefficients held fixed.
 
-Assume $K>0$, $\rho>0$, and $z_{\max}>0$. The code returns zero force and stiffness when $\rho\leq0$. For positive parameters, the complete piecewise calculation is
-
-| Region | Selection condition | Auxiliary deformation $z_*$ | Force $N$ | Local stiffness $k_n$ |
-|---|---|---|---|---|
-| Released | $\lambda+\rho\mathcal R\leq0$ | $\mathcal R+\lambda/\rho$ | $0$ | $0$ |
-| Compressed spring | $0<\lambda+\rho\mathcal R\leq(K+\rho)z_{\max}$ | $(\lambda+\rho\mathcal R)/(K+\rho)$ | $Kz_*$ | $K\rho/(K+\rho)$ |
-| Hard compression limit, called the hard wall | $\lambda+\rho\mathcal R>(K+\rho)z_{\max}$ | $z_{\max}$ | $\lambda+\rho(\mathcal R-z_{\max})$ | $\rho$ |
-
-**Released.** The minimizing $z_*$ is nonpositive, so the spring energy is zero. The normal force also vanishes. Release depends on both geometry and the stored multiplier. In terms of distance, release occurs when $d\geq r+\lambda/\rho$. With no stored multiplier, this reduces to $d\geq r$.
-
-**Compressed spring.** Here $0<z_*<z_{\max}$, so differentiating $L_{\mathrm{contact}}$ with respect to $z$ gives
+Assume $K>0$, $\rho>0$, and $R>0$. The code returns zero force and stiffness when $\rho\leq0$. For positive parameters, define the two unconstrained candidates used by `alm_contact_row`:
 
 $$
-Kz_*-\lambda-\rho(\mathcal R-z_*)=0.
+z_{\mathrm{free}}=g-\frac\lambda\rho,
+\qquad
+z_0=\frac{KR-\lambda+\rho g}{K+\rho}.
+$$
+
+$z_{\mathrm{free}}$ minimizes the ALM terms when the spring is uncompressed. $z_0$ minimizes the quadratic compressed-spring expression before imposing $z\geq0$. Select the region in this order:
+
+| Region | Selection condition | Auxiliary gap $z_*$ | Force $N$ | Local stiffness $k_n$ |
+|---|---|---|---|---|
+| Released | $z_{\mathrm{free}}\geq R$ | $z_{\mathrm{free}}$ | $0$ | $0$ |
+| Compressed spring | Otherwise, if $z_0\geq0$ | $z_0$ | $K(R-z_*)$ | $K\rho/(K+\rho)$ |
+| Hard compression limit, called the hard wall | Otherwise: $z_0<0$ | $0$ | $\lambda-\rho g$ | $\rho$ |
+
+**Released.** The minimizing $z_*$ is at least $R$, so the spring energy is zero. The normal force also vanishes. Release depends on both geometry and the stored multiplier: $g\geq R+\lambda/\rho$, or $d\geq r+\lambda/\rho$. With no stored multiplier, this reduces to $d\geq r$.
+
+**Compressed spring.** For $0<z_*<R$, differentiating $L_{\mathrm{contact}}$ with respect to $z$ gives
+
+$$
+-K(R-z_*)+\lambda+\rho(z_*-g)=0.
 $$
 
 Consequently,
 
 $$
-z_*=\frac{\lambda+\rho\mathcal R}{K+\rho},
+z_*=\frac{KR-\lambda+\rho g}{K+\rho},
 \qquad
-N=Kz_*=
+N=K(R-z_*)=
 \underbrace{\frac{K}{K+\rho}}_{s}\lambda+
-\underbrace{\frac{K\rho}{K+\rho}}_{k_{\mathrm{eff}}}\mathcal R.
+\underbrace{\frac{K\rho}{K+\rho}}_{k_{\mathrm{eff}}}(R-g).
 $$
 
-These are the coefficients in the PDF's Section 1.1, Equations (3)–(6). This is what “active quadratic compliant region” referred to: the spring is compressed, its energy is quadratic, and its stiffness is finite.
+This matches the code directly:
 
-**Hard wall.** The unconstrained spring calculation would require $z_*>z_{\max}$, so the auxiliary deformation is capped at $z_{\max}$. The returned force is then
+```python
+z0 = (stiffness * radius - lam + rho * gap) / (stiffness + rho)
+```
+
+The coefficients $s$ and $k_{\mathrm{eff}}$ are the same as in the PDF's Section 1.1, Equations (3)–(6). Here the geometric compression is written explicitly as $R-g$.
+
+**Hard wall.** The unconstrained spring calculation gives $z_0<0$. The constrained minimum is therefore $z_*=0$, and the returned force is
 
 $$
-N=\lambda+\rho(\mathcal R-z_{\max})
+N=\lambda-\rho g
 =\lambda+\rho(d_h-d).
 $$
 
-This caps the auxiliary deformation during a force evaluation. It does not directly move or clamp a particle. The proposed geometry can still have $d<d_h$ while the position and multiplier iterations are unfinished. DAT separately decides the accepted particle motion.
+This keeps the auxiliary gap nonnegative during a force evaluation. It does not directly move or clamp a particle. The proposed geometry can still have $g<0$, or $d<d_h$, while the position and multiplier iterations are unfinished. DAT separately decides the accepted particle motion.
 
-The returned force is continuous at the switches. At release it is zero; at the spring-to-wall switch it is $Kz_{\max}$. The stiffness changes from $0$ to $k_{\mathrm{eff}}$ to $\rho$. At exact switches, the table gives the branch chosen by the code.
+The returned force is continuous at the switches. At release it is zero; at the spring-to-wall switch it is $KR$. The stiffness changes from $0$ to $k_{\mathrm{eff}}$ to $\rho$. At exact switches, the table gives the branch chosen by the code: release at $z_{\mathrm{free}}=R$, and the spring branch at $z_0=0$.
 
-After a full VBD iteration, the solver reevaluates this law at the resulting proposed positions and sets $\lambda\leftarrow N$. If the geometry is held fixed in the spring region and these multiplier updates converge, then $\lambda=K\mathcal R$ and $z_*=\mathcal R$. This explains the difference between the intermediate response $k_{\mathrm{eff}}$ and the target material stiffness $K$.
+After a full VBD iteration, the solver reevaluates this law at the resulting proposed positions, using the old multiplier, and sets $\lambda\leftarrow N$. Equivalently,
 
-[Piecewise force implementation](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:873) · [Multiplier update](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:1389)
+$$
+\lambda^{j+1}=\lambda^j+\rho\bigl(z_*(y^{j+1},\lambda^j)-g(y^{j+1})\bigr).
+$$
+
+If the geometry is held fixed with $0<g<R$ and these multiplier updates converge, then $z_*=g$ and $\lambda=K(R-g)$. This explains the difference between the intermediate response $k_{\mathrm{eff}}$ and the target material stiffness $K$.
+
+[Piecewise force implementation](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:873) · [Multiplier update](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:1376)
 
 **5. Where the contact Hessian change enters**
 
@@ -267,7 +356,7 @@ For each VBD iteration:
 
 This worktree uses the stored-plane checkpoint procedure. The separate current-trial plane-replacement experiments are outside this change.
 
-[Force evaluation and assembly call](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/solver_vbd.py:4903) · [Position solve](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_vbd_kernels.py:2883) · [Anchor advance and plane rebuild](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/solver_vbd.py:4100)
+[Force evaluation and assembly call](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/solver_vbd.py:4907) · [Position solve](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_vbd_kernels.py:2883) · [Anchor advance and plane rebuild](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/solver_vbd.py:4103)
 
 **6. One contact couples the position updates of its vertices**
 
@@ -286,13 +375,13 @@ Here $w_i$ are signed interpolation weights.
 
 The PDF's $w$ in Equation (15) denotes mobility. The subscripted $w_i$ here denotes a vertex interpolation weight.
 
-**Start with the Hessian of the normal contact energy.** Let $\bar L_{\mathrm{contact}}$ be the contact energy after minimizing over the auxiliary deformation $z$. For this position derivative, hold the stored normal, interpolation weights, multiplier, and numerical metric fixed. Since $\mathcal R=r-n^Tu$ and $N=\partial\bar L_{\mathrm{contact}}/\partial\mathcal R$, the Hessian with respect to $u$ is
+**Start with the Hessian of the normal contact energy.** Let $\bar L_{\mathrm{contact}}$ be the contact energy after minimizing over the auxiliary gap $z\geq0$. For this position derivative, hold the stored normal, interpolation weights, multiplier, and numerical metric fixed. Since $g=n^Tu-d_h$ and $N=-\partial\bar L_{\mathrm{contact}}/\partial g$, the gradient with respect to $u$ is $-Nn$. Differentiating again gives the Hessian
 
 $$
 \boxed{
 B_{\mathrm{normal}}
 =\frac{\partial^2\bar L_{\mathrm{contact}}}{\partial u^2}
-=\frac{\partial N}{\partial\mathcal R}\,nn^T
+=-\frac{\partial N}{\partial g}\,nn^T
 =k_nnn^T.
 }
 $$
@@ -306,7 +395,7 @@ force = normal_force * n - friction_force
 B = normal_stiffness * outer(n, n) + friction_jacobian
 ```
 
-The undamped part of `normal_stiffness` is $k_n$; the function adds the normal damping derivative separately. `friction_jacobian` differentiates the friction response at a fixed normal load and fixed tangent plane. Thus $B$ is the approximation to the negative force derivative, $-\partial f/\partial u$, used in the position update. Its normal-energy part is the exact Hessian under the frozen-geometry assumptions above. The complete $B$ does not include all derivatives through changing normals, closest-point weights, numerical metrics, or the normal load in friction. [Pair response](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:1168)
+The undamped part of `normal_stiffness` is $k_n$; the function adds the normal damping derivative separately. `friction_jacobian` differentiates the friction response at a fixed normal load and fixed tangent plane. Thus $B$ is the approximation to the negative force derivative, $-\partial f/\partial u$, used in the position update. Its normal-energy part is the exact Hessian under the frozen-geometry assumptions above. The complete $B$ does not include all derivatives through changing normals, closest-point weights, numerical metrics, or the normal load in friction. [Pair response](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:1168)
 
 **Next distribute the Hessian to particle positions.** The force contribution to vertex $i$ is $w_i f$. Since $\partial u/\partial y_i=w_iI$, the contact Hessian blocks for the four vertices are
 
@@ -457,7 +546,7 @@ particle_forces[p] += w * force
 particle_hessians[p] += curvature_weight * hessian
 ```
 
-The same accumulation helper handles VT and EE. Here `weight_sum` is $S$ and `hessian` is $B$. Pinned and inactive vertices are excluded from $S$; their unused buffer entries retain the original $w_i^2$ factor. The vertex solve then uses the accumulated force and Hessian. [Contact accumulation](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:1210) · [Per-vertex position solve](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_vbd_kernels.py:2883)
+The same accumulation helper handles VT and EE. Here `weight_sum` is $S$ and `hessian` is $B$. Pinned and inactive vertices are excluded from $S$; their unused buffer entries retain the original $w_i^2$ factor. The vertex solve then uses the accumulated force and Hessian. [Contact accumulation](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:1210) · [Per-vertex position solve](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_vbd_kernels.py:2883)
 
 The temporary internal integer `solver._particle_contact_stiffness_mode` selects `0` for the original $w_i^2B$ blocks or `1` for the new $|w_i|SB$ blocks. It defaults to `1` and is not a constructor argument. Set it before CUDA graph capture; changing it afterward requires recapturing the graph. It affects ALM self-contact Hessian assembly only; contact forces, multipliers, and DAT truncation are unchanged.
 
@@ -496,36 +585,59 @@ Here $v_0,v_1$ are increments; the PDF names them $z_0,z_1$, unrelated to its au
 
 The formula also covers fractional weights. For a VT contact, put the vertex $v$ and triangle corner $a$ in one color, and corners $b,c$ in other colors. At triangle barycentric coordinates $(1/3,1/3,1/3)$, the updated vertices have weights $1,-1/3$. Therefore $S=4/3$, and their blocks are $\widetilde H_{vv}=(4/3)B$ and $\widetilde H_{aa}=(4/9)B$.
 
-The paragraph after Equation (50) says the code doubles contact solve blocks for dynamic endpoints updated simultaneously in one color. It does not explicitly distinguish normal and friction contributions. The proof above applies to any positive-semidefinite $B$. The rigid-contact code in this checkout does not perform that doubling, and the PDF's Equation (48) uses a different friction Hessian approximation from this soft solver. The specific mathematical connection here is Equation (50). [Rigid contact evaluation](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/rigid_vbd_kernels.py:1920) · [Rigid contact accumulation](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/rigid_vbd_kernels.py:5302)
+The paragraph after Equation (50) says the code doubles contact solve blocks for dynamic endpoints updated simultaneously in one color. It does not explicitly distinguish normal and friction contributions. The proof above applies to any positive-semidefinite $B$. The rigid-contact code in this checkout does not perform that doubling, and the PDF's Equation (48) uses a different friction Hessian approximation from this soft solver. The specific mathematical connection here is Equation (50). [Rigid contact evaluation](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/rigid_vbd_kernels.py:1920) · [Rigid contact accumulation](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/rigid_vbd_kernels.py:5302)
 
 **Scope of the result.** The proof assumes positive-semidefinite contact Hessian approximations $B$, a positive-definite solve matrix $D$, and fixed geometry and response coefficients. It proves decrease of that quadratic, not of the full nonlinear simulation energy across changes in contact geometry, ALM multipliers or DAT truncation. A larger block can also slow convergence at a fixed iteration count; the simulation comparisons in Section 9 assess the outcome.
 
 The argument does not require ALM. An active quadratic penalty contact with a fixed normal has $B=Knn^T$, so the same construction applies. This worktree changes the ALM-DAT path; penalty-DAT implementation and evaluation are separate in [newton-penalty-dat-contact-stiffness-fix](/mnt/nvme1/Workspace/robotics/newton-penalty-dat-contact-stiffness-fix/).
 
-**8. Translating the PDF notation back to this code**
+**8. Code correspondence, JC's notation, and optional smoothing**
 
-The code evaluates the same scalar law using auxiliary *separation*. Its local variable named `z` therefore has a different meaning from the PDF's $z$. This table is the translation; the mathematical derivation above consistently uses the PDF meaning.
+**Code correspondence.** The derivation above uses the code's auxiliary-separation convention throughout. The outer contact response takes the unshifted separation and spring onset; the scalar contact function takes their values shifted by the hard gap:
 
 | Code quantity | Meaning in the notation above |
 |---|---|
 | `gap` in `_alm_contact_response` | $d$ |
 | `radius` in `_alm_contact_response` | $r$ |
 | `hard_gap` | $d_h$ |
-| `gap` passed to `alm_contact_row` | $d-d_h=z_{\max}-\mathcal R$ |
-| `radius` passed to `alm_contact_row` | $r-d_h=z_{\max}$ |
-| Auxiliary separation `z0` / `z` in the scalar contact functions | $z_{\max}-z_*$ |
+| `gap` passed to `alm_contact_row` or `alm_contact_row_smooth` | $g=d-d_h$ |
+| `radius` passed to those scalar contact functions | $R=r-d_h$ |
+| `z_free` in `alm_contact_row` | $z_{\mathrm{free}}=g-\lambda/\rho$; the released candidate |
+| `z0` in `alm_contact_row` | $z_0=(KR-\lambda+\rho g)/(K+\rho)$; the unconstrained spring candidate |
+| `z` in the Newton loop of `alm_contact_row_smooth` | Auxiliary gap iterated toward $z_*$, clamped to $[0,R]$ |
 | `stiffness` | $K$ |
 | `vt_lambda` / `ee_lambda` | Stored $\lambda$ |
 | `transmitted` | Undamped $N$ |
 
-For example, the code's separation bound `z >= 0` becomes the deformation bound $z_*\leq z_{\max}$. The code's spring compression `radius - z` becomes the auxiliary deformation $z_*$. [Shifted arguments](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:1192)
+The hard-limit branch sets the solved auxiliary gap to zero implicitly; it returns $N=\lambda-\rho g$ without storing a separate $z_*$. The code's spring compression `radius - z` is $R-z$. [Shifted arguments](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:1192)
 
-**Optional smoothing.** With `particle_contact_alm_transition_band = 0`, the constant-stiffness formulas in Section 4 apply exactly. For a positive band width $b\leq z_{\max}$, define $\beta$ as `particle_contact_alm_wall_stiffness_ratio`. In deformation coordinates the material tangent is
+**Connection to JC's compliant ALM.** JC's Equation (1) uses geometric deformation and auxiliary deformation. For contact, take deformation to mean positive compression. To distinguish those quantities from the gap variables used throughout this document, label them explicitly:
+
+$$
+\mathcal R_{\mathrm{JC}}=R-g=r-d,
+\qquad
+z_{\mathrm{JC}}=R-z.
+$$
+
+Then the ALM residual agrees exactly:
+
+$$
+\mathcal R_{\mathrm{JC}}-z_{\mathrm{JC}}
+=(R-g)-(R-z)=z-g.
+$$
+
+This explains the sign of the linear term $\lambda(z-g)$ in Section 3. The multiplier keeps the same compressive-positive convention. JC's generic scalar force is also named $g$ in his Equation (5); that force is represented by $N$ here. Our $g(y)$ always means a geometric gap, not a force.
+
+The spring branch uses JC's coefficients $s=K/(K+\rho)$ and $k_{\mathrm{eff}}=K\rho/(K+\rho)$. With no hard compression limit, release and compression give $N=[s\lambda+k_{\mathrm{eff}}(R-g)]_+$, matching his unstabilized normal-contact formula. His Section 3.1, Equations (34)–(35), evaluates this force during the position sweep and updates the multiplier afterward using the resulting positions and the old multiplier.
+
+The complete model here adds an extra requirement: $z\geq0$, or equivalently $z_{\mathrm{JC}}\leq R$. **JC's finite-stiffness normal contact does not specify this hard compression limit or the smoothing below.** The auxiliary-variable construction and compliant coefficients agree; the complete contact model includes this additional constraint.
+
+**Optional smoothing.** With the default `particle_contact_alm_transition_band = 0`, the constant-stiffness formulas in Section 4 apply exactly. For a positive band width $0<b\leq R$, define $\beta$ as `particle_contact_alm_wall_stiffness_ratio`. In the same auxiliary-gap coordinate $z$, the material stiffness is
 
 $$
 K_{\mathrm{wall}}=\max(K,\beta\rho),\qquad
 t=\operatorname{clamp}\!\left(
-\frac{z-(z_{\max}-b)}{b},0,1
+1-\frac zb,0,1
 \right),
 $$
 
@@ -534,21 +646,23 @@ K_{\mathrm{mat}}(z)
 =K+(K_{\mathrm{wall}}-K)(3t^2-2t^3).
 $$
 
-The tangent increases as compression approaches its limit. For $0\leq z\leq z_{\max}$, its material force is
+The stiffness increases as the auxiliary gap decreases toward zero. For $0\leq z\leq R$, its material force is
 
 $$
-F_{\mathrm{mat}}(z)=\int_0^zK_{\mathrm{mat}}(\zeta)\,d\zeta.
+F_{\mathrm{mat}}(z)=\int_z^R K_{\mathrm{mat}}(\zeta)\,d\zeta,
+\qquad
+F'_{\mathrm{mat}}(z)=-K_{\mathrm{mat}}(z).
 $$
 
-For $z\leq0$, set $F_{\mathrm{mat}}(z)=0$. The three regions become
+For $z\geq R$, set $F_{\mathrm{mat}}(z)=0$. In particular, $F_{\mathrm{mat}}(0)=KR+(K_{\mathrm{wall}}-K)b/2$. The smoothed spring energy is $\int_z^R F_{\mathrm{mat}}(\zeta)\,d\zeta$ for $0\leq z\leq R$, and zero for $z\geq R$; it replaces the quadratic spring term, while the ALM terms and the constraint $z\geq0$ stay the same. Select the regions in this order:
 
 | Region | Selection condition | Result |
 |---|---|---|
-| Released | $\lambda+\rho\mathcal R\leq0$ | $N=0$, $k_n=0$ |
-| Compressed spring | $0<\lambda+\rho\mathcal R\leq F_{\mathrm{mat}}(z_{\max})+\rho z_{\max}$ | Solve $F_{\mathrm{mat}}(z_*)=\lambda+\rho(\mathcal R-z_*)$; then $N=F_{\mathrm{mat}}(z_*)$, $k_n=K_{\mathrm{mat}}(z_*)\rho/[K_{\mathrm{mat}}(z_*)+\rho]$ |
-| Hard wall | $\lambda+\rho\mathcal R>F_{\mathrm{mat}}(z_{\max})+\rho z_{\max}$ | $z_*=z_{\max}$, $N=\lambda+\rho(\mathcal R-z_{\max})$, $k_n=\rho$ |
+| Released | $g-\lambda/\rho\geq R$ | $z_*=g-\lambda/\rho$, $N=0$, $k_n=0$ |
+| Compressed spring | Otherwise, if $F_{\mathrm{mat}}(0)-\lambda+\rho g\geq0$ | Solve $F_{\mathrm{mat}}(z_*)=\lambda+\rho(z_*-g)$; then $N=F_{\mathrm{mat}}(z_*)$, $k_n=K_{\mathrm{mat}}(z_*)\rho/[K_{\mathrm{mat}}(z_*)+\rho]$ |
+| Hard wall | Otherwise: $F_{\mathrm{mat}}(0)-\lambda+\rho g<0$ | $z_*=0$, $N=\lambda-\rho g$, $k_n=\rho$ |
 
-The code uses eight clamped Newton iterations for the compressed-spring root. The effective spring stiffness approaches the hard-wall stiffness $\rho$ as the material tangent increases, but finite $K_{\mathrm{wall}}$ generally leaves a remaining stiffness jump. This smoothing predates the per-vertex contact Hessian change. [Smooth material tangent](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:850) · [Smooth response](/mnt/nvme1/Workspace/robotics/newton-alm-dat-contact-stiffness-fix/newton/_src/solvers/vbd/particle_dat_kernels.py:928)
+The code uses eight clamped Newton iterations for the compressed-spring root. The effective spring stiffness approaches the hard-wall stiffness $\rho$ as the material stiffness increases, but finite $K_{\mathrm{wall}}$ generally leaves a remaining stiffness jump. Because $K_{\mathrm{wall}}$ depends on $\rho$, enabling this smoothing makes the material law depend on the numerical metric. This is an additional modeling choice, rather than JC's separation of a fixed material law from numerical conditioning. The smoothing predates the per-vertex contact Hessian change. [Smooth material stiffness](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:850) · [Smooth response](/mnt/nvme1/Workspace/robotics/newton-collision/newton/_src/solvers/vbd/particle_dat_kernels.py:928)
 
 **9. What was tested, and what remains limited**
 
