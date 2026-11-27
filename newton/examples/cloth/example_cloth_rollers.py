@@ -144,38 +144,21 @@ def rolled_cloth_mesh(
 
 
 def cylinder_mesh(radius=9.5, height=120.0, segments=64):
-    """Create a cylinder mesh (side walls only)."""
+    """Create cylinder side walls with shared vertices along every quad boundary."""
     verts = []
     faces = []
-
     for i in range(segments):
-        t0 = 2 * math.pi * i / segments
-        t1 = 2 * math.pi * (i + 1) / segments
-
-        x0, z0 = radius * math.cos(t0), radius * math.sin(t0)
-        x1, z1 = radius * math.cos(t1), radius * math.sin(t1)
-
-        y0 = -height * 0.5
-        y1 = height * 0.5
-
-        base = len(verts)
-
-        verts += [
-            [x0, y0, z0],
-            [x1, y0, z1],
-            [x1, y1, z1],
-            [x0, y1, z0],
-        ]
-
-        faces += [
-            [base + 0, base + 1, base + 2],
-            [base + 0, base + 2, base + 3],
-        ]
-
-    return (
-        np.array(verts, np.float32),
-        np.array(faces, np.int32),
-    )
+        angle = 2 * math.pi * i / segments
+        x, z = radius * math.cos(angle), radius * math.sin(angle)
+        verts += [[x, -height * 0.5, z], [x, height * 0.5, z]]
+    # Shared indices let the self-contact topology filter exclude adjacent faces,
+    # including the seam. Duplicated corners create pairs that cannot be separated.
+    for i in range(segments):
+        next_i = (i + 1) % segments
+        lower, upper = 2 * i, 2 * i + 1
+        next_lower, next_upper = 2 * next_i, 2 * next_i + 1
+        faces += [[lower, next_lower, next_upper], [lower, next_upper, upper]]
+    return np.array(verts, np.float32), np.array(faces, np.int32)
 
 
 class Example:
@@ -378,6 +361,22 @@ class Example:
         self.angular_speed_cyl2 = linear_velocity / self.cyl2_radius  # slower due to larger radius
         self.spin_duration = spin_duration  # seconds
 
+        self_contact_method = getattr(args, "self_contact_method", "penalty_dat")
+        self_contact_slot = newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT
+        frequency_type = newton.solvers.SolverBase.CollisionFrequencyType
+        contact_options = {
+            "particle_self_contact_method": self_contact_method,
+            "collision_frequency_type": {self_contact_slot: frequency_type.ITERATIONS},
+        }
+        if self_contact_method == "alm_dat":
+            # Match the recorded ALM comparison: use its supported schedule and
+            # the latest public scene's contact capacities, retaining warning output.
+            contact_options.update(
+                collision_frequency_type={self_contact_slot: frequency_type.PRE_POST_INIT},
+                particle_vertex_contact_buffer_size=48,
+                particle_edge_contact_buffer_size=160,
+            )
+
         # Create solver
         self.solver = newton.solvers.SolverVBD(
             model=self.model,
@@ -386,10 +385,8 @@ class Example:
             particle_self_contact_margin=0.3,
             particle_self_contact_gap=0.3,
             collision_frequency={newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: 5},
-            collision_frequency_type={
-                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.ITERATIONS,
-            },
             particle_topological_contact_filter_threshold=2,
+            **contact_options,
         )
 
         # Create states
@@ -542,6 +539,12 @@ class Example:
 if __name__ == "__main__":
     # Create parser with base arguments
     parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--self-contact-method",
+        choices=("penalty_dat", "alm_dat"),
+        default="penalty_dat",
+        help="Soft self-contact method (default: penalty_dat).",
+    )
 
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)
